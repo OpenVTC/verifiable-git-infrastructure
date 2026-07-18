@@ -1,0 +1,33 @@
+[package]
+name = "verify-trust"
+description = "CI verifier for VGI: checks that every commit in a git range is signed by a DID the community's Trust Registry currently authorizes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "verify-trust"
+path = "src/main.rs"
+
+[dependencies]
+vgi-core = { workspace = true }
+trql-client = { workspace = true }
+affinidi-tdk = { workspace = true }
+pgp = { workspace = true }
+ssh-key = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }

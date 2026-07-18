@@ -1,1 +1,52 @@
-# verifiable-git-infrastructure
+# Verifiable Git Infrastructure (VGI)
+
+**Commit trust for DIDs** — sign git commits with keys held by a Verifiable
+Trust Agent (VTA), and verify, in CI, that every commit in a pull request is
+signed by a DID your community's Trust Registry currently authorizes.
+
+VGI is the git-layer sibling of
+[verifiable-trust-infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure).
+It is **not** a generic git-signing library: it is bound to the DID /
+Trust-Registry ecosystem — you need a VTA to sign and a Trust Registry to
+verify against. See the operator runbook for the full activation flow.
+
+## Crates
+
+| Crate | Role |
+|---|---|
+| [`vgi-core`](crates/vgi-core) | Shared, dependency-light primitives: the PROTOCOL.sshsig encoder, git commit-object handling, and DID-document Ed25519 key extraction. No network, keyring, or VTA. |
+| [`verify-trust`](crates/verify-trust) | The CI verifier (`verify-trust` binary). Checks a commit range against the registry. Depends only on `vgi-core`, a DID resolver, and the query client — no VTA or keyring, so PR runs stay small. |
+| [`did-git-sign`](crates/did-git-sign) | The signer (`did-git-sign`, a git `gpg.ssh.program`). Signs commits with a DID key held by your VTA; carries the dev-machine stack (VTA client, keyring, prompts). |
+
+## The CI check
+
+Verify every commit in a PR against the Trust Registry:
+
+```sh
+verify-trust \
+  --range origin/main..HEAD \
+  --registry-url  https://registry.example.com \
+  --registry-did  did:webvh:...registry \
+  --authority     did:webvh:...your-community \
+  --resource      your-org/your-repo
+```
+
+A GitHub composite action wraps this — see `.github/actions/verify-trust`.
+Verdicts: `trusted` / `exempt` pass; `unsigned`, `unknownKey`, `badSignature`,
+`unauthorized`, `registryUnavailable` fail. Fails closed at every layer.
+
+## Signing
+
+`did-git-sign init` configures git to sign your commits with a DID key held by
+your VTA (SSH-signature format; the DID's verification-method id binds each
+commit to the DID). No private key touches disk.
+
+## Status
+
+Extracted from `OpenVTC/openvtc` (where it was developed and dogfooded), with
+history preserved. Prebuilt release binaries and a versioned, download-based
+GitHub Action follow.
+
+## License
+
+Apache-2.0.
