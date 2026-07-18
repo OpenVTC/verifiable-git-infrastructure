@@ -20,10 +20,11 @@ as the git `user.email`, linking every commit to your decentralized identity.
 
 ## Prerequisites
 
-- A running VTA instance with your DID and keys provisioned
-- A **VTA credential bundle** (base64url-encoded string issued by the VTA)
-- Your **VTA signing key ID** (the opaque key identifier in the VTA)
-- Your **DID#key-id** (e.g. `did:webvh:abc123:example.com#key-0`)
+- A running VTA with your persona DID(s) and Ed25519 signing key(s) provisioned.
+- Your **VTA DID** (e.g. `did:webvh:scid:your-vta.example.com`). `init`
+  discovers the service URL from the DID document, mints a short-lived admin
+  did:key for the setup session, and prints the `pnm contexts create` command
+  to authorise it.
 
 ## Install
 
@@ -40,39 +41,49 @@ the CI verifier is the separate [`verify-trust`](https://crates.io/crates/verify
 ### Per-repository
 
 ```bash
-did-git-sign init \
-  --credential "eyJkaWQiOi..." \
-  --key-id "your-vta-key-id" \
-  --did-key-id "did:webvh:abc123:example.com#key-0" \
-  --name "Your Name"
+did-git-sign init --vta-did did:webvh:scid:your-vta.example.com
 ```
 
-This creates `.did-git-sign.json` in the current directory and configures the
-local git repo.
+`init` resolves the VTA, mints a temporary admin did:key, and prints a
+`pnm contexts create …` command. Run it in your Personal Network Manager to
+authorise the setup session, press Enter, then select the persona and signing
+key interactively. This writes `.did-git-sign.json` in the current directory
+and configures the local git repo.
 
 ### Global (all repositories)
 
 ```bash
-did-git-sign init --global \
-  --credential "eyJkaWQiOi..." \
-  --key-id "your-vta-key-id" \
-  --did-key-id "did:webvh:abc123:example.com#key-0" \
-  --name "Your Name"
+did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
 ```
 
-This saves config to `~/.config/did-git-sign/config.json` and sets global git
-config.
+Saves config to `~/.config/did-git-sign/` and sets global git config.
+
+### Non-interactive
+
+Name the persona and key to skip the picker (and `--yes` to skip the
+"press Enter once authorised" prompt):
+
+```bash
+did-git-sign init \
+  --vta-did    did:webvh:scid:your-vta.example.com \
+  --key-id     your-vta-key-id \
+  --did-key-id did:webvh:scid:your-vta.example.com#key-0 \
+  --name       "Your Name" \
+  --yes
+```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--credential` | Base64url-encoded VTA credential bundle (required) |
-| `--key-id` | VTA key ID for your Ed25519 signing key (required) |
-| `--did-key-id` | DID verification method ID to use as git `user.email` (required) |
+| `--vta-did` | VTA DID; the service URL is discovered from its document (required) |
+| `--context` | Context id to provision into (default `did-git-sign`) |
+| `--key-id` | VTA key id for the signing key (skips interactive selection) |
+| `--did-key-id` | DID verification-method id to sign as (skips interactive selection) |
 | `--name` | Git `user.name` (optional) |
-| `--vta-url` | Override VTA URL if not present in credential bundle (optional) |
-| `--global` | Use global git config instead of per-repo (optional) |
+| `--vta-url` | Override the VTA URL instead of resolving it from the DID |
+| `--global` | Configure global git instead of per-repo |
+| `--yes` | Assume the admin grant is already registered; skip the prompt |
 
 ### What `init` configures
 
@@ -104,10 +115,10 @@ Verify signatures:
 git log --show-signature
 ```
 
-Check your configuration:
+Check your configuration and VTA connectivity:
 
 ```bash
-did-git-sign status
+did-git-sign health
 ```
 
 ### Selecting which community persona signs
