@@ -1,18 +1,21 @@
 name: Publish
 
-# Publish the three crates to crates.io in dependency order. Runs when a
-# GitHub Release is published (the `release.yml` pipeline creates it on a
-# `vX.Y.Z` tag), or manually via workflow_dispatch.
+# Publish the three crates to crates.io in dependency order. Runs on a
+# `vX.Y.Z` tag push (alongside release.yml), or manually via workflow_dispatch.
 #
-# Auth is crates.io Trusted Publishing (OIDC) — no long-lived token. This
-# requires a one-time setup per crate on crates.io: add this repo + this
-# workflow as a Trusted Publisher for `vgi-core`, `verify-trust`, and
-# `did-git-sign`. A brand-new crate name has no owner yet, so the *first*
-# publish of each name may need a manual token-based `cargo publish` to
-# establish it; trusted publishing covers every release after that.
+# The tag push — not `release: published` — is the trigger on purpose: a
+# GitHub Release created by release.yml uses the default GITHUB_TOKEN, and
+# GitHub does not let GITHUB_TOKEN-created events cascade-trigger other
+# workflows, so a `release: published` handler would never fire. Keying off
+# the tag push (done by a human/PAT) avoids that. Publishing is independent of
+# the release binaries, so running in parallel with release.yml is fine.
+#
+# Auth is crates.io Trusted Publishing (OIDC) — no long-lived token. Setup per
+# crate on crates.io: add this repo + this workflow (`publish.yml`) as a
+# Trusted Publisher for `vgi-core`, `verify-trust`, and `did-git-sign`.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*.*.*"]
   workflow_dispatch:
 
 permissions:
