@@ -1,0 +1,105 @@
+name: "verify-trust"
+description: "Verify that every commit in a range is signed by a DID your community's Trust Registry currently authorizes."
+
+inputs:
+  range:
+    description: "Commit range in git rev-list syntax (e.g. origin/main..HEAD). Requires the base ref to be fetched (actions/checkout with fetch-depth: 0)."
+    required: true
+  registry-url:
+    description: "Base URL of the Trust Registry (queries POST to <url>/trust-tasks)."
+    required: true
+  registry-did:
+    description: "DID of the Trust Registry (the recipient of every query)."
+    required: true
+  authority:
+    description: "DID of the authority the trust tuple is evaluated under."
+    required: true
+  action:
+    description: "TRQP action of the trust tuple."
+    required: false
+    default: "git.commit.sign"
+  resource:
+    description: "TRQP resource of the trust tuple. Defaults to this repository (owner/name)."
+    required: false
+    default: ${{ github.repository }}
+  fallback-resource:
+    description: "Broader resource to also accept a grant under (e.g. the org). Grant semantics are OR. Omitted: only the primary resource is queried."
+    required: false
+    default: ""
+  signers-file:
+    description: "Signer index file (one DID per line). Relative to the checkout root."
+    required: false
+    default: ".did-signers"
+  exempt-keyring:
+    description: "Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow key). PGP-signed commits pass only if they verify against a key in this file. Omitted: no exemptions."
+    required: false
+    default: ""
+  json:
+    description: "Emit a machine-readable JSON report on stdout."
+    required: false
+    default: "false"
+  version:
+    description: "VGI release to download the verify-trust binary from — a tag like v0.1.0, or 'latest'."
+    required: false
+    default: "latest"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install verify-trust
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VGI_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   target=x86_64-unknown-linux-gnu ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          macOS-X64)   target=x86_64-apple-darwin ;;
+          Windows-X64) target=x86_64-pc-windows-msvc ;;
+          *) echo "::error::verify-trust: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        repo="OpenVTC/verifiable-git-infrastructure"
+        asset="verify-trust-${target}.tar.gz"
+        tag="$VGI_VERSION"
+        if [ "$tag" = "latest" ]; then
+          tag="$(gh release view --repo "$repo" --json tagName -q .tagName)"
+        fi
+        echo "Downloading ${asset} from ${repo}@${tag}"
+        gh release download "$tag" --repo "$repo" \
+          --pattern "$asset" --pattern "${asset}.sha256" --dir "$RUNNER_TEMP"
+        (
+          cd "$RUNNER_TEMP"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "${asset}.sha256"
+          else
+            shasum -a 256 -c "${asset}.sha256"
+          fi
+          tar xzf "$asset"
+        )
+        echo "${RUNNER_TEMP}/verify-trust-${target}" >> "$GITHUB_PATH"
+
+    - name: Run verify-trust
+      shell: bash
+      run: |
+        set -euo pipefail
+        args=(
+          --range "${{ inputs.range }}"
+          --registry-url "${{ inputs.registry-url }}"
+          --registry-did "${{ inputs.registry-did }}"
+          --authority "${{ inputs.authority }}"
+          --action "${{ inputs.action }}"
+          --resource "${{ inputs.resource }}"
+          --signers-file "${{ inputs.signers-file }}"
+        )
+        if [ -n "${{ inputs.fallback-resource }}" ]; then
+          args+=(--fallback-resource "${{ inputs.fallback-resource }}")
+        fi
+        if [ -n "${{ inputs.exempt-keyring }}" ]; then
+          args+=(--exempt-keyring "${{ inputs.exempt-keyring }}")
+        fi
+        if [ "${{ inputs.json }}" = "true" ]; then
+          args+=(--json)
+        fi
+        verify-trust "${args[@]}"
