@@ -1,6 +1,9 @@
 [package]
 name = "vgi-core"
 description = "Shared primitives for Verifiable Git Infrastructure (VGI): PROTOCOL.sshsig encoding, git commit-object handling, and DID-document Ed25519 key extraction."
+readme = "README.md"
+keywords = ["git", "did", "sshsig", "ssh", "signature"]
+categories = ["cryptography", "development-tools"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
