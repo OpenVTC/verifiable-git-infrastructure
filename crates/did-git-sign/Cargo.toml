@@ -1,7 +1,10 @@
 [package]
 name = "did-git-sign"
 description = "Git commit signing proxy using DID Ed25519 keys via VTA"
-version = "0.1.0"
+readme = "README.md"
+keywords = ["git", "did", "ssh", "commit-signing", "vta"]
+categories = ["command-line-utilities", "cryptography"]
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 authors.workspace = true

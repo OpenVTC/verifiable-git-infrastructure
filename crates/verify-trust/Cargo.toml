@@ -1,6 +1,9 @@
 [package]
 name = "verify-trust"
 description = "CI verifier for VGI: checks that every commit in a git range is signed by a DID the community's Trust Registry currently authorizes."
+readme = "README.md"
+keywords = ["git", "did", "ci", "trust-registry", "signatures"]
+categories = ["command-line-utilities", "development-tools"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

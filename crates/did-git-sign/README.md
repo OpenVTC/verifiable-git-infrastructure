@@ -27,11 +27,13 @@ as the git `user.email`, linking every commit to your decentralized identity.
 
 ## Install
 
-From the workspace root:
-
 ```bash
-cargo install --path did-git-sign
+cargo install did-git-sign
 ```
+
+`did-git-sign` is the signing half of
+[Verifiable Git Infrastructure (VGI)](https://github.com/OpenVTC/verifiable-git-infrastructure);
+the CI verifier is the separate [`verify-trust`](https://crates.io/crates/verify-trust) crate.
 
 ## Setup
 

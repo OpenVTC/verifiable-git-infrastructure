@@ -3,7 +3,7 @@ members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -13,7 +13,7 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.1.0", path = "crates/vgi-core" }
+vgi-core = { version = "0.1.1", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
 trql-client = "0.8"
 # VTA client for signing with DID-held keys.
