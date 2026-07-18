@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["Glenn Gore <glenn@affinidi.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/OpenVTC/verifiable-git-infrastructure"
+publish = true
+
+[workspace.dependencies]
+# VGI shared primitives (sshsig codec, commit handling, DID key extraction).
+vgi-core = { version = "0.1.0", path = "crates/vgi-core" }
+# Trust Registry query client (registry authorization queries).
+trql-client = "0.8"
+# VTA client for signing with DID-held keys.
+vta-sdk = { version = "0.18", features = ["session", "client", "didcomm", "provision-client"] }
+affinidi-tdk = "0.8"
+multibase = "0.9"
+pgp = "0.19"
+clap = { version = "4.6", features = ["derive"] }
+tokio = "1.52"
+serde = "1.0"
+serde_json = "1.0"
+anyhow = "1.0"
+keyring-core = "1"
+zeroize = "1.8"
+dirs = "6.0"
+base64 = "0.22"
+ed25519-dalek = "2.2"
+ssh-key = { version = "0.6", features = ["ed25519", "crypto"] }
+sha2 = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dialoguer = { version = "0.12", features = ["password"] }
+sysinfo = "0.39"
+chrono = "0.4"
+hex = "0.4"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+linux-keyutils-keyring-store = "1"
+windows-native-keyring-store = "1"
+rand = "0.8"
+tempfile = "3"
+serial_test = "3"
