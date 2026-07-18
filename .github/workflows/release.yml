@@ -1,0 +1,107 @@
+name: Release
+
+# Builds prebuilt `verify-trust` binaries for each supported platform and
+# attaches them to the GitHub Release for a `vX.Y.Z` tag. The download-based
+# GitHub Action (`.github/actions/verify-trust`) consumes these so CI runners
+# need neither a Rust toolchain nor a source build.
+#
+# Trigger:
+#   - push a tag `vX.Y.Z`         → build + publish a Release
+#   - workflow_dispatch (manual)  → build only (a dry run; no Release made)
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: verify-trust
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One unsupported/flaky platform must not stop the others from
+      # producing artifacts; the release job uploads whatever succeeded.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: System dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+
+      - name: Build verify-trust
+        run: cargo build --release --locked -p verify-trust --target ${{ matrix.target }}
+
+      # Package as a `.tar.gz` on every platform (git-bash on the Windows
+      # runner provides tar + sha256sum), so downstream extraction is uniform.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$BIN"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$BIN.exe"; fi
+          stage="${BIN}-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+          # macOS runners ship `shasum`, not coreutils `sha256sum`.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          else
+            shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.BIN }}-${{ matrix.target }}.tar.gz
+            ${{ env.BIN }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    # Only cut a Release for a tag; a manual dispatch is a build-only dry run.
+    # `always()` so a single failed build leg still releases the rest.
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
