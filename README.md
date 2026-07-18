@@ -31,9 +31,25 @@ verify-trust \
   --resource      your-org/your-repo
 ```
 
-A GitHub composite action wraps this — see `.github/actions/verify-trust`.
-Verdicts: `trusted` / `exempt` pass; `unsigned`, `unknownKey`, `badSignature`,
-`unauthorized`, `registryUnavailable` fail. Fails closed at every layer.
+In a GitHub PR check, use the composite action instead — it downloads the
+prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
+
+```yaml
+- uses: actions/checkout@v4
+  with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v1
+  with:
+    range:        origin/${{ github.base_ref }}..HEAD
+    registry-url: ${{ vars.TRUST_REGISTRY_URL }}
+    registry-did: ${{ vars.TRUST_REGISTRY_DID }}
+    authority:    ${{ vars.TRUST_AUTHORITY_DID }}
+    exempt-keyring: .github/trusted-platform-keys.asc   # optional
+```
+
+`resource` defaults to the current repo; `version` selects which release to
+download (default `latest`). Verdicts: `trusted` / `exempt` pass; `unsigned`,
+`unknownKey`, `badSignature`, `unauthorized`, `registryUnavailable` fail. Fails
+closed at every layer.
 
 ## Signing
 

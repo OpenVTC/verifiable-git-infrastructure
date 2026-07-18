@@ -1,0 +1,32 @@
+name: verify-trust
+
+# VGI dogfoods its own commit-trust check. Dormant until the repo is
+# configured with a Trust Registry: set the repository variables
+# TRUST_REGISTRY_URL, TRUST_REGISTRY_DID, and TRUST_AUTHORITY_DID, and commit
+# a `.did-signers` index of the DIDs allowed to sign here.
+on:
+  pull_request:
+
+jobs:
+  verify:
+    name: Verify commit trust
+    # Skip entirely until a registry is configured, so the check is a no-op
+    # for forks and for this repo before enrolment.
+    if: vars.TRUST_REGISTRY_URL != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base ref present so `origin/<base>..HEAD` resolves.
+          fetch-depth: 0
+
+      - name: verify-trust
+        uses: ./.github/actions/verify-trust
+        with:
+          range: origin/${{ github.base_ref }}..HEAD
+          registry-url: ${{ vars.TRUST_REGISTRY_URL }}
+          registry-did: ${{ vars.TRUST_REGISTRY_DID }}
+          authority: ${{ vars.TRUST_AUTHORITY_DID }}
+          # GitHub web-UI merge/squash commits are PGP-signed by web-flow;
+          # they pass only via this committed keyring.
+          exempt-keyring: .github/trusted-platform-keys.asc
