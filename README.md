@@ -26,9 +26,8 @@ Verify every commit in a PR against the Trust Registry:
 ```sh
 verify-trust \
   --range origin/main..HEAD \
-  --registry-url  https://registry.example.com \
   --registry-did  did:webvh:...registry \
-  --authority     did:webvh:...your-community \
+  --vtc-did       did:webvh:...your-community \
   --resource      your-org/your-repo
 ```
 
@@ -38,20 +37,24 @@ prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.3.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
-    registry-url: ${{ vars.TRUST_REGISTRY_URL }}
     registry-did: ${{ vars.TRUST_REGISTRY_DID }}
-    authority:    ${{ vars.TRUST_AUTHORITY_DID }}
+    vtc-did:      ${{ vars.VTC_DID }}
     exempt-keyring: .github/trusted-platform-keys.asc   # optional
 ```
 
-There is nothing else to configure and nothing to commit: **who may sign is a
-registry grant**, not a file in the repository. Each commit names its signer
-DID on its own `committer` header; that DID must publish the key that signed,
-and the registry must authorize it. Enrolling a contributor is one grant, and
-it covers every repo the grant's resource covers.
+Two DIDs, and nothing to commit: **who may sign is a registry grant**, not a
+file in the repository. Each commit names its signer DID on its own `committer`
+header; that DID must publish the key that signed, and the registry must
+authorize it. Enrolling a contributor is one grant, and it covers every repo
+the grant's resource covers.
+
+There is no registry URL to configure either — the endpoint is discovered from
+`registry-did`'s DID document, taking the highest-preference binding both sides
+support: **TSP, then DIDComm, then HTTPS**. `registry-url` exists only to
+override discovery for a registry that publishes no service entry.
 
 `resource` defaults to the current repo and is security-relevant — it is the
 only thing scoping a signer to this repository. `version` selects which release

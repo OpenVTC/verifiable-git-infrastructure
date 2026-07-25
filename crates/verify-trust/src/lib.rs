@@ -8,7 +8,18 @@
 //!    verify over the exact bytes git signed.
 //! 2. **Is that DID trusted, right now?** The signer DID is checked against
 //!    the Trust Registry with a TRQP authorization query
-//!    (`{entity: signer, authority, action, resource}`) via `trql-client`.
+//!    (`{entity: signer, authority, action, resource}`) via `trql-client`,
+//!    where `authority` is the **VTC's** DID — the community the tuple is
+//!    evaluated under.
+//!
+//! The registry's endpoint is discovered from its DID document rather than
+//! configured alongside it: [`resolve_registry_endpoint`] picks the
+//! highest-preference transport both sides support (TSP, then DIDComm, then
+//! HTTPS). Over the HTTPS binding the registry's answer carries no signature —
+//! the registry DID is only stamped on the *outgoing* request as `recipient` —
+//! so the endpoint is what the answer's trustworthiness rests on, and deriving
+//! it from the DID document keeps it bound to an identifier with integrity
+//! behind it.
 //!
 //! The signer set is **derived from the commits themselves** — there is no
 //! per-repository allowlist. The committer header is author-controlled text,
@@ -46,7 +57,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use ssh_key::{SshSig, public::KeyData};
-use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqlError, TrqpQuery};
+use trql_client::{
+    HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportKind, TrqlClient,
+    TrqlError, TrqpQuery,
+};
 use vgi_core::{
     GIT_SSHSIG_NAMESPACE, committer_did, committer_identity, ed25519_keys_from_doc,
     normalize_sshsig_armor, split_signed_commit,
@@ -72,11 +86,25 @@ pub struct VerifyTrustArgs {
     /// remains. Exceeding it fails the run rather than resolving anyway.
     pub max_signers: usize,
     /// Base URL of the Trust Registry (`POST <url>/trust-tasks`).
-    pub registry_url: String,
-    /// DID of the registry (the `recipient` on every query document).
+    ///
+    /// `None` until discovery fills it in from `registry_did`'s DID document;
+    /// set explicitly to override discovery (a local or dev registry that
+    /// publishes no service endpoint). [`verify_prepared`] requires it
+    /// resolved — [`handle_verify_trust`] does that before calling.
+    ///
+    /// Prefer discovery. Over the HTTPS binding the registry's answer is not
+    /// signed — `registry_did` is only stamped on the outgoing request as
+    /// `recipient` — so trust in "is this DID authorized" rests on reaching
+    /// the right host. Deriving the URL from the DID document makes the
+    /// endpoint inherit that DID's integrity instead of being a second,
+    /// independently mutable value that nothing cross-checks.
+    pub registry_url: Option<String>,
+    /// DID of the registry (the `recipient` on every query document, and what
+    /// the endpoint is discovered from).
     pub registry_did: String,
-    /// DID of the authority the tuple is evaluated under.
-    pub authority_did: String,
+    /// DID of the **VTC** — the community whose authority the trust tuple is
+    /// evaluated under, sent as TRQP's `authority_id`.
+    pub vtc_did: String,
     /// TRQP action, e.g. `git.commit.sign`.
     pub action: String,
     /// TRQP resource, e.g. the `org/repo` slug.
@@ -223,13 +251,22 @@ impl ResolvedSigners {
     }
 }
 
-/// Run the check end to end: collect the DIDs the range claims, resolve them,
-/// then verify. Returns the process exit code (0 = every commit passes).
-pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
+/// Run the check end to end: discover the registry endpoint, collect the DIDs
+/// the range claims, resolve them, then verify. Returns the process exit code
+/// (0 = every commit passes).
+pub async fn handle_verify_trust(mut args: VerifyTrustArgs) -> Result<i32> {
     let exempt = load_exempt_keyring(&args)?;
     let commits = read_range(&args.repo_dir, &args.range)?;
     let claimed = claimed_signer_dids(&commits, args.max_signers)?;
-    let signers = resolve_signer_keys(&claimed, args.resolve_agent_names).await?;
+
+    // One resolver for both lookups: the registry's endpoint and the signers'
+    // keys come from the same cache.
+    let tdk = build_resolver(args.resolve_agent_names).await?;
+    if args.registry_url.is_none() {
+        args.registry_url = Some(resolve_registry_endpoint(&tdk, &args.registry_did).await?);
+    }
+    let signers = resolve_signer_keys(&tdk, &claimed).await?;
+
     let report = verify_prepared(&args, &commits, &signers, exempt.as_ref()).await?;
     print_report(&args, &report)?;
     Ok(if report.ok { 0 } else { 1 })
@@ -436,19 +473,12 @@ fn load_exempt_keyring(args: &VerifyTrustArgs) -> Result<Option<ExemptKeyring>> 
 
 // --- DID resolution ----------------------------------------------------------
 
-/// Resolve every DID the range claimed: collect the Ed25519 keys their
-/// documents publish, and name each signer from the same document. A DID that
-/// fails to resolve is recorded (its commits fail as `unresolvedSigner`)
-/// without blocking the others.
+/// Build the DID resolver used for both the registry endpoint and the signers.
 ///
 /// `resolve_agent_names` turns on the resolver's shortcut derivation, which
-/// round-trips each claimed name before it is treated as this DID's — see
-/// [`VerifyTrustArgs::resolve_agent_names`]. Unverified claims are picked up
-/// either way, since they arrive with documents that must be resolved anyway.
-pub async fn resolve_signer_keys(
-    dids: &[String],
-    resolve_agent_names: bool,
-) -> Result<ResolvedSigners> {
+/// round-trips each claimed name before it is treated as its DID's — see
+/// [`VerifyTrustArgs::resolve_agent_names`].
+pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::TDK> {
     use affinidi_tdk::TDK;
     use affinidi_tdk::common::config::TDKConfig;
     use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
@@ -456,7 +486,7 @@ pub async fn resolve_signer_keys(
     // `with_resolve_shortcuts` exists because `vta-sdk/agent-names` turns on
     // `affinidi-did-resolver-cache-sdk/agent-names`, which cargo unifies onto
     // the resolver the TDK builds here.
-    let tdk = TDK::new(
+    TDK::new(
         TDKConfig::builder()
             .with_load_environment(false)
             .with_did_resolver_config(
@@ -469,8 +499,65 @@ pub async fn resolve_signer_keys(
         None,
     )
     .await
-    .context("TDK init")?;
+    .context("TDK init")
+}
 
+/// Discover the Trust Registry's endpoint from its DID document.
+///
+/// The document advertises one service entry per binding it serves;
+/// [`ServiceCapabilities::select`] takes the highest-preference transport
+/// present in **both** the document and this build — TSP, then DIDComm, then
+/// HTTPS. `TransportKind::compiled()` is what this binary can actually
+/// construct, so a registry offering only bindings we were not built with
+/// fails with both sides listed rather than silently downgrading.
+///
+/// There is deliberately **no fallback to guessing a URL from the DID's
+/// domain**. `vta-sdk` does that for a VTA, where a wrong host merely fails
+/// authentication; here a wrong host is one whose authorization answers we
+/// would believe. A registry that advertises nothing is an error, and
+/// [`VerifyTrustArgs::registry_url`] is the explicit override.
+pub async fn resolve_registry_endpoint(
+    tdk: &affinidi_tdk::TDK,
+    registry_did: &str,
+) -> Result<String> {
+    let response = tdk
+        .did_resolver()
+        .resolve(registry_did)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not resolve registry DID {registry_did}: {e}"))?;
+    let doc = serde_json::to_value(&response.doc)
+        .with_context(|| format!("DID document for {registry_did} did not serialize"))?;
+
+    let capabilities = ServiceCapabilities::from_document(&doc);
+    let choice = capabilities
+        .select(&TransportKind::compiled())
+        .with_context(|| format!("no usable Trust Registry transport on {registry_did}"))?;
+
+    match choice.kind {
+        TransportKind::Https => {
+            tracing::debug!(endpoint = %choice.endpoint, "discovered registry REST endpoint");
+            Ok(choice.endpoint)
+        }
+        // Unreachable while `compiled()` is HTTPS-only, but the TSP and DIDComm
+        // endpoints are *mediator DIDs*, not URLs — handing one to an HTTPS
+        // transport would be a category error, so refuse explicitly.
+        kind => bail!(
+            "registry {registry_did} was selected for the {kind} binding, whose endpoint \
+             ({}) is a mediator DID rather than a URL; verify-trust can only query over \
+             HTTPS. Set --registry-url to a REST endpoint.",
+            choice.endpoint
+        ),
+    }
+}
+
+/// Resolve every DID the range claimed: collect the Ed25519 keys their
+/// documents publish, and name each signer from the same document. A DID that
+/// fails to resolve is recorded (its commits fail as `unresolvedSigner`)
+/// without blocking the others.
+pub async fn resolve_signer_keys(
+    tdk: &affinidi_tdk::TDK,
+    dids: &[String],
+) -> Result<ResolvedSigners> {
     let mut signers = ResolvedSigners::default();
     for did in dids {
         match tdk.did_resolver().resolve(did).await {
@@ -550,7 +637,12 @@ async fn query_registry(
     if signer_dids.is_empty() {
         return Ok(decisions);
     }
-    let transport = HttpsTransport::new(HttpsTransportConfig::new(&args.registry_url))?;
+    // Resolved by `handle_verify_trust` (discovered from `registry_did`, or
+    // taken from the explicit override) before this point.
+    let registry_url = args.registry_url.as_deref().context(
+        "registry URL not resolved: discover it from --registry-did or pass --registry-url",
+    )?;
+    let transport = HttpsTransport::new(HttpsTransportConfig::new(registry_url))?;
     let client = TrqlClient::new(Arc::new(transport), &args.registry_did);
     // The primary resource, then the broader fallback if it did not grant.
     let mut resources = vec![args.resource.clone()];
@@ -562,7 +654,8 @@ async fn query_registry(
     for did in signer_dids {
         let mut decision: Result<Option<String>, String> = Ok(None);
         for resource in &resources {
-            let query = TrqpQuery::new(did, &args.authority_did, &args.action, resource);
+            // The VTC's DID is TRQP's `authority_id`.
+            let query = TrqpQuery::new(did, &args.vtc_did, &args.action, resource);
             match client.authorization(query).await {
                 Ok(response) if response.authorized => {
                     decision = Ok(Some(resource.clone()));
@@ -1097,6 +1190,132 @@ mod tests {
             None,
         );
         assert_eq!(check, SignatureCheck::Unsigned);
+    }
+
+    // --- registry endpoint discovery ---
+
+    /// The `service` block from the Trust Registry DID document in the
+    /// workspace's DID_SERVICE_DISCOVERY design note: one entry per binding,
+    /// `#rest` carrying both types via the set form, TSP/DIDComm endpoints
+    /// being mediator DIDs rather than URLs.
+    fn registry_document() -> serde_json::Value {
+        serde_json::json!({
+            "id": "did:webvh:QmRegistryScid:registry.example",
+            "service": [
+                {
+                    "id": "did:webvh:QmRegistryScid:registry.example#rest",
+                    "type": ["TRQPRest", "TrustRegistry"],
+                    "serviceEndpoint": {
+                        "uri": "https://registry.example",
+                        "profile": "https://trustoverip.org/profiles/trp/v2"
+                    }
+                },
+                {
+                    "id": "did:webvh:QmRegistryScid:registry.example#didcomm",
+                    "type": "DIDCommMessaging",
+                    "serviceEndpoint": {
+                        "uri": "did:web:mediator.example",
+                        "accept": ["didcomm/v2"],
+                        "routingKeys": []
+                    }
+                },
+                {
+                    "id": "did:webvh:QmRegistryScid:registry.example#tsp",
+                    "type": "TSPTransport",
+                    "serviceEndpoint": "did:web:mediator.example"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn all_three_bindings_are_parsed_from_the_registry_document() {
+        let caps = ServiceCapabilities::from_document(&registry_document());
+        assert_eq!(caps.https.as_deref(), Some("https://registry.example"));
+        assert_eq!(caps.tsp.as_deref(), Some("did:web:mediator.example"));
+        assert_eq!(caps.didcomm.as_deref(), Some("did:web:mediator.example"));
+        assert_eq!(
+            caps.advertised(),
+            vec![
+                TransportKind::Tsp,
+                TransportKind::Didcomm,
+                TransportKind::Https
+            ],
+            "advertised order is the preference order: TSP, DIDComm, HTTPS"
+        );
+    }
+
+    #[test]
+    fn selection_prefers_tsp_then_didcomm_then_https() {
+        let caps = ServiceCapabilities::from_document(&registry_document());
+        // Against a client that speaks everything, TSP wins outright.
+        assert_eq!(
+            caps.select(&[
+                TransportKind::Tsp,
+                TransportKind::Didcomm,
+                TransportKind::Https
+            ])
+            .unwrap()
+            .kind,
+            TransportKind::Tsp
+        );
+        // Drop TSP and DIDComm is next, ahead of the HTTPS floor.
+        assert_eq!(
+            caps.select(&[TransportKind::Didcomm, TransportKind::Https])
+                .unwrap()
+                .kind,
+            TransportKind::Didcomm
+        );
+    }
+
+    #[test]
+    fn this_build_selects_https_because_that_is_what_it_can_construct() {
+        // `compiled()` is feature-gated, and verify-trust takes trql-client's
+        // default features (https only): the preference order is honoured, we
+        // simply cannot construct the two above it. Selecting against what we
+        // advertise rather than a hard-coded list is what stops us choosing a
+        // transport and then failing to build it.
+        let compiled = TransportKind::compiled();
+        assert_eq!(compiled, vec![TransportKind::Https]);
+
+        let choice = ServiceCapabilities::from_document(&registry_document())
+            .select(&compiled)
+            .unwrap();
+        assert_eq!(choice.kind, TransportKind::Https);
+        assert_eq!(choice.endpoint, "https://registry.example");
+    }
+
+    #[test]
+    fn a_registry_offering_no_binding_we_speak_fails_with_both_sides_named() {
+        // TSP and DIDComm only. Failing loudly beats guessing a URL: the error
+        // carries what each side offers so the mismatch is diagnosable.
+        let doc = serde_json::json!({
+            "id": "did:webvh:QmRegistryScid:registry.example",
+            "service": [{
+                "id": "did:webvh:QmRegistryScid:registry.example#tsp",
+                "type": "TSPTransport",
+                "serviceEndpoint": "did:web:mediator.example"
+            }]
+        });
+        let error = ServiceCapabilities::from_document(&doc)
+            .select(&[TransportKind::Https])
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("https") && rendered.contains("tsp"),
+            "the error must name both sides' transports: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_document_advertising_nothing_yields_no_endpoint() {
+        // No service block at all: there is nothing to discover, and no
+        // domain-guessing fallback exists to paper over it.
+        let caps = ServiceCapabilities::from_document(&serde_json::json!({
+            "id": "did:webvh:QmRegistryScid:registry.example"
+        }));
+        assert_eq!(caps, ServiceCapabilities::default());
+        assert!(caps.select(&TransportKind::compiled()).is_err());
     }
 
     #[test]

@@ -10,15 +10,16 @@ inputs:
   range:
     description: "Commit range in git rev-list syntax (e.g. origin/main..HEAD). Requires the base ref to be fetched (actions/checkout with fetch-depth: 0)."
     required: true
-  registry-url:
-    description: "Base URL of the Trust Registry (queries POST to <url>/trust-tasks)."
-    required: true
   registry-did:
-    description: "DID of the Trust Registry (the recipient of every query)."
+    description: "DID of the Trust Registry — the recipient of every query, and what the endpoint is discovered from."
     required: true
-  authority:
-    description: "DID of the authority the trust tuple is evaluated under."
+  vtc-did:
+    description: "DID of your VTC: the community whose authority the trust tuple is evaluated under (TRQP's authority_id)."
     required: true
+  registry-url:
+    description: "Base URL of the Trust Registry. Optional — by default the endpoint is discovered from registry-did's DID document, preferring TSP, then DIDComm, then HTTPS. Set this only to override discovery (e.g. a local registry publishing no service entry); it unbinds where we ask from the DID we name."
+    required: false
+    default: ""
   action:
     description: "TRQP action of the trust tuple."
     required: false
@@ -95,13 +96,15 @@ runs:
         set -euo pipefail
         args=(
           --range "${{ inputs.range }}"
-          --registry-url "${{ inputs.registry-url }}"
           --registry-did "${{ inputs.registry-did }}"
-          --authority "${{ inputs.authority }}"
+          --vtc-did "${{ inputs.vtc-did }}"
           --action "${{ inputs.action }}"
           --resource "${{ inputs.resource }}"
           --max-signers "${{ inputs.max-signers }}"
         )
+        if [ -n "${{ inputs.registry-url }}" ]; then
+          args+=(--registry-url "${{ inputs.registry-url }}")
+        fi
         if [ -n "${{ inputs.fallback-resource }}" ]; then
           args+=(--fallback-resource "${{ inputs.fallback-resource }}")
         fi
