@@ -15,7 +15,7 @@ jobs:
     if: vars.TRUST_REGISTRY_URL != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Need the base ref present so `origin/<base>..HEAD` resolves.
           fetch-depth: 0
