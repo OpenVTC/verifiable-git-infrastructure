@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod init;
+pub mod names;
 pub mod policy;
 pub mod sign;
 pub mod vta;

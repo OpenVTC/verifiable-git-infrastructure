@@ -19,6 +19,10 @@ path = "src/main.rs"
 vgi-core = { workspace = true }
 trql-client = { workspace = true }
 affinidi-tdk = { workspace = true }
+# Display names only — the verifier never talks to a VTA, so it takes
+# `agent-names` (NameBook, shorten_did, the verified name round trip) without
+# the client/DIDComm stack.
+vta-sdk = { workspace = true, features = ["agent-names"] }
 pgp = { workspace = true }
 ssh-key = { workspace = true }
 clap = { workspace = true }

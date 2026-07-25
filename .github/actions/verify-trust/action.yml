@@ -34,6 +34,10 @@ inputs:
     description: "Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow key). PGP-signed commits pass only if they verify against a key in this file. Omitted: no exemptions."
     required: false
     default: ""
+  resolve-agent-names:
+    description: "Verify the agent names signers' DID documents claim, by resolving each name back to the DID claiming it. Without this a claimed name still shows, tagged [unverified] — alsoKnownAs is self-asserted. Costs one outbound HTTPS fetch per claimed name."
+    required: false
+    default: "false"
   json:
     description: "Emit a machine-readable JSON report on stdout."
     required: false
@@ -98,6 +102,9 @@ runs:
         fi
         if [ -n "${{ inputs.exempt-keyring }}" ]; then
           args+=(--exempt-keyring "${{ inputs.exempt-keyring }}")
+        fi
+        if [ "${{ inputs.resolve-agent-names }}" = "true" ]; then
+          args+=(--resolve-agent-names)
         fi
         if [ "${{ inputs.json }}" = "true" ]; then
           args+=(--json)

@@ -15,12 +15,16 @@ publish = true
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
 vgi-core = { version = "0.1.1", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
-trql-client = "0.8"
-# VTA client for signing with DID-held keys.
-vta-sdk = { version = "0.18", features = ["session", "client", "didcomm", "provision-client"] }
-affinidi-tdk = "0.8"
+trql-client = "0.8.2"
+# VTA client for signing with DID-held keys, and the `display_name` module
+# (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
+# and VTC operator CLIs so every surface abbreviates a DID the same way.
+# Features are chosen per member: did-git-sign needs the client and
+# provisioning stack, verify-trust needs only `agent-names`.
+vta-sdk = { version = "0.19", default-features = false }
+affinidi-tdk = "0.8.4"
 multibase = "0.9"
-pgp = "0.19"
+pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
 tokio = "1.52"
 serde = "1.0"

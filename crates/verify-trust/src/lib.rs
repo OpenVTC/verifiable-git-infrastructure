@@ -21,6 +21,12 @@
 //! unpublished key, a cryptographically invalid signature, an unauthorized
 //! DID, and an unreachable registry all fail the check — each with its own
 //! status so an operator can tell which remediation applies.
+//!
+//! Signers are reported by **agent name** where one is available
+//! (`example.com/@alice`) rather than by raw DID. Names come out of the DID
+//! documents this crate already resolves, and render through
+//! [`vta_sdk::display_name`] — the same seam the PNM, CNM and VTC operator
+//! surfaces use, so a DID is abbreviated identically wherever it appears.
 
 pub mod pgp_exempt;
 
@@ -36,6 +42,7 @@ use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqlError, T
 use vgi_core::{
     GIT_SSHSIG_NAMESPACE, ed25519_keys_from_doc, normalize_sshsig_armor, split_signed_commit,
 };
+use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
 use crate::pgp_exempt::ExemptKeyring;
 
@@ -68,6 +75,15 @@ pub struct VerifyTrustArgs {
     /// web-flow key); relative paths resolve against `repo_dir`. Absent means
     /// no exemptions: every PGP-signed commit fails.
     pub exempt_keyring: Option<PathBuf>,
+    /// Round-trip the agent names the signers' DID documents claim, so a
+    /// verified name renders unqualified instead of tagged `[unverified]`.
+    ///
+    /// Costs one outbound HTTPS fetch per claimed name, to a host the
+    /// *document's author* chose, so it is opt-in — the same rule the PNM and
+    /// CNM CLIs apply to their `--resolve-agent-names` flag. With it off the
+    /// claims still show (they come free with the documents this crate must
+    /// resolve anyway), but as the self-assertions they are.
+    pub resolve_agent_names: bool,
     /// Emit machine-readable JSON on stdout instead of human lines.
     pub json: bool,
 }
@@ -134,6 +150,37 @@ pub struct TrustReport {
     /// Signer DIDs whose resolution failed (their commits show as
     /// `unknownKey`); surfaced so the cause is visible.
     pub unresolved_signers: BTreeMap<String, String>,
+    /// Display name per named signer DID, with its provenance. Only DIDs that
+    /// have a name appear. The commit entries keep full DIDs, so a consumer
+    /// that does not care about names is unaffected.
+    pub signer_names: BTreeMap<String, DisplayName>,
+}
+
+/// The declared signers, resolved: their published keys, why any of them
+/// could not be resolved, and what to call them.
+///
+/// Produced by [`resolve_signer_keys`] and consumed by [`verify_with_keys`],
+/// which tests construct directly via [`ResolvedSigners::from_keys`].
+#[derive(Debug, Default)]
+pub struct ResolvedSigners {
+    /// Published Ed25519 key → the DID that publishes it.
+    pub keys: HashMap<[u8; 32], String>,
+    /// Declared DID → why it did not resolve.
+    pub unresolved: BTreeMap<String, String>,
+    /// DID → display name, for every signer whose document names it.
+    pub names: NameBook,
+}
+
+impl ResolvedSigners {
+    /// A signer set with keys but no names — the shape a test wants when it
+    /// supplies keys directly instead of resolving DID documents.
+    #[must_use]
+    pub fn from_keys(keys: HashMap<[u8; 32], String>) -> Self {
+        Self {
+            keys,
+            ..Self::default()
+        }
+    }
 }
 
 /// Run the check end to end: resolve the declared signers' keys, then verify
@@ -141,19 +188,18 @@ pub struct TrustReport {
 pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
     let signer_dids = load_signers(&args.repo_dir, &args.signers_file)?;
     let exempt = load_exempt_keyring(&args)?;
-    let (keys, unresolved) = resolve_signer_keys(&signer_dids).await?;
-    let report = verify_with_keys(&args, &keys, exempt.as_ref(), unresolved).await?;
+    let signers = resolve_signer_keys(&signer_dids, args.resolve_agent_names).await?;
+    let report = verify_with_keys(&args, &signers, exempt.as_ref()).await?;
     print_report(&args, &report)?;
     Ok(if report.ok { 0 } else { 1 })
 }
 
-/// Verify the range against an already-resolved key→DID map. Split from
+/// Verify the range against an already-resolved signer set. Split from
 /// [`handle_verify_trust`] so tests can supply keys without a live resolver.
 pub async fn verify_with_keys(
     args: &VerifyTrustArgs,
-    signer_keys: &HashMap<[u8; 32], String>,
+    signers: &ResolvedSigners,
     exempt: Option<&ExemptKeyring>,
-    unresolved_signers: BTreeMap<String, String>,
 ) -> Result<TrustReport> {
     let shas = list_commits(&args.repo_dir, &args.range)?;
 
@@ -162,7 +208,7 @@ pub async fn verify_with_keys(
     let mut signer_dids = BTreeSet::new();
     for sha in shas {
         let raw = read_commit_raw(&args.repo_dir, &sha)?;
-        let signature = check_commit_signature(&raw, signer_keys, exempt);
+        let signature = check_commit_signature(&raw, &signers.keys, exempt);
         if let SignatureCheck::Valid { signer_did } = &signature {
             signer_dids.insert(signer_did.clone());
         }
@@ -180,12 +226,25 @@ pub async fn verify_with_keys(
         })
         .collect();
 
+    // Names are reported for the declared signers that actually signed
+    // something here — a name for a DID absent from the range is noise.
+    let signer_names = signer_dids
+        .iter()
+        .filter_map(|did| {
+            signers
+                .names
+                .get(did)
+                .map(|name| (did.clone(), name.clone()))
+        })
+        .collect();
+
     // An empty range passes vacuously (nothing new to verify).
     let ok = commits.iter().all(|c| c.status.passes());
     Ok(TrustReport {
         ok,
         commits,
-        unresolved_signers,
+        unresolved_signers: signers.unresolved.clone(),
+        signer_names,
     })
 }
 
@@ -304,18 +363,34 @@ pub fn parse_signers(text: &str) -> Result<Vec<String>> {
     Ok(dids)
 }
 
-/// Resolve every declared signer DID and collect the Ed25519 keys their DID
-/// documents publish. A DID that fails to resolve is recorded (its commits
-/// will fail as `unknownKey`) without blocking the other signers.
+/// Resolve every declared signer DID: collect the Ed25519 keys their DID
+/// documents publish, and name each signer from the same document. A DID that
+/// fails to resolve is recorded (its commits will fail as `unknownKey`)
+/// without blocking the other signers.
+///
+/// `resolve_agent_names` turns on the resolver's shortcut derivation, which
+/// round-trips each claimed name before it is treated as this DID's — see
+/// [`VerifyTrustArgs::resolve_agent_names`]. Unverified claims are picked up
+/// either way, since they arrive with documents that must be resolved anyway.
 pub async fn resolve_signer_keys(
     dids: &[String],
-) -> Result<(HashMap<[u8; 32], String>, BTreeMap<String, String>)> {
+    resolve_agent_names: bool,
+) -> Result<ResolvedSigners> {
     use affinidi_tdk::TDK;
     use affinidi_tdk::common::config::TDKConfig;
+    use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
 
+    // `with_resolve_shortcuts` exists because `vta-sdk/agent-names` turns on
+    // `affinidi-did-resolver-cache-sdk/agent-names`, which cargo unifies onto
+    // the resolver the TDK builds here.
     let tdk = TDK::new(
         TDKConfig::builder()
             .with_load_environment(false)
+            .with_did_resolver_config(
+                DIDCacheConfigBuilder::default()
+                    .with_resolve_shortcuts(resolve_agent_names)
+                    .build(),
+            )
             .build()
             .context("TDK config")?,
         None,
@@ -323,30 +398,64 @@ pub async fn resolve_signer_keys(
     .await
     .context("TDK init")?;
 
-    let mut keys = HashMap::new();
-    let mut unresolved = BTreeMap::new();
+    let mut signers = ResolvedSigners::default();
     for did in dids {
         match tdk.did_resolver().resolve(did).await {
             Ok(response) => {
+                // A shortcut is only ever set after the resolver checked the
+                // claimed name resolves back to this DID; anything else the
+                // document claims is a bare self-assertion.
+                let name = signer_display_name(
+                    response.shortcut.as_ref().map(|s| s.label()),
+                    &vta_sdk::display_name::agent_name::claimed_names(&response.doc),
+                );
+                if let Some(name) = name {
+                    signers.names.insert(did.clone(), name);
+                }
+
                 let doc = serde_json::to_value(&response.doc)
                     .with_context(|| format!("DID document for {did} did not serialize"))?;
                 let published = ed25519_keys_from_doc(&doc);
                 if published.is_empty() {
-                    unresolved.insert(
+                    signers.unresolved.insert(
                         did.clone(),
                         "DID document publishes no Ed25519 verification keys".to_string(),
                     );
                 }
                 for key in published {
-                    keys.insert(key, did.clone());
+                    signers.keys.insert(key, did.clone());
                 }
             }
             Err(e) => {
-                unresolved.insert(did.clone(), format!("resolution failed: {e}"));
+                signers
+                    .unresolved
+                    .insert(did.clone(), format!("resolution failed: {e}"));
             }
         }
     }
-    Ok((keys, unresolved))
+    Ok(signers)
+}
+
+/// Pick what to call a signer, given the name its resolution verified (if any)
+/// and the names its document claims.
+///
+/// A verified shortcut wins outright. Otherwise the first claim is reported
+/// **unverified**: `alsoKnownAs` is self-asserted, so a hostile DID can claim
+/// `mybank.com/@treasury` and a verifier that printed that bare would have
+/// told the reviewer, in an authoritative voice, that the bank signed this
+/// commit. The claim still surfaces — a DID *attempting* to present as
+/// someone else is exactly what a reviewer should see — but tagged, and
+/// ranked below every trusted source. See [`vta_sdk::display_name`].
+fn signer_display_name(verified: Option<&str>, claimed: &[String]) -> Option<DisplayName> {
+    if let Some(name) = verified {
+        return Some(DisplayName::new(
+            name,
+            NameSource::AgentName { verified: true },
+        ));
+    }
+    claimed
+        .first()
+        .map(|name| DisplayName::new(name, NameSource::AgentName { verified: false }))
 }
 
 // --- registry layer -----------------------------------------------------------
@@ -479,6 +588,12 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
+
+    // Per-commit lines name the signer and abbreviate its DID; the signer
+    // block below carries every DID in full, so nothing that has to be
+    // cross-checked against `.did-signers` is lost to the abbreviation.
+    let signer = |did: &str| render_signer(report, did);
+
     for commit in &report.commits {
         let short = &commit.sha[..commit.sha.len().min(12)];
         match &commit.status {
@@ -486,7 +601,10 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
                 signer_did,
                 resource,
             } => {
-                println!("TRUSTED      {short}  {signer_did} (via {resource})");
+                println!(
+                    "TRUSTED      {short}  {} (via {resource})",
+                    signer(signer_did)
+                );
             }
             CommitStatus::Exempt { fingerprint } => {
                 println!("EXEMPT       {short}  PGP-signed by exempt platform key {fingerprint}");
@@ -495,15 +613,22 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
                 println!("PGP-REJECTED {short}  {detail}");
             }
             CommitStatus::Unauthorized { signer_did } => {
-                println!("UNAUTHORIZED {short}  {signer_did} is not authorized by the registry");
+                println!(
+                    "UNAUTHORIZED {short}  {} is not authorized by the registry",
+                    signer(signer_did)
+                );
             }
             CommitStatus::RegistryUnavailable { signer_did, error } => {
                 println!(
-                    "UNAVAILABLE  {short}  signed by {signer_did}; registry check failed: {error}"
+                    "UNAVAILABLE  {short}  signed by {}; registry check failed: {error}",
+                    signer(signer_did)
                 );
             }
             CommitStatus::BadSignature { signer_did } => {
-                println!("BAD-SIG      {short}  signature by {signer_did} does not verify");
+                println!(
+                    "BAD-SIG      {short}  signature by {} does not verify",
+                    signer(signer_did)
+                );
             }
             CommitStatus::UnknownKey { fingerprint } => {
                 println!(
@@ -521,6 +646,9 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
     for (did, reason) in &report.unresolved_signers {
         println!("WARNING      declared signer {did}: {reason}");
     }
+
+    print_signer_block(args, report);
+
     let passing = report.commits.iter().filter(|c| c.status.passes()).count();
     println!(
         "{}: {passing}/{} commits pass",
@@ -528,6 +656,56 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
         report.commits.len()
     );
     Ok(())
+}
+
+/// A signer for one commit line: `name (did:webvh:QmXk…:example.com)`, or the
+/// abbreviated DID alone when nothing names it. Unverified names carry the
+/// `[unverified]` tag `NameBook` appends — surfaces must not strip it.
+fn render_signer(report: &TrustReport, did: &str) -> String {
+    match report.signer_names.get(did) {
+        Some(name) if name.is_trusted() => {
+            format!(
+                "{} ({})",
+                name.name,
+                vta_sdk::display_name::shorten_did(did)
+            )
+        }
+        Some(name) => format!(
+            "{}{} ({})",
+            name.name,
+            vta_sdk::display_name::UNVERIFIED_SUFFIX,
+            vta_sdk::display_name::shorten_did(did)
+        ),
+        None => vta_sdk::display_name::shorten_did(did),
+    }
+}
+
+/// The signers that signed this range, each with its full DID.
+///
+/// Emitted only when something was named — on a repo whose signers claim no
+/// agent names this would be a list of DIDs already on every line above.
+fn print_signer_block(args: &VerifyTrustArgs, report: &TrustReport) {
+    if report.signer_names.is_empty() {
+        return;
+    }
+    println!();
+    println!("Signers:");
+    for (did, name) in &report.signer_names {
+        let tag = if name.is_trusted() {
+            String::new()
+        } else {
+            format!(" {}", vta_sdk::display_name::UNVERIFIED_SUFFIX.trim())
+        };
+        println!("  {}{tag}", name.name);
+        println!("    {did}");
+    }
+    if !args.resolve_agent_names && report.signer_names.values().any(|n| !n.is_trusted()) {
+        println!();
+        println!(
+            "  Names above are claimed by the DID and were not checked. Pass \
+             --resolve-agent-names to resolve each claim back to its DID."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -726,5 +904,74 @@ mod tests {
             status_of(SignatureCheck::Valid { signer_did: did }, &decisions),
             CommitStatus::RegistryUnavailable { .. }
         ));
+    }
+
+    // --- signer naming ---
+
+    #[test]
+    fn a_verified_shortcut_is_the_name() {
+        let name = signer_display_name(
+            Some("example.com/@alice"),
+            &["https://example.com/@alice".to_string()],
+        )
+        .unwrap();
+        assert_eq!(name.name, "example.com/@alice");
+        assert!(name.is_trusted());
+    }
+
+    #[test]
+    fn an_unchecked_claim_is_never_trusted() {
+        // The spoof this exists for: a signer's document claims the bank's
+        // name. Nothing resolved it back, so it must not render as the bank.
+        let name =
+            signer_display_name(None, &["https://mybank.com/@treasury".to_string()]).unwrap();
+        assert_eq!(name.source, NameSource::AgentName { verified: false });
+        assert!(!name.is_trusted());
+    }
+
+    #[test]
+    fn a_signer_claiming_nothing_has_no_name() {
+        assert!(signer_display_name(None, &[]).is_none());
+    }
+
+    #[test]
+    fn an_unverified_name_renders_tagged_beside_its_did() {
+        let did = "did:webvh:QmScidAbCdEfGhIj:example.com:ops";
+        let report = TrustReport {
+            ok: true,
+            commits: Vec::new(),
+            unresolved_signers: BTreeMap::new(),
+            signer_names: BTreeMap::from([(
+                did.to_string(),
+                DisplayName::new(
+                    "mybank.com/@treasury",
+                    NameSource::AgentName { verified: false },
+                ),
+            )]),
+        };
+        let rendered = render_signer(&report, did);
+        assert!(
+            rendered.contains("unverified"),
+            "an unchecked claim must never render as a plain name: {rendered}"
+        );
+        assert!(
+            rendered.contains("example.com"),
+            "the DID must stay visible beside the name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_signer_falls_back_to_its_did() {
+        let did = "did:webvh:QmScidAbCdEfGhIj:example.com:ops";
+        let report = TrustReport {
+            ok: true,
+            commits: Vec::new(),
+            unresolved_signers: BTreeMap::new(),
+            signer_names: BTreeMap::new(),
+        };
+        assert_eq!(
+            render_signer(&report, did),
+            vta_sdk::display_name::shorten_did(did)
+        );
     }
 }
