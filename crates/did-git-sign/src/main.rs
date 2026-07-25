@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::{Select, theme::ColorfulTheme};
-use did_git_sign::{config, init, sign, vta};
+use did_git_sign::{config, init, names, sign, vta};
 use ed25519_dalek::SigningKey;
 use std::path::PathBuf;
 
@@ -175,13 +175,25 @@ enum Commands {
         /// setups.
         #[arg(long)]
         yes: bool,
+
+        /// Show the agent name each DID claims, having resolved that name
+        /// back to the DID claiming it. Costs a DID resolution plus an
+        /// outbound fetch per claimed name, so it is asked for rather than
+        /// paid for by accident.
+        #[arg(long)]
+        resolve_agent_names: bool,
     },
 
     /// Verify the signing setup by performing a test sign operation
     Verify,
 
     /// Check configuration, VTA connectivity, and show signing public key
-    Health,
+    Health {
+        /// Show the signing identity's agent name, having resolved that name
+        /// back to the DID claiming it. See `init --resolve-agent-names`.
+        #[arg(long)]
+        resolve_agent_names: bool,
+    },
 
     /// Remove this host's did-git-sign install: deletes the JSON config,
     /// drops the keyring entries, strips the matching allowed_signers
@@ -265,14 +277,25 @@ async fn main() -> Result<()> {
             key_id,
             did_key_id,
             yes,
+            resolve_agent_names,
         }) => {
             cmd_init(
-                global, vta_did, context, name, vta_url, key_id, did_key_id, yes,
+                global,
+                vta_did,
+                context,
+                name,
+                vta_url,
+                key_id,
+                did_key_id,
+                yes,
+                resolve_agent_names,
             )
             .await
         }
         Some(Commands::Verify) => cmd_verify().await,
-        Some(Commands::Health) => cmd_health().await,
+        Some(Commands::Health {
+            resolve_agent_names,
+        }) => cmd_health(resolve_agent_names).await,
         Some(Commands::Uninstall {
             global,
             local,
@@ -312,6 +335,7 @@ async fn cmd_init(
     key_id_override: Option<String>,
     did_key_id_override: Option<String>,
     yes: bool,
+    resolve_agent_names: bool,
 ) -> Result<()> {
     // 1. Resolve the VTA service URL (or take the override).
     let vta_url = if let Some(url) = vta_url_override {
@@ -374,14 +398,20 @@ async fn cmd_init(
     println!("Authenticated.");
     println!();
 
+    // Names for the pickers and the closing summary. ACL labels and context
+    // names ride along on listings we fetch anyway; agent names cost network
+    // and are opt-in.
+    let mut book = names::book_from_vta(&client).await;
+
     let (key_id, did_key_id) =
         if let (Some(kid), Some(dkid)) = (key_id_override, did_key_id_override) {
             // Non-interactive: use provided values directly
             (kid, dkid)
         } else {
             // Interactive: select context, DID, and signing key
-            interactive_select(&client).await?
+            interactive_select(&client, &mut book, resolve_agent_names).await?
         };
+    names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names).await;
 
     // Fetch the persona signing key so we know its public bytes for the
     // allowed_signers entry. Uses the freshly-issued admin token.
@@ -423,6 +453,12 @@ async fn cmd_init(
 
     println!();
     println!("Setup complete! Git commits will now be signed with:");
+    // The DID stays whole here — this is the identity the operator has to be
+    // able to recognise later, and abbreviating it is exactly what a summary
+    // must not do. The name goes above it, never in place of it.
+    if let Some(name) = names::name_line(&book, &did_key_id) {
+        println!("  Name: {name}");
+    }
     println!("  DID: {did_key_id}");
     println!("  Key: {}", result.ssh_public_key);
     println!();
@@ -442,7 +478,11 @@ async fn cmd_init(
 
 /// Interactive flow: select context → DID → signing key.
 /// Returns (vta_key_id, did_key_id).
-async fn interactive_select(client: &vta_sdk::client::VtaClient) -> Result<(String, String)> {
+async fn interactive_select(
+    client: &vta_sdk::client::VtaClient,
+    book: &mut vta_sdk::display_name::NameBook,
+    resolve_agent_names: bool,
+) -> Result<(String, String)> {
     // 1. List and select context
     let contexts = client
         .list_contexts()
@@ -457,7 +497,10 @@ async fn interactive_select(client: &vta_sdk::client::VtaClient) -> Result<(Stri
         .contexts
         .iter()
         .map(|c| {
-            let did_info = c.did.as_deref().unwrap_or("no DID");
+            let did_info = c
+                .did
+                .as_deref()
+                .map_or_else(|| "no DID".to_string(), |d| names::inline(book, d));
             format!("{} — {} ({})", c.id, c.name, did_info)
         })
         .collect();
@@ -488,7 +531,22 @@ async fn interactive_select(client: &vta_sdk::client::VtaClient) -> Result<(Stri
         );
     }
 
-    let did_labels: Vec<String> = dids.dids.iter().map(|d| d.did.clone()).collect();
+    // A DID is what the operator is choosing between here, so this is the
+    // picker that most needs a name. `list_dids_webvh` carries no label of
+    // its own, so the names come from the book: an ACL label if the VTA has
+    // one, otherwise an agent name when asked for.
+    names::resolve_agent_names_into(
+        book,
+        dids.dids.iter().map(|d| d.did.as_str()),
+        resolve_agent_names,
+    )
+    .await;
+
+    let did_labels: Vec<String> = dids
+        .dids
+        .iter()
+        .map(|d| names::inline(book, &d.did))
+        .collect();
 
     let did_idx = if dids.dids.len() == 1 {
         println!("Using DID: {}", did_labels[0]);
@@ -645,26 +703,51 @@ async fn cmd_verify() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_health() -> Result<()> {
+async fn cmd_health(resolve_agent_names: bool) -> Result<()> {
     let (config_path, cfg) = load_config()?;
 
     println!("did-git-sign health check");
     println!("=========================");
     println!();
 
+    // Keyring — read before the identity block so every DID this install
+    // holds can be named in one pass.
+    let creds = config::load_vta_credentials(&cfg.did_key_id)
+        .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
+
+    // Health is a diagnostic: it prints every DID in full and puts the name
+    // above, never in place of it. Nothing here talks to the VTA yet, so the
+    // only source that can name these is an agent name, which is opt-in.
+    let mut book = vta_sdk::display_name::NameBook::new();
+    names::resolve_agent_names_into(
+        &mut book,
+        [
+            cfg.did_key_id.as_str(),
+            creds.vta_did.as_str(),
+            creds.credential_did.as_str(),
+        ],
+        resolve_agent_names,
+    )
+    .await;
+    let named = |label: &str, did: &str| {
+        if let Some(name) = names::name_line(&book, did) {
+            println!("{label:<16} {name}");
+        }
+    };
+
     // Config
     println!("Config:          {}", config_path.display());
+    named("Signing name:", &cfg.did_key_id);
     println!("DID:             {}", cfg.did_key_id);
     if let Some(name) = &cfg.user_name {
         println!("User:            {name}");
     }
     println!();
 
-    // Keyring
-    let creds = config::load_vta_credentials(&cfg.did_key_id)
-        .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
     println!("VTA URL:         {}", creds.vta_url);
+    named("VTA name:", &creds.vta_did);
     println!("VTA DID:         {}", creds.vta_did);
+    named("Credential name:", &creds.credential_did);
     println!("Credential DID:  {}", creds.credential_did);
     println!("Signing Key ID:  {}", creds.key_id);
 

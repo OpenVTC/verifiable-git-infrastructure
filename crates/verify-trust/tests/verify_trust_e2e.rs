@@ -6,14 +6,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use verify_trust::{CommitStatus, VerifyTrustArgs, verify_with_keys};
+use verify_trust::{CommitStatus, ResolvedSigners, VerifyTrustArgs, verify_with_keys};
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
 // --- git helpers -------------------------------------------------------------
@@ -202,6 +202,7 @@ fn args_for(repo: &Path, range: String, registry_url: String) -> VerifyTrustArgs
         action: "git.commit.sign".into(),
         resource: "example/repo".into(),
         fallback_resource: None,
+        resolve_agent_names: false,
         json: false,
     }
 }
@@ -219,7 +220,7 @@ async fn signed_and_authorized_commit_passes() {
 
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -234,6 +235,53 @@ async fn signed_and_authorized_commit_passes() {
     assert!(report.ok);
 }
 
+/// The report names the signers that actually signed the range, and only
+/// those: a name for a declared signer absent from the range is noise on a PR
+/// check, and a commit entry always keeps its full DID so a consumer that
+/// ignores names is unaffected.
+#[tokio::test]
+async fn the_report_names_only_the_signers_present_in_the_range() {
+    use vta_sdk::display_name::{DisplayName, NameSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let registry = stub_registry(SIGNER.to_string()).await;
+
+    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
+    let mut signers = ResolvedSigners::from_keys(keys);
+    signers.names.insert(
+        SIGNER,
+        DisplayName::new(
+            "example.com/@alice",
+            NameSource::AgentName { verified: true },
+        ),
+    );
+    // Declared, named, but signed nothing here.
+    signers.names.insert(
+        "did:example:absent",
+        DisplayName::new("example.com/@bob", NameSource::AgentName { verified: true }),
+    );
+
+    let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
+    let report = verify_with_keys(&args, &signers, None).await.unwrap();
+
+    assert_eq!(
+        report.signer_names.keys().collect::<Vec<_>>(),
+        vec![SIGNER],
+        "only signers that signed in the range are named"
+    );
+    assert_eq!(report.signer_names[SIGNER].name, "example.com/@alice");
+    assert_eq!(
+        report.commits[0].status,
+        CommitStatus::Trusted {
+            signer_did: SIGNER.to_string(),
+            resource: "example/repo".to_string()
+        },
+        "the commit entry keeps the full DID; the name is reported alongside"
+    );
+}
+
 #[tokio::test]
 async fn signed_but_unauthorized_commit_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -244,7 +292,7 @@ async fn signed_but_unauthorized_commit_fails() {
 
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -273,7 +321,7 @@ async fn unsigned_commit_fails_without_touching_the_registry() {
 
     // Deliberately unreachable registry: no signed commits means no queries.
     let args = args_for(repo, format!("{base}..{head}"), "http://127.0.0.1:1".into());
-    let report = verify_with_keys(&args, &HashMap::new(), None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::default(), None)
         .await
         .unwrap();
 
@@ -293,7 +341,7 @@ async fn unreachable_registry_fails_closed() {
         format!("{base}..{signed}"),
         "http://127.0.0.1:1".into(),
     );
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -415,7 +463,7 @@ mod pgp_platform {
         let registry = stub_registry(SIGNER.to_string()).await;
         let keys = HashMap::from([(did_key.verifying_key().to_bytes(), SIGNER.to_string())]);
         let args = args_for(repo, format!("{base}..{pgp_signed}"), registry);
-        let report = verify_with_keys(&args, &keys, Some(&keyring), BTreeMap::new())
+        let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), Some(&keyring))
             .await
             .unwrap();
 
@@ -450,7 +498,7 @@ mod pgp_platform {
             format!("{base}..{pgp_signed}"),
             "http://127.0.0.1:1".into(),
         );
-        let report = verify_with_keys(&args, &HashMap::new(), None, BTreeMap::new())
+        let report = verify_with_keys(&args, &ResolvedSigners::default(), None)
             .await
             .unwrap();
 
@@ -475,7 +523,7 @@ async fn org_grant_authorizes_via_fallback() {
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -498,7 +546,7 @@ async fn org_grant_is_ignored_without_fallback_configured() {
 
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -526,7 +574,7 @@ async fn repo_grant_wins_before_fallback_is_queried() {
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 
@@ -550,7 +598,7 @@ async fn denied_at_both_scopes_is_unauthorized() {
     let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &keys, None, BTreeMap::new())
+    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
         .await
         .unwrap();
 

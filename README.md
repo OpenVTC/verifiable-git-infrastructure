@@ -15,7 +15,7 @@ verify against. See the operator runbook for the full activation flow.
 | Crate | Role |
 |---|---|
 | [`vgi-core`](crates/vgi-core) | Shared, dependency-light primitives: the PROTOCOL.sshsig encoder, git commit-object handling, and DID-document Ed25519 key extraction. No network, keyring, or VTA. |
-| [`verify-trust`](crates/verify-trust) | The CI verifier (`verify-trust` binary). Checks a commit range against the registry. Depends only on `vgi-core`, a DID resolver, and the query client — no VTA or keyring, so PR runs stay small. |
+| [`verify-trust`](crates/verify-trust) | The CI verifier (`verify-trust` binary). Checks a commit range against the registry. Depends on `vgi-core`, a DID resolver, the query client, and `vta-sdk`'s display-name rendering — it never opens a VTA session or touches a keyring, so PR runs stay small. |
 | [`did-git-sign`](crates/did-git-sign) | The signer (`did-git-sign`, a git `gpg.ssh.program`). Signs commits with a DID key held by your VTA; carries the dev-machine stack (VTA client, keyring, prompts). |
 
 ## The CI check

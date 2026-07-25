@@ -65,6 +65,14 @@ struct Cli {
     #[arg(long)]
     repo_dir: Option<PathBuf>,
 
+    /// Verify the agent names the signers' DID documents claim, by resolving
+    /// each name back to the DID that claims it. Without this, a claimed name
+    /// still shows but is tagged `[unverified]` — `alsoKnownAs` is
+    /// self-asserted, so an unchecked name is only what a DID says about
+    /// itself. Costs one outbound HTTPS fetch per claimed name.
+    #[arg(long)]
+    resolve_agent_names: bool,
+
     /// Emit a machine-readable JSON report on stdout.
     #[arg(long)]
     json: bool,
@@ -99,6 +107,7 @@ async fn main() -> Result<()> {
         resource,
         fallback_resource: cli.fallback_resource,
         exempt_keyring: cli.exempt_keyring,
+        resolve_agent_names: cli.resolve_agent_names,
         json: cli.json,
     })
     .await?;

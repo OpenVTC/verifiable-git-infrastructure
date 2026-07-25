@@ -52,7 +52,30 @@ Exits `0` only when every commit is `trusted` (registry-authorized) or `exempt`
 (a platform commit verified against a committed PGP keyring). The verdicts
 `unsigned`, `unknownKey`, `badSignature`, `unauthorized`, and
 `registryUnavailable` each fail with a distinct status. `--json` emits a
-machine-readable report.
+machine-readable report, in which commits keep their full signer DIDs and
+`signerNames` maps each named signer to its name and that name's provenance.
+
+## Signer names
+
+Signers are reported by the agent name their DID document claims, so a review
+reads `example.com/@alice` rather than a DID:
+
+```
+TRUSTED      a1b2c3d4e5f6  example.com/@alice (did:webvh:QmXkAbCdEf…:example.com) (via your-org/your-repo)
+
+Signers:
+  example.com/@alice
+    did:webvh:QmXkAbCdEfGhIjKlMnOp:example.com
+```
+
+A claimed name is a **self-assertion** — `alsoKnownAs` is written by the DID's
+own controller, so nothing stops a hostile DID from claiming
+`mybank.com/@treasury`. Claims are therefore shown tagged `[unverified]` by
+default. Pass `--resolve-agent-names` (or `resolve-agent-names: true` on the
+Action) to resolve each claimed name forward and require it to lead back to the
+DID that claims it; only a name that round-trips renders untagged. That costs
+one outbound HTTPS fetch per claimed name, to a host the document's author
+chose, which is why it is opt-in.
 
 ## License
 

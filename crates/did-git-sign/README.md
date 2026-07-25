@@ -121,6 +121,24 @@ Check your configuration and VTA connectivity:
 did-git-sign health
 ```
 
+### Showing names instead of DIDs
+
+`init`'s context and DID pickers label each entry with a human name where the
+VTA has one — an ACL label, or the context's own name — falling back to an
+abbreviated DID. Pass `--resolve-agent-names` to `init` or `health` to also
+read back the agent name a DID document claims (`example.com/@alice`):
+
+```bash
+did-git-sign health --resolve-agent-names
+```
+
+Each claimed name is resolved forward and must lead back to the DID that claims
+it before it is shown as that DID's; a claim that does not round-trip is tagged
+`[unverified]`, because `alsoKnownAs` is self-asserted and an unchecked name is
+only what a DID says about itself. Resolution costs an outbound HTTPS fetch per
+claimed name, so it is opt-in. Names never replace the DID in a summary or
+diagnostic — they are printed above it.
+
 ### Selecting which community persona signs
 
 With more than one provisioned persona, you can choose which one signs without
