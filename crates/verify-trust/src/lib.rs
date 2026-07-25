@@ -2,25 +2,33 @@
 //!
 //! For every commit in a range this module answers two questions, in order:
 //!
-//! 1. **Who signed it, cryptographically?** The commit's `gpgsig` header is
-//!    parsed as a PROTOCOL.sshsig blob; the Ed25519 public key embedded in it
-//!    is matched against the keys published in the DID documents of the
-//!    repository's declared signers, and the signature is verified over the
-//!    exact bytes git signed.
+//! 1. **Who signed it, cryptographically?** The commit names a DID on its
+//!    `committer` header; that DID is resolved, its document must publish the
+//!    Ed25519 key embedded in the commit's sshsig, and the signature must
+//!    verify over the exact bytes git signed.
 //! 2. **Is that DID trusted, right now?** The signer DID is checked against
 //!    the Trust Registry with a TRQP authorization query
 //!    (`{entity: signer, authority, action, resource}`) via `trql-client`.
 //!
-//! The signer set comes from a committed index file (default `.did-signers`,
-//! one DID per line) that lists *identities, not keys* — keys are resolved
-//! from each DID document at verification time, so key rotation never
-//! requires touching the repository, and revoking a signer is a registry
-//! operation that takes effect on the next run.
+//! The signer set is **derived from the commits themselves** — there is no
+//! per-repository allowlist. The committer header is author-controlled text,
+//! so it is treated strictly as a lookup hint: the claim is only ever as good
+//! as the two checks that follow it. A commit claiming a DID it cannot sign
+//! for fails step 1 (the DID does not publish the signing key, or the
+//! signature does not verify over a payload that includes the claim itself);
+//! a commit signed by a DID nobody enrolled fails step 2.
 //!
-//! Failure is closed at every layer: an unsigned commit, a signature by an
-//! unpublished key, a cryptographically invalid signature, an unauthorized
-//! DID, and an unreachable registry all fail the check — each with its own
-//! status so an operator can tell which remediation applies.
+//! That places every question of *who may sign here* in the registry, where
+//! enrolment, rotation and revocation already live. `--resource` is
+//! consequently the only thing scoping a signer to this repository, and is
+//! security-relevant input: widening it, or widening `--fallback-resource`,
+//! widens who may sign, with nothing in the repository to contradict it.
+//!
+//! Failure is closed at every layer: an unsigned commit, a committer naming no
+//! DID, a DID that will not resolve, a signature by a key that DID does not
+//! publish, a cryptographically invalid signature, an unauthorized DID, and an
+//! unreachable registry all fail the check — each with its own status so an
+//! operator can tell which remediation applies.
 //!
 //! Signers are reported by **agent name** where one is available
 //! (`example.com/@alice`) rather than by raw DID. Names come out of the DID
@@ -30,7 +38,7 @@
 
 pub mod pgp_exempt;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -40,7 +48,8 @@ use serde::Serialize;
 use ssh_key::{SshSig, public::KeyData};
 use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqlError, TrqpQuery};
 use vgi_core::{
-    GIT_SSHSIG_NAMESPACE, ed25519_keys_from_doc, normalize_sshsig_armor, split_signed_commit,
+    GIT_SSHSIG_NAMESPACE, committer_did, committer_identity, ed25519_keys_from_doc,
+    normalize_sshsig_armor, split_signed_commit,
 };
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
@@ -53,8 +62,15 @@ pub struct VerifyTrustArgs {
     pub repo_dir: PathBuf,
     /// Commit range in `git rev-list` syntax, e.g. `origin/main..HEAD`.
     pub range: String,
-    /// Signer index file; relative paths resolve against `repo_dir`.
-    pub signers_file: PathBuf,
+    /// Ceiling on the number of *distinct* DIDs a range may claim, each of
+    /// which costs one resolution.
+    ///
+    /// The signer set is derived from the commits, so a pull request chooses
+    /// which identifiers CI resolves — and for the network-resolved methods
+    /// (`did:web`, `did:webvh`) that means an outbound fetch to a host the
+    /// author picked. Distinct DIDs are deduplicated first; this bounds what
+    /// remains. Exceeding it fails the run rather than resolving anyway.
+    pub max_signers: usize,
     /// Base URL of the Trust Registry (`POST <url>/trust-tasks`).
     pub registry_url: String,
     /// DID of the registry (the `recipient` on every query document).
@@ -64,6 +80,11 @@ pub struct VerifyTrustArgs {
     /// TRQP action, e.g. `git.commit.sign`.
     pub action: String,
     /// TRQP resource, e.g. the `org/repo` slug.
+    ///
+    /// With no committed signer index, this is the **only** thing scoping a
+    /// signer to this repository: a grant is accepted exactly when the
+    /// registry authorizes the tuple under this resource (or the fallback).
+    /// Treat it as security-relevant configuration.
     pub resource: String,
     /// Broader resource to try when the primary one does not authorize
     /// (e.g. the org for an org-wide grant). Grant semantics are
@@ -96,9 +117,16 @@ pub enum CommitStatus {
     Unsigned,
     /// The signature did not parse as an Ed25519 sshsig.
     Malformed(String),
-    /// The embedded key is published by none of the declared signers.
-    UnknownKey { fingerprint: String },
-    /// The key maps to a signer, but the signature does not verify.
+    /// Signed, but the `committer` header names no DID, so the commit asserts
+    /// no identity to resolve or authorize.
+    NoSignerDid { committer: String },
+    /// The claimed DID could not be resolved, so its published keys are
+    /// unknown. Fails closed: an unresolvable signer is not a trusted one.
+    UnresolvedSigner { did: String, error: String },
+    /// The claimed DID resolved, but publishes no verification method holding
+    /// the key that signed this commit.
+    UnknownKey { did: String, fingerprint: String },
+    /// The DID publishes the key, but the signature does not verify.
     BadSignature { signer_did: String },
     /// Valid signature, but the registry did not authorize the signer.
     Unauthorized { signer_did: String },
@@ -147,8 +175,9 @@ pub struct CommitVerdict {
 pub struct TrustReport {
     pub ok: bool,
     pub commits: Vec<CommitVerdict>,
-    /// Signer DIDs whose resolution failed (their commits show as
-    /// `unknownKey`); surfaced so the cause is visible.
+    /// Claimed DIDs whose resolution failed, each with the reason. Their
+    /// commits already carry `unresolvedSigner`; this aggregates the set for
+    /// a consumer that wants it without walking every commit.
     pub unresolved_signers: BTreeMap<String, String>,
     /// Display name per named signer DID, with its provenance. Only DIDs that
     /// have a name appear. The commit entries keep full DIDs, so a consumer
@@ -156,16 +185,18 @@ pub struct TrustReport {
     pub signer_names: BTreeMap<String, DisplayName>,
 }
 
-/// The declared signers, resolved: their published keys, why any of them
-/// could not be resolved, and what to call them.
+/// The DIDs a range claimed, resolved: the keys each publishes, why any of
+/// them could not be resolved, and what to call them.
 ///
 /// Produced by [`resolve_signer_keys`] and consumed by [`verify_with_keys`],
 /// which tests construct directly via [`ResolvedSigners::from_keys`].
 #[derive(Debug, Default)]
 pub struct ResolvedSigners {
-    /// Published Ed25519 key → the DID that publishes it.
-    pub keys: HashMap<[u8; 32], String>,
-    /// Declared DID → why it did not resolve.
+    /// DID → the Ed25519 keys its document publishes. Keyed by DID rather
+    /// than by key so a commit is checked against *the identity it claims*,
+    /// not against whatever identity happens to publish the signing key.
+    pub keys: BTreeMap<String, Vec<[u8; 32]>>,
+    /// Claimed DID → why it did not resolve.
     pub unresolved: BTreeMap<String, String>,
     /// DID → display name, for every signer whose document names it.
     pub names: NameBook,
@@ -175,44 +206,93 @@ impl ResolvedSigners {
     /// A signer set with keys but no names — the shape a test wants when it
     /// supplies keys directly instead of resolving DID documents.
     #[must_use]
-    pub fn from_keys(keys: HashMap<[u8; 32], String>) -> Self {
+    pub fn from_keys<I, D>(keys: I) -> Self
+    where
+        I: IntoIterator<Item = (D, Vec<[u8; 32]>)>,
+        D: Into<String>,
+    {
         Self {
-            keys,
+            keys: keys.into_iter().map(|(did, k)| (did.into(), k)).collect(),
             ..Self::default()
         }
     }
+
+    /// The keys `did` publishes, or `None` if it never resolved.
+    fn published(&self, did: &str) -> Option<&[[u8; 32]]> {
+        self.keys.get(did).map(Vec::as_slice)
+    }
 }
 
-/// Run the check end to end: resolve the declared signers' keys, then verify
-/// the range. Returns the process exit code (0 = every commit trusted).
+/// Run the check end to end: collect the DIDs the range claims, resolve them,
+/// then verify. Returns the process exit code (0 = every commit passes).
 pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
-    let signer_dids = load_signers(&args.repo_dir, &args.signers_file)?;
     let exempt = load_exempt_keyring(&args)?;
-    let signers = resolve_signer_keys(&signer_dids, args.resolve_agent_names).await?;
-    let report = verify_with_keys(&args, &signers, exempt.as_ref()).await?;
+    let commits = read_range(&args.repo_dir, &args.range)?;
+    let claimed = claimed_signer_dids(&commits, args.max_signers)?;
+    let signers = resolve_signer_keys(&claimed, args.resolve_agent_names).await?;
+    let report = verify_prepared(&args, &commits, &signers, exempt.as_ref()).await?;
     print_report(&args, &report)?;
     Ok(if report.ok { 0 } else { 1 })
 }
 
-/// Verify the range against an already-resolved signer set. Split from
+/// One commit of the range, read once so the object is not fetched again for
+/// the claim pass and the verification pass.
+#[derive(Debug, Clone)]
+pub struct RangeCommit {
+    pub sha: String,
+    pub raw: Vec<u8>,
+}
+
+/// Read every commit object in the range, oldest first.
+pub fn read_range(repo_dir: &Path, range: &str) -> Result<Vec<RangeCommit>> {
+    list_commits(repo_dir, range)?
+        .into_iter()
+        .map(|sha| {
+            let raw = read_commit_raw(repo_dir, &sha)?;
+            Ok(RangeCommit { sha, raw })
+        })
+        .collect()
+}
+
+/// The distinct DIDs the range's commits claim on their committer headers.
+///
+/// Deduplicated, then bounded by `max_signers`: the set is chosen by whoever
+/// wrote the commits, and each entry costs a resolution. Commits claiming no
+/// DID contribute nothing here — they fail later, individually, with a status
+/// that says so.
+pub fn claimed_signer_dids(commits: &[RangeCommit], max_signers: usize) -> Result<Vec<String>> {
+    let dids: BTreeSet<String> = commits
+        .iter()
+        .filter_map(|commit| committer_did(&commit.raw))
+        .collect();
+    if dids.len() > max_signers {
+        bail!(
+            "range claims {} distinct signer DIDs, over the limit of {max_signers}; \
+             each costs a resolution to a host the commit's author chose. Raise \
+             --max-signers only if this range is legitimately that wide.",
+            dids.len()
+        );
+    }
+    Ok(dids.into_iter().collect())
+}
+
+/// Verify commits already read and resolved. Split from
 /// [`handle_verify_trust`] so tests can supply keys without a live resolver.
-pub async fn verify_with_keys(
+pub async fn verify_prepared(
     args: &VerifyTrustArgs,
+    commits: &[RangeCommit],
     signers: &ResolvedSigners,
     exempt: Option<&ExemptKeyring>,
 ) -> Result<TrustReport> {
-    let shas = list_commits(&args.repo_dir, &args.range)?;
-
     // Pass 1: cryptographic verification, collecting the DIDs that signed.
-    let mut checked = Vec::with_capacity(shas.len());
+    let mut checked = Vec::with_capacity(commits.len());
     let mut signer_dids = BTreeSet::new();
-    for sha in shas {
-        let raw = read_commit_raw(&args.repo_dir, &sha)?;
-        let signature = check_commit_signature(&raw, &signers.keys, exempt);
+    for commit in commits {
+        let signature = check_commit_signature(&commit.raw, signers, exempt);
         if let SignatureCheck::Valid { signer_did } = &signature {
             signer_dids.insert(signer_did.clone());
         }
-        checked.push((sha, signature));
+        checked.push((commit.sha.clone(), signature));
     }
 
     // Pass 2: one registry query per distinct signer DID.
@@ -226,8 +306,8 @@ pub async fn verify_with_keys(
         })
         .collect();
 
-    // Names are reported for the declared signers that actually signed
-    // something here — a name for a DID absent from the range is noise.
+    // Names are reported for the signers that actually signed something here
+    // — a name for a DID absent from the range is noise.
     let signer_names = signer_dids
         .iter()
         .filter_map(|did| {
@@ -255,17 +335,25 @@ pub async fn verify_with_keys(
 pub enum SignatureCheck {
     Unsigned,
     Malformed(String),
-    UnknownKey { fingerprint: String },
+    NoSignerDid { committer: String },
+    UnresolvedSigner { did: String, error: String },
+    UnknownKey { did: String, fingerprint: String },
     BadSignature { signer_did: String },
     PgpRejected { detail: String },
     Exempt { fingerprint: String },
     Valid { signer_did: String },
 }
 
-/// Verify one raw commit object against the signer key map.
+/// Verify one raw commit object against the resolved signers.
+///
+/// The identity comes from the commit's own `committer` header, and is checked
+/// against itself: the DID it claims must publish the key that signed, and the
+/// signature must verify over a payload that includes that very header. The
+/// claim is therefore never trusted — it only selects which document to check
+/// the key against, and a commit naming a DID it cannot sign for fails here.
 pub fn check_commit_signature(
     raw: &[u8],
-    signer_keys: &HashMap<[u8; 32], String>,
+    signers: &ResolvedSigners,
     exempt: Option<&ExemptKeyring>,
 ) -> SignatureCheck {
     let (payload, pem) = match split_signed_commit(raw) {
@@ -297,18 +385,38 @@ pub fn check_commit_signature(
         ));
     };
     let key_bytes: [u8; 32] = embedded.0;
-    let Some(signer_did) = signer_keys.get(&key_bytes) else {
-        return SignatureCheck::UnknownKey {
-            fingerprint: hex::encode(key_bytes),
+
+    // The identity is read from the payload — the bytes the signature covers —
+    // so a claim that survives verification is one the signer committed to.
+    let Some(claimed) = committer_did(&payload) else {
+        return SignatureCheck::NoSignerDid {
+            committer: committer_identity(&payload).unwrap_or_else(|| "(absent)".to_string()),
         };
     };
+    let Some(published) = signers.published(&claimed) else {
+        let error = signers
+            .unresolved
+            .get(&claimed)
+            .cloned()
+            .unwrap_or_else(|| "not resolved".to_string());
+        return SignatureCheck::UnresolvedSigner {
+            did: claimed,
+            error,
+        };
+    };
+    if !published.contains(&key_bytes) {
+        return SignatureCheck::UnknownKey {
+            did: claimed,
+            fingerprint: hex::encode(key_bytes),
+        };
+    }
     let public_key = ssh_key::PublicKey::from(sig.public_key().clone());
     match public_key.verify(GIT_SSHSIG_NAMESPACE, &payload, &sig) {
         Ok(()) => SignatureCheck::Valid {
-            signer_did: signer_did.clone(),
+            signer_did: claimed,
         },
         Err(_) => SignatureCheck::BadSignature {
-            signer_did: signer_did.clone(),
+            signer_did: claimed,
         },
     }
 }
@@ -326,47 +434,12 @@ fn load_exempt_keyring(args: &VerifyTrustArgs) -> Result<Option<ExemptKeyring>> 
     Ok(Some(ExemptKeyring::load(&path)?))
 }
 
-// --- signer index & DID resolution -------------------------------------------
+// --- DID resolution ----------------------------------------------------------
 
-/// Read and parse the signer index: one DID per line, `#` comments allowed.
-/// A missing or malformed file is a hard error — with no declared signers
-/// there is nothing to verify against, and the check must not silently pass.
-pub fn load_signers(repo_dir: &Path, signers_file: &Path) -> Result<Vec<String>> {
-    let path = if signers_file.is_absolute() {
-        signers_file.to_path_buf()
-    } else {
-        repo_dir.join(signers_file)
-    };
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read signer index {}", path.display()))?;
-    let dids = parse_signers(&text)?;
-    if dids.is_empty() {
-        bail!("signer index {} declares no DIDs", path.display());
-    }
-    Ok(dids)
-}
-
-/// Parse signer-index text. Rejects non-DID entries outright rather than
-/// skipping them: a typo must fail loudly, not silently drop a signer.
-pub fn parse_signers(text: &str) -> Result<Vec<String>> {
-    let mut dids = Vec::new();
-    for (number, line) in text.lines().enumerate() {
-        let entry = line.trim();
-        if entry.is_empty() || entry.starts_with('#') {
-            continue;
-        }
-        if !entry.starts_with("did:") {
-            bail!("signer index line {}: not a DID: {entry}", number + 1);
-        }
-        dids.push(entry.to_string());
-    }
-    Ok(dids)
-}
-
-/// Resolve every declared signer DID: collect the Ed25519 keys their DID
+/// Resolve every DID the range claimed: collect the Ed25519 keys their
 /// documents publish, and name each signer from the same document. A DID that
-/// fails to resolve is recorded (its commits will fail as `unknownKey`)
-/// without blocking the other signers.
+/// fails to resolve is recorded (its commits fail as `unresolvedSigner`)
+/// without blocking the others.
 ///
 /// `resolve_agent_names` turns on the resolver's shortcut derivation, which
 /// round-trips each claimed name before it is treated as this DID's — see
@@ -417,13 +490,16 @@ pub async fn resolve_signer_keys(
                     .with_context(|| format!("DID document for {did} did not serialize"))?;
                 let published = ed25519_keys_from_doc(&doc);
                 if published.is_empty() {
+                    // Left out of `keys` deliberately: a document with no
+                    // Ed25519 method can verify nothing, and recording it as
+                    // resolved-but-empty would report its commits as an
+                    // unknown key rather than as this, the actual cause.
                     signers.unresolved.insert(
                         did.clone(),
                         "DID document publishes no Ed25519 verification keys".to_string(),
                     );
-                }
-                for key in published {
-                    signers.keys.insert(key, did.clone());
+                } else {
+                    signers.keys.insert(did.clone(), published);
                 }
             }
             Err(e) => {
@@ -517,7 +593,13 @@ fn status_of(signature: SignatureCheck, decisions: &RegistryDecisions) -> Commit
     match signature {
         SignatureCheck::Unsigned => CommitStatus::Unsigned,
         SignatureCheck::Malformed(detail) => CommitStatus::Malformed(detail),
-        SignatureCheck::UnknownKey { fingerprint } => CommitStatus::UnknownKey { fingerprint },
+        SignatureCheck::NoSignerDid { committer } => CommitStatus::NoSignerDid { committer },
+        SignatureCheck::UnresolvedSigner { did, error } => {
+            CommitStatus::UnresolvedSigner { did, error }
+        }
+        SignatureCheck::UnknownKey { did, fingerprint } => {
+            CommitStatus::UnknownKey { did, fingerprint }
+        }
         SignatureCheck::BadSignature { signer_did } => CommitStatus::BadSignature { signer_did },
         SignatureCheck::PgpRejected { detail } => CommitStatus::PgpRejected { detail },
         SignatureCheck::Exempt { fingerprint } => CommitStatus::Exempt { fingerprint },
@@ -590,8 +672,8 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
     }
 
     // Per-commit lines name the signer and abbreviate its DID; the signer
-    // block below carries every DID in full, so nothing that has to be
-    // cross-checked against `.did-signers` is lost to the abbreviation.
+    // block below carries every DID in full, so nothing a reviewer has to
+    // check against the registry is lost to the abbreviation.
     let signer = |did: &str| render_signer(report, did);
 
     for commit in &report.commits {
@@ -630,10 +712,17 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
                     signer(signer_did)
                 );
             }
-            CommitStatus::UnknownKey { fingerprint } => {
+            CommitStatus::UnknownKey { did, fingerprint } => {
                 println!(
-                    "UNKNOWN-KEY  {short}  key {fingerprint} is published by no declared signer"
+                    "UNKNOWN-KEY  {short}  {} publishes no key {fingerprint}",
+                    signer(did)
                 );
+            }
+            CommitStatus::UnresolvedSigner { did, error } => {
+                println!("UNRESOLVED   {short}  claimed signer {did} did not resolve: {error}");
+            }
+            CommitStatus::NoSignerDid { committer } => {
+                println!("NO-SIGNER    {short}  committer <{committer}> is not a DID");
             }
             CommitStatus::Malformed(detail) => {
                 println!("MALFORMED    {short}  {detail}");
@@ -642,9 +731,6 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
                 println!("UNSIGNED     {short}  commit carries no signature");
             }
         }
-    }
-    for (did, reason) in &report.unresolved_signers {
-        println!("WARNING      declared signer {did}: {reason}");
     }
 
     print_signer_block(args, report);
@@ -722,13 +808,27 @@ mod tests {
         (signing, public)
     }
 
+    const SIGNER: &str = "did:webvh:QmSigner:example.com";
+
+    /// An unsigned commit whose committer claims `SIGNER`, as `did-git-sign`
+    /// writes it: `user.email` is the verification-method id.
     fn unsigned_commit() -> String {
-        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
-         author A U Thor <a@example.com> 1700000000 +0000\n\
-         committer A U Thor <a@example.com> 1700000000 +0000\n\
-         \n\
-         a message\n"
-            .to_string()
+        commit_committed_by(&format!("{SIGNER}#key-0"))
+    }
+
+    fn commit_committed_by(committer: &str) -> String {
+        format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer A U Thor <{committer}> 1700000000 +0000\n\
+             \n\
+             a message\n"
+        )
+    }
+
+    /// A signer set in which `SIGNER` publishes `public`.
+    fn signers_publishing(public: [u8; 32]) -> ResolvedSigners {
+        ResolvedSigners::from_keys([(SIGNER, vec![public])])
     }
 
     /// Insert a gpgsig header before the blank line, continuation-indented,
@@ -785,14 +885,142 @@ mod tests {
         let payload = unsigned_commit();
         let (key, public) = test_key();
         let commit = sign_commit(&payload, &key);
-        let keys = HashMap::from([(public, "did:example:signer".to_string())]);
 
-        let check = check_commit_signature(commit.as_bytes(), &keys, None);
+        let check = check_commit_signature(commit.as_bytes(), &signers_publishing(public), None);
         assert_eq!(
             check,
             SignatureCheck::Valid {
-                signer_did: "did:example:signer".to_string()
+                signer_did: SIGNER.to_string()
             }
+        );
+    }
+
+    #[test]
+    fn the_signer_is_the_did_the_commit_claims() {
+        // The identity is not configuration: it comes off the commit's own
+        // committer header, with the fragment stripped.
+        let payload = unsigned_commit();
+        let (key, public) = test_key();
+        let commit = sign_commit(&payload, &key);
+
+        let SignatureCheck::Valid { signer_did } =
+            check_commit_signature(commit.as_bytes(), &signers_publishing(public), None)
+        else {
+            panic!("expected a valid signature");
+        };
+        assert_eq!(signer_did, SIGNER, "the bare DID, not the key id");
+    }
+
+    #[test]
+    fn claiming_a_did_that_does_not_publish_the_signing_key_fails() {
+        // The spoof the committer header invites: sign with your own key while
+        // naming someone else's DID. The claim selects whose document to
+        // check, and that document does not publish this key.
+        let payload = commit_committed_by("did:webvh:QmVictim:example.com#key-0");
+        let (key, public) = test_key();
+        let commit = sign_commit(&payload, &key);
+
+        let signers = ResolvedSigners::from_keys([
+            (SIGNER, vec![public]),
+            ("did:webvh:QmVictim:example.com", vec![[0u8; 32]]),
+        ]);
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers, None),
+            SignatureCheck::UnknownKey {
+                did: "did:webvh:QmVictim:example.com".to_string(),
+                fingerprint: hex::encode(public),
+            },
+            "a key published by another DID must not authenticate this claim"
+        );
+    }
+
+    #[test]
+    fn a_committer_that_is_not_a_did_has_no_identity_to_check() {
+        let payload = commit_committed_by("alice@example.com");
+        let (key, public) = test_key();
+        let commit = sign_commit(&payload, &key);
+
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers_publishing(public), None),
+            SignatureCheck::NoSignerDid {
+                committer: "alice@example.com".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_claimed_did_that_did_not_resolve_fails_closed() {
+        let payload = unsigned_commit();
+        let (key, _) = test_key();
+        let commit = sign_commit(&payload, &key);
+
+        let mut signers = ResolvedSigners::default();
+        signers
+            .unresolved
+            .insert(SIGNER.to_string(), "resolution failed: no such host".into());
+
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers, None),
+            SignatureCheck::UnresolvedSigner {
+                did: SIGNER.to_string(),
+                error: "resolution failed: no such host".to_string(),
+            },
+            "an unresolvable signer is not a trusted one"
+        );
+    }
+
+    #[test]
+    fn the_claim_is_read_from_the_bytes_the_signature_covers() {
+        // Rewriting the committer after signing invalidates the signature, so
+        // a surviving claim is one the signer committed to.
+        let payload = unsigned_commit();
+        let (key, public) = test_key();
+        let commit = sign_commit(&payload, &key).replace(
+            &format!("{SIGNER}#key-0"),
+            "did:webvh:QmOther:example.com#key-0",
+        );
+
+        let signers = ResolvedSigners::from_keys([
+            (SIGNER, vec![public]),
+            ("did:webvh:QmOther:example.com", vec![public]),
+        ]);
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers, None),
+            SignatureCheck::BadSignature {
+                signer_did: "did:webvh:QmOther:example.com".to_string()
+            },
+            "tampering with the claimed identity breaks the signature over it"
+        );
+    }
+
+    #[test]
+    fn distinct_claimed_dids_are_deduplicated_and_bounded() {
+        let (key, _) = test_key();
+        let commits: Vec<RangeCommit> = ["QmA", "QmB", "QmA"]
+            .iter()
+            .enumerate()
+            .map(|(i, scid)| RangeCommit {
+                sha: format!("{i:040}"),
+                raw: sign_commit(
+                    &commit_committed_by(&format!("did:webvh:{scid}:example.com#key-0")),
+                    &key,
+                )
+                .into_bytes(),
+            })
+            .collect();
+
+        let claimed = claimed_signer_dids(&commits, 32).unwrap();
+        assert_eq!(
+            claimed,
+            vec![
+                "did:webvh:QmA:example.com".to_string(),
+                "did:webvh:QmB:example.com".to_string(),
+            ],
+            "three commits, two identities, two resolutions"
+        );
+        assert!(
+            claimed_signer_dids(&commits, 1).is_err(),
+            "a range may not make CI resolve more hosts than the cap allows"
         );
     }
 
@@ -821,23 +1049,29 @@ mod tests {
         legacy.push_str("-----END SSH SIGNATURE-----\n");
 
         let commit = signed_commit(&payload, &legacy);
-        let keys = HashMap::from([(public, "did:example:signer".to_string())]);
         assert_eq!(
-            check_commit_signature(commit.as_bytes(), &keys, None),
+            check_commit_signature(commit.as_bytes(), &signers_publishing(public), None),
             SignatureCheck::Valid {
-                signer_did: "did:example:signer".to_string()
+                signer_did: SIGNER.to_string()
             }
         );
     }
 
     #[test]
-    fn unknown_key_is_reported_with_fingerprint() {
+    fn a_key_the_claimed_did_does_not_publish_is_reported_with_its_fingerprint() {
         let payload = unsigned_commit();
-        let (key, _) = test_key();
+        let (key, public) = test_key();
         let commit = sign_commit(&payload, &key);
 
-        let check = check_commit_signature(commit.as_bytes(), &HashMap::new(), None);
-        assert!(matches!(check, SignatureCheck::UnknownKey { .. }));
+        // The DID resolved, but publishes a different key.
+        let signers = ResolvedSigners::from_keys([(SIGNER, vec![[3u8; 32]])]);
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers, None),
+            SignatureCheck::UnknownKey {
+                did: SIGNER.to_string(),
+                fingerprint: hex::encode(public),
+            }
+        );
     }
 
     #[test]
@@ -845,30 +1079,24 @@ mod tests {
         let payload = unsigned_commit();
         let (key, public) = test_key();
         let commit = sign_commit(&payload, &key).replace("a message", "b message");
-        let keys = HashMap::from([(public, "did:example:signer".to_string())]);
 
-        let check = check_commit_signature(commit.as_bytes(), &keys, None);
+        let check = check_commit_signature(commit.as_bytes(), &signers_publishing(public), None);
         assert_eq!(
             check,
             SignatureCheck::BadSignature {
-                signer_did: "did:example:signer".to_string()
+                signer_did: SIGNER.to_string()
             }
         );
     }
 
     #[test]
     fn unsigned_commit_is_unsigned() {
-        let check = check_commit_signature(unsigned_commit().as_bytes(), &HashMap::new(), None);
+        let check = check_commit_signature(
+            unsigned_commit().as_bytes(),
+            &ResolvedSigners::default(),
+            None,
+        );
         assert_eq!(check, SignatureCheck::Unsigned);
-    }
-
-    #[test]
-    fn signers_index_parses_and_rejects_non_dids() {
-        let parsed =
-            parse_signers("# team\n did:webvh:abc:example.com \n\ndid:webvh:def:example.com\n")
-                .unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert!(parse_signers("not-a-did\n").is_err());
     }
 
     #[test]

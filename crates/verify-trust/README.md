@@ -3,16 +3,23 @@
 The CI verifier of [Verifiable Git Infrastructure (VGI)][vgi]. For every commit
 in a range it answers two questions, and **fails closed** on any doubt:
 
-1. **Who signed it, cryptographically?** The commit's `gpgsig` header is parsed
-   as a PROTOCOL.sshsig blob; the embedded Ed25519 key is matched against the
-   keys published in the DID documents of the repository's declared signers,
-   and the signature is verified over the exact bytes git signed.
+1. **Who signed it, cryptographically?** The commit names a signer DID on its
+   `committer` header; that DID is resolved, its document must publish the
+   Ed25519 key embedded in the commit's PROTOCOL.sshsig blob, and the signature
+   must verify over the exact bytes git signed.
 2. **Is that DID trusted, right now?** The signer DID is checked against a Trust
    Registry with a TRQP authorization query.
 
-Signers are declared as DIDs in a committed index (default `.did-signers`) —
-identities, not keys — so key rotation never touches the repository, and
-revoking a signer is a registry operation that takes effect on the next run.
+There is **no per-repository signer list**. The committer header is
+author-controlled text, so it is used strictly as a lookup hint whose answer is
+then checked: a commit claiming a DID it cannot sign for fails step 1 — the DID
+does not publish the signing key, and the signature covers the header making
+the claim — and a commit signed by a DID nobody enrolled fails step 2.
+
+That leaves every question of *who may sign here* in the registry, where
+enrolment, rotation and revocation already live. Adding a contributor is one
+grant, not a pull request against each repository they touch, and revoking one
+takes effect on the next run with nothing to un-commit.
 
 > **Not a generic git-signature checker.** verify-trust is bound to the DID /
 > Trust-Registry ecosystem: you need a Trust Registry to verify against and
@@ -29,7 +36,7 @@ Or use the prebuilt binary via the GitHub Action (no toolchain on the runner):
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.1.2
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
     registry-url: ${{ vars.TRUST_REGISTRY_URL }}
@@ -49,11 +56,36 @@ verify-trust \
 ```
 
 Exits `0` only when every commit is `trusted` (registry-authorized) or `exempt`
-(a platform commit verified against a committed PGP keyring). The verdicts
-`unsigned`, `unknownKey`, `badSignature`, `unauthorized`, and
-`registryUnavailable` each fail with a distinct status. `--json` emits a
-machine-readable report, in which commits keep their full signer DIDs and
-`signerNames` maps each named signer to its name and that name's provenance.
+(a platform commit verified against a committed PGP keyring). Every other
+verdict fails, each with a distinct status so an operator can tell which
+remediation applies:
+
+| Verdict | Cause |
+|---|---|
+| `unsigned` | no `gpgsig` header |
+| `noSignerDid` | signed, but the committer names no DID |
+| `unresolvedSigner` | the claimed DID did not resolve |
+| `unknownKey` | the claimed DID publishes no such key |
+| `badSignature` | the DID publishes the key, but the signature fails |
+| `unauthorized` | valid signature, registry says no |
+| `registryUnavailable` | the registry could not be consulted |
+
+`--json` emits a machine-readable report, in which commits keep their full
+signer DIDs and `signerNames` maps each named signer to its name and that
+name's provenance.
+
+## Scoping and cost
+
+Two inputs carry weight that a committed signer list used to:
+
+- **`--resource`** (and `--fallback-resource`) is the only thing scoping a
+  signer to this repository. A grant is accepted exactly when the registry
+  authorizes the tuple under it, so widening either widens who may sign, with
+  nothing in the repository to contradict it.
+- **`--max-signers`** (default 32) bounds the distinct DIDs one range may
+  claim. The set is chosen by whoever wrote the commits, and for the
+  network-resolved methods each entry is an outbound fetch to a host the author
+  picked. DIDs are deduplicated first; exceeding the cap fails the run.
 
 ## Signer names
 

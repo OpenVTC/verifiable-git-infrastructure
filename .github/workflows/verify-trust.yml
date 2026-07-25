@@ -2,8 +2,9 @@ name: verify-trust
 
 # VGI dogfoods its own commit-trust check. Dormant until the repo is
 # configured with a Trust Registry: set the repository variables
-# TRUST_REGISTRY_URL, TRUST_REGISTRY_DID, and TRUST_AUTHORITY_DID, and commit
-# a `.did-signers` index of the DIDs allowed to sign here.
+# TRUST_REGISTRY_URL, TRUST_REGISTRY_DID, and TRUST_AUTHORITY_DID. Who may
+# sign here is a registry grant, not a file in this repo — enrolment,
+# rotation and revocation all live in the VTC.
 on:
   pull_request:
 

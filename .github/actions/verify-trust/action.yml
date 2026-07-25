@@ -1,6 +1,11 @@
 name: "verify-trust"
 description: "Verify that every commit in a range is signed by a DID your community's Trust Registry currently authorizes."
 
+# The signer set is derived from the commits: each names its signer DID on its
+# committer header, that DID must publish the key that signed, and the registry
+# must authorize it. There is no per-repository signer list — `resource` below
+# is what scopes a signer to this repository.
+
 inputs:
   range:
     description: "Commit range in git rev-list syntax (e.g. origin/main..HEAD). Requires the base ref to be fetched (actions/checkout with fetch-depth: 0)."
@@ -19,17 +24,17 @@ inputs:
     required: false
     default: "git.commit.sign"
   resource:
-    description: "TRQP resource of the trust tuple. Defaults to this repository (owner/name)."
+    description: "TRQP resource of the trust tuple. Defaults to this repository (owner/name). SECURITY-RELEVANT: with no committed signer list, this is the only thing scoping a signer to this repository — widening it widens who may sign."
     required: false
     default: ${{ github.repository }}
   fallback-resource:
-    description: "Broader resource to also accept a grant under (e.g. the org). Grant semantics are OR. Omitted: only the primary resource is queried."
+    description: "Broader resource to also accept a grant under (e.g. the org). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`."
     required: false
     default: ""
-  signers-file:
-    description: "Signer index file (one DID per line). Relative to the checkout root."
+  max-signers:
+    description: "Ceiling on the number of distinct signer DIDs a range may claim. Each costs one DID resolution, to a host the commit's author chose, so this bounds what a pull request can make the runner resolve."
     required: false
-    default: ".did-signers"
+    default: "32"
   exempt-keyring:
     description: "Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow key). PGP-signed commits pass only if they verify against a key in this file. Omitted: no exemptions."
     required: false
@@ -95,7 +100,7 @@ runs:
           --authority "${{ inputs.authority }}"
           --action "${{ inputs.action }}"
           --resource "${{ inputs.resource }}"
-          --signers-file "${{ inputs.signers-file }}"
+          --max-signers "${{ inputs.max-signers }}"
         )
         if [ -n "${{ inputs.fallback-resource }}" ]; then
           args+=(--fallback-resource "${{ inputs.fallback-resource }}")
