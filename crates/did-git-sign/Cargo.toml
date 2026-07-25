@@ -23,7 +23,14 @@ path = "src/main.rs"
 [dependencies]
 # Shared sshsig codec (create_ssh_signature) — kept in lockstep with the verifier.
 vgi-core = { workspace = true }
-vta-sdk = { workspace = true, features = ["client", "session"] }
+vta-sdk = { workspace = true, features = [
+    "client",
+    "session",
+    "didcomm",
+    "provision-client",
+    # DID → human name for the setup pickers and `health`.
+    "agent-names",
+] }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
