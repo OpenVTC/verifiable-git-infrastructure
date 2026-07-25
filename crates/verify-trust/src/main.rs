@@ -1,9 +1,10 @@
 //! `verify-trust`: the VGI CI verifier.
 //!
-//! Verifies every commit in a range's SSH signature against the signers' DID
-//! documents and checks each signer DID against the VTC Trust Registry. Exits
-//! 0 only when every commit in the range is signed by a registry-authorized
-//! DID (or is an exempt platform commit). Designed for CI (GitHub PR checks).
+//! Verifies every commit in a range against the DID document of the signer the
+//! commit itself names, then checks that DID against the VTC Trust Registry.
+//! Exits 0 only when every commit in the range is signed by a
+//! registry-authorized DID (or is an exempt platform commit). Designed for CI
+//! (GitHub PR checks).
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -21,10 +22,11 @@ struct Cli {
     #[arg(long)]
     range: String,
 
-    /// Signer index file (one DID per line, `#` comments). Relative paths
-    /// resolve against --repo-dir.
-    #[arg(long, default_value = ".did-signers")]
-    signers_file: PathBuf,
+    /// Maximum number of distinct signer DIDs a range may claim. Each costs
+    /// one DID resolution, to a host the commit's author chose, so the set a
+    /// pull request can make CI resolve is bounded.
+    #[arg(long, default_value_t = 32)]
+    max_signers: usize,
 
     /// Base URL of the Trust Registry (queries POST to `<url>/trust-tasks`).
     #[arg(long)]
@@ -44,6 +46,9 @@ struct Cli {
 
     /// TRQP resource of the trust tuple (e.g. the `org/repo` slug). Defaults
     /// to $GITHUB_REPOSITORY when unset.
+    ///
+    /// Security-relevant: this is the only thing scoping a signer to this
+    /// repository, so widening it widens who may sign.
     #[arg(long)]
     resource: Option<String>,
 
@@ -99,7 +104,7 @@ async fn main() -> Result<()> {
     let code = handle_verify_trust(VerifyTrustArgs {
         repo_dir,
         range: cli.range,
-        signers_file: cli.signers_file,
+        max_signers: cli.max_signers,
         registry_url: cli.registry_url,
         registry_did: cli.registry_did,
         authority_did: cli.authority,

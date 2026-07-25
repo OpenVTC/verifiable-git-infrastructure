@@ -1,0 +1,207 @@
+# VGI operator runbook
+
+Activating commit trust on a repository, end to end. Read this if you run the
+Trust Registry, the VTA, or the repositories the check protects.
+
+The shape to hold in your head: **VGI verifies, the VTC decides.** A commit
+names its signer DID on its own `committer` header; `verify-trust` proves that
+DID signed it, then asks the registry whether that DID is authorized. Who may
+sign, key rotation, and revocation are registry and VTA concerns — nothing
+about them lives in the repository.
+
+---
+
+## 1. Prerequisites
+
+These are outside VGI, and standing them up is the long pole.
+
+| What | Why VGI needs it | What you take away |
+|---|---|---|
+| A **VTA** with a persona and Ed25519 signing key per contributor | `did-git-sign` fetches the key at sign time; no private key touches disk | each contributor's `did:webvh:…#key-N` |
+| A **Trust Registry** speaking TRQP | answers "is this DID authorized, right now" | `TRUST_REGISTRY_URL`, `TRUST_REGISTRY_DID` |
+| An **authority DID** for your community | the authority each trust tuple is evaluated under | `TRUST_AUTHORITY_DID` |
+
+Provisioning the VTA and registry themselves is documented in
+[verifiable-trust-infrastructure][vti], not here.
+
+## 2. Enrol the signers
+
+For each contributor, issue a grant in the registry over the tuple:
+
+```
+entity    = did:webvh:…            the contributor's DID (no fragment)
+authority = <TRUST_AUTHORITY_DID>
+action    = git.commit.sign
+resource  = <owner>/<repo>         or <owner> for an org-wide grant
+```
+
+`entity` is the **bare DID**, not the verification-method id. A commit signed
+as `did:webvh:QmAbc:example.com#key-0` is queried as
+`did:webvh:QmAbc:example.com` — the fragment names which key, and which key is
+already settled by then.
+
+Choose the resource scope deliberately. A repo-scoped grant authorizes one
+repository; an org-scoped grant authorizes every repository that passes
+`fallback-resource: <owner>`. Grant semantics are OR, so a repo-level record
+**cannot veto** an org-level grant — narrowing is a matter of not issuing the
+broad grant in the first place.
+
+This step is the whole access-control decision. There is no second list to
+maintain, and nothing to commit to the repository.
+
+## 3. Set up a contributor's machine
+
+Once per contributor:
+
+```sh
+cargo install did-git-sign
+did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
+did-git-sign health
+```
+
+`init` resolves the VTA, mints a temporary admin did:key, and prints a
+`pnm contexts create …` command. Run that in your Personal Network Manager to
+authorise the setup session, press Enter, then pick the persona and signing
+key. It configures git:
+
+- `gpg.format = ssh`, `gpg.ssh.program = did-git-sign`, `commit.gpgsign = true`
+- **`user.email = <DID#key-id>`** — this is load-bearing. It is the only place
+  a commit states which identity signed it. A repo that overrides `user.email`
+  with an ordinary address will fail `noSignerDid` even with a valid signature.
+
+Use `--global` for all repositories, or plain `init` for one. Verify with
+`did-git-sign health` before the first push, not after the PR check fails.
+
+To sign as a different persona without re-running `init`, set
+`DID_GIT_SIGN_KEY` for one commit or `git config did-git-sign.key` for the
+repository.
+
+## 4. Set up the repository
+
+**Workflow** — `.github/workflows/verify-trust.yml`:
+
+```yaml
+on: pull_request
+
+jobs:
+  verify:
+    name: Verify commit trust
+    if: vars.TRUST_REGISTRY_URL != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
+        with:
+          range:        origin/${{ github.base_ref }}..HEAD
+          registry-url: ${{ vars.TRUST_REGISTRY_URL }}
+          registry-did: ${{ vars.TRUST_REGISTRY_DID }}
+          authority:    ${{ vars.TRUST_AUTHORITY_DID }}
+          exempt-keyring: .github/trusted-platform-keys.asc
+          resolve-agent-names: true     # optional; one HTTPS fetch per claimed name
+```
+
+`fetch-depth: 0` is not optional — without the base ref present the range does
+not resolve.
+
+**Platform keyring** — `.github/trusted-platform-keys.asc`:
+
+```sh
+curl -sS https://github.com/web-flow.gpg > .github/trusted-platform-keys.asc
+```
+
+GitHub's web-UI merge and squash commits are PGP-signed by `web-flow`, not by a
+DID. Without this file every merge commit fails `pgpRejected`. Committing the
+key is what makes the exemption explicit and auditable.
+
+**Repository variables** — plain variables, not secrets; they are public values
+and fork PRs must be able to read them:
+
+```sh
+gh variable set TRUST_REGISTRY_URL  --body 'https://registry.example.com'
+gh variable set TRUST_REGISTRY_DID  --body 'did:webvh:…registry'
+gh variable set TRUST_AUTHORITY_DID --body 'did:webvh:…your-community'
+```
+
+Setting these is what un-dormants the `if:` guard. Until then the job is a
+no-op, which is deliberate: it keeps the workflow harmless in a repo that has
+not been enrolled, and in forks.
+
+**Branch protection** — the check is worthless unless it is *required*. On a
+ruleset for `main`:
+
+- require a pull request before merging
+- require the **"Verify commit trust"** status check to pass
+- block force-pushes and branch deletion
+
+## 5. Verdicts and what to do about them
+
+`trusted` and `exempt` pass. Everything else fails, with a distinct status so
+the remediation is unambiguous:
+
+| Verdict | Cause | Fix |
+|---|---|---|
+| `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
+| `noSignerDid` | signed, committer is not a DID | `user.email` was overridden; re-run `init` |
+| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or publishes no Ed25519 method |
+| `unknownKey` | the claimed DID publishes no such key | signed by a key that identity does not hold |
+| `badSignature` | key is published, signature fails | the commit was altered after signing |
+| `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
+| `registryUnavailable` | the registry could not be consulted | registry outage; the check fails closed by design |
+
+`registryUnavailable` makes registry availability a merge-blocking dependency.
+That is the intended trade — "denied" and "unreachable" are indistinguishable
+on the wire, so passing on doubt would be the wrong default — but plan
+monitoring for it accordingly.
+
+`--json` emits the same report machine-readably, with full signer DIDs and a
+`signerNames` map carrying each name's provenance.
+
+## 6. Day-to-day operations
+
+**Add a contributor.** One grant in the registry. No pull request, no repo
+change, effective on the next run. If the grant is org-scoped, it covers every
+repository configured with that `fallback-resource`.
+
+**Revoke a contributor.** Revoke the grant. Effective on the next run. Their
+existing commits stay in history and keep verifying cryptographically — they
+simply stop being authorized, which is the honest description of what changed.
+
+**Rotate a key.** Update the DID document. The DID is unchanged, so the grant
+stays valid and no repository is touched. This is why enrolment is by identity
+rather than by key.
+
+**Retire a repository.** Nothing to clean up in the repo; drop the grants whose
+resource named it.
+
+## 7. Things that carry more weight than they look like
+
+**`resource` is the only scope.** With no committed signer list, the tuple
+resource is the sole thing binding a signer to this repository. Widening
+`resource` or `fallback-resource` widens who may sign, and nothing in the
+repository will contradict it. Treat both as security-relevant configuration
+and review changes to them as you would a permissions change.
+
+**The registry is the single gate.** Enrolment, authorization and revocation
+all resolve to one TRQP answer. This is the design's premise, not an oversight
+— but it means registry compromise is sufficient to authorize commits, so the
+registry's own operational security is the system's floor.
+
+**`max-signers` bounds attacker-directed resolution.** The signer set comes
+from the commits, so a pull request chooses which DIDs CI resolves — and for
+`did:web` / `did:webvh` that is an outbound fetch to a host the author picked.
+DIDs are deduplicated, then capped (default 32). Raise it only for a range
+that is legitimately that wide.
+
+**GitHub's own "Verified" badge is a separate axis.** These SSH signatures show
+as verified in the GitHub UI only if the contributor also adds that Ed25519
+public key to their GitHub account as a signing key. VGI's check is entirely
+independent of it. If you additionally enable GitHub's built-in *Require signed
+commits* rule, it will reject DID-signed commits whose keys are not registered
+with GitHub — enable one or the other deliberately, not both by reflex.
+
+**Squash and rebase merges rewrite commits.** The result is signed by
+`web-flow` and passes via the exempt keyring, not as `trusted`. That is
+expected: the DID-signed commits in the pull request are what got verified.
+
+[vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure

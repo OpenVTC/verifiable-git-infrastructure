@@ -10,6 +10,9 @@ cannot drift.
 - **`split_signed_commit` / `normalize_sshsig_armor`** — reconstruct the exact
   bytes git signed from a raw commit object, and re-wrap sshsig armor to the
   70-column width strict PEM parsers require.
+- **`committer_did` / `committer_identity`** — read the signer DID a commit
+  claims on its `committer` header. A claim, not a fact: safe only as a lookup
+  hint whose answer the caller then checks against the signature.
 - **`ed25519_keys_from_doc`** — extract Ed25519 verification keys from a DID
   document (`publicKeyMultibase`, multicodec `0xED01`).
 

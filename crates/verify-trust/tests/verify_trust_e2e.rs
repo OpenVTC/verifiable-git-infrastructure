@@ -6,19 +6,31 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use verify_trust::{CommitStatus, ResolvedSigners, VerifyTrustArgs, verify_with_keys};
+use verify_trust::{
+    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, pgp_exempt::ExemptKeyring,
+    read_range, verify_prepared,
+};
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
+
+const SIGNER: &str = "did:webvh:QmSigner:example.com";
 
 // --- git helpers -------------------------------------------------------------
 
 fn git(repo: &Path, args: &[&str]) -> String {
+    // The identity every commit claims: `did-git-sign` sets `user.email` to
+    // the verification-method id it signs with, and that header is what the
+    // verifier reads the signer DID from.
+    git_as(repo, &format!("{SIGNER}#key-0"), args)
+}
+
+/// `git`, with the committer identity the caller wants on the commit object.
+fn git_as(repo: &Path, committer: &str, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -26,7 +38,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_NAME", "A U Thor")
         .env("GIT_AUTHOR_EMAIL", "author@example.com")
         .env("GIT_COMMITTER_NAME", "A U Thor")
-        .env("GIT_COMMITTER_EMAIL", "author@example.com")
+        .env("GIT_COMMITTER_EMAIL", committer)
         // Hermetic: the host's config may enable commit signing (this very
         // tool!), which would corrupt the fixtures.
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -194,7 +206,7 @@ fn args_for(repo: &Path, range: String, registry_url: String) -> VerifyTrustArgs
     VerifyTrustArgs {
         repo_dir: repo.to_path_buf(),
         range,
-        signers_file: ".did-signers".into(),
+        max_signers: 32,
         exempt_keyring: None,
         registry_url,
         registry_did: "did:example:registry".into(),
@@ -207,7 +219,24 @@ fn args_for(repo: &Path, range: String, registry_url: String) -> VerifyTrustArgs
     }
 }
 
-const SIGNER: &str = "did:example:signer";
+/// The signer set a resolver would produce for a repo whose commits claim
+/// `SIGNER` and whose DID document publishes `key`.
+fn signers_for(key: &SigningKey) -> ResolvedSigners {
+    ResolvedSigners::from_keys([(SIGNER, vec![key.verifying_key().to_bytes()])])
+}
+
+/// Read the range and verify it, the two halves `handle_verify_trust` runs
+/// either side of DID resolution.
+async fn verify(
+    args: &VerifyTrustArgs,
+    signers: &ResolvedSigners,
+    exempt: Option<&ExemptKeyring>,
+) -> TrustReport {
+    let commits = read_range(&args.repo_dir, &args.range).expect("range reads");
+    verify_prepared(args, &commits, signers, exempt)
+        .await
+        .expect("verification runs")
+}
 
 // --- tests ---------------------------------------------------------------------
 
@@ -218,11 +247,8 @@ async fn signed_and_authorized_commit_passes() {
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
     let registry = stub_registry(SIGNER.to_string()).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert_eq!(report.commits.len(), 1);
     assert_eq!(
@@ -236,9 +262,9 @@ async fn signed_and_authorized_commit_passes() {
 }
 
 /// The report names the signers that actually signed the range, and only
-/// those: a name for a declared signer absent from the range is noise on a PR
-/// check, and a commit entry always keeps its full DID so a consumer that
-/// ignores names is unaffected.
+/// those: a name for a signer absent from the range is noise on a PR check,
+/// and a commit entry always keeps its full DID so a consumer that ignores
+/// names is unaffected.
 #[tokio::test]
 async fn the_report_names_only_the_signers_present_in_the_range() {
     use vta_sdk::display_name::{DisplayName, NameSource};
@@ -248,8 +274,7 @@ async fn the_report_names_only_the_signers_present_in_the_range() {
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
     let registry = stub_registry(SIGNER.to_string()).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
-    let mut signers = ResolvedSigners::from_keys(keys);
+    let mut signers = signers_for(&key);
     signers.names.insert(
         SIGNER,
         DisplayName::new(
@@ -257,14 +282,14 @@ async fn the_report_names_only_the_signers_present_in_the_range() {
             NameSource::AgentName { verified: true },
         ),
     );
-    // Declared, named, but signed nothing here.
+    // Resolved and named, but signed nothing here.
     signers.names.insert(
         "did:example:absent",
         DisplayName::new("example.com/@bob", NameSource::AgentName { verified: true }),
     );
 
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &signers, None).await.unwrap();
+    let report = verify(&args, &signers, None).await;
 
     assert_eq!(
         report.signer_names.keys().collect::<Vec<_>>(),
@@ -282,6 +307,101 @@ async fn the_report_names_only_the_signers_present_in_the_range() {
     );
 }
 
+/// The spoof the committer header invites, end to end: sign with a key you
+/// hold while naming a DID you do not control. The claim only chooses whose
+/// document to check the key against, and that document does not publish it.
+#[tokio::test]
+async fn a_commit_claiming_a_did_it_cannot_sign_for_fails() {
+    const VICTIM: &str = "did:webvh:QmVictim:example.com";
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(repo, &["add", "a.txt"]);
+    git(repo, &["commit", "-q", "-m", "base"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+
+    // The attacker's own key, on a commit claiming the victim's DID.
+    let attacker = SigningKey::from_bytes(&[13u8; 32]);
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    git_as(repo, &format!("{VICTIM}#key-0"), &["add", "a.txt"]);
+    git_as(
+        repo,
+        &format!("{VICTIM}#key-0"),
+        &["commit", "-q", "-m", "impersonation"],
+    );
+    let unsigned = git(repo, &["rev-parse", "HEAD"]);
+    let signed = sign_head_commit(repo, &unsigned, &attacker);
+    git(repo, &["update-ref", "refs/heads/main", &signed]);
+
+    // The victim's DID resolves, and publishes a key that is not the
+    // attacker's. The registry would authorize the victim — it is never asked.
+    let signers = ResolvedSigners::from_keys([(
+        VICTIM,
+        vec![
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        ],
+    )]);
+    let registry = stub_registry(VICTIM.to_string()).await;
+    let args = args_for(repo, format!("{base}..{signed}"), registry);
+    let report = verify(&args, &signers, None).await;
+
+    assert!(
+        !report.ok,
+        "a key the claimed DID does not publish must fail"
+    );
+    assert!(
+        matches!(report.commits[0].status, CommitStatus::UnknownKey { ref did, .. } if did == VICTIM),
+        "expected unknownKey against the claimed DID, got {:?}",
+        report.commits[0].status
+    );
+}
+
+/// A signed commit whose committer is an ordinary email asserts no identity,
+/// so there is nothing to resolve or authorize.
+#[tokio::test]
+async fn a_commit_whose_committer_is_not_a_did_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(repo, &["add", "a.txt"]);
+    git(repo, &["commit", "-q", "-m", "base"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    git_as(repo, "alice@example.com", &["add", "a.txt"]);
+    git_as(
+        repo,
+        "alice@example.com",
+        &["commit", "-q", "-m", "no did here"],
+    );
+    let unsigned = git(repo, &["rev-parse", "HEAD"]);
+    let signed = sign_head_commit(repo, &unsigned, &key);
+    git(repo, &["update-ref", "refs/heads/main", &signed]);
+
+    // Deliberately unreachable: a commit with no claimed DID never gets there.
+    let args = args_for(
+        repo,
+        format!("{base}..{signed}"),
+        "http://127.0.0.1:1".into(),
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+
+    assert!(!report.ok);
+    assert_eq!(
+        report.commits[0].status,
+        CommitStatus::NoSignerDid {
+            committer: "alice@example.com".to_string()
+        },
+        "a valid signature is not an identity"
+    );
+}
+
 #[tokio::test]
 async fn signed_but_unauthorized_commit_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -290,11 +410,8 @@ async fn signed_but_unauthorized_commit_fails() {
     // The registry authorizes a different DID.
     let registry = stub_registry("did:example:someone-else".to_string()).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(!report.ok);
     assert_eq!(
@@ -321,9 +438,7 @@ async fn unsigned_commit_fails_without_touching_the_registry() {
 
     // Deliberately unreachable registry: no signed commits means no queries.
     let args = args_for(repo, format!("{base}..{head}"), "http://127.0.0.1:1".into());
-    let report = verify_with_keys(&args, &ResolvedSigners::default(), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &ResolvedSigners::default(), None).await;
 
     assert!(!report.ok);
     assert_eq!(report.commits[0].status, CommitStatus::Unsigned);
@@ -335,15 +450,12 @@ async fn unreachable_registry_fails_closed() {
     let key = SigningKey::from_bytes(&[9u8; 32]);
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(
         dir.path(),
         format!("{base}..{signed}"),
         "http://127.0.0.1:1".into(),
     );
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(
         !report.ok,
@@ -461,11 +573,8 @@ mod pgp_platform {
         let keyring = ExemptKeyring::from_armored(&keyring_armor).unwrap();
 
         let registry = stub_registry(SIGNER.to_string()).await;
-        let keys = HashMap::from([(did_key.verifying_key().to_bytes(), SIGNER.to_string())]);
         let args = args_for(repo, format!("{base}..{pgp_signed}"), registry);
-        let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), Some(&keyring))
-            .await
-            .unwrap();
+        let report = verify(&args, &signers_for(&did_key), Some(&keyring)).await;
 
         assert!(report.ok, "DID-signed + platform-exempt should both pass");
         assert_eq!(report.commits.len(), 2);
@@ -498,9 +607,7 @@ mod pgp_platform {
             format!("{base}..{pgp_signed}"),
             "http://127.0.0.1:1".into(),
         );
-        let report = verify_with_keys(&args, &ResolvedSigners::default(), None)
-            .await
-            .unwrap();
+        let report = verify(&args, &ResolvedSigners::default(), None).await;
 
         assert!(!report.ok, "no keyring means no exemptions");
         assert!(matches!(
@@ -520,12 +627,9 @@ async fn org_grant_authorizes_via_fallback() {
     // Grant exists only at org scope.
     let registry = stub_registry_with(vec![(SIGNER.to_string(), "example".to_string())]).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(report.ok);
     assert_eq!(
@@ -544,11 +648,8 @@ async fn org_grant_is_ignored_without_fallback_configured() {
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
     let registry = stub_registry_with(vec![(SIGNER.to_string(), "example".to_string())]).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let args = args_for(dir.path(), format!("{base}..{signed}"), registry);
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(
         !report.ok,
@@ -571,12 +672,9 @@ async fn repo_grant_wins_before_fallback_is_queried() {
     ])
     .await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert_eq!(
         report.commits[0].status,
@@ -595,12 +693,9 @@ async fn denied_at_both_scopes_is_unauthorized() {
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
     let registry = stub_registry_with(vec![]).await;
 
-    let keys = HashMap::from([(key.verifying_key().to_bytes(), SIGNER.to_string())]);
     let mut args = args_for(dir.path(), format!("{base}..{signed}"), registry);
     args.fallback_resource = Some("example".to_string());
-    let report = verify_with_keys(&args, &ResolvedSigners::from_keys(keys), None)
-        .await
-        .unwrap();
+    let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(!report.ok);
     assert!(matches!(

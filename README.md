@@ -8,7 +8,8 @@ VGI is the git-layer sibling of
 [verifiable-trust-infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure).
 It is **not** a generic git-signing library: it is bound to the DID /
 Trust-Registry ecosystem — you need a VTA to sign and a Trust Registry to
-verify against. See the operator runbook for the full activation flow.
+verify against. See the [operator runbook](docs/RUNBOOK.md) for the full
+activation flow.
 
 ## Crates
 
@@ -37,7 +38,7 @@ prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.1.2
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
     registry-url: ${{ vars.TRUST_REGISTRY_URL }}
@@ -46,10 +47,17 @@ prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
     exempt-keyring: .github/trusted-platform-keys.asc   # optional
 ```
 
-`resource` defaults to the current repo; `version` selects which release to
-download (default `latest`). Verdicts: `trusted` / `exempt` pass; `unsigned`,
-`unknownKey`, `badSignature`, `unauthorized`, `registryUnavailable` fail. Fails
-closed at every layer.
+There is nothing else to configure and nothing to commit: **who may sign is a
+registry grant**, not a file in the repository. Each commit names its signer
+DID on its own `committer` header; that DID must publish the key that signed,
+and the registry must authorize it. Enrolling a contributor is one grant, and
+it covers every repo the grant's resource covers.
+
+`resource` defaults to the current repo and is security-relevant — it is the
+only thing scoping a signer to this repository. `version` selects which release
+to download (default `latest`). Verdicts: `trusted` / `exempt` pass;
+`unsigned`, `noSignerDid`, `unresolvedSigner`, `unknownKey`, `badSignature`,
+`unauthorized`, `registryUnavailable` fail. Fails closed at every layer.
 
 ## Signing
 
