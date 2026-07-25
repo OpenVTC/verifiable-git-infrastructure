@@ -18,8 +18,11 @@ These are outside VGI, and standing them up is the long pole.
 | What | Why VGI needs it | What you take away |
 |---|---|---|
 | A **VTA** with a persona and Ed25519 signing key per contributor | `did-git-sign` fetches the key at sign time; no private key touches disk | each contributor's `did:webvh:…#key-N` |
-| A **Trust Registry** speaking TRQP | answers "is this DID authorized, right now" | `TRUST_REGISTRY_URL`, `TRUST_REGISTRY_DID` |
-| An **authority DID** for your community | the authority each trust tuple is evaluated under | `TRUST_AUTHORITY_DID` |
+| A **Trust Registry** speaking TRQP | answers "is this DID authorized, right now" | `TRUST_REGISTRY_DID` |
+| Your **VTC's DID** | the community whose authority each trust tuple is evaluated under — TRQP's `authority_id` | `VTC_DID` |
+
+Two DIDs, no URLs. The registry's endpoint is discovered from its own DID
+document (§4), so there is nothing to keep in sync with it.
 
 Provisioning the VTA and registry themselves is documented in
 [verifiable-trust-infrastructure][vti], not here.
@@ -30,7 +33,7 @@ For each contributor, issue a grant in the registry over the tuple:
 
 ```
 entity    = did:webvh:…            the contributor's DID (no fragment)
-authority = <TRUST_AUTHORITY_DID>
+authority = <VTC_DID>              your VTC — TRQP calls this authority_id
 action    = git.commit.sign
 resource  = <owner>/<repo>         or <owner> for an org-wide grant
 ```
@@ -86,23 +89,54 @@ on: pull_request
 jobs:
   verify:
     name: Verify commit trust
-    if: vars.TRUST_REGISTRY_URL != ''
+    if: vars.TRUST_REGISTRY_DID != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.3.0
         with:
           range:        origin/${{ github.base_ref }}..HEAD
-          registry-url: ${{ vars.TRUST_REGISTRY_URL }}
           registry-did: ${{ vars.TRUST_REGISTRY_DID }}
-          authority:    ${{ vars.TRUST_AUTHORITY_DID }}
+          vtc-did:      ${{ vars.VTC_DID }}
           exempt-keyring: .github/trusted-platform-keys.asc
           resolve-agent-names: true     # optional; one HTTPS fetch per claimed name
 ```
 
 `fetch-depth: 0` is not optional — without the base ref present the range does
 not resolve.
+
+**Registry endpoint discovery.** There is no `registry-url` to set. The
+endpoint comes from the registry's own DID document, which advertises one
+service entry per binding it serves:
+
+```json
+"service": [
+  { "id": "…#rest",    "type": ["TRQPRest", "TrustRegistry"],
+    "serviceEndpoint": { "uri": "https://registry.example",
+                         "profile": "https://trustoverip.org/profiles/trp/v2" } },
+  { "id": "…#didcomm", "type": "DIDCommMessaging",
+    "serviceEndpoint": { "uri": "did:web:mediator.example", "accept": ["didcomm/v2"] } },
+  { "id": "…#tsp",     "type": "TSPTransport",
+    "serviceEndpoint": "did:web:mediator.example" }
+]
+```
+
+Selection takes the highest-preference binding present in **both** the document
+and the verifier: **TSP → DIDComm → HTTPS**. `verify-trust` is built with
+`trql-client`'s default features, so today it can construct only HTTPS and
+selects that; if your registry advertises none of what the verifier speaks, the
+run fails naming both sides' transports rather than downgrading quietly.
+
+Note the `#tsp` and `#didcomm` endpoints are **mediator DIDs**, not URLs — a
+consumer of those bindings resolves a second hop. Only `#rest` carries a URL.
+
+`registry-url` remains as an override for a registry that publishes no service
+entry (local, dev). Prefer discovery: over HTTPS the registry's reply is
+unsigned — `registry-did` is only stamped on the *outgoing* request as
+`recipient` — so trust in the answer rests on reaching the right host. Two
+independently settable values that nothing cross-checks is exactly the gap an
+override reintroduces.
 
 **Platform keyring** — `.github/trusted-platform-keys.asc`:
 
@@ -118,9 +152,8 @@ key is what makes the exemption explicit and auditable.
 and fork PRs must be able to read them:
 
 ```sh
-gh variable set TRUST_REGISTRY_URL  --body 'https://registry.example.com'
-gh variable set TRUST_REGISTRY_DID  --body 'did:webvh:…registry'
-gh variable set TRUST_AUTHORITY_DID --body 'did:webvh:…your-community'
+gh variable set TRUST_REGISTRY_DID --body 'did:webvh:…registry'
+gh variable set VTC_DID            --body 'did:webvh:…your-community'
 ```
 
 Setting these is what un-dormants the `if:` guard. Until then the job is a

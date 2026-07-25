@@ -36,12 +36,11 @@ Or use the prebuilt binary via the GitHub Action (no toolchain on the runner):
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.2.0
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.3.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
-    registry-url: ${{ vars.TRUST_REGISTRY_URL }}
     registry-did: ${{ vars.TRUST_REGISTRY_DID }}
-    authority:    ${{ vars.TRUST_AUTHORITY_DID }}
+    vtc-did:      ${{ vars.VTC_DID }}
 ```
 
 ## Usage
@@ -49,9 +48,8 @@ Or use the prebuilt binary via the GitHub Action (no toolchain on the runner):
 ```sh
 verify-trust \
   --range origin/main..HEAD \
-  --registry-url https://registry.example.com \
   --registry-did did:webvh:...registry \
-  --authority    did:webvh:...your-community \
+  --vtc-did      did:webvh:...your-community \
   --resource     your-org/your-repo
 ```
 
@@ -73,6 +71,39 @@ remediation applies:
 `--json` emits a machine-readable report, in which commits keep their full
 signer DIDs and `signerNames` maps each named signer to its name and that
 name's provenance.
+
+## Registry discovery
+
+`--registry-url` is optional. By default the endpoint comes from the registry's
+own DID document, which advertises one service entry per binding it serves:
+
+```json
+"service": [
+  { "id": "…#rest",    "type": ["TRQPRest", "TrustRegistry"],
+    "serviceEndpoint": { "uri": "https://registry.example",
+                         "profile": "https://trustoverip.org/profiles/trp/v2" } },
+  { "id": "…#didcomm", "type": "DIDCommMessaging",
+    "serviceEndpoint": { "uri": "did:web:mediator.example", "accept": ["didcomm/v2"] } },
+  { "id": "…#tsp",     "type": "TSPTransport",
+    "serviceEndpoint": "did:web:mediator.example" }
+]
+```
+
+Selection takes the highest-preference transport present in **both** the
+document and this build — **TSP, then DIDComm, then HTTPS**. `verify-trust`
+takes `trql-client`'s default features, so today it can construct only the
+HTTPS binding and selects that; a registry offering none of what we speak fails
+with both sides' transports named, rather than downgrading silently.
+
+There is deliberately **no fallback to guessing a URL from the DID's domain**.
+`vta-sdk` does that for a VTA, where a wrong host merely fails authentication;
+here a wrong host is one whose authorization answers we would believe.
+
+Why discover rather than configure: over the HTTPS binding the registry's reply
+carries no signature — `--registry-did` is only stamped on the *outgoing*
+request as `recipient`. Trust in "is this DID authorized" therefore rests on
+reaching the right host, so the endpoint is better derived from an identifier
+with integrity behind it than supplied as a second value nothing cross-checks.
 
 ## Scoping and cost
 

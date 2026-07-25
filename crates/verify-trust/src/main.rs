@@ -29,16 +29,23 @@ struct Cli {
     max_signers: usize,
 
     /// Base URL of the Trust Registry (queries POST to `<url>/trust-tasks`).
+    ///
+    /// Optional: by default the endpoint is discovered from --registry-did's
+    /// DID document, preferring TSP, then DIDComm, then HTTPS. Pass this only
+    /// to override discovery — e.g. a local registry that publishes no service
+    /// entry — since it unbinds where we ask from the DID we name.
     #[arg(long)]
-    registry_url: String,
+    registry_url: Option<String>,
 
-    /// DID of the Trust Registry (the recipient of every query).
+    /// DID of the Trust Registry: the recipient of every query, and what the
+    /// endpoint is discovered from.
     #[arg(long)]
     registry_did: String,
 
-    /// DID of the authority the trust tuple is evaluated under.
+    /// DID of your VTC — the community whose authority the trust tuple is
+    /// evaluated under (TRQP's `authority_id`).
     #[arg(long)]
-    authority: String,
+    vtc_did: String,
 
     /// TRQP action of the trust tuple.
     #[arg(long, default_value = "git.commit.sign")]
@@ -107,7 +114,7 @@ async fn main() -> Result<()> {
         max_signers: cli.max_signers,
         registry_url: cli.registry_url,
         registry_did: cli.registry_did,
-        authority_did: cli.authority,
+        vtc_did: cli.vtc_did,
         action: cli.action,
         resource,
         fallback_resource: cli.fallback_resource,
