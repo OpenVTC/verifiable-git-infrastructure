@@ -53,6 +53,40 @@ pub async fn authenticate(cfg: &SigningConfig) -> Result<(VtaClient, VtaCredenti
     Ok((connected.client, creds))
 }
 
+/// May we speak cleartext HTTP to this URL?
+///
+/// Only to loopback, and decided by **parsing the host** rather than matching
+/// a prefix of the URL. `url.starts_with("http://localhost")` — the test this
+/// replaces — also accepts `http://localhost.evil.com`, which is a cleartext
+/// VTA session, carrying the credential exchange, to a host an attacker chose.
+/// `http://localhostevil.com` passed too.
+///
+/// The Trust Registry's `validate_public_url` is the same rule applied to a
+/// different URL. Note it still carries this bug in its IPv6 arm
+/// (`rest.starts_with("[::1]")` admits `http://[::1].evil.com`), so the two
+/// are deliberately *not* identical until that is fixed there too.
+fn is_loopback_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // A bracketed IPv6 literal contains ':' itself, so its host is delimited
+    // by the closing bracket, and what follows must be a port, a path, a
+    // query, or nothing — `[::1].evil.com` is a different host entirely.
+    if let Some(after) = rest.strip_prefix('[') {
+        let Some((host, tail)) = after.split_once(']') else {
+            return false;
+        };
+        return host == "::1" && (tail.is_empty() || tail.starts_with([':', '/', '?']));
+    }
+    let host = rest.split(['/', ':', '?']).next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// Is this a URL we may carry VTA credentials over?
+fn vta_url_is_secure(url: &str) -> bool {
+    url.starts_with("https://") || is_loopback_http(url)
+}
+
 /// Validate VTA credentials before use.
 ///
 /// REST transport requires a non-empty HTTPS URL. DIDComm transport
@@ -70,12 +104,10 @@ fn validate_credentials(creds: &VtaCredentials) -> Result<()> {
         // DIDComm transport — the URL is optional. If it *is* set, hold
         // it to the same HTTPS rule (it'll be passed through as a /health
         // fallback so we don't want to risk leaking creds over plain HTTP).
-        if !creds.vta_url.is_empty()
-            && !creds.vta_url.starts_with("https://")
-            && !creds.vta_url.starts_with("http://localhost")
-        {
+        if !creds.vta_url.is_empty() && !vta_url_is_secure(&creds.vta_url) {
             bail!(
-                "VTA URL must use HTTPS (got: {}). Use http://localhost only for local development.",
+                "VTA URL must use HTTPS (got: {}). Cleartext http:// is allowed only to \
+                 loopback (localhost, 127.0.0.1, [::1]) for local development.",
                 creds.vta_url
             );
         }
@@ -86,9 +118,10 @@ fn validate_credentials(creds: &VtaCredentials) -> Result<()> {
     if creds.vta_url.is_empty() {
         bail!("VTA URL is empty");
     }
-    if !creds.vta_url.starts_with("https://") && !creds.vta_url.starts_with("http://localhost") {
+    if !vta_url_is_secure(&creds.vta_url) {
         bail!(
-            "VTA URL must use HTTPS (got: {}). Use http://localhost only for local development.",
+            "VTA URL must use HTTPS (got: {}). Cleartext http:// is allowed only to \
+             loopback (localhost, 127.0.0.1, [::1]) for local development.",
             creds.vta_url
         );
     }
@@ -214,6 +247,69 @@ mod tests {
         let mut creds = test_creds();
         creds.vta_url = "http://localhost:3000".to_string();
         assert!(validate_credentials(&creds).is_ok());
+    }
+
+    /// Every loopback form the dev affordance is meant to cover.
+    #[test]
+    fn cleartext_is_allowed_to_every_loopback_form() {
+        for url in [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://localhost/path",
+            "http://127.0.0.1:8100",
+            "http://[::1]:8100",
+        ] {
+            let mut creds = test_creds();
+            creds.vta_url = url.to_string();
+            assert!(
+                validate_credentials(&creds).is_ok(),
+                "loopback must stay usable for local dev: {url}"
+            );
+        }
+    }
+
+    /// The bug this replaces: `starts_with("http://localhost")` matched any
+    /// host merely *beginning* with those characters, so the HTTPS
+    /// requirement could be sidestepped by registering a lookalike domain.
+    /// The credential exchange would then cross the network in cleartext to
+    /// a host the attacker controls.
+    #[test]
+    fn cleartext_is_rejected_to_hosts_that_only_look_like_loopback() {
+        for url in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com/vta",
+            "http://localhostevil.com",
+            "http://127.0.0.1.evil.com",
+            "http://[::1].evil.com",
+        ] {
+            let mut creds = test_creds();
+            creds.vta_url = url.to_string();
+            assert!(
+                validate_credentials(&creds).is_err(),
+                "a lookalike host must not pass the HTTPS requirement: {url}"
+            );
+        }
+    }
+
+    /// The DIDComm branch treats the URL as optional but holds a present one
+    /// to the same rule — it is passed through as a `/health` fallback, so a
+    /// lookalike there leaks just the same.
+    #[test]
+    fn the_didcomm_branch_applies_the_same_host_rule() {
+        let mut creds = test_creds();
+        creds.mediator_did = Some("did:web:mediator.example".to_string());
+
+        creds.vta_url = String::new();
+        assert!(validate_credentials(&creds).is_ok(), "empty stays allowed");
+
+        creds.vta_url = "http://localhost:3000".to_string();
+        assert!(validate_credentials(&creds).is_ok());
+
+        creds.vta_url = "http://localhost.evil.com".to_string();
+        assert!(
+            validate_credentials(&creds).is_err(),
+            "the lookalike must fail on the DIDComm path too"
+        );
     }
 
     #[test]

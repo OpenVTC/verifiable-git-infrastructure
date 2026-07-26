@@ -31,8 +31,30 @@ use sysinfo::{Pid, System};
 const BYPASS_ENV: &str = "DID_GIT_SIGN_BYPASS_POLICY";
 
 /// Names whose presence as the parent process causes the policy to
-/// permit signing. Match is on the leading token of the process name.
+/// permit signing. See [`parent_is_allowed`] for how they are matched.
 const ALLOWED_PARENTS: &[&str] = &["git", "ssh-keygen"];
+
+/// Does this parent-process name identify a program we sign for?
+///
+/// Matched on the **whole name**, not as a prefix. The previous
+/// `token.starts_with("git")` also admitted `gitleaks`, `github-desktop`, and
+/// anything an attacker chose to call `gitfoo` — every one of which satisfied
+/// the gate this check exists to be. A build script only had to name its
+/// binary well.
+///
+/// `git-*` is accepted because git dispatches subcommands as separate
+/// `git-<name>` binaries, and a `.exe` suffix is stripped so the rule holds on
+/// Windows, where the parent reports as `git.exe`.
+///
+/// This remains defence in depth, not a boundary: as the module docs note, an
+/// attacker who can execute code as the user can spawn real `git` and satisfy
+/// any parent check. Tightening it removes the free pass, not the attack.
+fn parent_is_allowed(name: &str) -> bool {
+    let token = name.strip_suffix(".exe").unwrap_or(name);
+    ALLOWED_PARENTS
+        .iter()
+        .any(|allowed| token == *allowed || (*allowed == "git" && token.starts_with("git-")))
+}
 
 /// One audit-log line.
 #[derive(Debug, Clone, Serialize)]
@@ -63,14 +85,7 @@ pub fn evaluate(
         .as_deref()
         .and_then(|n| n.split_whitespace().next())
         .map(|s| s.to_lowercase());
-    let parent_ok = parent_token
-        .as_deref()
-        .map(|tok| {
-            ALLOWED_PARENTS
-                .iter()
-                .any(|allowed| tok.starts_with(allowed))
-        })
-        .unwrap_or(false);
+    let parent_ok = parent_token.as_deref().is_some_and(parent_is_allowed);
     let allowed = bypass || parent_ok;
 
     let mut hasher = Sha256::new();
@@ -144,6 +159,42 @@ fn parent_process_info() -> (Option<u32>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_and_its_subcommand_binaries_may_sign() {
+        for name in ["git", "git-remote-https", "git-lfs", "ssh-keygen"] {
+            assert!(parent_is_allowed(name), "must still sign for {name}");
+        }
+    }
+
+    /// Windows reports the parent as `git.exe`; the rule must survive that
+    /// without falling back to prefix matching.
+    #[test]
+    fn a_windows_exe_suffix_is_stripped() {
+        assert!(parent_is_allowed("git.exe"));
+        assert!(parent_is_allowed("ssh-keygen.exe"));
+    }
+
+    /// The free pass the old `starts_with("git")` handed out: any program
+    /// whose name merely began with an allowed one satisfied the gate, so an
+    /// attacker's build script only had to be named well.
+    #[test]
+    fn programs_that_merely_start_with_an_allowed_name_may_not_sign() {
+        for name in [
+            "gitleaks",
+            "github-desktop",
+            "gitfoo",
+            "gitk-evil",
+            "ssh-keygen-wrapper",
+            "not-git",
+            "",
+        ] {
+            assert!(
+                !parent_is_allowed(name),
+                "{name} must not satisfy the parent check"
+            );
+        }
+    }
 
     #[test]
     fn audit_entry_is_json_serializable() {

@@ -1,1 +1,6 @@
 /target
+
+# Security-scan artifacts. Triage decisions live in docs/security/ instead;
+# the raw reports are large, regenerated per scan, and quote source inline.
+docs/validation-report-*.md
+.DS_Store
