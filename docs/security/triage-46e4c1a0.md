@@ -44,7 +44,10 @@ parent check. Tightening removes the free pass, not the attack.
 | Unvalidated namespace allows signature confusion (MEDIUM) | PROTOCOL.sshsig binds the namespace into the signed blob, so a signature made under one namespace cannot be replayed as another. Cross-protocol confusion is prevented by construction. |
 | Missing rate limiting on VTA authentication retry (MEDIUM) | A local CLI retrying against its own VTA. No attacker gains anything from it. |
 | Race condition in token caching / stale token use (MEDIUM ×2) | The 30-second validity margin is the mitigation. |
-| Audit log missing failure details (LOW) · TOCTOU without file locking (LOW) | The log opens `O_APPEND`; appends below `PIPE_BUF` are atomic on POSIX. |
+| TOCTOU in audit log append without file locking (LOW) | The log opens `O_APPEND`; appends below `PIPE_BUF` are atomic on POSIX. (The *visibility* of a failed append was a real gap — fixed, below.) |
+| Missing authorization check on signing key selection override (HIGH) | The check exists. `handle_sign` refuses when an override names a persona with no stored credentials, rather than silently falling back to the config file's — the keyring is the authorization, and R-G-2 is exactly this rule. |
+| Sensitive key material not zeroized in all code paths (MEDIUM) | Both paths zeroize. `SeedMaterial` wipes on drop (test pins it), and `ed25519_dalek::SigningKey` carries an unconditional `Drop` that zeroizes its secret plus `ZeroizeOnDrop`. |
+| Sensitive credential material logged in VTA connection errors (MEDIUM) | The retry path formats the SDK's error value, never the credential struct, and `VtaCredentials`' `Debug` redacts `private_key_multibase` regardless. What a third-party SDK puts in its own error text is outside this crate, and worth watching if `vta-sdk` changes. |
 
 ## Deferred, then resolved
 
