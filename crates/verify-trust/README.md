@@ -81,7 +81,7 @@ own DID document, which advertises one service entry per binding it serves:
 "service": [
   { "id": "…#rest",    "type": ["TRQPRest", "TrustRegistry"],
     "serviceEndpoint": { "uri": "https://registry.example",
-                         "profile": "https://trustoverip.org/profiles/trp/v2" } },
+                         "profile": "https://trustoverip.org/profiles/trqp/v2" } },
   { "id": "…#didcomm", "type": "DIDCommMessaging",
     "serviceEndpoint": { "uri": "did:web:mediator.example", "accept": ["didcomm/v2"] } },
   { "id": "…#tsp",     "type": "TSPTransport",

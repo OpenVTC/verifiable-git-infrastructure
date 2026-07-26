@@ -1207,7 +1207,7 @@ mod tests {
                     "type": ["TRQPRest", "TrustRegistry"],
                     "serviceEndpoint": {
                         "uri": "https://registry.example",
-                        "profile": "https://trustoverip.org/profiles/trp/v2"
+                        "profile": "https://trustoverip.org/profiles/trqp/v2"
                     }
                 },
                 {
