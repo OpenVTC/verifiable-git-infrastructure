@@ -105,10 +105,28 @@ pub fn evaluate(
     }
 }
 
-/// Append `entry` to the per-user audit log. Best-effort — failures
-/// here log a warning but never block signing.
+/// Append `entry` to the per-user audit log.
+///
+/// Signing is not blocked when this fails. A read-only or full home directory
+/// would otherwise make the user unable to commit, and refusing to sign does
+/// not make the missing record appear.
+///
+/// It is reported on **stderr** rather than through `tracing` alone. The
+/// subscriber is built with `EnvFilter::from_default_env()`, which defaults to
+/// `ERROR` when `RUST_LOG` is unset — so a `warn!` here reached nobody in
+/// normal use. This log is the only surface on which a user can notice
+/// signatures they did not ask for, and losing it silently is precisely the
+/// state an attacker would want. git shows a signing program's stderr, so this
+/// lands in front of the person committing.
 pub fn write_audit(entry: &AuditEntry) {
     if let Err(e) = try_write_audit(entry) {
+        let path = audit_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<audit log unavailable>".to_string());
+        eprintln!(
+            "did-git-sign: WARNING — could not record this signing attempt in {path}: {e}\n\
+             did-git-sign: the signature was still produced; the audit trail is incomplete."
+        );
         tracing::warn!("did-git-sign audit log write failed: {e}");
     }
 }

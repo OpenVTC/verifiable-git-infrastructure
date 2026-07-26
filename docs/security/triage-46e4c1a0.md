@@ -46,19 +46,29 @@ parent check. Tightening removes the free pass, not the attack.
 | Race condition in token caching / stale token use (MEDIUM ×2) | The 30-second validity margin is the mitigation. |
 | Audit log missing failure details (LOW) · TOCTOU without file locking (LOW) | The log opens `O_APPEND`; appends below `PIPE_BUF` are atomic on POSIX. |
 
-## Deferred — worth doing, not urgent
+## Deferred, then resolved
 
-Tracked for a follow-up rather than fixed here, to keep the security fix
-reviewable on its own:
+All three were taken up in the follow-up PR. Two were real; one was not, and
+this record was wrong about it.
 
-- **`allowed_signers` read-modify-write race** (`init.rs:341`). A genuine
-  TOCTOU on a file the user owns; low impact, cheap to fix with
-  temp-file-plus-rename.
-- **Uninstall does not revoke VTA tokens** (`init.rs:167`). Cached tokens
-  outlive the uninstall that was meant to remove access.
-- **Audit-write failure is silent** (`policy.rs:93`). `tracing::warn!` under
-  git is usually swallowed, and this log is the only post-compromise detection
-  surface there is.
+- **`allowed_signers` write is not atomic** (`init.rs`). **Fixed.** Both the
+  install and uninstall paths used `std::fs::write`, which truncates before
+  writing — a concurrent `git verify-commit` could read an empty file and
+  report a good signature as unverified. Now written to a sibling temp file
+  and renamed over the target. The read-modify-write against a *concurrent
+  `init`* remains; it needs locking, and losing one of two simultaneously
+  provisioned personas is a lesser fault than the truncation window.
+- **Audit-write failure is silent** (`policy.rs`). **Fixed**, and worse than
+  this record first claimed. The subscriber is built with
+  `EnvFilter::from_default_env()`, which defaults to `ERROR` when `RUST_LOG` is
+  unset — so the `warn!` was not merely easy to miss, it was filtered out and
+  reached nobody. Now reported on stderr, which git shows.
+- **~~Uninstall does not revoke VTA tokens~~** (`init.rs:167`). **Not a
+  finding — this record was wrong.** `uninstall` iterates `[":vta", ":token"]`
+  and deletes both keyring entries, so the cached token does not survive it.
+  What is not attempted is *server-side* revocation at the VTA, which the
+  finding did not claim and which is not warranted for tokens carrying a
+  30-second validity margin.
 
 ## Noted elsewhere
 
