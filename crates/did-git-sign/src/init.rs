@@ -291,6 +291,20 @@ pub fn setup_git(config_path: &Path, cfg: &SigningConfig, global: bool) -> Resul
     // Enable commit signing by default
     git_config(scope, "commit.gpgsign", "true")?;
 
+    // The committer identity IS the DID claim. An sshsig blob carries a raw
+    // Ed25519 key and no identity, so `user.email` is the only place a commit
+    // states which DID signed it — `verify-trust` reads it from the committer
+    // header (inside the payload the signature covers), resolves that DID, and
+    // requires it to publish the signing key. Left unset, every commit fails
+    // the CI check as `noSignerDid` however valid its signature.
+    //
+    // This was removed once, on the grounds that git's own SSH verification
+    // uses the allowed_signers principal rather than user.email. That reasoning
+    // does not hold either way round: `allowed_signers_entry` writes the
+    // principal as `did_key_id`, and git matches principals against the
+    // committer email — so leaving it unset breaks the local check too.
+    git_config(scope, "user.email", &cfg.did_key_id)?;
+
     // Optionally set user.name
     if let Some(name) = &cfg.user_name {
         git_config(scope, "user.name", name)?;
@@ -491,15 +505,20 @@ mod tests {
         }
     }
 
-    /// Regression guard: setup_git must never write user.email to the git config.
+    /// `setup_git` must write `user.email` as the signing DID's key id.
     ///
-    /// user.email was historically set in earlier versions of this tool.  It was
-    /// removed because git's SSH signature verification uses the allowed_signers
-    /// principal (derived from the key fingerprint), not user.email, making the
-    /// field irrelevant and misleading.  This test ensures it stays absent.
+    /// This inverts an earlier regression guard that asserted the opposite. That
+    /// guard's reasoning — git's SSH verification matches the allowed_signers
+    /// principal, not user.email — does not survive either direction:
+    /// [`allowed_signers_entry`] writes the principal as `did_key_id` and git
+    /// matches principals *against the committer email*, so an unset value
+    /// breaks local verification too. And `verify-trust` has no other channel
+    /// for the identity at all: an sshsig carries a key, never a DID, so a
+    /// commit whose committer is not a DID fails CI as `noSignerDid` no matter
+    /// how valid its signature.
     #[test]
     #[serial_test::serial]
-    fn setup_git_never_writes_user_email() {
+    fn setup_git_writes_the_signing_did_as_user_email() {
         let dir = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
             .args(["init"])
@@ -544,9 +563,14 @@ mod tests {
             .unwrap();
 
         assert!(
-            !out.status.success(),
-            "user.email must not be set by setup_git; found: {}",
+            out.status.success(),
+            "user.email must be set by setup_git: without it every commit fails \
+             verify-trust as noSignerDid"
+        );
+        assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
+            "did:webvh:test#key-0",
+            "user.email must be the signing DID's verification-method id"
         );
     }
 }

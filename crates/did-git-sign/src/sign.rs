@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Read;
 use std::path::Path;
-use vgi_core::create_ssh_signature;
+use vgi_core::{committer_did, committer_identity, create_ssh_signature};
 
 use crate::config::{self, SigningConfig};
 use crate::policy;
@@ -83,6 +83,51 @@ fn resolve_signing_key(config_did: &str) -> (String, KeySource) {
     select_signing_key(config_did, env.as_deref(), git.as_deref())
 }
 
+/// The bare DID of a verification-method id (`did:webvh:…#key-0` → `did:webvh:…`).
+fn bare_did(did_key_id: &str) -> &str {
+    did_key_id
+        .split(['#', '?', '/'])
+        .next()
+        .unwrap_or(did_key_id)
+}
+
+/// Refuse to sign a commit whose committer identity disagrees with the key
+/// being used (R-G-3).
+///
+/// Two settings choose an identity — `user.email`, which becomes the commit's
+/// claim, and the persona selection that picks the key — and when they name
+/// different DIDs the commit is born unverifiable. `verify-trust` would reject
+/// it as `unknownKey`: the claimed DID does not publish the key that signed.
+/// That is a correct verdict pointing at the wrong thing, arriving in CI, on a
+/// commit already written. Catching it here turns a confusing remote failure
+/// into a local one that names both halves.
+///
+/// Only commit-shaped payloads are checked. A payload with no `committer`
+/// header (a tag, or a non-git namespace) carries no claim to disagree with.
+/// The comparison is on **bare DIDs**, matching what the verifier actually
+/// requires — signing with `#key-1` while the committer says `#key-0` verifies
+/// fine, since the check is that the DID publishes the key, not which one.
+fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
+    let Some(identity) = committer_identity(data) else {
+        return Ok(());
+    };
+    let signing_did = bare_did(did_key_id);
+    match committer_did(data) {
+        Some(claimed) if claimed == signing_did => Ok(()),
+        Some(claimed) => anyhow::bail!(
+            "did-git-sign: this commit would claim '{claimed}' but is being signed with a key \
+             held by '{signing_did}' (selected via {source}). The commit would fail \
+             verification as unknownKey. Set user.email to a '{signing_did}' key id, or select \
+             the persona matching the committer."
+        ),
+        None => anyhow::bail!(
+            "did-git-sign: this commit's committer is <{identity}>, which is not a DID, so the \
+             commit would state no signer identity and fail verification as noSignerDid. Set \
+             user.email to '{did_key_id}' (git config user.email '{did_key_id}')."
+        ),
+    }
+}
+
 /// Handle the signing invocation from git.
 /// Git calls: `did-git-sign -Y sign -f <config_path> -n <namespace> <file_to_sign>`
 /// The file to sign is passed as a positional argument; the armored SSH signature is written
@@ -141,6 +186,11 @@ pub async fn handle_sign(
             SIGNING_KEY_GIT_CONFIG,
         );
     }
+    // R-G-3: the committer header is the identity claim this signature will be
+    // checked against. Refuse now if it names a different DID than the key we
+    // are about to sign with — see [`check_committer_matches_key`].
+    check_committer_matches_key(&data, &did_key_id, source)?;
+
     let cfg = SigningConfig {
         did_key_id,
         user_name: cfg.user_name,
@@ -191,6 +241,84 @@ pub fn test_sign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIGNER: &str = "did:webvh:QmSigner:example.com";
+
+    fn commit_committed_by(committer: &str) -> Vec<u8> {
+        format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer A U Thor <{committer}> 1700000000 +0000\n\
+             \n\
+             a message\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_matching_committer_and_key_may_sign() {
+        let commit = commit_committed_by(&format!("{SIGNER}#key-0"));
+        assert!(
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::ConfigFile)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_different_key_of_the_same_did_still_signs() {
+        // The verifier requires the claimed DID to publish the signing key, not
+        // that the fragments agree — being stricter here would fail commits CI
+        // would happily accept.
+        let commit = commit_committed_by(&format!("{SIGNER}#key-0"));
+        assert!(
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-3"), KeySource::GitConfig)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn signing_as_one_community_while_claiming_another_is_refused() {
+        // The multi-community footgun: a persona override moved but user.email
+        // did not, so the commit would be born unverifiable.
+        let commit = commit_committed_by("did:webvh:QmOther:community.example#key-0");
+        let error =
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::GitConfig)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("QmOther"), "names the claim: {error}");
+        assert!(error.contains("QmSigner"), "names the key's DID: {error}");
+        assert!(
+            error.contains("git config did-git-sign.key"),
+            "names where the selection came from: {error}"
+        );
+    }
+
+    #[test]
+    fn a_non_did_committer_is_refused_before_signing() {
+        // Signing would succeed and the commit would fail CI as noSignerDid.
+        let commit = commit_committed_by("alice@example.com");
+        let error =
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::ConfigFile)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("noSignerDid"), "names the verdict: {error}");
+        assert!(
+            error.contains("alice@example.com"),
+            "names the offending identity: {error}"
+        );
+    }
+
+    #[test]
+    fn a_payload_with_no_committer_is_not_a_claim_to_check() {
+        // Tags and non-git namespaces carry no committer header, so there is
+        // nothing to disagree with — signing must not be blocked.
+        assert!(
+            check_committer_matches_key(b"not a commit object", SIGNER, KeySource::ConfigFile)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn signing_key_selection_precedence() {
