@@ -57,6 +57,16 @@ pub struct InstallResult {
     /// install just shadowed it. The caller can flag this to the operator
     /// so they aren't surprised when inspecting `git config --list`.
     pub overridden_global_signing_key: Option<String>,
+    /// Set when a `--global` install just made a DID the committer email for
+    /// **every** repository on the machine.
+    ///
+    /// Correct for a contributor in one community, and wrong the moment there
+    /// are two: the identity a commit claims has to match the key that signs
+    /// it, so a single global value silently claims the wrong community
+    /// everywhere else. The caller surfaces this with the per-community
+    /// alternative rather than refusing — the single-community case is real
+    /// and `--global` is the right tool for it.
+    pub global_committer_email: Option<String>,
 }
 
 /// Configure did-git-sign for an already-provisioned persona.
@@ -113,6 +123,7 @@ pub fn install(args: InstallArgs<'_>) -> Result<InstallResult> {
         config_path,
         ssh_public_key: ssh_public_key_string(args.verifying_key),
         overridden_global_signing_key,
+        global_committer_email: args.global.then(|| cfg.did_key_id.clone()),
     })
 }
 
