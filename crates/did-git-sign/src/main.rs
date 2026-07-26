@@ -451,6 +451,30 @@ async fn cmd_init(
         println!("      signing key path. Your global signing configuration is unchanged.");
     }
 
+    // A global install sets the committer identity machine-wide. That is right
+    // for one community and wrong for two, and the failure is quiet: commits in
+    // the other community claim this DID, are signed by its key, and are
+    // rejected as unauthorized rather than as misconfigured.
+    if let Some(email) = &result.global_committer_email {
+        println!();
+        println!("Note: user.email is now {email}");
+        println!("      for every repository on this machine — that is the identity your");
+        println!("      commits will claim, and it must match the key that signs them.");
+        println!();
+        println!("      Signing for more than one community? Scope it per remote instead,");
+        println!("      keeping the identity and the key together so they cannot drift:");
+        println!();
+        println!("        # ~/.gitconfig");
+        println!("        [includeIf \"hasconfig:remote.*.url:https://github.com/YourOrg/**\"]");
+        println!("            path = ~/.config/git/community-yourorg");
+        println!();
+        println!("        # ~/.config/git/community-yourorg");
+        println!("        [user]");
+        println!("            email = {email}");
+        println!("        [did-git-sign]");
+        println!("            key = {email}");
+    }
+
     println!();
     println!("Setup complete! Git commits will now be signed with:");
     // The DID stays whole here — this is the identity the operator has to be

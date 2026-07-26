@@ -75,6 +75,10 @@ key. It configures git:
 Use `--global` for all repositories, or plain `init` for one. Verify with
 `did-git-sign health` before the first push, not after the PR check fails.
 
+`--global` also sets `user.email` machine-wide. Fine for a contributor in one
+community; if they are in two, use §3a instead — `init` prints that alternative
+when run with `--global`.
+
 `did-git-sign` refuses to sign a commit whose committer names a different DID
 than the key it is about to use, so a mismatch fails at `git commit` with both
 halves named rather than in CI as `unknownKey`.

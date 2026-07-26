@@ -66,6 +66,13 @@ did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
 
 Saves config to `~/.config/did-git-sign/` and sets global git config.
 
+This also sets `user.email` to your DID key id for **every repository on the
+machine** — that is the identity your commits claim, and it must match the key
+that signs them. Right for one community; wrong for two, and quietly so, since
+commits in the other community would claim this DID. `init` prints the
+per-remote alternative when you use `--global`; see
+[Selecting which community persona signs](#selecting-which-community-persona-signs).
+
 ### Non-interactive
 
 Name the persona and key to skip the picker (and `--yes` to skip the
