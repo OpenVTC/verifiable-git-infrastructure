@@ -37,7 +37,7 @@ prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.3.0
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
     registry-did: ${{ vars.TRUST_REGISTRY_DID }}

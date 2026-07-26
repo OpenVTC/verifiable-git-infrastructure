@@ -142,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.3.0
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.0
         with:
           range:        origin/${{ github.base_ref }}..HEAD
           registry-did: ${{ vars.TRUST_REGISTRY_DID }}
