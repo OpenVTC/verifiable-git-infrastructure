@@ -204,7 +204,10 @@ pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
                     if !new_content.is_empty() {
                         new_content.push('\n');
                     }
-                    if let Err(e) = std::fs::write(&signers_path, new_content) {
+                    // Atomic for the same reason as the install path: a reader
+                    // must never catch this file mid-truncate and conclude the
+                    // remaining principals are not allowed to sign.
+                    if let Err(e) = write_file_atomic(&signers_path, &new_content) {
                         summary
                             .warnings
                             .push(format!("could not rewrite {}: {e}", signers_path.display()));
@@ -330,6 +333,38 @@ pub fn allowed_signers_entry(cfg: &SigningConfig, public_key_bytes: &[u8; 32]) -
     format!("{} ssh-ed25519 {}", cfg.did_key_id, pub_b64)
 }
 
+/// Replace a file's contents in one step: write a sibling temp file, then
+/// rename it over the target.
+///
+/// `std::fs::write` truncates and then writes, so a reader arriving in between
+/// sees an empty or partial file, and two writers racing can interleave. For
+/// `allowed_signers` that means a concurrent `git verify-commit` reading no
+/// principals — a signature that verifies reported as one that does not — or
+/// one `init` losing another's entry. `rename(2)` within a directory is atomic
+/// on POSIX: a reader sees either the old file or the new one.
+///
+/// The temp file is created in the destination directory because rename cannot
+/// cross filesystems, and carries the pid so two processes cannot collide on
+/// it.
+fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("allowed_signers");
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Do not leave the temp file behind on a failed rename.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("failed to replace {}", path.display()))
+        }
+    }
+}
+
 /// Set up the allowed_signers file for signature verification.
 pub fn setup_allowed_signers(config_dir: &Path, entry: &str, global: bool) -> Result<()> {
     let signers_path = config_dir.join("allowed_signers");
@@ -337,7 +372,10 @@ pub fn setup_allowed_signers(config_dir: &Path, entry: &str, global: bool) -> Re
         .to_str()
         .context("signers path is not valid UTF-8")?;
 
-    // Append or create the allowed_signers file
+    // Append or create the allowed_signers file. Read-modify-write is still a
+    // race against a *concurrent* init — two personas provisioned at once can
+    // still lose one entry — but the write itself no longer exposes a
+    // truncated file to a reader mid-update.
     let existing = std::fs::read_to_string(&signers_path).unwrap_or_default();
     if !existing.contains(entry) {
         let mut content = existing;
@@ -346,8 +384,7 @@ pub fn setup_allowed_signers(config_dir: &Path, entry: &str, global: bool) -> Re
         }
         content.push_str(entry);
         content.push('\n');
-        std::fs::write(&signers_path, content)
-            .with_context(|| format!("failed to write {}", signers_path.display()))?;
+        write_file_atomic(&signers_path, &content)?;
     }
 
     let scope = if global { "--global" } else { "--local" };
@@ -484,6 +521,48 @@ mod tests {
 
         let read_back = std::fs::read_to_string(&signers_path).unwrap();
         assert!(read_back.contains(entry));
+    }
+
+    #[test]
+    fn atomic_write_replaces_contents_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowed_signers");
+
+        write_file_atomic(&path, "first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        write_file_atomic(&path, "second\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "second\n",
+            "the rename must replace, not append"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "allowed_signers")
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+    }
+
+    /// The property `std::fs::write` could not offer: a reader either sees the
+    /// old file or the new one, never a truncated one. Asserted by observing
+    /// that the target is never absent or empty across a replace — with
+    /// truncate-then-write there is a window where it is both.
+    #[test]
+    fn atomic_write_never_exposes_a_truncated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowed_signers");
+        let long = "did:webvh:test:host#key-0 ssh-ed25519 AAAA\n".repeat(500);
+        write_file_atomic(&path, &long).unwrap();
+
+        for _ in 0..20 {
+            write_file_atomic(&path, &long).unwrap();
+            let seen = std::fs::read_to_string(&path).expect("target always exists");
+            assert_eq!(seen.len(), long.len(), "a reader saw a partial file");
+        }
     }
 
     #[test]
