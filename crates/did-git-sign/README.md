@@ -18,6 +18,14 @@ git calls `did-git-sign` with the commit data on stdin. The tool:
 Your DID verification method ID (e.g. `did:webvh:abc:example.com#key-0`) is used
 as the git `user.email`, linking every commit to your decentralized identity.
 
+That field is load-bearing, not decorative. An sshsig blob carries a raw Ed25519
+key and **no identity**, so the committer header is the only place a commit
+states which DID signed it — [`verify-trust`][verify-trust] reads it, resolves
+that DID, and requires it to publish the signing key. A commit whose committer
+is an ordinary address fails CI as `noSignerDid` however valid its signature.
+Signing therefore refuses when the committer names a DID other than the key's;
+see [Selecting which community persona signs](#selecting-which-community-persona-signs).
+
 ## Prerequisites
 
 - A running VTA with your persona DID(s) and Ed25519 signing key(s) provisioned.
@@ -97,7 +105,8 @@ The `init` command performs the following:
    - `gpg.ssh.program = did-git-sign`
    - `gpg.ssh.defaultKeyFile = <config path>`
    - `commit.gpgsign = true`
-   - `user.email = <DID#key-id>`
+   - `user.signingKey = <config path>`
+   - `user.email = <DID#key-id>` — the commit's identity claim; see below
    - `user.name = <name>` (if provided)
 5. **Creates an `allowed_signers` file** for signature verification and sets `gpg.ssh.allowedSignersFile`
 
@@ -153,12 +162,43 @@ in the keyring (i.e. you ran `init` for that persona); otherwise signing fails
 with a clear message rather than silently signing as a different persona.
 
 ```bash
-# One commit as a specific persona:
-DID_GIT_SIGN_KEY=did:webvh:abc:example.com#key-1 git commit -m "…"
+# One commit as a specific persona (move user.email with it — see below):
+DID_GIT_SIGN_KEY=did:webvh:abc:example.com#key-1 \
+  git -c user.email=did:webvh:abc:example.com#key-1 commit -m "…"
 
 # Pin a persona for this repository:
-git config did-git-sign.key did:webvh:abc:example.com#key-1
+git config did-git-sign.key   did:webvh:abc:example.com#key-1
+git config user.email         did:webvh:abc:example.com#key-1
 ```
+
+**The persona and the committer must agree.** The key selection above chooses
+what signs; `user.email` chooses what the commit *claims*. Naming different
+DIDs produces a commit that cannot verify — the claimed DID does not publish
+the key that signed — so signing refuses outright, naming both halves, rather
+than writing a commit that fails in CI as `unknownKey`.
+
+For contributors in more than one community, do not manage this per repository
+by hand: a `git config --local` you forget does not error, it signs as the
+wrong community. Use git's conditional includes, one file per community, with
+both settings together so they cannot drift:
+
+```ini
+# ~/.gitconfig
+[includeIf "hasconfig:remote.*.url:https://github.com/OpenVTC/**"]
+    path = ~/.config/git/community-openvtc
+```
+
+```ini
+# ~/.config/git/community-openvtc
+[user]
+    email = did:webvh:abc:example.com#key-0
+[did-git-sign]
+    key = did:webvh:abc:example.com#key-0
+```
+
+`hasconfig:remote.*.url` (git ≥ 2.36) keys off the remote, so membership follows
+the repository rather than where it was cloned; `includeIf "gitdir:…"` matches
+on path instead if your layout is authoritative.
 
 ## Security Model
 
@@ -220,3 +260,5 @@ service name `did-git-sign`:
 |---------------|----------|
 | `{did_key_id}:vta` | VTA URL, VTA DID, credential DID, credential private key, signing key ID |
 | `{did_key_id}:token` | Cached VTA access token and expiry |
+
+[verify-trust]: https://crates.io/crates/verify-trust

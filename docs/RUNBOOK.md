@@ -75,9 +75,57 @@ key. It configures git:
 Use `--global` for all repositories, or plain `init` for one. Verify with
 `did-git-sign health` before the first push, not after the PR check fails.
 
-To sign as a different persona without re-running `init`, set
-`DID_GIT_SIGN_KEY` for one commit or `git config did-git-sign.key` for the
-repository.
+`did-git-sign` refuses to sign a commit whose committer names a different DID
+than the key it is about to use, so a mismatch fails at `git commit` with both
+halves named rather than in CI as `unknownKey`.
+
+## 3a. Contributors in more than one community
+
+Two settings pick an identity, and they must agree: `user.email` becomes the
+commit's claim, and the persona selection picks the key. `did-git-sign`
+resolves the key in this order —
+
+1. `DID_GIT_SIGN_KEY` (per-invocation),
+2. `did-git-sign.key` in git config (per-repo),
+3. the `did_key_id` in the config file (the `init` default).
+
+**Do not hand-manage per-repo config.** `git config --local` works but does not
+survive a fresh clone, and when you forget it you get no error — you get a
+commit signed as the wrong community. Where the community *is* the
+authorization boundary, silent misattribution is the failure to design against.
+
+Use git's **conditional includes**, one file per community, carrying the
+identity and the key selection together so they cannot drift:
+
+```ini
+# ~/.gitconfig
+[includeIf "hasconfig:remote.*.url:https://github.com/OpenVTC/**"]
+    path = ~/.config/git/community-openvtc
+[includeIf "hasconfig:remote.*.url:https://github.com/OtherOrg/**"]
+    path = ~/.config/git/community-other
+```
+
+```ini
+# ~/.config/git/community-openvtc
+[user]
+    email = did:webvh:QmAbc:openvtc.example#key-0
+    name  = Your Name
+[did-git-sign]
+    key = did:webvh:QmAbc:openvtc.example#key-0
+```
+
+`hasconfig:remote.*.url` (git ≥ 2.36) keys off the remote rather than the
+filesystem, so membership follows the repository rather than where you happened
+to clone it — and a throwaway clone outside your usual tree still gets the right
+persona. Use `includeIf "gitdir:~/devel/openvtc/"` instead if your layout is
+authoritative and you prefer path matching.
+
+Keep `user.email` in the same file as `did-git-sign.key`. Splitting them is
+what lets them drift, and the pair is what the commit's verifiability rests on.
+
+Reserve `DID_GIT_SIGN_KEY` for one-off overrides — and note that it moves the
+key without moving `user.email`, so the sign-time check will refuse unless you
+override both.
 
 ## 4. Set up the repository
 
