@@ -15,26 +15,26 @@ publish = true
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
 vgi-core = { version = "0.4.1", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
-trql-client = "0.8.2"
+trql-client = "0.10"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
 # Features are chosen per member: did-git-sign needs the client and
 # provisioning stack, verify-trust needs only `agent-names`.
-vta-sdk = { version = "0.19", default-features = false }
-affinidi-tdk = "0.8.4"
+vta-sdk = { version = "0.21", default-features = false }
+affinidi-tdk = "0.8.5"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
-tokio = "1.52"
+tokio = "1.53"
 serde = "1.0"
 serde_json = "1.0"
 anyhow = "1.0"
 keyring-core = "1"
-zeroize = "1.8"
+zeroize = "1.9"
 dirs = "6.0"
-base64 = "0.22"
-ed25519-dalek = "2.2"
+base64 = "0.23"
+ed25519-dalek = "3.0"
 ssh-key = { version = "0.6", features = ["ed25519", "crypto"] }
 sha2 = "0.11"
 tracing = "0.1"
@@ -46,6 +46,8 @@ hex = "0.4"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 linux-keyutils-keyring-store = "1"
 windows-native-keyring-store = "1"
+# Pinned to 0.8 by pgp 0.20, which takes rand_core 0.6 RNGs in its
+# key-builder/signing APIs (used only by the PGP-exemption test fixtures).
 rand = "0.8"
 tempfile = "3"
-serial_test = "3"
+serial_test = "4"
