@@ -14,14 +14,19 @@ publish = true
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
 vgi-core = { version = "0.4.1", path = "crates/vgi-core" }
-# Trust Registry query client (registry authorization queries).
-trql-client = "0.10"
+# Trust Registry query client (registry authorization queries). 0.11 still
+# builds its task specs against trust-tasks-rs 0.3, so the tree carries that
+# alongside the 0.4 the VTA stack pulls in. The two never meet: verify-trust
+# only sends TRQP queries through trql-client's HTTPS transport, and takes
+# nothing but display names from vta-sdk.
+trql-client = "0.11"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
 # Features are chosen per member: did-git-sign needs the client and
 # provisioning stack, verify-trust needs only `agent-names`.
-vta-sdk = { version = "0.21", default-features = false }
+# Floor is 0.21.10: that is the first release built on trust-tasks-rs 0.4.
+vta-sdk = { version = "0.21.10", default-features = false }
 affinidi-tdk = "0.8.5"
 multibase = "0.9"
 pgp = "0.20"
