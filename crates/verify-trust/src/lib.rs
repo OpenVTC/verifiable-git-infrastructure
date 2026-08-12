@@ -62,8 +62,8 @@ use trql_client::{
     TrqlError, TrqpQuery,
 };
 use vgi_core::{
-    GIT_SSHSIG_NAMESPACE, committer_did, committer_identity, ed25519_keys_from_doc,
-    normalize_sshsig_armor, split_signed_commit,
+    GIT_SSHSIG_NAMESPACE, committer_identity, ed25519_keys_from_doc, normalize_sshsig_armor,
+    signer_did, split_signed_commit,
 };
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
@@ -300,7 +300,7 @@ pub fn read_range(repo_dir: &Path, range: &str) -> Result<Vec<RangeCommit>> {
 pub fn claimed_signer_dids(commits: &[RangeCommit], max_signers: usize) -> Result<Vec<String>> {
     let dids: BTreeSet<String> = commits
         .iter()
-        .filter_map(|commit| committer_did(&commit.raw))
+        .filter_map(|commit| signer_did(&commit.raw))
         .collect();
     if dids.len() > max_signers {
         bail!(
@@ -425,7 +425,7 @@ pub fn check_commit_signature(
 
     // The identity is read from the payload — the bytes the signature covers —
     // so a claim that survives verification is one the signer committed to.
-    let Some(claimed) = committer_did(&payload) else {
+    let Some(claimed) = signer_did(&payload) else {
         return SignatureCheck::NoSignerDid {
             committer: committer_identity(&payload).unwrap_or_else(|| "(absent)".to_string()),
         };

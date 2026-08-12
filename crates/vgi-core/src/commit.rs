@@ -117,6 +117,34 @@ pub fn committer_did(commit: &[u8]) -> Option<String> {
     Some(did.to_string())
 }
 
+/// The signer DID a commit claims, checking the `Signed-by-DID:` trailer
+/// first, then falling back to the committer email for legacy commits.
+///
+/// The trailer is the canonical location for new commits (it lets
+/// `user.email` be a normal email for git-host attribution). Old commits
+/// that carried the DID in the committer email still verify via the
+/// fallback.
+#[must_use]
+pub fn signer_did(commit: &[u8]) -> Option<String> {
+    trailer_did(commit).or_else(|| committer_did(commit))
+}
+
+/// Extract a bare DID from a `Signed-by-DID:` trailer in the commit body.
+fn trailer_did(commit: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(commit).ok()?;
+    let (_, body) = text.split_once("\n\n")?;
+    // Trailers are conventionally at the end; scan backwards.
+    for line in body.lines().rev() {
+        if let Some(value) = line.strip_prefix("Signed-by-DID:") {
+            let value = value.trim();
+            if value.starts_with("did:") {
+                return Some(value.split(['#', '?']).next().unwrap_or(value).to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -202,5 +230,76 @@ mod tests {
             committer_did(&payload).unwrap(),
             "did:webvh:QmAbc:example.com"
         );
+    }
+
+    fn commit_with_trailer(committer: &str, trailer: &str) -> String {
+        format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer {committer} 1700000000 +0000\n\
+             \n\
+             a message\n\
+             \n\
+             {trailer}\n"
+        )
+    }
+
+    #[test]
+    fn signer_did_prefers_trailer_over_committer() {
+        let commit = commit_with_trailer(
+            "Alice <did:webvh:QmOld:old.example#key-0>",
+            "Signed-by-DID: did:webvh:QmNew:new.example#key-0",
+        );
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:webvh:QmNew:new.example",
+            "trailer must take precedence over committer email"
+        );
+    }
+
+    #[test]
+    fn signer_did_falls_back_to_committer_for_legacy_commits() {
+        let commit = commit_with_committer("Alice <did:webvh:QmAbc:example.com#key-0>");
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:webvh:QmAbc:example.com",
+            "legacy commits with DID in committer email must still work"
+        );
+    }
+
+    #[test]
+    fn signer_did_reads_trailer_with_normal_email_committer() {
+        let commit = commit_with_trailer(
+            "Alice <alice@example.com>",
+            "Signed-by-DID: did:webvh:QmAbc:example.com#key-0",
+        );
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:webvh:QmAbc:example.com",
+        );
+    }
+
+    #[test]
+    fn signer_did_returns_none_without_did_anywhere() {
+        let commit = commit_with_committer("Alice <alice@example.com>");
+        assert!(signer_did(commit.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn trailer_strips_fragment() {
+        let commit = commit_with_trailer(
+            "Alice <alice@example.com>",
+            "Signed-by-DID: did:webvh:QmAbc:example.com#key-1",
+        );
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:webvh:QmAbc:example.com",
+        );
+    }
+
+    #[test]
+    fn trailer_ignores_non_did_values() {
+        let commit = commit_with_trailer("Alice <alice@example.com>", "Signed-by-DID: not-a-did");
+        assert!(signer_did(commit.as_bytes()).is_none());
     }
 }
