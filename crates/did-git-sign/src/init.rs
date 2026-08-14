@@ -434,20 +434,25 @@ fn base64_encode_pubkey(public_key_bytes: &[u8; 32]) -> String {
 }
 
 /// The commit-msg hook script. Reads the DID from `did-git-sign.key` git
-/// config and appends a `Signed-by-DID:` trailer if one is not already
-/// present. This is how `verify-trust` discovers the signer DID without
-/// requiring `user.email` to be a DID.
+/// config and appends `Signed-off-by:` and `Signed-by-DID:` trailers if they
+/// are not already present. This is how `verify-trust` discovers the signer DID
+/// without requiring `user.email` to be a DID.
 const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
-# Installed by did-git-sign — adds the Signed-by-DID trailer.
+# Installed by did-git-sign — adds Signed-off-by and Signed-by-DID trailers.
 DID=$(git config did-git-sign.key 2>/dev/null)
 [ -z "$DID" ] && exit 0
-# Do not duplicate if already present.
-grep -q "^Signed-by-DID:" "$1" 2>/dev/null && exit 0
-# Strip trailing blank lines, then append trailer directly.
+
+# Strip trailing blank lines.
 while [ "$(tail -c 1 "$1" | wc -l)" -eq 1 ] && [ "$(tail -1 "$1")" = "" ]; do
     sed -i '' -e '$ d' "$1"
 done
-echo "Signed-by-DID: $DID" >> "$1"
+
+# Append Signed-off-by if absent.
+SOB="Signed-off-by: $(git config user.name) <$(git config user.email)>"
+grep -q "^Signed-off-by:" "$1" 2>/dev/null || echo "$SOB" >> "$1"
+
+# Append Signed-by-DID if absent.
+grep -q "^Signed-by-DID:" "$1" 2>/dev/null || echo "Signed-by-DID: $DID" >> "$1"
 "#;
 
 /// Install the `commit-msg` hook that injects the `Signed-by-DID:` trailer.
