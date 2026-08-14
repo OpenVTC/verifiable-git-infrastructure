@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -5529,7 +5529,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "affinidi-tdk",
  "anyhow",
@@ -5558,7 +5558,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5576,9 +5576,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.21.10"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6456716fe80d4a904d17fb841698db36375d53a6a70e2544c433ca0c6d4648f7"
+checksum = "6b8d9df250173cc4f3793f84de441616ba885cc3c1423b926ef3c19232f15a18"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",

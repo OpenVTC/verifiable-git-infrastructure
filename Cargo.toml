@@ -3,7 +3,7 @@ members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -13,7 +13,7 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.4.2", path = "crates/vgi-core" }
+vgi-core = { version = "0.4.3", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries). 0.11 still
 # builds its task specs against trust-tasks-rs 0.3, so the tree carries that
 # alongside the 0.4 the VTA stack pulls in. The two never meet: verify-trust
@@ -25,8 +25,18 @@ trql-client = "0.11"
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
 # Features are chosen per member: did-git-sign needs the client and
 # provisioning stack, verify-trust needs only `agent-names`.
-# Floor is 0.21.10: that is the first release built on trust-tasks-rs 0.4.
-vta-sdk = { version = "0.21.10", default-features = false }
+# The 0.23 line, matching what the VTA/VTC deploy and what OpenVTC's CLI runs
+# on. Holding at 0.21 was not a private choice: OpenVTC depends on both this
+# crate and vta-sdk directly, so a 0.21 requirement here put a *second* vta-sdk
+# in its binary once it moved to 0.23 (OpenVTC #214). Two sdks in one graph are
+# not merely untidy — `vti-common` re-exports `vta_sdk::acl::{ActScope,
+# ApproveScope, ContextDirection}` as its own public API, so the two copies
+# carry types that cannot unify.
+#
+# The old floor note (0.21.10, the first release built on trust-tasks-rs 0.4) is
+# below this line by construction and kept in git history rather than as a
+# satisfied constraint.
+vta-sdk = { version = "0.23", default-features = false }
 affinidi-tdk = "0.8.5"
 multibase = "0.9"
 pgp = "0.20"
