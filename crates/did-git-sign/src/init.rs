@@ -415,6 +415,30 @@ fn git_config(scope: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one git config value. A missing key is not an error.
+fn git_config_get(scope: &str, key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("config")
+        .arg(scope)
+        .arg("--get")
+        .arg(key)
+        .output()
+        .context("failed to run git config")?;
+
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(|c| c == '\r' || c == '\n')
+                .to_string(),
+        ));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("git config {scope} --get {key} failed: {stderr}");
+}
+
 /// Format an Ed25519 public key as an SSH public key string (e.g., `ssh-ed25519 AAAA...`).
 pub fn ssh_public_key_string(public_key_bytes: &[u8; 32]) -> String {
     format!("ssh-ed25519 {}", base64_encode_pubkey(public_key_bytes))
@@ -477,6 +501,15 @@ fn install_commit_msg_hook(global: bool, _did_key_id: &str) -> Result<()> {
             .join("did-git-sign")
             .join("hooks");
         std::fs::create_dir_all(&config_dir)?;
+        if let Some(existing) = git_config_get("--global", "core.hooksPath")?
+            && PathBuf::from(existing.trim()) != config_dir
+        {
+            anyhow::bail!(
+                "global core.hooksPath is already set to '{}'; refusing to overwrite it. \
+                 Install did-git-sign locally, or merge the commit-msg hook manually.",
+                existing
+            );
+        }
         git_config("--global", "core.hooksPath", config_dir.to_str().unwrap())?;
         config_dir
     } else {

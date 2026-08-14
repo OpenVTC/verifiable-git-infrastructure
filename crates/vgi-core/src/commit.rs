@@ -129,6 +129,15 @@ pub fn signer_did(commit: &[u8]) -> Option<String> {
     trailer_did(commit).or_else(|| committer_did(commit))
 }
 
+/// Return both explicit identity claims when the final `Signed-by-DID:`
+/// trailer and legacy DID committer identity disagree.
+#[must_use]
+pub fn conflicting_signer_dids(commit: &[u8]) -> Option<(String, String)> {
+    let trailer = trailer_did(commit)?;
+    let committer = committer_did(commit)?;
+    (trailer != committer).then_some((trailer, committer))
+}
+
 /// Extract a bare DID from a `Signed-by-DID:` trailer in the commit body's
 /// final trailer block.
 fn trailer_did(commit: &[u8]) -> Option<String> {
@@ -358,6 +367,21 @@ mod tests {
         assert_eq!(
             signer_did(commit.as_bytes()).unwrap(),
             "did:webvh:QmTrailer:example.com"
+        );
+    }
+
+    #[test]
+    fn conflicting_signer_dids_reports_trailer_and_committer_disagreement() {
+        let commit = commit_with_trailer(
+            "Alice <did:webvh:QmCommitter:example.com#key-0>",
+            "Signed-by-DID: did:webvh:QmTrailer:example.com#key-0",
+        );
+        assert_eq!(
+            conflicting_signer_dids(commit.as_bytes()).unwrap(),
+            (
+                "did:webvh:QmTrailer:example.com".to_string(),
+                "did:webvh:QmCommitter:example.com".to_string(),
+            )
         );
     }
 }

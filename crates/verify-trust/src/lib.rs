@@ -62,8 +62,8 @@ use trql_client::{
     TrqlError, TrqpQuery,
 };
 use vgi_core::{
-    GIT_SSHSIG_NAMESPACE, committer_identity, ed25519_keys_from_doc, normalize_sshsig_armor,
-    signer_did, split_signed_commit,
+    GIT_SSHSIG_NAMESPACE, committer_identity, conflicting_signer_dids, ed25519_keys_from_doc,
+    normalize_sshsig_armor, signer_did, split_signed_commit,
 };
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
@@ -148,6 +148,9 @@ pub enum CommitStatus {
     /// Signed, but the `committer` header names no DID, so the commit asserts
     /// no identity to resolve or authorize.
     NoSignerDid { committer: String },
+    /// The commit carries both a `Signed-by-DID:` trailer and a DID committer
+    /// identity, and they name different DIDs.
+    ConflictingSignerDids { trailer: String, committer: String },
     /// The claimed DID could not be resolved, so its published keys are
     /// unknown. Fails closed: an unresolvable signer is not a trusted one.
     UnresolvedSigner { did: String, error: String },
@@ -300,6 +303,7 @@ pub fn read_range(repo_dir: &Path, range: &str) -> Result<Vec<RangeCommit>> {
 pub fn claimed_signer_dids(commits: &[RangeCommit], max_signers: usize) -> Result<Vec<String>> {
     let dids: BTreeSet<String> = commits
         .iter()
+        .filter(|commit| conflicting_signer_dids(&commit.raw).is_none())
         .filter_map(|commit| signer_did(&commit.raw))
         .collect();
     if dids.len() > max_signers {
@@ -373,6 +377,7 @@ pub enum SignatureCheck {
     Unsigned,
     Malformed(String),
     NoSignerDid { committer: String },
+    ConflictingSignerDids { trailer: String, committer: String },
     UnresolvedSigner { did: String, error: String },
     UnknownKey { did: String, fingerprint: String },
     BadSignature { signer_did: String },
@@ -425,6 +430,9 @@ pub fn check_commit_signature(
 
     // The identity is read from the payload — the bytes the signature covers —
     // so a claim that survives verification is one the signer committed to.
+    if let Some((trailer, committer)) = conflicting_signer_dids(&payload) {
+        return SignatureCheck::ConflictingSignerDids { trailer, committer };
+    }
     let Some(claimed) = signer_did(&payload) else {
         return SignatureCheck::NoSignerDid {
             committer: committer_identity(&payload).unwrap_or_else(|| "(absent)".to_string()),
@@ -687,6 +695,9 @@ fn status_of(signature: SignatureCheck, decisions: &RegistryDecisions) -> Commit
         SignatureCheck::Unsigned => CommitStatus::Unsigned,
         SignatureCheck::Malformed(detail) => CommitStatus::Malformed(detail),
         SignatureCheck::NoSignerDid { committer } => CommitStatus::NoSignerDid { committer },
+        SignatureCheck::ConflictingSignerDids { trailer, committer } => {
+            CommitStatus::ConflictingSignerDids { trailer, committer }
+        }
         SignatureCheck::UnresolvedSigner { did, error } => {
             CommitStatus::UnresolvedSigner { did, error }
         }
@@ -816,6 +827,11 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
             }
             CommitStatus::NoSignerDid { committer } => {
                 println!("NO-SIGNER    {short}  committer <{committer}> is not a DID");
+            }
+            CommitStatus::ConflictingSignerDids { trailer, committer } => {
+                println!(
+                    "CONFLICT     {short}  Signed-by-DID {trailer} disagrees with committer DID {committer}"
+                );
             }
             CommitStatus::Malformed(detail) => {
                 println!("MALFORMED    {short}  {detail}");
@@ -1037,6 +1053,29 @@ mod tests {
             check_commit_signature(commit.as_bytes(), &signers_publishing(public), None),
             SignatureCheck::NoSignerDid {
                 committer: "alice@example.com".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn conflicting_trailer_and_committer_dids_fail_closed() {
+        let payload = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer A U Thor <did:webvh:QmCommitter:example.com#key-0> 1700000000 +0000\n\
+             \n\
+             a message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        let (key, public) = test_key();
+        let commit = sign_commit(&payload, &key);
+
+        assert_eq!(
+            check_commit_signature(commit.as_bytes(), &signers_publishing(public), None),
+            SignatureCheck::ConflictingSignerDids {
+                trailer: SIGNER.to_string(),
+                committer: "did:webvh:QmCommitter:example.com".to_string(),
             }
         );
     }

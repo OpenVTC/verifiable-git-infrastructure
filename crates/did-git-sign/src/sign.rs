@@ -101,9 +101,16 @@ fn bare_did(did_key_id: &str) -> &str {
 /// the trailer may already be present (hook ran) or absent (no hook, legacy
 /// flow). We only reject a **conflicting** claim.
 fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
-    use vgi_core::{committer_did, committer_identity, signer_did};
+    use vgi_core::{committer_did, committer_identity, conflicting_signer_dids, signer_did};
 
     let signing_did = bare_did(did_key_id);
+
+    if let Some((trailer, committer)) = conflicting_signer_dids(data) {
+        anyhow::bail!(
+            "did-git-sign: Signed-by-DID trailer claims '{trailer}' but committer claims \
+             '{committer}'. Remove one claim or make them match before signing."
+        );
+    }
 
     // If a Signed-by-DID trailer is present, it must match.
     if let Some(trailer) = signer_did(data) {
@@ -368,6 +375,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn conflicting_trailer_and_committer_dids_are_refused() {
+        let commit = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <did:webvh:QmOther:other.example#key-0> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        let error = check_committer_matches_key(
+            commit.as_bytes(),
+            &format!("{SIGNER}#key-0"),
+            KeySource::ConfigFile,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Signed-by-DID"), "names trailer: {error}");
+        assert!(error.contains("committer"), "names committer: {error}");
     }
 
     #[test]

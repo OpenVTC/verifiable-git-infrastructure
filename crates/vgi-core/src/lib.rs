@@ -18,7 +18,8 @@ mod did;
 mod sshsig;
 
 pub use commit::{
-    committer_did, committer_identity, normalize_sshsig_armor, signer_did, split_signed_commit,
+    committer_did, committer_identity, conflicting_signer_dids, normalize_sshsig_armor, signer_did,
+    split_signed_commit,
 };
 pub use did::{ED25519_MULTICODEC_PREFIX, ed25519_keys_from_doc};
 pub use sshsig::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
