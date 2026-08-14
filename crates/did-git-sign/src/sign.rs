@@ -101,7 +101,7 @@ fn bare_did(did_key_id: &str) -> &str {
 /// the trailer may already be present (hook ran) or absent (no hook, legacy
 /// flow). We only reject a **conflicting** claim.
 fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
-    use vgi_core::{committer_did, signer_did};
+    use vgi_core::{committer_did, committer_identity, signer_did};
 
     let signing_did = bare_did(did_key_id);
 
@@ -134,7 +134,11 @@ fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource)
              verification as unknownKey. Set user.email to a '{signing_did}' key id, or select \
              the persona matching the committer."
         ),
-        // No DID in trailer or committer — the commit-msg hook is missing.
+        // No committer header: tags and non-git namespaces carry no commit
+        // identity claim, so there is nothing for this guard to compare.
+        None if committer_identity(data).is_none() => Ok(()),
+        // Committer exists, but no DID in trailer or committer — the
+        // commit-msg hook is missing.
         None => anyhow::bail!(
             "did-git-sign: no Signed-by-DID trailer and user.email is not a DID. \
              The commit would fail verification as noSignerDid. \

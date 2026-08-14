@@ -129,20 +129,47 @@ pub fn signer_did(commit: &[u8]) -> Option<String> {
     trailer_did(commit).or_else(|| committer_did(commit))
 }
 
-/// Extract a bare DID from a `Signed-by-DID:` trailer in the commit body.
+/// Extract a bare DID from a `Signed-by-DID:` trailer in the commit body's
+/// final trailer block.
 fn trailer_did(commit: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(commit).ok()?;
     let (_, body) = text.split_once("\n\n")?;
-    // Trailers are conventionally at the end; scan backwards.
-    for line in body.lines().rev() {
+
+    let mut lines: Vec<&str> = body.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+
+    let mut trailer_start = lines.len();
+    while trailer_start > 0 && is_trailer_line(lines[trailer_start - 1]) {
+        trailer_start -= 1;
+    }
+    if trailer_start == lines.len() {
+        return None;
+    }
+
+    for line in lines[trailer_start..].iter().rev() {
         if let Some(value) = line.strip_prefix("Signed-by-DID:") {
             let value = value.trim();
             if value.starts_with("did:") {
-                return Some(value.split(['#', '?']).next().unwrap_or(value).to_string());
+                return Some(
+                    value
+                        .split(['#', '?', '/'])
+                        .next()
+                        .unwrap_or(value)
+                        .to_string(),
+                );
             }
         }
     }
     None
+}
+
+fn is_trailer_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 #[cfg(test)]
@@ -301,5 +328,36 @@ mod tests {
     fn trailer_ignores_non_did_values() {
         let commit = commit_with_trailer("Alice <alice@example.com>", "Signed-by-DID: not-a-did");
         assert!(signer_did(commit.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn signer_did_ignores_body_line_outside_final_trailer_block() {
+        let commit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer Alice <alice@example.com> 1700000000 +0000\n\
+             \n\
+             This line only discusses a trailer.\n\
+             Signed-by-DID: did:webvh:QmBody:example.com#key-0\n\
+             \n\
+             final prose, not a trailer block\n";
+        assert!(signer_did(commit.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn signer_did_reads_final_trailer_block_only() {
+        let commit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer Alice <alice@example.com> 1700000000 +0000\n\
+             \n\
+             Signed-by-DID: did:webvh:QmBody:ignored.example#key-0\n\
+             \n\
+             body text\n\
+             \n\
+             Signed-off-by: Alice <alice@example.com>\n\
+             Signed-by-DID: did:webvh:QmTrailer:example.com#key-0\n";
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:webvh:QmTrailer:example.com"
+        );
     }
 }

@@ -441,6 +441,13 @@ const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
 # Installed by did-git-sign — adds Signed-off-by and Signed-by-DID trailers.
 DID=$(git config did-git-sign.key 2>/dev/null)
 [ -z "$DID" ] && exit 0
+case "$DID" in
+    did:*) ;;
+    *) exit 0 ;;
+esac
+case "$DID" in
+    *[[:space:]]*) exit 1 ;;
+esac
 
 # Strip trailing blank lines.
 while [ "$(tail -c 1 "$1" | wc -l)" -eq 1 ] && [ "$(tail -1 "$1")" = "" ]; do
@@ -448,11 +455,13 @@ while [ "$(tail -c 1 "$1" | wc -l)" -eq 1 ] && [ "$(tail -1 "$1")" = "" ]; do
 done
 
 # Append Signed-off-by if absent.
-SOB="Signed-off-by: $(git config user.name) <$(git config user.email)>"
-grep -q "^Signed-off-by:" "$1" 2>/dev/null || echo "$SOB" >> "$1"
+NAME=$(git config user.name 2>/dev/null | tr -d '\r\n')
+EMAIL=$(git config user.email 2>/dev/null | tr -d '\r\n')
+SOB="Signed-off-by: $NAME <$EMAIL>"
+grep -q "^Signed-off-by:" "$1" 2>/dev/null || printf '%s\n' "$SOB" >> "$1"
 
 # Append Signed-by-DID if absent.
-grep -q "^Signed-by-DID:" "$1" 2>/dev/null || echo "Signed-by-DID: $DID" >> "$1"
+grep -q "^Signed-by-DID:" "$1" 2>/dev/null || printf '%s\n' "Signed-by-DID: $DID" >> "$1"
 "#;
 
 /// Install the `commit-msg` hook that injects the `Signed-by-DID:` trailer.
