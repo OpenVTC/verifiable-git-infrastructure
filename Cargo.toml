@@ -14,12 +14,21 @@ publish = true
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
 vgi-core = { version = "0.4.4", path = "crates/vgi-core" }
-# Trust Registry query client (registry authorization queries). 0.11 still
-# builds its task specs against trust-tasks-rs 0.3, so the tree carries that
-# alongside the 0.4 the VTA stack pulls in. The two never meet: verify-trust
-# only sends TRQP queries through trql-client's HTTPS transport, and takes
-# nothing but display names from vta-sdk.
-trql-client = "0.11"
+# Trust Registry query client (registry authorization queries).
+#
+# Held at 0.11 for a long time, which built its task specs against
+# trust-tasks-rs 0.3 while the VTA stack pulled 0.4 and then 0.6 — three copies
+# in the tree at once. That was tolerated on the argument that the two never
+# meet (verify-trust only sends TRQP queries through trql-client's HTTPS
+# transport, and takes nothing but display names from vta-sdk), which was true
+# but relied on nobody ever passing a trust-tasks type across the boundary.
+#
+# 0.13 builds against trust-tasks-rs ^0.6 — the same line vta-sdk 0.24 resolves
+# — so the tree now carries a single copy and the argument no longer has to
+# hold. Keep it that way: the check is `cargo tree -d -e normal,build` listing
+# no trust-tasks-rs. This requirement follows the trust registry's published
+# line for the same reason vta-sdk's does below.
+trql-client = "0.13"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
