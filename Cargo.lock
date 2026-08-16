@@ -5353,6 +5353,21 @@ checksum = "7e8749686980d1e1ec639afce6e39cb6ae53f0662b5f7593238fc8439af36e3e"
 dependencies = [
  "async-trait",
  "chrono",
+ "regress",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror",
+]
+
+[[package]]
+name = "trust-tasks-rs"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0b630d88cf3258040b38722b4dc8f99d74da84bae431277d46a9a65f1496b40"
+dependencies = [
+ "async-trait",
+ "chrono",
  "jsonschema",
  "regress",
  "serde",
@@ -5576,9 +5591,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b8d9df250173cc4f3793f84de441616ba885cc3c1423b926ef3c19232f15a18"
+checksum = "c334dec68315b74378fa443f9ad0d95bd503f92078b2550312ca2df4c04d283e"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -5610,7 +5625,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.4.1",
+ "trust-tasks-rs 0.6.5",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",
