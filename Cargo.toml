@@ -28,7 +28,7 @@ vgi-core = { version = "0.4.4", path = "crates/vgi-core" }
 # hold. Keep it that way: the check is `cargo tree -d -e normal,build` listing
 # no trust-tasks-rs. This requirement follows the trust registry's published
 # line for the same reason vta-sdk's does below.
-trql-client = "0.13"
+trql-client = "0.14"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -51,7 +51,7 @@ trql-client = "0.13"
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.24", default-features = false }
+vta-sdk = { version = "0.25", default-features = false }
 affinidi-tdk = "0.8.5"
 multibase = "0.9"
 pgp = "0.20"
