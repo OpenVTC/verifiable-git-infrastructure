@@ -36,7 +36,7 @@ Or use the prebuilt binary via the GitHub Action (no toolchain on the runner):
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.4
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.5
   with:
     range:        origin/${{ github.base_ref }}..HEAD
     registry-did: ${{ vars.TRUST_REGISTRY_DID }}
