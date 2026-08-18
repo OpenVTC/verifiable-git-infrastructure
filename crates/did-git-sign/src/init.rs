@@ -104,10 +104,11 @@ pub fn install(args: InstallArgs<'_>) -> Result<InstallResult> {
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
     setup_allowed_signers(config_dir, &entry, args.global)?;
 
-    // Install the commit-msg hook that injects the Signed-by-DID trailer.
-    if let Err(e) = install_commit_msg_hook(args.global, &cfg.did_key_id) {
+    // Install the hook dispatcher that injects the Signed-by-DID trailer while
+    // preserving any repository hooks shadowed by core.hooksPath.
+    if let Err(e) = install_hook_dispatcher(args.global) {
         eprintln!(
-            "warning: could not install commit-msg hook: {e}\n  \
+            "warning: could not install git hook dispatcher: {e}\n  \
              Commits will not carry a Signed-by-DID trailer unless you add one manually."
         );
     }
@@ -249,6 +250,15 @@ pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
             summary.git_config_keys_unset.push(key.to_string());
         }
     }
+    match unset_did_git_sign_hooks_path(scope, global) {
+        Ok(true) => summary
+            .git_config_keys_unset
+            .push("core.hooksPath".to_string()),
+        Ok(false) => {}
+        Err(e) => summary
+            .warnings
+            .push(format!("could not inspect core.hooksPath: {e}")),
+    }
 
     Ok(summary)
 }
@@ -282,6 +292,40 @@ fn git_config_unset(scope: &str, key: &str) -> bool {
         .ok()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn unset_did_git_sign_hooks_path(scope: &str, global: bool) -> Result<bool> {
+    let Some(expected) = expected_hooks_dir(global)? else {
+        return Ok(false);
+    };
+    let Some(configured) = git_config_get(scope, "core.hooksPath")? else {
+        return Ok(false);
+    };
+    if PathBuf::from(configured.trim()) == expected {
+        return Ok(git_config_unset(scope, "core.hooksPath"));
+    }
+    Ok(false)
+}
+
+fn expected_hooks_dir(global: bool) -> Result<Option<PathBuf>> {
+    if global {
+        return Ok(Some(
+            dirs::config_dir()
+                .context("cannot determine config directory")?
+                .join("did-git-sign")
+                .join("hooks"),
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .context("failed to find .git directory")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(Some(git_dir.join("did-git-sign-hooks")))
 }
 
 /// Initialize git configuration for DID-based SSH signing.
@@ -462,7 +506,13 @@ fn base64_encode_pubkey(public_key_bytes: &[u8; 32]) -> String {
 /// are not already present. This is how `verify-trust` discovers the signer DID
 /// without requiring `user.email` to be a DID.
 const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
-# Installed by did-git-sign — adds Signed-off-by and Signed-by-DID trailers.
+# Installed by did-git-sign — chains the repo commit-msg hook, then adds Signed-by-DID trailers.
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+repo_hook="$git_dir/hooks/commit-msg"
+if [ -x "$repo_hook" ] && [ "$repo_hook" != "$0" ]; then
+    "$repo_hook" "$@" || exit $?
+fi
+
 DID=$(git config did-git-sign.key 2>/dev/null)
 [ -z "$DID" ] && exit 0
 case "$DID" in
@@ -488,21 +538,63 @@ grep -q "^Signed-off-by:" "$1" 2>/dev/null || printf '%s\n' "$SOB" >> "$1"
 grep -q "^Signed-by-DID:" "$1" 2>/dev/null || printf '%s\n' "Signed-by-DID: $DID" >> "$1"
 "#;
 
-/// Install the `commit-msg` hook that injects the `Signed-by-DID:` trailer.
+const STANDARD_GIT_HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "commit-msg",
+    "fsmonitor-watchman",
+    "post-applypatch",
+    "post-checkout",
+    "post-commit",
+    "post-index-change",
+    "post-merge",
+    "post-receive",
+    "post-rewrite",
+    "post-update",
+    "pre-applypatch",
+    "pre-auto-gc",
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "pre-rebase",
+    "pre-receive",
+    "prepare-commit-msg",
+    "proc-receive",
+    "push-to-checkout",
+    "reference-transaction",
+    "sendemail-validate",
+    "update",
+];
+
+fn delegating_hook(hook_name: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# Installed by did-git-sign — delegates to the repository's {hook_name} hook.
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+repo_hook="$git_dir/hooks/{hook_name}"
+[ -x "$repo_hook" ] || exit 0
+[ "$repo_hook" != "$0" ] || exit 0
+exec "$repo_hook" "$@"
+"#
+    )
+}
+
+/// Install the hook dispatcher that injects the `Signed-by-DID:` trailer while
+/// delegating every other standard Git hook back to the repository's default
+/// `.git/hooks` directory.
 ///
-/// For a **local** install, writes to `.git/hooks/commit-msg` in the current
-/// repo. For a **global** install, writes to `~/.config/did-git-sign/hooks/`
-/// and sets `core.hooksPath` (git 2.9+). An existing hook is not overwritten
-/// — the operator is warned and can merge manually.
-fn install_commit_msg_hook(global: bool, _did_key_id: &str) -> Result<()> {
-    let hooks_dir = if global {
-        let config_dir = dirs::config_dir()
-            .context("cannot determine config directory")?
-            .join("did-git-sign")
-            .join("hooks");
-        std::fs::create_dir_all(&config_dir)?;
+/// For a **local** install, writes to `.git/did-git-sign-hooks/` in the current
+/// repo and sets repo-local `core.hooksPath`. For a **global** install, writes
+/// to `~/.config/did-git-sign/hooks/` and sets global `core.hooksPath` (git
+/// 2.9+). The original `.git/hooks` directory remains the source for repository
+/// hooks, including hooks added after did-git-sign is installed.
+fn install_hook_dispatcher(global: bool) -> Result<()> {
+    let hooks_dir = expected_hooks_dir(global)?
+        .context("not inside a git repository — cannot install hook dispatcher")?;
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    if global {
         if let Some(existing) = git_config_get("--global", "core.hooksPath")?
-            && PathBuf::from(existing.trim()) != config_dir
+            && PathBuf::from(existing.trim()) != hooks_dir
         {
             anyhow::bail!(
                 "global core.hooksPath is already set to '{}'; refusing to overwrite it. \
@@ -510,40 +602,44 @@ fn install_commit_msg_hook(global: bool, _did_key_id: &str) -> Result<()> {
                 existing
             );
         }
-        git_config("--global", "core.hooksPath", config_dir.to_str().unwrap())?;
-        config_dir
+        git_config("--global", "core.hooksPath", hooks_dir.to_str().unwrap())?;
     } else {
-        // Find .git/hooks in the current repo.
-        let output = Command::new("git")
-            .args(["rev-parse", "--git-dir"])
-            .output()
-            .context("failed to find .git directory")?;
-        if !output.status.success() {
-            anyhow::bail!("not inside a git repository — cannot install commit-msg hook");
-        }
-        let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        let hooks = git_dir.join("hooks");
-        std::fs::create_dir_all(&hooks)?;
-        hooks
-    };
-
-    let hook_path = hooks_dir.join("commit-msg");
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        if existing.contains("Signed-by-DID") {
-            return Ok(()); // Already installed.
-        }
-        anyhow::bail!(
-            "commit-msg hook already exists at {}; merge manually",
-            hook_path.display()
-        );
+        git_config("--local", "core.hooksPath", hooks_dir.to_str().unwrap())?;
     }
 
-    std::fs::write(&hook_path, COMMIT_MSG_HOOK)?;
+    for hook_name in STANDARD_GIT_HOOKS {
+        let hook_path = hooks_dir.join(hook_name);
+        let content = if *hook_name == "commit-msg" {
+            COMMIT_MSG_HOOK.to_string()
+        } else {
+            delegating_hook(hook_name)
+        };
+
+        write_executable_hook(&hook_path, &content)?;
+    }
+
+    Ok(())
+}
+
+fn write_executable_hook(hook_path: &Path, content: &str) -> Result<()> {
+    if hook_path.exists() {
+        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+        if existing.contains("Installed by did-git-sign") {
+            std::fs::write(hook_path, content)?;
+        } else {
+            anyhow::bail!(
+                "hook already exists at {}; merge manually",
+                hook_path.display()
+            );
+        }
+    } else {
+        std::fs::write(hook_path, content)?;
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(hook_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
     Ok(())
@@ -683,6 +779,25 @@ mod tests {
             let seen = std::fs::read_to_string(&path).expect("target always exists");
             assert_eq!(seen.len(), long.len(), "a reader saw a partial file");
         }
+    }
+
+    #[test]
+    fn delegating_hook_targets_default_repo_hook_dir() {
+        let hook = delegating_hook("pre-push");
+        assert!(hook.contains("git rev-parse --absolute-git-dir"));
+        assert!(hook.contains("$git_dir/hooks/pre-push"));
+        assert!(hook.contains("exec \"$repo_hook\" \"$@\""));
+    }
+
+    #[test]
+    fn commit_msg_hook_chains_before_adding_signed_by_did() {
+        let chain_pos = COMMIT_MSG_HOOK.find("repo_hook=").unwrap();
+        let did_pos = COMMIT_MSG_HOOK
+            .find("DID=$(git config did-git-sign.key")
+            .unwrap();
+        assert!(chain_pos < did_pos);
+        assert!(COMMIT_MSG_HOOK.contains("$git_dir/hooks/commit-msg"));
+        assert!(COMMIT_MSG_HOOK.contains("Signed-by-DID: $DID"));
     }
 
     #[test]
