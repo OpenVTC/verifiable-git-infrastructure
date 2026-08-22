@@ -23,35 +23,63 @@ vgi-core = { version = "0.4.5", path = "crates/vgi-core" }
 # transport, and takes nothing but display names from vta-sdk), which was true
 # but relied on nobody ever passing a trust-tasks type across the boundary.
 #
-# 0.13 builds against trust-tasks-rs ^0.6 — the same line vta-sdk 0.24 resolves
-# — so the tree now carries a single copy and the argument no longer has to
-# hold. Keep it that way: the check is `cargo tree -d -e normal,build` listing
-# no trust-tasks-rs. This requirement follows the trust registry's published
-# line for the same reason vta-sdk's does below.
+# 0.13 built against trust-tasks-rs ^0.6 — the same line vta-sdk 0.24 resolved —
+# and 0.14 carried that single copy to 0.9. This requirement follows the trust
+# registry's published line for the same reason vta-sdk's does below.
+#
+# The single copy did not survive the vta-sdk 0.27 move, and it cannot yet:
+# 0.14.0 is the registry's latest published crate and it declares
+# `trust-tasks-rs ^0.9`, while vta-sdk 0.27 declares ^0.11. So the tree carries
+# 0.9.0 and 0.11.1 again, reachable only as:
+#
+#     trust-tasks-rs v0.9.0 -> trql-client v0.14.0 -> verify-trust
+#
+# Two things bound that. It is confined to `verify-trust`, which is the crate the
+# old tolerance argument was written about and still holds for: it sends TRQP
+# queries through trql-client's HTTPS transport and takes nothing but display
+# names from vta-sdk, so no trust-tasks type crosses between them. And it does
+# **not** reach `did-git-sign`, which has no trql-client edge at all — which
+# matters because did-git-sign is the crate OpenVTC consumes, and OpenVTC's graph
+# is where a duplicated vta-sdk actually causes a type that cannot unify.
+#
+# It clears when affinidi-trust-registry-rs publishes a trql-client on
+# trust-tasks-rs 0.11; take it as soon as it lands. Until then the check is
+# narrowed rather than abandoned: `cargo tree -i trust-tasks-rs@0.9.0` must show
+# trql-client as its only parent, and `cargo tree -d -e normal,build` must list
+# no vta-sdk.
 trql-client = "0.14"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
 # Features are chosen per member: did-git-sign needs the client and
 # provisioning stack, verify-trust needs only `agent-names`.
-# The 0.24 line, matching what the VTA/VTC deploy and what OpenVTC's CLI runs
-# on. This requirement is a *follow*, never a lead: OpenVTC depends on both this
-# crate and vta-sdk directly, so whichever line it moves to, a stale requirement
-# here puts a *second* vta-sdk in its binary. That is not merely untidy —
-# `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
-# ContextDirection}` as its own public API, so the two copies carry types that
-# cannot unify.
+# The 0.27 line, matching what the VTA/VTC deploy (vta-service 0.19 is built on
+# it) and what OpenVTC's CLI runs on. This requirement is a *follow*, never a
+# lead: OpenVTC depends on both this crate and vta-sdk directly, so whichever
+# line it moves to, a stale requirement here puts a *second* vta-sdk in its
+# binary. That is not merely untidy — `vti-common` re-exports
+# `vta_sdk::acl::{ActScope, ApproveScope, ContextDirection}` as its own public
+# API, so the two copies carry types that cannot unify.
 #
-# It has happened twice now (0.21 held while OpenVTC moved to 0.23, then 0.23
-# held while it moved to 0.24), so treat it as a standing obligation rather than
-# an incident: when vta-sdk's minor moves, this moves with it, and the check is
-# `cargo tree -i vta-sdk` resolving a single node — here *and* in OpenVTC, which
-# is where the duplicate actually lands.
+# It has happened three times now (0.21 held while OpenVTC moved to 0.23, 0.23
+# while it moved to 0.24, 0.25 while it moved to 0.27), so treat it as a standing
+# obligation rather than an incident: when vta-sdk's minor moves, this moves with
+# it, and the check is `cargo tree -i vta-sdk` resolving a single node — here
+# *and* in OpenVTC, which is where the duplicate actually lands. Note that the
+# obligation is only discharged by a *published release*: main moving is what
+# OpenVTC cannot consume, and that is precisely how the last two were found.
+#
+# 0.25 -> 0.27 crossed two minors and required no source change here. The two
+# things it carries are VTI #1033 (the Trust-Task response decode, where the
+# agent had moved to `basePath` and the client still demanded `base_path` —
+# `ContextResponse` is one of the eleven affected, and `names.rs` reads it) and
+# VTI #1012 (`VtaClient::idempotent`, one idempotency key held across every
+# attempt of an operation).
 #
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.25", default-features = false }
+vta-sdk = { version = "0.27", default-features = false }
 affinidi-tdk = "0.8.5"
 multibase = "0.9"
 pgp = "0.20"
