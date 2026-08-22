@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -5530,7 +5530,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "affinidi-tdk",
  "anyhow",
@@ -5559,7 +5559,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
