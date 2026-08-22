@@ -104,6 +104,15 @@ pub fn install(args: InstallArgs<'_>) -> Result<InstallResult> {
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
     setup_allowed_signers(config_dir, &entry, args.global)?;
 
+    // Install the hook dispatcher that injects the Signed-by-DID trailer while
+    // preserving any repository hooks shadowed by core.hooksPath.
+    if let Err(e) = install_hook_dispatcher(args.global) {
+        eprintln!(
+            "warning: could not install git hook dispatcher: {e}\n  \
+             Commits will not carry a Signed-by-DID trailer unless you add one manually."
+        );
+    }
+
     // If we just shadowed a global user.signingKey with a local one, tell
     // the caller so they can surface it. Best-effort — failures here are
     // non-fatal.
@@ -235,10 +244,20 @@ pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
         "gpg.ssh.defaultKeyFile",
         "gpg.ssh.allowedSignersFile",
         "commit.gpgsign",
+        "did-git-sign.key",
     ] {
         if git_config_unset(scope, key) {
             summary.git_config_keys_unset.push(key.to_string());
         }
+    }
+    match unset_did_git_sign_hooks_path(scope, global) {
+        Ok(true) => summary
+            .git_config_keys_unset
+            .push("core.hooksPath".to_string()),
+        Ok(false) => {}
+        Err(e) => summary
+            .warnings
+            .push(format!("could not inspect core.hooksPath: {e}")),
     }
 
     Ok(summary)
@@ -275,6 +294,40 @@ fn git_config_unset(scope: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn unset_did_git_sign_hooks_path(scope: &str, global: bool) -> Result<bool> {
+    let Some(expected) = expected_hooks_dir(global)? else {
+        return Ok(false);
+    };
+    let Some(configured) = git_config_get(scope, "core.hooksPath")? else {
+        return Ok(false);
+    };
+    if PathBuf::from(configured.trim()) == expected {
+        return Ok(git_config_unset(scope, "core.hooksPath"));
+    }
+    Ok(false)
+}
+
+fn expected_hooks_dir(global: bool) -> Result<Option<PathBuf>> {
+    if global {
+        return Ok(Some(
+            dirs::config_dir()
+                .context("cannot determine config directory")?
+                .join("did-git-sign")
+                .join("hooks"),
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .context("failed to find .git directory")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(Some(git_dir.join("did-git-sign-hooks")))
+}
+
 /// Initialize git configuration for DID-based SSH signing.
 pub fn setup_git(config_path: &Path, cfg: &SigningConfig, global: bool) -> Result<()> {
     let scope = if global { "--global" } else { "--local" };
@@ -305,19 +358,14 @@ pub fn setup_git(config_path: &Path, cfg: &SigningConfig, global: bool) -> Resul
     // Enable commit signing by default
     git_config(scope, "commit.gpgsign", "true")?;
 
-    // The committer identity IS the DID claim. An sshsig blob carries a raw
-    // Ed25519 key and no identity, so `user.email` is the only place a commit
-    // states which DID signed it — `verify-trust` reads it from the committer
-    // header (inside the payload the signature covers), resolves that DID, and
-    // requires it to publish the signing key. Left unset, every commit fails
-    // the CI check as `noSignerDid` however valid its signature.
+    // The committer identity IS the DID claim. With the Signed-by-DID trailer
+    // flow, the DID is injected as a trailer by the commit-msg hook rather
+    // than set as user.email. This lets user.email stay a normal email for
+    // git-host attribution (GitLab/GitHub account linking).
     //
-    // This was removed once, on the grounds that git's own SSH verification
-    // uses the allowed_signers principal rather than user.email. That reasoning
-    // does not hold either way round: `allowed_signers_entry` writes the
-    // principal as `did_key_id`, and git matches principals against the
-    // committer email — so leaving it unset breaks the local check too.
-    git_config(scope, "user.email", &cfg.did_key_id)?;
+    // For backwards compatibility, also store the DID in did-git-sign.key
+    // git config so the hook can read it.
+    git_config(scope, "did-git-sign.key", &cfg.did_key_id)?;
 
     // Optionally set user.name
     if let Some(name) = &cfg.user_name {
@@ -411,6 +459,30 @@ fn git_config(scope: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one git config value. A missing key is not an error.
+fn git_config_get(scope: &str, key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("config")
+        .arg(scope)
+        .arg("--get")
+        .arg(key)
+        .output()
+        .context("failed to run git config")?;
+
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(|c| c == '\r' || c == '\n')
+                .to_string(),
+        ));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("git config {scope} --get {key} failed: {stderr}");
+}
+
 /// Format an Ed25519 public key as an SSH public key string (e.g., `ssh-ed25519 AAAA...`).
 pub fn ssh_public_key_string(public_key_bytes: &[u8; 32]) -> String {
     format!("ssh-ed25519 {}", base64_encode_pubkey(public_key_bytes))
@@ -427,6 +499,150 @@ fn base64_encode_pubkey(public_key_bytes: &[u8; 32]) -> String {
     blob.extend_from_slice(&(public_key_bytes.len() as u32).to_be_bytes());
     blob.extend_from_slice(public_key_bytes);
     base64::engine::general_purpose::STANDARD.encode(&blob)
+}
+
+/// The commit-msg hook script. Reads the DID from `did-git-sign.key` git
+/// config and appends `Signed-off-by:` and `Signed-by-DID:` trailers if they
+/// are not already present. This is how `verify-trust` discovers the signer DID
+/// without requiring `user.email` to be a DID.
+const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
+# Installed by did-git-sign — chains the repo commit-msg hook, then adds Signed-by-DID trailers.
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+repo_hook="$git_dir/hooks/commit-msg"
+if [ -x "$repo_hook" ] && [ "$repo_hook" != "$0" ]; then
+    "$repo_hook" "$@" || exit $?
+fi
+
+DID=$(git config did-git-sign.key 2>/dev/null)
+[ -z "$DID" ] && exit 0
+case "$DID" in
+    did:*) ;;
+    *) exit 0 ;;
+esac
+case "$DID" in
+    *[[:space:]]*) exit 1 ;;
+esac
+
+# Strip trailing blank lines.
+while [ "$(tail -c 1 "$1" | wc -l)" -eq 1 ] && [ "$(tail -1 "$1")" = "" ]; do
+    sed -i '' -e '$ d' "$1"
+done
+
+# Append Signed-off-by if absent.
+NAME=$(git config user.name 2>/dev/null | tr -d '\r\n')
+EMAIL=$(git config user.email 2>/dev/null | tr -d '\r\n')
+SOB="Signed-off-by: $NAME <$EMAIL>"
+grep -q "^Signed-off-by:" "$1" 2>/dev/null || printf '%s\n' "$SOB" >> "$1"
+
+# Append Signed-by-DID if absent.
+grep -q "^Signed-by-DID:" "$1" 2>/dev/null || printf '%s\n' "Signed-by-DID: $DID" >> "$1"
+"#;
+
+const STANDARD_GIT_HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "commit-msg",
+    "fsmonitor-watchman",
+    "post-applypatch",
+    "post-checkout",
+    "post-commit",
+    "post-index-change",
+    "post-merge",
+    "post-receive",
+    "post-rewrite",
+    "post-update",
+    "pre-applypatch",
+    "pre-auto-gc",
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "pre-rebase",
+    "pre-receive",
+    "prepare-commit-msg",
+    "proc-receive",
+    "push-to-checkout",
+    "reference-transaction",
+    "sendemail-validate",
+    "update",
+];
+
+fn delegating_hook(hook_name: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# Installed by did-git-sign — delegates to the repository's {hook_name} hook.
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+repo_hook="$git_dir/hooks/{hook_name}"
+[ -x "$repo_hook" ] || exit 0
+[ "$repo_hook" != "$0" ] || exit 0
+exec "$repo_hook" "$@"
+"#
+    )
+}
+
+/// Install the hook dispatcher that injects the `Signed-by-DID:` trailer while
+/// delegating every other standard Git hook back to the repository's default
+/// `.git/hooks` directory.
+///
+/// For a **local** install, writes to `.git/did-git-sign-hooks/` in the current
+/// repo and sets repo-local `core.hooksPath`. For a **global** install, writes
+/// to `~/.config/did-git-sign/hooks/` and sets global `core.hooksPath` (git
+/// 2.9+). The original `.git/hooks` directory remains the source for repository
+/// hooks, including hooks added after did-git-sign is installed.
+fn install_hook_dispatcher(global: bool) -> Result<()> {
+    let hooks_dir = expected_hooks_dir(global)?
+        .context("not inside a git repository — cannot install hook dispatcher")?;
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    if global {
+        if let Some(existing) = git_config_get("--global", "core.hooksPath")?
+            && PathBuf::from(existing.trim()) != hooks_dir
+        {
+            anyhow::bail!(
+                "global core.hooksPath is already set to '{}'; refusing to overwrite it. \
+                 Install did-git-sign locally, or merge the commit-msg hook manually.",
+                existing
+            );
+        }
+        git_config("--global", "core.hooksPath", hooks_dir.to_str().unwrap())?;
+    } else {
+        git_config("--local", "core.hooksPath", hooks_dir.to_str().unwrap())?;
+    }
+
+    for hook_name in STANDARD_GIT_HOOKS {
+        let hook_path = hooks_dir.join(hook_name);
+        let content = if *hook_name == "commit-msg" {
+            COMMIT_MSG_HOOK.to_string()
+        } else {
+            delegating_hook(hook_name)
+        };
+
+        write_executable_hook(&hook_path, &content)?;
+    }
+
+    Ok(())
+}
+
+fn write_executable_hook(hook_path: &Path, content: &str) -> Result<()> {
+    if hook_path.exists() {
+        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+        if existing.contains("Installed by did-git-sign") {
+            std::fs::write(hook_path, content)?;
+        } else {
+            anyhow::bail!(
+                "hook already exists at {}; merge manually",
+                hook_path.display()
+            );
+        }
+    } else {
+        std::fs::write(hook_path, content)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -566,6 +782,25 @@ mod tests {
     }
 
     #[test]
+    fn delegating_hook_targets_default_repo_hook_dir() {
+        let hook = delegating_hook("pre-push");
+        assert!(hook.contains("git rev-parse --absolute-git-dir"));
+        assert!(hook.contains("$git_dir/hooks/pre-push"));
+        assert!(hook.contains("exec \"$repo_hook\" \"$@\""));
+    }
+
+    #[test]
+    fn commit_msg_hook_chains_before_adding_signed_by_did() {
+        let chain_pos = COMMIT_MSG_HOOK.find("repo_hook=").unwrap();
+        let did_pos = COMMIT_MSG_HOOK
+            .find("DID=$(git config did-git-sign.key")
+            .unwrap();
+        assert!(chain_pos < did_pos);
+        assert!(COMMIT_MSG_HOOK.contains("$git_dir/hooks/commit-msg"));
+        assert!(COMMIT_MSG_HOOK.contains("Signed-by-DID: $DID"));
+    }
+
+    #[test]
     fn test_different_keys_produce_different_ssh_strings() {
         let key_a = [0x00; 32];
         let key_b = [0xFF; 32];
@@ -595,20 +830,14 @@ mod tests {
         }
     }
 
-    /// `setup_git` must write `user.email` as the signing DID's key id.
-    ///
-    /// This inverts an earlier regression guard that asserted the opposite. That
-    /// guard's reasoning — git's SSH verification matches the allowed_signers
-    /// principal, not user.email — does not survive either direction:
-    /// [`allowed_signers_entry`] writes the principal as `did_key_id` and git
-    /// matches principals *against the committer email*, so an unset value
-    /// breaks local verification too. And `verify-trust` has no other channel
-    /// for the identity at all: an sshsig carries a key, never a DID, so a
-    /// commit whose committer is not a DID fails CI as `noSignerDid` no matter
-    /// how valid its signature.
+    /// `setup_git` must write the signing DID into `did-git-sign.key` git
+    /// config so the commit-msg hook can read it and inject the
+    /// `Signed-by-DID:` trailer. Previously the DID was written to
+    /// `user.email`, but that broke git-host attribution (GitLab/GitHub
+    /// account linking).
     #[test]
     #[serial_test::serial]
-    fn setup_git_writes_the_signing_did_as_user_email() {
+    fn setup_git_writes_did_to_git_config_key() {
         let dir = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
             .args(["init"])
@@ -616,9 +845,6 @@ mod tests {
             .output()
             .unwrap();
 
-        // Move into the temp repo so that `git config --local` targets it.
-        // The inner block ensures CwdGuard is dropped (and CWD restored) before
-        // the assertions run, keeping the verify step independent of CWD.
         let original_cwd = std::env::current_dir().unwrap();
         {
             let _cwd = CwdGuard::change_to(dir.path());
@@ -628,20 +854,36 @@ mod tests {
                 user_name: None,
             };
             setup_git(&config_path, &cfg, false).unwrap();
-            // _cwd drops here: original directory is restored
         }
-        // Pin the invariant explicitly so a future edit that moves the
-        // verify command inside the guard's scope (or drops the guard) is
-        // caught loudly rather than silently regressing the CWD-independence
-        // promise the inner block makes.
         assert_eq!(
             std::env::current_dir().unwrap(),
             original_cwd,
             "CwdGuard must restore the original directory on drop"
         );
 
-        // Verify with an explicit -C so the check is not sensitive to the current CWD.
+        // did-git-sign.key must carry the signing DID for the commit-msg hook.
         let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "config",
+                "--local",
+                "did-git-sign.key",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            out.status.success(),
+            "did-git-sign.key must be set by setup_git"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "did:webvh:test#key-0",
+        );
+
+        // user.email must NOT be overwritten to a DID.
+        let email_out = std::process::Command::new("git")
             .args([
                 "-C",
                 dir.path().to_str().unwrap(),
@@ -652,15 +894,14 @@ mod tests {
             .output()
             .unwrap();
 
-        assert!(
-            out.status.success(),
-            "user.email must be set by setup_git: without it every commit fails \
-             verify-trust as noSignerDid"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "did:webvh:test#key-0",
-            "user.email must be the signing DID's verification-method id"
-        );
+        if email_out.status.success() {
+            let email = String::from_utf8_lossy(&email_out.stdout)
+                .trim()
+                .to_string();
+            assert!(
+                !email.starts_with("did:"),
+                "user.email must not be set to a DID (got {email})"
+            );
+        }
     }
 }
