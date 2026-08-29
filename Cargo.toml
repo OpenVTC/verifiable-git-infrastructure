@@ -84,10 +84,24 @@ trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", 
 # 0.27 -> 0.31 is the same shape: four minors, no source change here, taken
 # alongside the trust-tasks 0.17 / TDK 0.10 refresh across the stack.
 #
+# 0.31 -> 0.32 is one more of the same, and it is a *follow*, not a choice: this
+# crate is the reason OpenVTC cannot move. `vta-sdk` is 0.x, so `"0.31"` excludes
+# 0.32, and a consumer that takes 0.32 while `did-git-sign` asks for 0.31 gets
+# two copies of `vta-sdk` — which do not unify, so the workspace stops building.
+# That has now blocked the same consumer five times (0.23, 0.25, 0.27, 0.31,
+# 0.32). Nothing here needs 0.32: this crate reaches the VTA through
+# `connect_auto` and takes display names, so the API it uses is unchanged
+# (`ClientIdentity` grew a `verification_method` member in 0.32 — VTI #1193 —
+# and nothing here names that type). The bump exists so the ceiling moves.
+#
+# Same discipline as the trust-tasks pin below: the requirement follows what the
+# rest of the stack resolves, and `cargo tree -i vta-sdk` in a consumer is the
+# check that it worked — one row, not two.
+#
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.31", default-features = false }
+vta-sdk = { version = "0.32", default-features = false }
 affinidi-tdk = "0.10"
 multibase = "0.9"
 pgp = "0.20"
