@@ -13,6 +13,14 @@ name: Publish
 # Auth is crates.io Trusted Publishing (OIDC) — no long-lived token. Setup per
 # crate on crates.io: add this repo + this workflow (`publish.yml`) as a
 # Trusted Publisher for `vgi-core`, `verify-trust`, and `did-git-sign`.
+#
+# The run is resumable: each crate already on crates.io at the workspace version
+# is skipped rather than re-published. Publishing is not atomic across three
+# crates — an earlier one uploads, a later one can fail (a `git` dependency with
+# no version requirement will do it, which is how v0.4.7 left `vgi-core` 0.4.7
+# published against `verify-trust`/`did-git-sign` 0.4.6). Without the skip, the
+# retry after fixing the cause dies on "already uploaded" for the crate that did
+# land, and the only way forward is a version bump nothing else needed.
 on:
   push:
     tags: ["v*.*.*"]
@@ -43,11 +51,47 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
+
+          # Sparse-index path for a crate name, per the cargo registry layout:
+          # 1- and 2-char names live under `1/` and `2/`, 3-char under
+          # `3/<first>/`, and everything else under `<first two>/<next two>/`.
+          index_path() {
+            local name=$1
+            case ${#name} in
+              1) printf '1/%s\n'       "$name" ;;
+              2) printf '2/%s\n'       "$name" ;;
+              3) printf '3/%s/%s\n'    "${name:0:1}" "$name" ;;
+              *) printf '%s/%s/%s\n'   "${name:0:2}" "${name:2:2}" "$name" ;;
+            esac
+          }
+
+          # True when crates.io already holds <name> at exactly <version>. The
+          # sparse index is newline-delimited JSON, one object per version, so
+          # slurp it and ask whether any entry matches. A 404 (name never
+          # published) is a clean "no".
+          already_published() {
+            local name=$1 version=$2 body
+            body=$(curl -sSf "https://index.crates.io/$(index_path "$name")" 2>/dev/null) || return 1
+            printf '%s\n' "$body" | jq -se --arg v "$version" 'any(.[]; .vers == $v)' >/dev/null
+          }
+
           # vgi-core has no internal deps; verify-trust and did-git-sign both
           # depend on it. `cargo publish` waits for each crate to appear in
           # the index before returning, so the next one resolves it.
           for crate in vgi-core verify-trust did-git-sign; do
-            echo "::group::publish ${crate}"
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')
+            if [ -z "$version" ]; then
+              echo "::error::${crate} is not a member of this workspace"
+              exit 1
+            fi
+
+            if already_published "$crate" "$version"; then
+              echo "::notice::${crate} ${version} is already on crates.io — skipping"
+              continue
+            fi
+
+            echo "::group::publish ${crate} ${version}"
             cargo publish -p "${crate}" --locked
             echo "::endgroup::"
           done
