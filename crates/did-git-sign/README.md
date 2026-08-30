@@ -15,14 +15,23 @@ git calls `did-git-sign` with the commit data on stdin. The tool:
 4. Produces an SSH signature (PROTOCOL.sshsig format) and writes it to stdout
 5. Zeroizes the key material from memory
 
-Your DID verification method ID (e.g. `did:webvh:abc:example.com#key-0`) is used
-as the git `user.email`, linking every commit to your decentralized identity.
+Your DID verification method ID (e.g. `did:webvh:abc:example.com#key-0`) is
+recorded in a `Signed-by-DID:` git trailer, linking every commit to your
+decentralized identity.
 
-That field is load-bearing, not decorative. An sshsig blob carries a raw Ed25519
-key and **no identity**, so the committer header is the only place a commit
+That trailer is load-bearing, not decorative. An sshsig blob carries a raw
+Ed25519 key and **no identity**, so the trailer is the only place a commit
 states which DID signed it — [`verify-trust`][verify-trust] reads it, resolves
-that DID, and requires it to publish the signing key. A commit whose committer
-is an ordinary address fails CI as `noSignerDid` however valid its signature.
+that DID, and requires it to publish the signing key. A commit carrying no DID
+claim fails CI as `noSignerDid` however valid its signature.
+
+The trailer sits inside the commit message, which is part of the payload the
+signature covers, so it is as tamper-evident as the committer header was. It
+lives there rather than in `user.email` so that `user.email` can stay an
+ordinary address, which is what GitHub and GitLab match commits against when
+attributing them to an account. A `commit-msg` hook installed by `init` writes
+it; older commits that carry the DID in `user.email` still verify, through a
+fallback in `verify-trust`.
 Signing therefore refuses when the committer names a DID other than the key's;
 see [Selecting which community persona signs](#selecting-which-community-persona-signs).
 
@@ -66,12 +75,15 @@ did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
 
 Saves config to `~/.config/did-git-sign/` and sets global git config.
 
-This also sets `user.email` to your DID key id for **every repository on the
-machine** — that is the identity your commits claim, and it must match the key
-that signs them. Right for one community; wrong for two, and quietly so, since
-commits in the other community would claim this DID. `init` prints the
-per-remote alternative when you use `--global`; see
+This also sets `did-git-sign.key` and `core.hooksPath` for **every repository
+on the machine** — that pair decides the identity your commits claim, and it
+must match the key that signs them. Right for one community; wrong for two, and
+quietly so, since commits in the other community would claim this DID. `init`
+prints the per-remote alternative when you use `--global`; see
 [Selecting which community persona signs](#selecting-which-community-persona-signs).
+
+`init` refuses to take `core.hooksPath` if something else already owns it
+(husky, lefthook, pre-commit), rather than silently stopping those hooks.
 
 ### Non-interactive
 
@@ -113,9 +125,20 @@ The `init` command performs the following:
    - `gpg.ssh.defaultKeyFile = <config path>`
    - `commit.gpgsign = true`
    - `user.signingKey = <config path>`
-   - `user.email = <DID#key-id>` — the commit's identity claim; see below
+   - `did-git-sign.key = <DID#key-id>` — selects the signing persona *and* is
+     the claim the `commit-msg` hook writes into the trailer; see below
+   - `core.hooksPath = <hook dispatcher>` — see below
    - `user.name = <name>` (if provided)
+
+   `user.email` is left alone: it stays an ordinary address so forges can
+   attribute your commits to your account.
 5. **Creates an `allowed_signers` file** for signature verification and sets `gpg.ssh.allowedSignersFile`
+6. **Installs a `commit-msg` hook** that appends the `Signed-by-DID:` trailer.
+   Because `core.hooksPath` is a single slot, the hook directory it installs
+   also carries a delegating stub for every other standard hook, each of which
+   execs the repository's own `.git/hooks/<name>` — so hooks you already have,
+   and hooks you add later, keep running. `uninstall` removes the directory and
+   unsets `core.hooksPath`.
 
 ## Usage
 
@@ -169,25 +192,27 @@ in the keyring (i.e. you ran `init` for that persona); otherwise signing fails
 with a clear message rather than silently signing as a different persona.
 
 ```bash
-# One commit as a specific persona (move user.email with it — see below):
-DID_GIT_SIGN_KEY=did:webvh:abc:example.com#key-1 \
-  git -c user.email=did:webvh:abc:example.com#key-1 commit -m "…"
+# One commit as a specific persona:
+DID_GIT_SIGN_KEY=did:webvh:abc:example.com#key-1 git commit -m "…"
 
 # Pin a persona for this repository:
-git config did-git-sign.key   did:webvh:abc:example.com#key-1
-git config user.email         did:webvh:abc:example.com#key-1
+git config did-git-sign.key did:webvh:abc:example.com#key-1
 ```
 
-**The persona and the committer must agree.** The key selection above chooses
-what signs; `user.email` chooses what the commit *claims*. Naming different
-DIDs produces a commit that cannot verify — the claimed DID does not publish
-the key that signed — so signing refuses outright, naming both halves, rather
-than writing a commit that fails in CI as `unknownKey`.
+**One setting, so the persona and the claim cannot drift.** The `commit-msg`
+hook reads the same selector the signer does, in the same order —
+`DID_GIT_SIGN_KEY`, then `did-git-sign.key` — so whatever picks the key also
+writes the claim. This is why the second `user.email` line each example used to
+carry is gone: there is nothing left to keep in step by hand.
+
+Signing still refuses a commit whose claim and key disagree, naming both
+halves, rather than writing one that fails in CI as `unknownKey`. That now only
+happens if you write a `Signed-by-DID:` trailer yourself, or commit with the
+hook bypassed (`--no-verify`) in a repo whose `user.email` is a different DID.
 
 For contributors in more than one community, do not manage this per repository
 by hand: a `git config --local` you forget does not error, it signs as the
-wrong community. Use git's conditional includes, one file per community, with
-both settings together so they cannot drift:
+wrong community. Use git's conditional includes, one file per community:
 
 ```ini
 # ~/.gitconfig
@@ -197,8 +222,6 @@ both settings together so they cannot drift:
 
 ```ini
 # ~/.config/git/community-openvtc
-[user]
-    email = did:webvh:abc:example.com#key-0
 [did-git-sign]
     key = did:webvh:abc:example.com#key-0
 ```
