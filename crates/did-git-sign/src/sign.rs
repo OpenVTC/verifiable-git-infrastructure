@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Read;
 use std::path::Path;
-use vgi_core::{committer_did, committer_identity, create_ssh_signature};
+use vgi_core::create_ssh_signature;
 
 use crate::config::{self, SigningConfig};
 use crate::policy;
@@ -91,39 +91,63 @@ fn bare_did(did_key_id: &str) -> &str {
         .unwrap_or(did_key_id)
 }
 
-/// Refuse to sign a commit whose committer identity disagrees with the key
+/// Refuse to sign a commit whose signer identity disagrees with the key
 /// being used (R-G-3).
 ///
-/// Two settings choose an identity — `user.email`, which becomes the commit's
-/// claim, and the persona selection that picks the key — and when they name
-/// different DIDs the commit is born unverifiable. `verify-trust` would reject
-/// it as `unknownKey`: the claimed DID does not publish the key that signed.
-/// That is a correct verdict pointing at the wrong thing, arriving in CI, on a
+/// Two settings choose an identity — the DID the commit claims, and the
+/// persona selection that picks the key — and when they name different DIDs
+/// the commit is born unverifiable. `verify-trust` would reject it as
+/// `unknownKey`: the claimed DID does not publish the key that signed. That
+/// is a correct verdict pointing at the wrong thing, arriving in CI, on a
 /// commit already written. Catching it here turns a confusing remote failure
 /// into a local one that names both halves.
+///
+/// The claim is read the same way `verify-trust` reads it — [`signer_did`]:
+/// the `Signed-by-DID:` trailer first, then the committer email for legacy
+/// commits. At sign time the trailer may already be present (the commit-msg
+/// hook ran) or absent (no hook, legacy flow), so only a *conflicting* claim
+/// is refused.
 ///
 /// Only commit-shaped payloads are checked. A payload with no `committer`
 /// header (a tag, or a non-git namespace) carries no claim to disagree with.
 /// The comparison is on **bare DIDs**, matching what the verifier actually
-/// requires — signing with `#key-1` while the committer says `#key-0` verifies
+/// requires — signing with `#key-1` while the claim says `#key-0` verifies
 /// fine, since the check is that the DID publishes the key, not which one.
 fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
-    let Some(identity) = committer_identity(data) else {
-        return Ok(());
-    };
+    use vgi_core::{committer_identity, conflicting_signer_dids, signer_did};
+
     let signing_did = bare_did(did_key_id);
-    match committer_did(data) {
+
+    // Two explicit claims that disagree with each other. No key satisfies
+    // both, so there is no point asking which one matches ours —
+    // `verify-trust` fails the commit closed whichever key signs it.
+    if let Some((trailer, committer)) = conflicting_signer_dids(data) {
+        anyhow::bail!(
+            "did-git-sign: Signed-by-DID trailer claims '{trailer}' but committer claims \
+             '{committer}'. Remove one claim or make them match before signing."
+        );
+    }
+
+    match signer_did(data) {
         Some(claimed) if claimed == signing_did => Ok(()),
         Some(claimed) => anyhow::bail!(
-            "did-git-sign: this commit would claim '{claimed}' but is being signed with a key \
-             held by '{signing_did}' (selected via {source}). The commit would fail \
-             verification as unknownKey. Set user.email to a '{signing_did}' key id, or select \
-             the persona matching the committer."
+            "did-git-sign: this commit claims signer '{claimed}' but would be signed with a key \
+             held by '{signing_did}' (selected via {source}), so it would fail verification as \
+             unknownKey. Point the claim at the signing key — \
+             `git config did-git-sign.key '{did_key_id}'` for the Signed-by-DID trailer, or \
+             `git config user.email` for a legacy DID committer — or select the persona \
+             matching the claim."
         ),
+        // Tags and non-git namespaces carry no committer header, so there is
+        // no commit identity claim for this guard to compare.
+        None if committer_identity(data).is_none() => Ok(()),
+        // A committer exists but neither it nor a trailer names a DID: the
+        // commit-msg hook did not run.
         None => anyhow::bail!(
-            "did-git-sign: this commit's committer is <{identity}>, which is not a DID, so the \
-             commit would state no signer identity and fail verification as noSignerDid. Set \
-             user.email to '{did_key_id}' (git config user.email '{did_key_id}')."
+            "did-git-sign: no Signed-by-DID trailer and user.email is not a DID, so the commit \
+             would state no signer identity and fail verification as noSignerDid. Run \
+             'did-git-sign init' to install the commit-msg hook, or set user.email to \
+             '{did_key_id}'."
         ),
     }
 }
@@ -295,19 +319,79 @@ mod tests {
     }
 
     #[test]
-    fn a_non_did_committer_is_refused_before_signing() {
-        // Signing would succeed and the commit would fail CI as noSignerDid.
+    fn a_non_did_committer_without_trailer_is_refused() {
+        // No trailer and no DID in committer email = missing commit-msg hook.
         let commit = commit_committed_by("alice@example.com");
         let error =
             check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::ConfigFile)
                 .unwrap_err()
                 .to_string();
-
-        assert!(error.contains("noSignerDid"), "names the verdict: {error}");
         assert!(
-            error.contains("alice@example.com"),
-            "names the offending identity: {error}"
+            error.contains("noSignerDid"),
+            "must refuse when no DID claim exists: {error}"
         );
+    }
+
+    #[test]
+    fn trailer_matching_key_is_accepted() {
+        let commit = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <alice@example.com> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        assert!(
+            check_committer_matches_key(
+                commit.as_bytes(),
+                &format!("{SIGNER}#key-0"),
+                KeySource::ConfigFile
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn trailer_conflicting_with_key_is_refused() {
+        let commit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <alice@example.com> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: did:webvh:QmOther:other.example#key-0\n";
+        assert!(
+            check_committer_matches_key(
+                commit.as_bytes(),
+                &format!("{SIGNER}#key-0"),
+                KeySource::ConfigFile
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn conflicting_trailer_and_committer_dids_are_refused() {
+        let commit = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <did:webvh:QmOther:other.example#key-0> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        let error = check_committer_matches_key(
+            commit.as_bytes(),
+            &format!("{SIGNER}#key-0"),
+            KeySource::ConfigFile,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Signed-by-DID"), "names trailer: {error}");
+        assert!(error.contains("committer"), "names committer: {error}");
     }
 
     #[test]

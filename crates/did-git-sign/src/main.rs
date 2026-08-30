@@ -193,6 +193,9 @@ enum Commands {
         /// back to the DID claiming it. See `init --resolve-agent-names`.
         #[arg(long)]
         resolve_agent_names: bool,
+        /// Path to a did.jsonl file to verify the signing key against.
+        #[arg(long)]
+        did_jsonl: Option<std::path::PathBuf>,
     },
 
     /// Remove this host's did-git-sign install: deletes the JSON config,
@@ -295,7 +298,8 @@ async fn main() -> Result<()> {
         Some(Commands::Verify) => cmd_verify().await,
         Some(Commands::Health {
             resolve_agent_names,
-        }) => cmd_health(resolve_agent_names).await,
+            did_jsonl,
+        }) => cmd_health(resolve_agent_names, did_jsonl.as_deref()).await,
         Some(Commands::Uninstall {
             global,
             local,
@@ -727,7 +731,7 @@ async fn cmd_verify() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_health(resolve_agent_names: bool) -> Result<()> {
+async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Path>) -> Result<()> {
     let (config_path, cfg) = load_config()?;
 
     println!("did-git-sign health check");
@@ -823,6 +827,41 @@ async fn cmd_health(resolve_agent_names: bool) -> Result<()> {
                         "  {}",
                         init::allowed_signers_entry(&cfg, verifying_key.as_bytes())
                     );
+
+                    // Verify the local did.jsonl publishes this key (if provided).
+                    if let Some(path) = did_jsonl {
+                        println!();
+                        print!("DID doc check:   ");
+                        match check_key_in_did_log(path, verifying_key.as_bytes()) {
+                            Ok(true) => {
+                                println!("OK (key found in {})", path.display());
+                                let local_mb = multibase::encode(
+                                    multibase::Base::Base58Btc,
+                                    [
+                                        vgi_core::ED25519_MULTICODEC_PREFIX.as_slice(),
+                                        verifying_key.as_bytes(),
+                                    ]
+                                    .concat(),
+                                );
+                                println!("  publicKeyMultibase: {local_mb}");
+                            }
+                            Ok(false) => {
+                                println!("MISMATCH");
+                                println!("  {} does not contain the signing key.", path.display());
+                                let local_mb = multibase::encode(
+                                    multibase::Base::Base58Btc,
+                                    [
+                                        vgi_core::ED25519_MULTICODEC_PREFIX.as_slice(),
+                                        verifying_key.as_bytes(),
+                                    ]
+                                    .concat(),
+                                );
+                                println!("  Local key (multibase): {local_mb}");
+                                println!("  Re-export or re-run onboarding.");
+                            }
+                            Err(e) => println!("FAILED ({e})"),
+                        }
+                    }
                 }
                 Err(e) => {
                     println!("FAILED");
@@ -837,6 +876,29 @@ async fn cmd_health(resolve_agent_names: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check whether a local did.jsonl file publishes the given Ed25519 key.
+fn check_key_in_did_log(path: &std::path::Path, local_key: &[u8; 32]) -> Result<bool> {
+    use vgi_core::ed25519_keys_from_doc;
+
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+
+    // did.jsonl is JSONL — the DID document state is in the first line's "state" field.
+    let first_line = content.lines().next().context("empty did.jsonl")?;
+    let entry: serde_json::Value =
+        serde_json::from_str(first_line).context("invalid JSON in did.jsonl")?;
+    let state = entry
+        .get("state")
+        .context("no 'state' field in did.jsonl entry")?;
+
+    let published_keys = ed25519_keys_from_doc(state);
+    if published_keys.is_empty() {
+        anyhow::bail!("DID document has no Ed25519 keys");
+    }
+
+    Ok(published_keys.iter().any(|k| k == local_key))
 }
 
 fn cmd_uninstall(

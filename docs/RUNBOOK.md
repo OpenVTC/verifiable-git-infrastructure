@@ -68,26 +68,37 @@ authorise the setup session, press Enter, then pick the persona and signing
 key. It configures git:
 
 - `gpg.format = ssh`, `gpg.ssh.program = did-git-sign`, `commit.gpgsign = true`
-- **`user.email = <DID#key-id>`** — this is load-bearing. It is the only place
-  a commit states which identity signed it. A repo that overrides `user.email`
-  with an ordinary address will fail `noSignerDid` even with a valid signature.
+- **`did-git-sign.key = <DID#key-id>`** — this is load-bearing. It selects the
+  signing persona, and a `commit-msg` hook writes it into a `Signed-by-DID:`
+  trailer, which is the only place a commit states which identity signed it.
+- **`core.hooksPath`** — points at the directory holding that hook. The
+  directory also carries a delegating stub for every other standard hook, each
+  execing the repo's own `.git/hooks/<name>`, so existing hooks keep running.
+  `init` refuses to take `core.hooksPath` from a tool that already owns it
+  (husky, lefthook, pre-commit) rather than silently disabling it.
+
+`user.email` is deliberately left alone: it stays an ordinary address so GitHub
+and GitLab can attribute commits to the author's account. A commit that reaches
+CI with no `Signed-by-DID:` trailer and a non-DID `user.email` fails
+`noSignerDid` even with a valid signature — that means the hook did not run
+(`--no-verify`, or a `core.hooksPath` taken by something else).
 
 Use `--global` for all repositories, or plain `init` for one. Verify with
 `did-git-sign health` before the first push, not after the PR check fails.
 
-`--global` also sets `user.email` machine-wide. Fine for a contributor in one
-community; if they are in two, use §3a instead — `init` prints that alternative
-when run with `--global`.
+`--global` also sets `did-git-sign.key` and `core.hooksPath` machine-wide. Fine
+for a contributor in one community; if they are in two, use §3a instead — `init`
+prints that alternative when run with `--global`.
 
-`did-git-sign` refuses to sign a commit whose committer names a different DID
-than the key it is about to use, so a mismatch fails at `git commit` with both
-halves named rather than in CI as `unknownKey`.
+`did-git-sign` refuses to sign a commit whose DID claim differs from the key it
+is about to use, so a mismatch fails at `git commit` with both halves named
+rather than in CI as `unknownKey`.
 
 ## 3a. Contributors in more than one community
 
-Two settings pick an identity, and they must agree: `user.email` becomes the
-commit's claim, and the persona selection picks the key. `did-git-sign`
-resolves the key in this order —
+One setting picks the identity: it selects the key *and*, read by the
+`commit-msg` hook, becomes the commit's claim. `did-git-sign` and the hook
+resolve it in the same order —
 
 1. `DID_GIT_SIGN_KEY` (per-invocation),
 2. `did-git-sign.key` in git config (per-repo),
@@ -112,7 +123,7 @@ identity and the key selection together so they cannot drift:
 ```ini
 # ~/.config/git/community-openvtc
 [user]
-    email = did:webvh:QmAbc:openvtc.example#key-0
+    email = you@openvtc.example
     name  = Your Name
 [did-git-sign]
     key = did:webvh:QmAbc:openvtc.example#key-0
@@ -124,12 +135,12 @@ to clone it — and a throwaway clone outside your usual tree still gets the rig
 persona. Use `includeIf "gitdir:~/devel/openvtc/"` instead if your layout is
 authoritative and you prefer path matching.
 
-Keep `user.email` in the same file as `did-git-sign.key`. Splitting them is
-what lets them drift, and the pair is what the commit's verifiability rests on.
+`did-git-sign.key` is the whole of it — there is no second setting to keep in
+step, which is what used to drift. Set `user.name` and `user.email` however you
+like alongside it; they affect forge attribution, not verifiability.
 
-Reserve `DID_GIT_SIGN_KEY` for one-off overrides — and note that it moves the
-key without moving `user.email`, so the sign-time check will refuse unless you
-override both.
+`DID_GIT_SIGN_KEY` is fine for one-off overrides: the hook honours it too, so
+`DID_GIT_SIGN_KEY=… git commit` moves the key and the claim together.
 
 ## 4. Set up the repository
 
@@ -227,7 +238,8 @@ the remediation is unambiguous:
 | Verdict | Cause | Fix |
 |---|---|---|
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
-| `noSignerDid` | signed, committer is not a DID | `user.email` was overridden; re-run `init` |
+| `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool; check `did-git-sign health`, then re-run `init` |
+| `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
 | `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or publishes no Ed25519 method |
 | `unknownKey` | the claimed DID publishes no such key | signed by a key that identity does not hold |
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
