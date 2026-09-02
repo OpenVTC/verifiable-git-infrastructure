@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use vta_sdk::client::{AutoConnect, ConnectedVta, VtaClient};
+use vta_sdk::client::{AutoConnect, ClientIdentity, ConnectedVta, VtaClient};
 use zeroize::Zeroize;
 
 use crate::config::{self, SigningConfig, VtaCredentials};
@@ -27,7 +27,12 @@ pub async fn authenticate(cfg: &SigningConfig) -> Result<(VtaClient, VtaCredenti
     if creds.mediator_did.is_none()
         && let Some(token) = config::load_cached_token(&cfg.did_key_id)
     {
-        let client = VtaClient::new(&creds.vta_url);
+        let identity = ClientIdentity::did_key(
+            &creds.credential_did,
+            &creds.private_key_multibase,
+            &creds.vta_did,
+        );
+        let client = VtaClient::new(&creds.vta_url).with_identity(identity);
         client.set_token(token);
         return Ok((client, creds));
     }
