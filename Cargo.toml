@@ -49,9 +49,24 @@ vgi-core = { version = "0.4.7", path = "crates/vgi-core" }
 # on the PR path is affected (CI runs fmt/clippy/check/test only) — but do not
 # cut a release until the registry publishes and this goes back to a version.
 #
-# The check is the one this comment has always carried, and it now passes
-# unnarrowed again: `cargo tree -d -e normal,build` lists no trust-tasks-rs and
-# no vta-sdk, and `cargo tree -i vta-sdk` resolves a single node.
+# The check is the one this comment has always carried, and with the stack on
+# trust-tasks 0.18 it is back to the *narrowed* form rather than the unnarrowed
+# one: `cargo tree -i vta-sdk` still resolves a single node, but
+# `cargo tree -i trust-tasks-rs@0.17.3` now lists one parent chain and it must
+# be exactly this —
+#
+#     trust-tasks-rs v0.17.3
+#     └── trql-client v0.15.0 (git ...)
+#         └── verify-trust
+#
+# The residue is tolerable only because of where it lands: `verify-trust` sends
+# TRQP queries through trql-client's HTTPS transport and passes no trust-tasks
+# type across that boundary, and `did-git-sign` — the crate OpenVTC actually
+# consumes — has no trql-client edge at all, so the duplicate does not reach a
+# graph where a type has to unify. The test is not "is there a duplicate" but
+# "does it reach somewhere that has to unify", and the way to keep that honest
+# is to assert the single expected parent rather than to drop the check.
+# It goes away when the registry moves to 0.18 and publishes.
 trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", rev = "22bb9a33da6379e09027948e6c8118aeb1533754" }
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
@@ -94,6 +109,16 @@ trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", 
 # (`ClientIdentity` grew a `verification_method` member in 0.32 — VTI #1193 —
 # and nothing here names that type). The bump exists so the ceiling moves.
 #
+# 0.32 -> 0.34 is the sixth, and the same shape again: OpenVTC is moving to the
+# line VTI main deploys (vta-sdk 0.34, vta-service 0.24, trust-tasks 0.18, TDK
+# 0.12), and this requirement is the edge that decides whether its graph holds
+# one sdk or two. What 0.33/0.34 change is the shape of the wire bodies — VTI
+# #1270/#1271 made `AclEntry` and `AppStateWrite` `#[non_exhaustive]`, and
+# #1280 replaced `create_acl`'s positional arguments with `CreateAclParams` —
+# and this workspace names none of those types, so again the bump exists only so
+# the ceiling moves. `affinidi-tdk` goes to 0.12 in the same step because that
+# is what vta-sdk 0.34 declares.
+#
 # Same discipline as the trust-tasks pin below: the requirement follows what the
 # rest of the stack resolves, and `cargo tree -i vta-sdk` in a consumer is the
 # check that it worked — one row, not two.
@@ -101,8 +126,8 @@ trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", 
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.32", default-features = false }
-affinidi-tdk = "0.10"
+vta-sdk = { version = "0.34", default-features = false }
+affinidi-tdk = "0.12"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
