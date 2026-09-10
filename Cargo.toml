@@ -16,58 +16,53 @@ publish = true
 vgi-core = { version = "0.4.7", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
 #
-# Held at 0.11 for a long time, which built its task specs against
-# trust-tasks-rs 0.3 while the VTA stack pulled 0.4 and then 0.6 — three copies
-# in the tree at once. That was tolerated on the argument that the two never
-# meet (verify-trust only sends TRQP queries through trql-client's HTTPS
-# transport, and takes nothing but display names from vta-sdk), which was true
-# but relied on nobody ever passing a trust-tasks type across the boundary.
+# Held on a git `rev` for several releases while the registry workspace caught
+# up: 0.14.0 was the latest published crate and declared `trust-tasks-rs ^0.9`
+# against a stack that had moved to ^0.17, so taking it would have put two
+# copies of trust-tasks in the tree. The pin pointed at the head of
+# affinidi-trust-registry-rs#128 instead, which is the commit that cut 0.15.0.
 #
-# 0.13 built against trust-tasks-rs ^0.6 — the same line vta-sdk 0.24 resolved —
-# and 0.14 carried that single copy to 0.9. This requirement follows the trust
-# registry's published line for the same reason vta-sdk's does below.
+# That scaffolding is now retired: the registry has published through 0.16.0,
+# which declares `trust-tasks-rs ^0.18` — the same line vta-sdk 0.34 resolves —
+# so this is back to a plain version requirement, as the note it replaces said
+# it should be. `cargo publish` rejects git dependencies outright, so
+# `publish.yml` could not have got past the manifest on a `vX.Y.Z` tag while
+# the rev stood; that blocker is gone. It is not the only one —
+# `cargo publish --dry-run -p verify-trust` still fails because the published
+# `vgi-core` 0.4.7 predates `signer_did` / `conflicting_signer_dids` and the
+# packaged build resolves that dependency from crates.io, so vgi-core has to be
+# republished before the dependents can go out. That is a separate, older
+# problem, neither caused nor fixed here.
 #
-# The single copy did not survive the vta-sdk 0.27 move: 0.14.0 is still the
-# registry's latest *published* crate and it declares `trust-tasks-rs ^0.9`,
-# while vta-sdk 0.31 declares ^0.17, so taking 0.14 here would put 0.9.0 and
-# 0.17.3 in the tree together.
+# Held at 0.16 while vta-sdk goes to 0.35 below, which splits trust-tasks-rs:
+# 0.16 declares ^0.18 and vta-sdk 0.35 declares ^0.19.4. trql-client 0.17.0 is
+# the fix and is *merged but not yet published* — registry commit d99228a
+# ("take trust-tasks 0.19.4, tdk 0.13 and vta-sdk 0.35", #133) declares ^0.19.4
+# and collapses the tree back to one copy. It is deliberately not taken as a
+# git `rev`: that would undo the paragraph above and re-block publishing to buy
+# a duplicate that is already tolerable. Bump this to `"0.17"` the moment it
+# lands on crates.io — verified locally that the coupled move needs no source
+# change and is clippy/test green.
 #
-# affinidi-trust-registry-rs#128 is the move that restores the single copy — it
-# takes the whole registry workspace to trust-tasks 0.17, TDK 0.10 and vta-sdk
-# 0.31, the same line this workspace is on — and it is not released yet. So this
-# requirement points at that PR's head commit rather than at a crates.io version:
-# a released 0.14 that reintroduces the duplicate is the worse of the two, and
-# the branch is green on the registry's own pipeline (check, clippy, fmt, deny,
-# audit, tests).
+# Until then the check is the *narrowed* form, and it must be exactly this —
 #
-# Pinned by `rev`, never by `branch`: the branch is still being pushed to, and a
-# floating branch requirement would silently rebuild against whatever landed last.
-# Replace both `git` and `rev` with a plain `trql-client = "0.15"` the moment the
-# registry publishes it — that is the end state, and this is scaffolding until
-# then. Note the one thing this costs: `cargo publish` rejects git dependencies,
-# so `publish.yml` would fail on a `vX.Y.Z` tag while this line stands. Nothing
-# on the PR path is affected (CI runs fmt/clippy/check/test only) — but do not
-# cut a release until the registry publishes and this goes back to a version.
-#
-# The check is the one this comment has always carried, and with the stack on
-# trust-tasks 0.18 it is back to the *narrowed* form rather than the unnarrowed
-# one: `cargo tree -i vta-sdk` still resolves a single node, but
-# `cargo tree -i trust-tasks-rs@0.17.3` now lists one parent chain and it must
-# be exactly this —
-#
-#     trust-tasks-rs v0.17.3
-#     └── trql-client v0.15.0 (git ...)
+#     trust-tasks-rs v0.18.11
+#     └── trql-client v0.16.0
 #         └── verify-trust
 #
-# The residue is tolerable only because of where it lands: `verify-trust` sends
-# TRQP queries through trql-client's HTTPS transport and passes no trust-tasks
-# type across that boundary, and `did-git-sign` — the crate OpenVTC actually
-# consumes — has no trql-client edge at all, so the duplicate does not reach a
-# graph where a type has to unify. The test is not "is there a duplicate" but
-# "does it reach somewhere that has to unify", and the way to keep that honest
-# is to assert the single expected parent rather than to drop the check.
-# It goes away when the registry moves to 0.18 and publishes.
-trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", rev = "22bb9a33da6379e09027948e6c8118aeb1533754" }
+# with every other consumer on 0.19.4. The residue is tolerable only because of
+# where it lands: verify-trust sends TRQP queries through trql-client's HTTPS
+# transport and passes no trust-tasks type across that boundary, and
+# did-git-sign — the crate OpenVTC consumes — has no trql-client edge at all
+# (`cargo tree -p did-git-sign | grep -c trql` is 0), so the duplicate never
+# reaches a graph where a type has to unify. The test is not "is there a
+# duplicate" but "does it reach somewhere that has to unify", so assert the
+# single expected parent rather than dropping the check.
+#
+# 0.16.0 also drops the AWS SDK's legacy hyper-0.14 client from the registry's
+# graph, and with it the h2 0.3 / rustls 0.21 advisories that workspace had
+# been suppressing.
+trql-client = "0.16"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -119,15 +114,34 @@ trql-client = { git = "https://github.com/affinidi/affinidi-trust-registry-rs", 
 # the ceiling moves. `affinidi-tdk` goes to 0.12 in the same step because that
 # is what vta-sdk 0.34 declares.
 #
-# Same discipline as the trust-tasks pin below: the requirement follows what the
-# rest of the stack resolves, and `cargo tree -i vta-sdk` in a consumer is the
-# check that it worked — one row, not two.
+# 0.34 -> 0.35 is the seventh, and it is the one place this comment's rule is
+# knowingly broken: it *leads* the consumer rather than following it. VTI main
+# is already on this line (tdk 0.13, trust-tasks 0.19.4) but OpenVTC main is
+# still on vta-sdk 0.34.1 / tdk 0.12 / trust-tasks 0.18.5 with no branch in
+# flight, so until it moves, a build that takes both this crate and vta-sdk
+# directly resolves 0.34.1 and 0.35.0 together — and `vti-common` re-exports
+# `vta_sdk::acl::{ActScope, ApproveScope, ContextDirection}` as its own public
+# API, so those two copies carry types that cannot unify.
+#
+# That was accepted deliberately (2026-09-10) to get this workspace onto the
+# published head, with OpenVTC to be moved separately. It is a temporary,
+# *known* break, not a new licence to lead: the standing obligation is still
+# that this requirement follows, and the debt is only discharged when OpenVTC
+# takes vta-sdk 0.35. Nothing here needs 0.35 — this crate reaches the VTA
+# through `connect_auto` and takes display names — so as before the bump exists
+# only so the ceiling moves. `affinidi-tdk` goes to 0.13 in the same step
+# because that is what vta-sdk 0.35 declares.
+#
+# Same discipline as the trql-client requirement above, and the same check —
+# `cargo tree -i vta-sdk` resolving a single node, here *and* in OpenVTC, which
+# is where the duplicate actually lands. It is one row here today; it will be
+# two in OpenVTC until that move happens, and that is the thing to fix next.
 #
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.34", default-features = false }
-affinidi-tdk = "0.12"
+vta-sdk = { version = "0.35", default-features = false }
+affinidi-tdk = "0.13"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
