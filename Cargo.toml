@@ -3,7 +3,7 @@ members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -13,7 +13,7 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.4.7", path = "crates/vgi-core" }
+vgi-core = { version = "0.4.8", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -27,12 +27,13 @@ vgi-core = { version = "0.4.7", path = "crates/vgi-core" }
 # so this is back to a plain version requirement, as the note it replaces said
 # it should be. `cargo publish` rejects git dependencies outright, so
 # `publish.yml` could not have got past the manifest on a `vX.Y.Z` tag while
-# the rev stood; that blocker is gone. It is not the only one —
-# `cargo publish --dry-run -p verify-trust` still fails because the published
-# `vgi-core` 0.4.7 predates `signer_did` / `conflicting_signer_dids` and the
-# packaged build resolves that dependency from crates.io, so vgi-core has to be
-# republished before the dependents can go out. That is a separate, older
-# problem, neither caused nor fixed here.
+# the rev stood; that blocker is gone. It was not the only one: the partial
+# v0.4.7 release had left `vgi-core` 0.4.7 on crates.io with content predating
+# `signer_did` / `conflicting_signer_dids`, against `verify-trust` and
+# `did-git-sign` still at 0.4.6 — and since `publish.yml` skips any crate
+# already published at the workspace version, a second `v0.4.7` tag would have
+# skipped vgi-core and built its dependents against that stale copy. Hence the
+# 0.4.8 bump: the version is the thing that makes vgi-core republish.
 #
 # 0.17.0 closes the last of that: it is the registry's release of commit
 # d99228a ("take trust-tasks 0.19.4, tdk 0.13 and vta-sdk 0.35", #133), so it
