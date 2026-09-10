@@ -347,7 +347,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "trust-tasks-rs 0.19.4",
+ "trust-tasks-rs",
  "uuid",
 ]
 
@@ -5364,9 +5364,9 @@ dependencies = [
 
 [[package]]
 name = "trql-client"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec2246171907d3833b2889bc7d049e2a11e61a2419b8a77da2baa42dd9fc84"
+checksum = "c8e5b4684bf6a22f92fb3dce054768d106716a0f56c4e683956594eb6383e3ac"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5375,22 +5375,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "trust-tasks-rs 0.18.11",
-]
-
-[[package]]
-name = "trust-tasks-rs"
-version = "0.18.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3b18725200227aa173e4c7b6b89450bf6d42ab4add65caf510464378f196356"
-dependencies = [
- "async-trait",
- "chrono",
- "regress",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror",
+ "trust-tasks-rs",
 ]
 
 [[package]]
@@ -5661,7 +5646,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.19.4",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",
