@@ -34,35 +34,29 @@ vgi-core = { version = "0.4.7", path = "crates/vgi-core" }
 # republished before the dependents can go out. That is a separate, older
 # problem, neither caused nor fixed here.
 #
-# Held at 0.16 while vta-sdk goes to 0.35 below, which splits trust-tasks-rs:
-# 0.16 declares ^0.18 and vta-sdk 0.35 declares ^0.19.4. trql-client 0.17.0 is
-# the fix and is *merged but not yet published* — registry commit d99228a
-# ("take trust-tasks 0.19.4, tdk 0.13 and vta-sdk 0.35", #133) declares ^0.19.4
-# and collapses the tree back to one copy. It is deliberately not taken as a
-# git `rev`: that would undo the paragraph above and re-block publishing to buy
-# a duplicate that is already tolerable. Bump this to `"0.17"` the moment it
-# lands on crates.io — verified locally that the coupled move needs no source
-# change and is clippy/test green.
+# 0.17.0 closes the last of that: it is the registry's release of commit
+# d99228a ("take trust-tasks 0.19.4, tdk 0.13 and vta-sdk 0.35", #133), so it
+# declares `trust-tasks-rs ^0.19.4` — the same line vta-sdk 0.35 resolves.
+# 0.16 briefly sat one line behind while vta-sdk went to 0.35, which split
+# trust-tasks into 0.18.11 (through trql-client) and 0.19.4 (everything else);
+# that gap is closed and `cargo tree -i trust-tasks-rs` resolves a single node
+# again. It was held at 0.16 rather than taken as a git `rev` in the meantime,
+# because a rev would have re-blocked publishing to buy a duplicate that was
+# already tolerable — the wait was the cheaper side of that trade.
 #
-# Until then the check is the *narrowed* form, and it must be exactly this —
+# The check when this moves is that single node, and it is the strict form:
+# one `trust-tasks-rs` row, not an expected parent chain for a second copy.
+# The weaker form was only ever justified by where the residue landed
+# (verify-trust sends TRQP queries through trql-client's HTTPS transport and
+# passes no trust-tasks type across that boundary, and did-git-sign — the crate
+# OpenVTC consumes — has no trql-client edge at all). Prefer the strict form
+# while it holds: if a bump here or in vta-sdk splits trust-tasks again, that
+# is a decision to make deliberately, not to discover later in a consumer.
 #
-#     trust-tasks-rs v0.18.11
-#     └── trql-client v0.16.0
-#         └── verify-trust
-#
-# with every other consumer on 0.19.4. The residue is tolerable only because of
-# where it lands: verify-trust sends TRQP queries through trql-client's HTTPS
-# transport and passes no trust-tasks type across that boundary, and
-# did-git-sign — the crate OpenVTC consumes — has no trql-client edge at all
-# (`cargo tree -p did-git-sign | grep -c trql` is 0), so the duplicate never
-# reaches a graph where a type has to unify. The test is not "is there a
-# duplicate" but "does it reach somewhere that has to unify", so assert the
-# single expected parent rather than dropping the check.
-#
-# 0.16.0 also drops the AWS SDK's legacy hyper-0.14 client from the registry's
+# 0.16.0 dropped the AWS SDK's legacy hyper-0.14 client from the registry's
 # graph, and with it the h2 0.3 / rustls 0.21 advisories that workspace had
 # been suppressing.
-trql-client = "0.16"
+trql-client = "0.17"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
