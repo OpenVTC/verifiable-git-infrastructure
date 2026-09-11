@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Workflow and composite-action `uses:` refs are pinned to commit SHAs;
+  # Dependabot moves the SHA and its version comment together.
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/verify-trust"
+    schedule:
+      interval: weekly
+    # Wait a week before proposing a new release, so a hijacked or re-pointed
+    # tag has time to be noticed. Security updates are not delayed.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"

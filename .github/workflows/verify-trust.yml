@@ -8,6 +8,10 @@ name: verify-trust
 on:
   pull_request:
 
+# Reads the repository and downloads a public release; writes nothing.
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: Verify commit trust
@@ -16,10 +20,11 @@ jobs:
     if: vars.TRUST_REGISTRY_DID != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Need the base ref present so `origin/<base>..HEAD` resolves.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: verify-trust
         uses: ./.github/actions/verify-trust

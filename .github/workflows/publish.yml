@@ -11,8 +11,22 @@ name: Publish
 # the release binaries, so running in parallel with release.yml is fine.
 #
 # Auth is crates.io Trusted Publishing (OIDC) — no long-lived token. Setup per
-# crate on crates.io: add this repo + this workflow (`publish.yml`) as a
-# Trusted Publisher for `vgi-core`, `verify-trust`, and `did-git-sign`.
+# crate on crates.io: add this repo + this workflow (`publish.yml`) + the
+# `crates-io` environment as a Trusted Publisher for `vgi-core`,
+# `verify-trust`, and `did-git-sign`.
+#
+# Two jobs, so dependency code never runs next to the publishing credential:
+#
+#   - `package` builds and verifies every crate tarball (`cargo package`
+#     compiles each one, running every dependency's build script). It has a
+#     read-only token and no OIDC permission.
+#   - `publish` runs only after `package` succeeds, only for a tag, and only
+#     inside the `crates-io` environment. It holds the OIDC permission and
+#     uploads with `--no-verify`, so it compiles nothing.
+#
+# A manual dispatch on a branch therefore packages and verifies without
+# publishing. A dispatch on a `v*` tag publishes that tag, which is how a
+# partial publish is retried.
 #
 # The run is resumable: each crate already on crates.io at the workspace version
 # is skipped rather than re-published. Publishing is not atomic across three
@@ -27,23 +41,52 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # OIDC token for crates.io Trusted Publishing
   contents: read
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  package:
+    name: Package and verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
 
+      # Packages all three crates and compiles each from its tarball. cargo
+      # resolves the workspace's own crates from the local packages, so this
+      # works before vgi-core's new version is on crates.io.
+      - name: Package and verify all crates
+        run: cargo package --workspace --locked
+
+  publish:
+    name: Publish to crates.io
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # OIDC token for crates.io Trusted Publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Authenticate to crates.io
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
       - name: Publish in dependency order
@@ -91,7 +134,10 @@ jobs:
               continue
             fi
 
+            # The `package` job already compiled this exact commit's tarballs;
+            # skipping verification here keeps build scripts out of the job
+            # that holds the token.
             echo "::group::publish ${crate} ${version}"
-            cargo publish -p "${crate}" --locked
+            cargo publish -p "${crate}" --locked --no-verify
             echo "::endgroup::"
           done
