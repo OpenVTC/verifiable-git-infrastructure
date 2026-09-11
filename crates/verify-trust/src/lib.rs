@@ -728,8 +728,18 @@ fn status_of(signature: SignatureCheck, decisions: &RegistryDecisions) -> Commit
 // --- git plumbing --------------------------------------------------------------
 
 /// List the commits in `range`, oldest first.
+///
+/// `range` is caller-supplied (a CI input), so it must never reach git as an
+/// option: a leading `-` is rejected outright, and `--end-of-options` (git
+/// 2.24+) makes git itself treat whatever follows as a revision.
 pub fn list_commits(repo_dir: &Path, range: &str) -> Result<Vec<String>> {
-    let output = git(repo_dir, &["rev-list", "--reverse", range])?;
+    if range.starts_with('-') {
+        bail!("--range must be a revision range, not an option: {range:?}");
+    }
+    let output = git(
+        repo_dir,
+        &["rev-list", "--reverse", "--end-of-options", range],
+    )?;
     Ok(output.lines().map(str::to_string).collect())
 }
 

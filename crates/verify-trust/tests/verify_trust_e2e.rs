@@ -13,8 +13,8 @@ use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use verify_trust::{
-    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, pgp_exempt::ExemptKeyring,
-    read_range, verify_prepared,
+    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, list_commits,
+    pgp_exempt::ExemptKeyring, read_range, verify_prepared,
 };
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
@@ -702,6 +702,35 @@ async fn denied_at_both_scopes_is_unauthorized() {
         report.commits[0].status,
         CommitStatus::Unauthorized { .. }
     ));
+}
+
+// --- range handling ---------------------------------------------------------------
+
+#[test]
+fn a_range_that_is_a_git_option_is_rejected_before_git_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let key = SigningKey::from_bytes(&[42u8; 32]);
+    let (base, signed) = repo_with_signed_commit(repo, &key);
+
+    // `--range` is a CI input. Handed to `git rev-list` as an option it
+    // would write (or truncate) a file of the caller's choosing.
+    let target = repo.join("x");
+    let err = list_commits(repo, &format!("--output={}", target.display()))
+        .expect_err("an option-shaped range must be refused");
+    assert!(
+        err.to_string().contains("not an option"),
+        "unexpected error: {err:#}"
+    );
+    assert!(!target.exists(), "git ran with the range as an option");
+    assert!(read_range(repo, "-n1").is_err());
+
+    // An ordinary range still lists its commits.
+    assert_eq!(
+        list_commits(repo, &format!("{base}..main")).unwrap(),
+        vec![signed.clone()]
+    );
+    assert_eq!(list_commits(repo, "main").unwrap(), vec![base, signed]);
 }
 
 // --- committed platform keyring --------------------------------------------------

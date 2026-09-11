@@ -92,29 +92,51 @@ runs:
 
     - name: Run verify-trust
       shell: bash
+      # Every input reaches the script through the environment, never through
+      # `${{ }}` in the script body: an expression there is pasted into the
+      # script as text before bash parses it. Referenced as quoted variables,
+      # the values stay data, whatever they contain.
+      env:
+        VT_RANGE: ${{ inputs.range }}
+        VT_REGISTRY_DID: ${{ inputs.registry-did }}
+        VT_VTC_DID: ${{ inputs.vtc-did }}
+        VT_ACTION: ${{ inputs.action }}
+        VT_RESOURCE: ${{ inputs.resource }}
+        VT_MAX_SIGNERS: ${{ inputs.max-signers }}
+        VT_REGISTRY_URL: ${{ inputs.registry-url }}
+        VT_FALLBACK_RESOURCE: ${{ inputs.fallback-resource }}
+        VT_EXEMPT_KEYRING: ${{ inputs.exempt-keyring }}
+        VT_RESOLVE_AGENT_NAMES: ${{ inputs.resolve-agent-names }}
+        VT_JSON: ${{ inputs.json }}
       run: |
         set -euo pipefail
+        case "$VT_MAX_SIGNERS" in
+          ''|*[!0-9]*) echo "::error::verify-trust: max-signers must be a non-negative integer"; exit 1 ;;
+        esac
+        case "$VT_RANGE" in
+          -*) echo "::error::verify-trust: range must be a revision range, not an option"; exit 1 ;;
+        esac
         args=(
-          --range "${{ inputs.range }}"
-          --registry-did "${{ inputs.registry-did }}"
-          --vtc-did "${{ inputs.vtc-did }}"
-          --action "${{ inputs.action }}"
-          --resource "${{ inputs.resource }}"
-          --max-signers "${{ inputs.max-signers }}"
+          --range "$VT_RANGE"
+          --registry-did "$VT_REGISTRY_DID"
+          --vtc-did "$VT_VTC_DID"
+          --action "$VT_ACTION"
+          --resource "$VT_RESOURCE"
+          --max-signers "$VT_MAX_SIGNERS"
         )
-        if [ -n "${{ inputs.registry-url }}" ]; then
-          args+=(--registry-url "${{ inputs.registry-url }}")
+        if [ -n "$VT_REGISTRY_URL" ]; then
+          args+=(--registry-url "$VT_REGISTRY_URL")
         fi
-        if [ -n "${{ inputs.fallback-resource }}" ]; then
-          args+=(--fallback-resource "${{ inputs.fallback-resource }}")
+        if [ -n "$VT_FALLBACK_RESOURCE" ]; then
+          args+=(--fallback-resource "$VT_FALLBACK_RESOURCE")
         fi
-        if [ -n "${{ inputs.exempt-keyring }}" ]; then
-          args+=(--exempt-keyring "${{ inputs.exempt-keyring }}")
+        if [ -n "$VT_EXEMPT_KEYRING" ]; then
+          args+=(--exempt-keyring "$VT_EXEMPT_KEYRING")
         fi
-        if [ "${{ inputs.resolve-agent-names }}" = "true" ]; then
+        if [ "$VT_RESOLVE_AGENT_NAMES" = "true" ]; then
           args+=(--resolve-agent-names)
         fi
-        if [ "${{ inputs.json }}" = "true" ]; then
+        if [ "$VT_JSON" = "true" ]; then
           args+=(--json)
         fi
         verify-trust "${args[@]}"

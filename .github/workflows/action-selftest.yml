@@ -1,0 +1,61 @@
+name: action-selftest
+
+# Regression check for the published composite action: its inputs are data,
+# never script. Each input below carries shell syntax that would create a
+# marker file if the action ever pasted an input into its `run:` script again.
+# The action is expected to fail (the DIDs and range are dummies); what must
+# not happen is the marker appearing.
+#
+# Needs no secrets. The action's install step downloads a pinned VGI release
+# with the job's read-only GITHUB_TOKEN; the dummy range makes verify-trust
+# exit at `git rev-list`, before any DID resolution or registry query.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  inputs-are-not-script:
+    name: Action inputs are not executed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the action with shell syntax in its inputs
+        id: action
+        continue-on-error: true
+        uses: ./.github/actions/verify-trust
+        with:
+          range: '$(touch "$RUNNER_TEMP/sec4045_pwned")'
+          registry-did: 'did:example:registry`touch "$RUNNER_TEMP/sec4045_pwned"`'
+          vtc-did: did:example:vtc
+          registry-url: 'http://127.0.0.1:9/$(touch "$RUNNER_TEMP/sec4045_pwned")'
+          fallback-resource: '"; touch "$RUNNER_TEMP/sec4045_pwned"; echo "'
+          # Pinned, not `latest`: the check is about the action's shell, so it
+          # should not move when a release is cut.
+          version: v0.4.8
+
+      - name: Assert no input was executed
+        env:
+          ACTION_OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          set -euo pipefail
+          # The install step puts verify-trust on PATH only when it completed,
+          # and the run step follows it unconditionally. Without this, a failed
+          # download would skip the run step and pass the check vacuously.
+          if ! command -v verify-trust >/dev/null 2>&1; then
+            echo "::error::verify-trust was not installed, so the run step never executed"
+            exit 1
+          fi
+          if [ "$ACTION_OUTCOME" != "failure" ]; then
+            echo "::error::expected the action to fail on dummy inputs, got: $ACTION_OUTCOME"
+            exit 1
+          fi
+          if [ -e "$RUNNER_TEMP/sec4045_pwned" ]; then
+            echo "::error::an action input was executed as shell"
+            exit 1
+          fi
+          echo "No action input was executed."
