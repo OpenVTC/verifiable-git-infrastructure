@@ -20,6 +20,12 @@ path = "src/lib.rs"
 name = "did-git-sign"
 path = "src/main.rs"
 
+[features]
+# Test-only: lets DID_GIT_SIGN_BYPASS_POLICY skip the parent-process check.
+# Never enable it in a published or released build; with it on, a build
+# without debug assertions (any release profile) fails to compile.
+insecure-policy-bypass = []
+
 [dependencies]
 # Shared sshsig codec (create_ssh_signature) — kept in lockstep with the verifier.
 vgi-core = { workspace = true }

@@ -1,24 +1,51 @@
-//! Signing-policy enforcement for `did-git-sign`.
+//! Signing-policy gate for `did-git-sign`.
 //!
-//! Without a policy gate the binary will sign arbitrary content for any
-//! local process that can execute it. A malicious build script (npm,
-//! cargo, pip…) that runs under the user's account could obtain Ed25519
-//! signatures with namespace `git` over attacker-chosen data, which can
-//! be used to forge "verified" git commits attributable to the user.
+//! # What the gate does
 //!
-//! The policy here raises the bar:
+//! 1. Signing is refused unless the parent process is git (`git`, or one of
+//!    git's `git-*` subcommand binaries) or `ssh-keygen`. The name is matched
+//!    whole; see [`parent_is_allowed`].
+//! 2. Every signing attempt, allowed or refused, is appended to an audit log
+//!    under the user's config directory.
 //!
-//! 1. The parent process must look like git (`git`, `git-*`, or
-//!    `ssh-keygen` for the verify path). Override with
-//!    `DID_GIT_SIGN_BYPASS_POLICY=1` for tests/CI.
-//! 2. Every signing attempt — accepted or denied — is recorded in an
-//!    append-only audit log under the user's config dir. The user can
-//!    inspect this to detect unexpected activity post-compromise.
+//! This stops **accidental and naive use**: the binary wired up as an SSH
+//! signing program for something other than git, or a script that runs
+//! `did-git-sign -Y sign` directly. The audit log gives an honest user a local
+//! record of what was signed to review.
+//!
+//! # What the gate does not do
+//!
+//! It is **not a boundary against code running as your user**, and no check of
+//! the parent process can be. Code with your uid can:
+//!
+//! - run real `git` with `did-git-sign` as its signing program. The parent is
+//!   then genuinely git, so a check on its name, path or code signature passes,
+//!   and git signs whatever commit object that code asks it to;
+//! - read the VTA credential from the OS keyring and talk to the VTA itself,
+//!   without running this binary at all;
+//! - edit or truncate the audit log, which is an ordinary file the user owns.
+//!
+//! The signing key is protected by the VTA credential in your OS keyring and by
+//! the access the VTA grants that credential, not by this module. Treat the
+//! audit log as a convenience, not as tamper-evident evidence.
 //!
 //! Path-based heuristics on the buffer file aren't enforced because
 //! git's buffer files live in `$TMPDIR` with random names; trying to
-//! pattern-match them produces false positives without meaningfully
-//! constraining a determined attacker (who can spawn `git` themselves).
+//! pattern-match them produces false positives without constraining
+//! anyone who can spawn `git` themselves.
+//!
+//! # Test builds
+//!
+//! The non-default `insecure-policy-bypass` feature lets an environment
+//! variable skip the parent check, for tests that cannot run under git. It is
+//! compiled out of normal builds, and enabling it without `debug_assertions`
+//! (for example in a release profile) is a compile error.
+
+#[cfg(all(feature = "insecure-policy-bypass", not(debug_assertions)))]
+compile_error!(
+    "the did-git-sign `insecure-policy-bypass` feature is for debug test builds only \
+     and must not be enabled in a release build"
+);
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -26,8 +53,10 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use sysinfo::{Pid, System};
 
-/// Bypass switch for tests/CI. Set this in the environment to skip the
-/// parent-process check; the audit log still records every attempt.
+/// Test-only switch that skips the parent-process check. It exists only when
+/// the `insecure-policy-bypass` feature is enabled, so a normal build neither
+/// reads nor contains it.
+#[cfg(feature = "insecure-policy-bypass")]
 const BYPASS_ENV: &str = "DID_GIT_SIGN_BYPASS_POLICY";
 
 /// Names whose presence as the parent process causes the policy to
@@ -46,14 +75,50 @@ const ALLOWED_PARENTS: &[&str] = &["git", "ssh-keygen"];
 /// `git-<name>` binaries, and a `.exe` suffix is stripped so the rule holds on
 /// Windows, where the parent reports as `git.exe`.
 ///
-/// This remains defence in depth, not a boundary: as the module docs note, an
-/// attacker who can execute code as the user can spawn real `git` and satisfy
-/// any parent check. Tightening it removes the free pass, not the attack.
+/// This is an accident guard, not a boundary: as the module docs note, code
+/// running as the user can spawn real `git` and satisfy any parent check.
+/// Tightening it removed a free pass, not the attack.
 fn parent_is_allowed(name: &str) -> bool {
     let token = name.strip_suffix(".exe").unwrap_or(name);
     ALLOWED_PARENTS
         .iter()
         .any(|allowed| token == *allowed || (*allowed == "git" && token.starts_with("git-")))
+}
+
+/// The gate's decision, as a pure function of its inputs.
+///
+/// `parent` is the parent process name as the OS reports it. Its first
+/// whitespace-separated word is compared, case-insensitively, by
+/// [`parent_is_allowed`]. An unknown parent is refused.
+fn decide(bypass: bool, parent: Option<&str>) -> bool {
+    bypass
+        || parent
+            .and_then(|name| name.split_whitespace().next())
+            .is_some_and(|token| parent_is_allowed(&token.to_lowercase()))
+}
+
+/// Whether this invocation asked to skip the parent check.
+///
+/// Always `false` unless the crate was built with the `insecure-policy-bypass`
+/// feature. With it, a bypass is announced on stderr every time it is used, so
+/// it cannot go unnoticed in a test log.
+fn bypass_requested() -> bool {
+    #[cfg(feature = "insecure-policy-bypass")]
+    {
+        let on =
+            std::env::var(BYPASS_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if on {
+            eprintln!(
+                "did-git-sign: WARNING — {BYPASS_ENV} is set; the parent-process check was \
+                 skipped (test build with the insecure-policy-bypass feature)."
+            );
+        }
+        on
+    }
+    #[cfg(not(feature = "insecure-policy-bypass"))]
+    {
+        false
+    }
 }
 
 /// One audit-log line.
@@ -67,6 +132,9 @@ pub struct AuditEntry {
     pub namespace: String,
     pub buffer_path: Option<String>,
     pub buffer_sha256: String,
+    /// Whether the parent check was skipped. Only a test build with the
+    /// `insecure-policy-bypass` feature can set this; the field is kept so the
+    /// log format does not change.
     pub bypass: bool,
 }
 
@@ -78,15 +146,9 @@ pub fn evaluate(
     buffer_path: Option<&std::path::Path>,
     buffer: &[u8],
 ) -> AuditEntry {
-    let bypass =
-        std::env::var(BYPASS_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let bypass = bypass_requested();
     let (parent_pid, parent_name) = parent_process_info();
-    let parent_token = parent_name
-        .as_deref()
-        .and_then(|n| n.split_whitespace().next())
-        .map(|s| s.to_lowercase());
-    let parent_ok = parent_token.as_deref().is_some_and(parent_is_allowed);
-    let allowed = bypass || parent_ok;
+    let allowed = decide(bypass, parent_name.as_deref());
 
     let mut hasher = Sha256::new();
     hasher.update(buffer);
@@ -243,11 +305,46 @@ mod tests {
     }
 
     #[test]
+    fn git_parents_are_allowed_whatever_the_os_reports() {
+        for parent in [
+            "git",
+            "Git.EXE",
+            "git-remote-https",
+            "ssh-keygen",
+            "git --no-pager",
+        ] {
+            assert!(decide(false, Some(parent)), "{parent:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn other_or_unknown_parents_are_refused() {
+        for parent in [Some("cargo"), Some("gitleaks"), Some(""), Some("  "), None] {
+            assert!(!decide(false, parent), "{parent:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_bypass_is_the_only_thing_that_admits_an_unknown_parent() {
+        assert!(decide(true, Some("cargo")));
+        assert!(decide(true, None));
+    }
+
+    /// Without the feature, the gate cannot be told to skip the parent check.
+    /// `bypass_requested` does not read the environment at all, so this needs
+    /// no env mutation; `tests/policy_bypass.rs` covers the set-variable case.
+    #[test]
+    #[cfg(not(feature = "insecure-policy-bypass"))]
+    fn normal_builds_never_request_a_bypass() {
+        assert!(!bypass_requested());
+    }
+
+    #[test]
+    #[cfg(feature = "insecure-policy-bypass")]
+    #[serial_test::serial]
     fn evaluate_bypass_env_allows_unknown_parent() {
-        // Run in a child process so we can mutate env without races.
-        // unsafe is required because env mutation is not thread-safe; this
-        // test is single-threaded by virtue of being the only one touching
-        // the env var in the suite.
+        // unsafe is required because env mutation is not thread-safe; the
+        // serial attribute keeps it apart from the other env-touching tests.
         unsafe { std::env::set_var(BYPASS_ENV, "1") };
         let entry = evaluate("git", None, b"x");
         unsafe { std::env::remove_var(BYPASS_ENV) };

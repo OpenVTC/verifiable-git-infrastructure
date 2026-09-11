@@ -2,11 +2,29 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Read;
 use std::path::Path;
-use vgi_core::create_ssh_signature;
+use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
 use crate::config::{self, SigningConfig};
 use crate::policy;
 use crate::vta;
+
+/// Refuse to sign in any sshsig namespace other than `git`.
+///
+/// git signs commits, tags and push certificates in the `git` namespace, and
+/// that is the only use the persona key is provisioned for. Without this, the
+/// same key would sign for `file`, `email` or any other namespace a caller
+/// passes with `-n`. This is friction against misuse through this binary, not
+/// a boundary: see the security model in [`crate::policy`].
+fn check_namespace(namespace: &str) -> Result<()> {
+    if namespace == GIT_SSHSIG_NAMESPACE {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "did-git-sign: refusing to sign in sshsig namespace {namespace:?}. did-git-sign only \
+         signs git objects, in the {GIT_SSHSIG_NAMESPACE:?} namespace; use ssh-keygen with a \
+         separate key for other namespaces."
+    )
+}
 
 /// Environment variable that selects which persona signs (R-G-1), as a
 /// per-invocation override. Its value is the persona's `did:webvh:…#key-N`.
@@ -162,6 +180,10 @@ pub async fn handle_sign(
     namespace: &str,
     sign_file: Option<&Path>,
 ) -> Result<()> {
+    // Checked before anything is read, so a refused namespace touches neither
+    // the buffer nor the VTA.
+    check_namespace(namespace)?;
+
     // Read data to sign from the file argument (git passes the buffer file path)
     // or fall back to stdin for compatibility.
     let data = if let Some(path) = sign_file {
@@ -175,16 +197,15 @@ pub async fn handle_sign(
         buf
     };
 
-    // Policy gate: parent process must look like git, audit every attempt.
-    // The audit log is append-only and records both accepted and denied
-    // signing attempts so a user can detect anomalous activity after a
-    // local-account compromise.
+    // Policy gate: parent process must be git, audit every attempt. This
+    // guards against accidental and naive use, not against code running as
+    // the user; see the module docs of `policy`.
     let decision = policy::evaluate(namespace, sign_file, &data);
     policy::write_audit(&decision);
     if !decision.allowed {
         anyhow::bail!(
-            "did-git-sign: signing refused by policy (parent process {:?} not in allow-list; \
-             set DID_GIT_SIGN_BYPASS_POLICY=1 to override). \
+            "did-git-sign: signing refused by policy (parent process {:?} is not git). \
+             did-git-sign signs only when git runs it as gpg.ssh.program. \
              Attempt recorded in {}.",
             decision.parent_name.as_deref().unwrap_or("<unknown>"),
             policy::audit_log_path()
@@ -445,6 +466,34 @@ mod tests {
             KeySource::GitConfig
                 .to_string()
                 .contains("did-git-sign.key")
+        );
+    }
+
+    #[test]
+    fn only_the_git_namespace_may_sign() {
+        assert!(check_namespace("git").is_ok());
+        for namespace in ["file", "email", "", "Git", "git ", "git\0"] {
+            let error = check_namespace(namespace).unwrap_err().to_string();
+            assert!(
+                error.contains("namespace"),
+                "{namespace:?} must be refused with a namespace error: {error}"
+            );
+        }
+    }
+
+    /// The namespace is refused before the buffer, config or VTA are touched:
+    /// every path handed in here is missing, so any later step would fail with
+    /// a different error.
+    #[tokio::test]
+    async fn a_non_git_namespace_is_refused_before_anything_is_read() {
+        let missing = std::path::Path::new("/nonexistent/did-git-sign/buffer");
+        let error = handle_sign(missing, "file", Some(missing))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to sign in sshsig namespace \"file\""),
+            "{error}"
         );
     }
 

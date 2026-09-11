@@ -42,6 +42,18 @@ jobs:
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
       - run: cargo test --workspace
+      - name: Test did-git-sign with the test-only policy bypass
+        run: cargo test -p did-git-sign --features insecure-policy-bypass
+      # The parent-process bypass is a test-only feature. A release build must
+      # not honour it, so it must not even contain the variable's name.
+      - name: Release did-git-sign carries no policy bypass
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p did-git-sign
+          if grep -a -q DID_GIT_SIGN_BYPASS_POLICY target/release/did-git-sign; then
+            echo "::error::the release did-git-sign binary contains DID_GIT_SIGN_BYPASS_POLICY"
+            exit 1
+          fi
 
   msrv:
     name: Minimum Supported Rust Version
