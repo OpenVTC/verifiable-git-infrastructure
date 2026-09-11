@@ -127,6 +127,25 @@ trql-client = "0.17"
 # only so the ceiling moves. `affinidi-tdk` goes to 0.13 in the same step
 # because that is what vta-sdk 0.35 declares.
 #
+# 0.35 -> 0.36 is the eighth, and it goes back to following. OpenVTC is moving
+# to the 0.36 line for peer identity vetting (VTI #1425 onward adds the `vetting`
+# feature and `protocols::vetting`, which OpenVTC's vetting branches take), and
+# vta-service 0.25.1 — the MockVta its tests boot — already requires `^0.36`. A
+# did-git-sign still asking for 0.35 is the edge that would put a second sdk in
+# OpenVTC's binary. Nothing here needs 0.36: this crate reaches the VTA through
+# `connect_auto` and takes display names, so as before the bump exists only so
+# the ceiling moves. `affinidi-tdk` goes to 0.14 because that is what vta-sdk
+# 0.36 declares.
+#
+# This step knowingly splits trust-tasks *here*: trql-client 0.17 is still the
+# registry's latest release and declares `^0.19.4`, while vta-sdk 0.36 is on
+# 0.20. That is the weaker form the trql-client note above describes and bounds
+# — verify-trust passes no trust-tasks type across the trql-client boundary, and
+# did-git-sign, the crate OpenVTC consumes, has no trql-client edge — so
+# OpenVTC's graph still resolves one node. It closes when the registry releases
+# on 0.20; waiting for that would have held OpenVTC's vetting work on a release
+# nothing here needs.
+#
 # Same discipline as the trql-client requirement above, and the same check —
 # `cargo tree -i vta-sdk` resolving a single node, here *and* in OpenVTC, which
 # is where the duplicate actually lands. It is one row here today; it will be
@@ -135,8 +154,8 @@ trql-client = "0.17"
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.35", default-features = false }
-affinidi-tdk = "0.13"
+vta-sdk = { version = "0.36", default-features = false }
+affinidi-tdk = "0.14"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
