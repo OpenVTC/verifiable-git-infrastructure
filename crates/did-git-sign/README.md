@@ -232,6 +232,38 @@ on path instead if your layout is authoritative.
 
 ## Security Model
 
+### What protects the signing key
+
+The signing key is protected by the **VTA credential in your OS keyring**, and
+by the access the VTA grants that credential. Anything that can read that
+keyring entry can ask the VTA for what the credential allows, with or without
+`did-git-sign`.
+
+### The signing gate is an accident guard, not a boundary
+
+`did-git-sign` signs only when its parent process is git (`git` or a `git-*`
+subcommand binary), and only in the `git` sshsig namespace. Every attempt,
+allowed or refused, is appended to `audit.log` under the did-git-sign config
+directory (`~/.config/did-git-sign/` on Linux).
+
+That **prevents accidental and naive use**: the binary configured as an SSH
+signing program for something other than git, a script calling
+`did-git-sign -Y sign` directly, or the persona key being used for `file` or
+other sshsig namespaces. The audit log gives you a local record to review.
+
+It is **not a boundary against code running as your user**. Such code can run
+real `git` with `did-git-sign` as its signing program, and so get a signature
+over a commit it chose; it can read the VTA credential from the keyring
+directly; and it can edit or truncate the audit log, which is an ordinary file
+you own. If you suspect that has happened, treat the persona's VTA credential
+as compromised and revoke it in the VTA.
+
+There is no switch that turns the gate off in a released binary. The
+`insecure-policy-bypass` cargo feature exists only for this crate's tests, and
+it does not compile without debug assertions.
+
+### Other properties
+
 - **No key material on disk** — the VTA credential private key is stored in the
   OS keyring, and the Ed25519 signing key is fetched from the VTA at sign-time
   and held only in memory.
