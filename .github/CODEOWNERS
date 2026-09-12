@@ -1,0 +1,35 @@
+# Code owners for verifiable-git-infrastructure.
+#
+# GitHub requests a review from the owning team on every pull request that
+# touches a matching path. On its own this file only *requests* those reviews:
+# it blocks nothing until a ruleset on `main` turns on "require review from
+# Code Owners", which is a repository setting rather than a file in the tree.
+#
+# The teams are the ones CLOWarden maintains for this repository from
+# OpenVTC/governance `config.yaml`: openvtc-admins (admin) and
+# openvtc-maintainers (maintain). A team named here must have write access to
+# the repository, so lf-staff is deliberately absent — it holds no grant on
+# this repository, and naming it would make the whole file invalid.
+#
+# Later entries win, so the catch-all comes first.
+
+*                                   @OpenVTC/openvtc-admins @OpenVTC/openvtc-maintainers
+
+# Release and CI plumbing. These workflows hold the crates.io OIDC permission
+# and write access to Releases, and the composite action under .github/actions
+# is published for third-party use, so a change here reaches further than this
+# repository.
+/.github/                           @OpenVTC/openvtc-admins
+
+# The signing gate: which parent processes may drive a signature, and the
+# local audit record of what was signed.
+/crates/did-git-sign/src/policy.rs  @OpenVTC/openvtc-admins
+
+# The CI authorization gate. What verify-trust accepts is what every
+# downstream trust decision rests on, including the commit-object and trailer
+# parsing it reads identities from.
+/crates/verify-trust/               @OpenVTC/openvtc-admins
+
+# Dependency changes reach the signing and verification paths.
+/Cargo.toml                         @OpenVTC/openvtc-admins
+/Cargo.lock                         @OpenVTC/openvtc-admins
