@@ -486,7 +486,25 @@ fn load_exempt_keyring(args: &VerifyTrustArgs) -> Result<Option<ExemptKeyring>> 
 /// `resolve_agent_names` turns on the resolver's shortcut derivation, which
 /// round-trips each claimed name before it is treated as its DID's — see
 /// [`VerifyTrustArgs::resolve_agent_names`].
+///
+/// **Public hosts only.** Every DID this resolver is asked about is chosen by
+/// the author of the commits under review: the `Signed-by-DID` trailer and the
+/// committer header are attacker-supplied on a fork pull request, and resolving
+/// a `did:web`/`did:webvh` DID is an outbound fetch of the host the DID names.
+/// On a self-hosted runner with internal reachability, that would be an SSRF
+/// primitive with the per-signer resolution error as its oracle. `PublicOnly`
+/// refuses non-public names outright, refuses a name whose resolved addresses
+/// are non-public, connects only to the addresses it checked, follows no
+/// redirect and ignores proxy environment variables.
+///
+/// It is stated rather than left to the default deliberately: `with_host_policy`
+/// does not exist before `affinidi-did-resolver-cache-sdk` 0.8.37, the release
+/// that first guards `did:webvh`, so a downgrade fails to compile instead of
+/// quietly reopening the fetch. There is **no opt-out here by design** — a DID
+/// on an internal host is not an identity this verifier can be asked to trust,
+/// and `max_signers` bounds the count rather than the reach.
 pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::TDK> {
+    use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy;
     use affinidi_tdk::TDK;
     use affinidi_tdk::common::config::TDKConfig;
     use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
@@ -499,6 +517,7 @@ pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::T
             .with_load_environment(false)
             .with_did_resolver_config(
                 DIDCacheConfigBuilder::default()
+                    .with_host_policy(HostPolicy::PublicOnly)
                     .with_resolve_shortcuts(resolve_agent_names)
                     .build(),
             )

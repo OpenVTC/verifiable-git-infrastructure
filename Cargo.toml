@@ -156,6 +156,30 @@ trql-client = "0.17"
 # of satisfied constraints.
 vta-sdk = { version = "0.36", default-features = false }
 affinidi-tdk = "0.14"
+# Named directly for one reason: the **floor**. The verifier resolves DIDs a
+# pull-request author chose — the `Signed-by-DID` trailer and the committer
+# header are attacker-supplied on a fork PR — so which hosts resolution may
+# contact is a property this workspace has to be able to state.
+#
+# `affinidi-tdk` reaches this crate as `^0.8`, which silently admits 0.8.36,
+# where `did:webvh` resolution contacts whatever host the DID names:
+# `did:webvh:{SCID}:localhost%3A<port>` was fetched over `http://`, and any
+# other name from whatever address it resolved to. On a self-hosted runner with
+# internal reachability that is an SSRF primitive with the resolution error as
+# its oracle. 0.8.37 is the release that closes it — `didwebvh-rs` 0.7 refuses
+# non-public names before any request, vets every resolved address, refuses
+# redirects and ignores proxies — and `did:web` has been guarded since 0.8.35.
+#
+# `build_resolver` states `HostPolicy::PublicOnly` rather than relying on the
+# default, so a downgrade below 0.8.37 fails to compile (`with_host_policy` does
+# not exist before it) instead of quietly reopening the fetch. That is the whole
+# reason this is a normal dependency and not a dev-dependency: a floor in
+# `[dev-dependencies]` would not travel with the published crate, and
+# `did-git-sign` — the crate OpenVTC consumes — resolves through the same graph.
+#
+# No feature is chosen here: `affinidi-tdk` already takes this crate with its
+# default features, so this line adds a version requirement and nothing else.
+affinidi-did-resolver-cache-sdk = "0.8.37"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }

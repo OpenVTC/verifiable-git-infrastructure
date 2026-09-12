@@ -19,6 +19,9 @@ path = "src/main.rs"
 vgi-core = { workspace = true }
 trql-client = { workspace = true }
 affinidi-tdk = { workspace = true }
+# The resolver the TDK above builds, named directly so `build_resolver` can
+# state the host policy it runs under. See the workspace manifest.
+affinidi-did-resolver-cache-sdk = { workspace = true }
 # Display names only — the verifier never talks to a VTA, so it takes
 # `agent-names` (NameBook, shorten_did, the verified name round trip) without
 # the client/DIDComm stack.

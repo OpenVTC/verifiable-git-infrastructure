@@ -13,8 +13,8 @@ use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use verify_trust::{
-    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, list_commits,
-    pgp_exempt::ExemptKeyring, read_range, verify_prepared,
+    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, build_resolver, list_commits,
+    pgp_exempt::ExemptKeyring, read_range, resolve_signer_keys, verify_prepared,
 };
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
@@ -731,6 +731,86 @@ fn a_range_that_is_a_git_option_is_rejected_before_git_runs() {
         vec![signed.clone()]
     );
     assert_eq!(list_commits(repo, "main").unwrap(), vec![base, signed]);
+}
+
+// --- resolution egress policy ----------------------------------------------------
+
+/// A signer DID naming an internal host must not be fetched at all.
+///
+/// This is the one input to the verifier that a fork pull request fully
+/// controls: the `Signed-by-DID` trailer (and the committer header it falls
+/// back to) is whatever the commit says, and resolving `did:webvh:<scid>:<host>`
+/// fetches `did.jsonl` from `<host>`. On a runner that can reach an internal
+/// network, an author could previously have walked it one DID at a time and read
+/// the answers off the per-signer resolution errors.
+///
+/// Asserted through the real path — `build_resolver` then `resolve_signer_keys`,
+/// exactly as `handle_verify_trust` runs them — because the property being
+/// pinned is that *this binary's* resolver is the guarded one, not that a
+/// guarded resolver exists somewhere. The listener stands in for the internal
+/// service and must never be connected to: a refusal after a connection has
+/// already told the author that something is listening.
+#[tokio::test]
+async fn a_signer_did_on_an_internal_host_is_refused_without_being_fetched() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let internal = format!("did:webvh:QmStandInScidAAAAAAAAAAAAAAAAAAAA:localhost%3A{port}:agent");
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(repo, &["add", "a.txt"]);
+    git(repo, &["commit", "-q", "-m", "base"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
+
+    // A real signature, over a commit claiming the internal DID. The signature
+    // is valid; the DID is what must not be looked up.
+    let key = SigningKey::from_bytes(&[21u8; 32]);
+    let committer = format!("{internal}#key-0");
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    git_as(repo, &committer, &["add", "a.txt"]);
+    git_as(repo, &committer, &["commit", "-q", "-m", "internal signer"]);
+    let unsigned = git(repo, &["rev-parse", "HEAD"]);
+    let signed = sign_head_commit(repo, &unsigned, &key);
+    git(repo, &["update-ref", "refs/heads/main", &signed]);
+
+    let tdk = build_resolver(false).await.expect("the resolver builds");
+    let signers = resolve_signer_keys(&tdk, std::slice::from_ref(&internal))
+        .await
+        .expect("resolution runs to a verdict per DID");
+
+    // Deliberately unreachable: a signer that did not resolve is never queried.
+    let args = args_for(
+        repo,
+        format!("{base}..{signed}"),
+        "http://127.0.0.1:1".into(),
+    );
+    let report = verify(&args, &signers, None).await;
+
+    assert!(
+        !report.ok,
+        "a commit whose claimed signer was never resolved cannot pass"
+    );
+    let reason = report
+        .unresolved_signers
+        .get(&internal)
+        .expect("the refused DID is reported as an unresolved signer");
+    assert!(
+        reason.contains("BlockedHost"),
+        "the reason must name the host refusal rather than a timeout: {reason}"
+    );
+    assert!(
+        matches!(report.commits[0].status, CommitStatus::UnresolvedSigner { ref did, .. } if did == &internal),
+        "expected unresolvedSigner against the claimed DID, got {:?}",
+        report.commits[0].status
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "something connected to the stand-in internal service"
+    );
 }
 
 // --- committed platform keyring --------------------------------------------------
