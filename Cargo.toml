@@ -210,3 +210,8 @@ tempfile = "3"
 serial_test = "4"
 # Property-based testing: used by vgi-core's trailer differential against git.
 proptest = "1"
+# YAML parser for the CI-workflow structural tests. A parser, not a regex: the
+# check is "no `${{ }}` inside a `run:` scalar", which is a statement about the
+# YAML tree. Matching the text instead finds the same marker in a comment or a
+# description and reports it as a finding.
+yaml-rust2 = "0.11"
