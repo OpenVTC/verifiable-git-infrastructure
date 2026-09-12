@@ -175,7 +175,7 @@ dependencies = [
  "ahash",
  "base64 0.23.1",
  "did-scid",
- "didwebvh-rs 0.7.0",
+ "didwebvh-rs",
  "highway",
  "moka",
  "rand 0.10.2",
@@ -347,7 +347,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "trust-tasks-rs 0.20.3",
+ "trust-tasks-rs 0.20.4",
  "uuid",
 ]
 
@@ -1797,38 +1797,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32bb54e6769f547fc641bbe63bb06f253fe41ad552e47e24cbd6c62a7b6436d8"
 dependencies = [
  "affinidi-did-common",
- "didwebvh-rs 0.7.0",
+ "didwebvh-rs",
  "regex",
  "serde_json",
  "thiserror",
  "tracing",
-]
-
-[[package]]
-name = "didwebvh-rs"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87a6d8803724264019c1b1dda174b4f666b833e9ac05acd45e87e9fecef2c67b"
-dependencies = [
- "affinidi-data-integrity",
- "affinidi-did-common",
- "affinidi-secrets-resolver",
- "ahash",
- "async-trait",
- "base58",
- "chrono",
- "getrandom 0.4.3",
- "percent-encoding",
- "reqwest",
- "serde",
- "serde_json",
- "serde_json_canonicalizer",
- "serde_with",
- "sha2 0.11.0",
- "thiserror",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -5170,7 +5143,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5481,9 +5454,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2dbddbfa65cacec94a8c6423fdde6bfd3236c1e2ac51fd6276c5f801682566f"
+checksum = "c2f308a570035bc810d285c264a202e267c553ec67a32dacbd79da8e304f7c89"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5719,9 +5692,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.36.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ba4a57d063ed5ccae8c8dd582d7e975b0d3fcd38aee5097bb852b4850e4010b"
+checksum = "75232f010392bd234dab89bcdc15e7edf47677b4591e941860013a1d5e81bc7a"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -5742,7 +5715,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "curve25519-dalek 5.0.0",
- "didwebvh-rs 0.6.1",
+ "didwebvh-rs",
  "dirs",
  "ed25519-dalek 3.0.0",
  "futures-util",
@@ -5756,7 +5729,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.20.3",
+ "trust-tasks-rs 0.20.4",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",
