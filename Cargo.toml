@@ -184,3 +184,5 @@ windows-native-keyring-store = "1"
 rand = "0.8"
 tempfile = "3"
 serial_test = "4"
+# Property-based testing: used by vgi-core's trailer differential against git.
+proptest = "1"
