@@ -26,3 +26,17 @@ updates:
       default-days: 7
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # `rand` is held at 0.8 by `pgp` 0.20, which takes `rand_core` 0.6 RNGs in
+      # `SecretKeyParams::generate`; a 0.9+ `StdRng` does not implement those
+      # traits. The workspace root already says so in the comment on `rand`, and
+      # the only users are verify-trust's PGP test helpers
+      # (src/pgp_exempt.rs, tests/verify_trust_e2e.rs). Dependabot proposed
+      # 0.8.8 -> 0.10.2 anyway (#46), which fails to compile.
+      #
+      # Patch updates are left flowing, so a 0.8.x advisory still arrives.
+      # Remove this entry once `pgp` supports rand 0.9+.
+      - dependency-name: "rand"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
