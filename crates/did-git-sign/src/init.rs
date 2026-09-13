@@ -886,8 +886,12 @@ mod tests {
     /// between subject and trailer, git's own trailer parser reads *nothing*,
     /// so the DID would be invisible to `git log`, to forges, and to every
     /// tool that asks git rather than re-implementing the format.
+    // Serial for the same reason as the other hook tests: see the note on
+    // `commit_msg_hook_terminates_on_a_message_with_trailing_blank_lines`.
+    // Here it is `git commit` that execs the hook, but the race is identical.
     #[test]
     #[cfg(unix)]
+    #[serial_test::serial]
     fn commit_msg_hook_trailer_is_readable_by_git_on_a_one_line_message() {
         let dir = tempfile::tempdir().unwrap();
         let did = "did:webvh:QmAbc:example.com#key-0";
@@ -923,8 +927,21 @@ mod tests {
     ///
     /// Note this only reproduces where sed is GNU sed: on a BSD userland (macOS)
     /// the old code worked and this test passes either way. CI runs Linux.
+    // Serial because this test writes a hook and then execs it, and so do the
+    // three below. Run in parallel they fail intermittently with `ETXTBSY`
+    // ("Text file busy"), and the test that fails moves between runs.
+    //
+    // The write is not the problem — `write_executable_hook` closes its handle
+    // before returning. The race is across threads: when one test forks a child
+    // (any `Command::spawn`) while another still holds its hook open for
+    // writing, the child inherits that descriptor for the moment before it
+    // execs, and Linux refuses to exec a file any process holds open for
+    // writing. Serialising the hook tests removes the overlap.
+    //
+    // Production is unaffected: there, git execs the hook long after install.
     #[test]
     #[cfg(unix)]
+    #[serial_test::serial]
     fn commit_msg_hook_terminates_on_a_message_with_trailing_blank_lines() {
         let dir = tempfile::tempdir().unwrap();
         let did = "did:webvh:QmAbc:example.com#key-0";
@@ -960,8 +977,10 @@ mod tests {
 
     /// Running twice must not stack duplicate trailers — amends and rebases
     /// re-run the hook over a message that already carries one.
+    // Serial: writes a hook and execs it — see the note above.
     #[test]
     #[cfg(unix)]
+    #[serial_test::serial]
     fn commit_msg_hook_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let did = "did:webvh:QmAbc:example.com#key-0";
@@ -991,8 +1010,10 @@ mod tests {
     /// A DCO sign-off asserts something about the committer's right to submit
     /// the code. The signing tool must not assert it for them, so the trailer
     /// is opt-in via `did-git-sign.signoff`.
+    // Serial: writes a hook and execs it twice — see the note above.
     #[test]
     #[cfg(unix)]
+    #[serial_test::serial]
     fn commit_msg_hook_adds_signoff_only_when_opted_in() {
         let dir = tempfile::tempdir().unwrap();
         let did = "did:webvh:QmAbc:example.com#key-0";
