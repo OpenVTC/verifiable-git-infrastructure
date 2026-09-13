@@ -41,3 +41,5 @@ hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
+# Parses `.github/` for the workflow-injection regression test.
+yaml-rust2 = { workspace = true }
