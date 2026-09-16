@@ -347,7 +347,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "trust-tasks-rs 0.20.4",
+ "trust-tasks-rs 0.20.7",
  "uuid",
 ]
 
@@ -1774,7 +1774,7 @@ dependencies = [
  "chrono",
  "clap",
  "dialoguer",
- "dirs",
+ "dirs 6.0.0",
  "ed25519-dalek 3.0.0",
  "hex",
  "keyring-core",
@@ -1867,6 +1867,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -5469,9 +5478,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.20.4"
+version = "0.20.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f308a570035bc810d285c264a202e267c553ec67a32dacbd79da8e304f7c89"
+checksum = "269d214716f4d91d2e05f86a752a4dab2878a8e8f197de0cb098ed75ae7f9269"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5708,9 +5717,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.38.0"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75232f010392bd234dab89bcdc15e7edf47677b4591e941860013a1d5e81bc7a"
+checksum = "ba7811143216e073b3b89e3d63d8289c5aa79213a3d40ef79f508d2b941b2e82"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -5732,7 +5741,7 @@ dependencies = [
  "ciborium",
  "curve25519-dalek 5.0.0",
  "didwebvh-rs",
- "dirs",
+ "dirs 7.0.0",
  "ed25519-dalek 3.0.0",
  "futures-util",
  "getrandom 0.4.3",
@@ -5745,7 +5754,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.20.4",
+ "trust-tasks-rs 0.20.7",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",
