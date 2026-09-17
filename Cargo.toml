@@ -3,7 +3,7 @@ members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -13,7 +13,7 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.4.11", path = "crates/vgi-core" }
+vgi-core = { version = "0.4.12", path = "crates/vgi-core" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -57,7 +57,19 @@ vgi-core = { version = "0.4.11", path = "crates/vgi-core" }
 # 0.16.0 dropped the AWS SDK's legacy hyper-0.14 client from the registry's
 # graph, and with it the h2 0.3 / rustls 0.21 advisories that workspace had
 # been suppressing.
-trql-client = "0.17"
+#
+# 0.17 -> 0.18 closes the trust-tasks split the 0.36 step opened knowingly. That
+# step took vta-sdk to the 0.20 trust-tasks line while trql-client 0.17 was still
+# the registry's latest release and declared `^0.19.4`, so the tree carried two
+# trust-tasks-rs copies (the weaker form this note bounds — verify-trust passes
+# no trust-tasks type across the trql-client boundary, and did-git-sign, the
+# crate OpenVTC consumes, has no trql-client edge). 0.18 is the registry release
+# cut for exactly this move: it declares `^0.21`, the same line vta-sdk 0.42
+# resolves, so `cargo tree -i trust-tasks-rs` is back to a single node — the
+# strict form this note prefers. Taken together with the vta-sdk 0.39 -> 0.42
+# step below; the registry published 0.18 so this workspace could land the whole
+# frontier at once rather than leaving the split standing behind a fresh pin.
+trql-client = "0.18"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -158,11 +170,29 @@ trql-client = "0.17"
 # records having escaped for the first time since 0.35. One row here is one row
 # there; a stale row here is a duplicate there.
 #
+# 0.39 -> 0.42 is the same "moves first" step, and again it is the whole point.
+# VTI published the 0.42 frontier (vta-sdk 0.42.0, affinidi-tdk 0.16.0,
+# affinidi-messaging-sdk 0.26.7, trust-tasks-rs 0.21.3, didwebvh-rs 0.7.0), and
+# OpenVTC's rev3 line already pins `vta-sdk 0.42.0` directly — but it consumes
+# did-git-sign, and while this crate declared `^0.39`, OpenVTC's graph dragged in
+# a *second*, broken vta-sdk 0.39 copy through it. Publishing this workspace on
+# 0.42 is what lets that duplicate collapse to one node in the consumer. One row
+# here is one row there.
+#
+# The bump crosses three minors (0.39, 0.40, 0.41, 0.42) but needs no source
+# change here: did-git-sign reaches the VTA through `connect_auto` and takes
+# display names, and verify-trust never talks to a VTA at all (it takes only
+# `agent-names`), so the client/session/didcomm surface those minors reshaped is
+# not named by anything in this workspace. `cargo build --workspace` and
+# `cargo test --workspace` pass unchanged. `affinidi-tdk` goes to 0.16 because
+# that is what vta-sdk 0.42 declares; trust-tasks-rs resolves to a single 0.21.3
+# node once trql-client 0.18 (above) lines up with it.
+#
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.39", default-features = false }
-affinidi-tdk = "0.14"
+vta-sdk = { version = "0.42", default-features = false }
+affinidi-tdk = "0.16"
 # Named directly for one reason: the **floor**. The verifier resolves DIDs a
 # pull-request author chose — the `Signed-by-DID` trailer and the committer
 # header are attacker-supplied on a fork PR — so which hosts resolution may
