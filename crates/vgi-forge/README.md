@@ -19,7 +19,15 @@ Forgejo, …) where that is enforced.
 - **`Capabilities`** — what a forge, and one namespace on it, can do. The core
   branches on these flags, never on which forge it is: a GitHub personal
   account is the GitHub adapter reporting `bot_can_create_repos: false` and a
-  one-level role ladder.
+  one-level role ladder. `required_workflow` says whether the check runs
+  from a namespace-level workflow pinned to a commit (so a pull request
+  cannot change what checks it); without it the repository's own workflow
+  is guarded by owner review where there are two or more owners, and
+  `single_owner_repos_unreviewed` tells the UI that a single-owner
+  repository's workflow edits are not review-protected.
+  `ProtectionState::check_source_guard` says which guard a repository has,
+  and `Projection::owners` lets `diff` hold it to the owner count
+  (`Drift::ReplanNeeded` when that crosses one ↔ two).
 - **`Resource`** — a normalised, forge-qualified resource
   (`github.com/acme/widgets`), built on the one grammar in
   [`vgi-core`][vgi-core] so the registry, the verifier and every adapter name

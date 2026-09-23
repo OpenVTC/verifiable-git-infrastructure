@@ -12,6 +12,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::MergeMethod;
+use crate::event::ProtectionGap;
 use crate::resource::Resource;
 use crate::rights::ForgeRole;
 
@@ -151,6 +152,45 @@ pub struct Capabilities {
     pub account_link: LinkMethod,
     /// Whether the credential can be narrowed to one repository per job.
     pub per_repo_tokens: bool,
+    /// The check runs from a namespace-level workflow pinned to a revision
+    /// (a GitHub org ruleset's required workflow), so a pull request cannot
+    /// change what checks it. Without it the repository's own workflow is
+    /// guarded by owner review instead (§9).
+    #[serde(default)]
+    pub required_workflow: bool,
+    /// Without a namespace workflow, a repository with a single owner gets
+    /// no review requirement on its workflow (there is nobody else to
+    /// review), so its owner could weaken their own check. The UI shows
+    /// "solo: workflow edits not review-protected" for such repositories;
+    /// [`ProtectionState::check_source_guard`] says which applies to each.
+    #[serde(default)]
+    pub single_owner_repos_unreviewed: bool,
+}
+
+/// What keeps a repository's check out of reach of the pull request it
+/// checks (§9), as observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[non_exhaustive]
+pub enum CheckSourceGuard {
+    /// Not observed (manual mode, or not inspected).
+    #[default]
+    Unknown,
+    /// A namespace-level workflow pinned to a commit. Its shortfalls are in
+    /// [`ProtectionState::other_gaps`].
+    RequiredWorkflow,
+    /// Workflow changes need an owner's approving review.
+    OwnerReview {
+        /// The accounts the managed owner rule names (ids resolved from the
+        /// forge's current logins).
+        reviewers: Vec<ForgeAccount>,
+        /// What is wrong with it; empty when it holds.
+        issues: Vec<String>,
+    },
+    /// No review guard: the repository's own workflow can be changed by a
+    /// pull request its owner merges. Accepted for a single-owner
+    /// repository.
+    Unreviewed,
 }
 
 /// A person's account on a forge. The numeric id is authoritative; the login
@@ -230,6 +270,11 @@ pub struct RepoSpec {
     /// Optional description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The repository's owners (`git.repo.own` holders) with linked forge
+    /// accounts — who may approve changes to its workflows where the forge
+    /// guards them with owner review (§9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<ForgeAccount>,
 }
 
 impl RepoSpec {
@@ -239,7 +284,14 @@ impl RepoSpec {
             resource,
             visibility: Visibility::Public,
             description: None,
+            owners: Vec::new(),
         }
+    }
+
+    /// Add an owner.
+    pub fn with_owner(mut self, owner: ForgeAccount) -> Self {
+        self.owners.push(owner);
+        self
     }
 
     /// Set the visibility.
@@ -312,6 +364,14 @@ pub struct ProtectionState {
     pub blocks_deletion: bool,
     /// Actors allowed to bypass it. Must be empty (§5.3).
     pub bypass_actors: Vec<String>,
+    /// Shortfalls in what keeps the check's own workflow out of the change
+    /// under test's reach (a namespace required workflow, owner review),
+    /// which the fields above cannot express. The adapter fills this in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_gaps: Vec<ProtectionGap>,
+    /// Which guard keeps the check out of the pull request's reach.
+    #[serde(default)]
+    pub check_source_guard: CheckSourceGuard,
     /// Paths a pull request may not change (forge glob syntax), for a forge
     /// that protects the workflow this way. Empty when not read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -383,6 +443,11 @@ pub struct Projection {
     pub archived: bool,
     /// The visibility the VTC recorded, if it tracks one.
     pub visibility: Option<Visibility>,
+    /// The repository's owners with linked forge accounts. Where the forge
+    /// guards workflows with owner review, two or more owners must all be
+    /// reviewers; one owner is a solo repository with no review guard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<ForgeAccount>,
 }
 
 impl Projection {
@@ -395,6 +460,7 @@ impl Projection {
             required_check: None,
             archived: false,
             visibility: None,
+            owners: Vec::new(),
         }
     }
 }
@@ -543,6 +609,10 @@ pub struct NamespaceBinding {
     /// Permissions the adapter needs that the installation does not grant
     /// (an owner who declined an upgrade). Empty when fully capable.
     pub missing_permissions: Vec<String>,
+    /// What the namespace can do, as found while binding (a probe of the
+    /// forge's plan, say). Persist it: the adapter's copy is in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
 }
 
 impl NamespaceBinding {
@@ -551,7 +621,14 @@ impl NamespaceBinding {
         NamespaceBinding {
             namespace,
             missing_permissions,
+            capabilities: None,
         }
+    }
+
+    /// Attach the capabilities found while binding.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
     }
 }
 

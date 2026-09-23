@@ -96,6 +96,20 @@ pub enum ForgeError {
     Config(String),
     /// The forge answered with something the adapter does not understand.
     Protocol(String),
+    /// A capability of the namespace turned out different from what was
+    /// planned with (a forge plan without a feature). The adapter has
+    /// updated its own copy; the caller persists the change and plans
+    /// again.
+    CapabilityChanged {
+        /// The namespace.
+        namespace: String,
+        /// Which [`crate::Capabilities`] field.
+        capability: String,
+        /// Its new value.
+        available: bool,
+        /// What the forge said.
+        reason: String,
+    },
 }
 
 impl ForgeError {
@@ -150,6 +164,15 @@ impl fmt::Display for ForgeError {
             ForgeError::Webhook(m) => write!(f, "webhook rejected: {m}"),
             ForgeError::Config(m) => write!(f, "configuration error: {m}"),
             ForgeError::Protocol(m) => write!(f, "unexpected forge response: {m}"),
+            ForgeError::CapabilityChanged {
+                namespace,
+                capability,
+                available,
+                reason,
+            } => write!(
+                f,
+                "`{capability}` is now {available} for `{namespace}` ({reason}); plan again"
+            ),
         }
     }
 }
