@@ -35,7 +35,9 @@ For each contributor, issue a grant in the registry over the tuple:
 entity    = did:webvh:…            the contributor's DID (no fragment)
 authority = <VTC_DID>              your VTC — TRQP calls this authority_id
 action    = git.commit.sign
-resource  = <owner>/<repo>         or <owner> for an org-wide grant
+resource  = <owner>/<repo>         or <owner> for an org-wide grant (legacy)
+resource  = <forge-host>/<owner>/<repo>
+                                   or <forge-host>/<owner> (qualified)
 ```
 
 `entity` is the **bare DID**, not the verification-method id. A commit signed
@@ -43,11 +45,40 @@ as `did:webvh:QmAbc:example.com#key-0` is queried as
 `did:webvh:QmAbc:example.com` — the fragment names which key, and which key is
 already settled by then.
 
+**Which resource form.** The check's `resource-format` decides which of the two
+`resource` forms it queries, and a grant only counts if it is written in that
+form:
+
+| `resource-format` | Repo grant | Org grant |
+|---|---|---|
+| `legacy` (default for now) | `acme/widgets` | `acme` |
+| `qualified` | `github.com/acme/widgets` | `github.com/acme` |
+
+The qualified form is `<forge-host>/<owner>[/<repo>]`, all lowercase. The forge
+host is the one CI runs against — `github.com`, your GitHub Enterprise Server
+host, or a Forgejo instance such as `codeberg.org` — so the same `acme` on two
+forges is two different resources. `verify-trust` derives it from the runner's
+environment; the port of a self-hosted instance is not part of it.
+
+Migration is staged:
+
+1. **Now** — `legacy` is the default; nothing deployed changes. To move a
+   repository over, issue its grants in qualified form (during the window the
+   VTC can write both forms for each grant), then set
+   `resource-format: qualified` on its workflow.
+2. **A later minor release** flips the default to `qualified`. A workflow that
+   still needs the old form pins `resource-format: legacy`.
+3. **The release after** removes `legacy`, and the legacy grants can go.
+
+A run queries one form only — never "qualified, else legacy". Accepting either
+would widen who may sign for as long as both exist, with nothing in the
+repository to show it.
+
 Choose the resource scope deliberately. A repo-scoped grant authorizes one
 repository; an org-scoped grant authorizes every repository that passes
-`fallback-resource: <owner>`. Grant semantics are OR, so a repo-level record
-**cannot veto** an org-level grant — narrowing is a matter of not issuing the
-broad grant in the first place.
+`fallback-resource: <owner>` (`<forge-host>/<owner>` under `qualified`). Grant
+semantics are OR, so a repo-level record **cannot veto** an org-level grant —
+narrowing is a matter of not issuing the broad grant in the first place.
 
 This step is the whole access-control decision. There is no second list to
 maintain, and nothing to commit to the repository.
@@ -164,6 +195,7 @@ jobs:
           vtc-did:      ${{ vars.VTC_DID }}
           exempt-keyring: .github/trusted-platform-keys.asc
           resolve-agent-names: true     # optional; one HTTPS fetch per claimed name
+          # resource-format: qualified  # once the grants are qualified (§2)
 ```
 
 `fetch-depth: 0` is not optional — without the base ref present the range does
@@ -230,6 +262,70 @@ ruleset for `main`:
 - require the **"Verify commit trust"** status check to pass
 - block force-pushes and branch deletion
 
+## 4a. Set up a Forgejo repository
+
+The same composite action runs on Forgejo Actions (Codeberg or a self-hosted
+instance). What differs:
+
+**Workflow** — `.forgejo/workflows/verify-trust.yml`, with the action referenced
+by **full URL**. A bare `uses: owner/repo/...` is resolved against the
+instance's own default actions host, which is not where this action lives:
+
+```yaml
+on: pull_request
+
+jobs:
+  verify:
+    name: Verify commit trust
+    if: vars.TRUST_REGISTRY_DID != ''
+    runs-on: docker                   # whatever label your runner registers
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.6
+        with:
+          range:           origin/${{ github.base_ref }}..HEAD
+          registry-did:    ${{ vars.TRUST_REGISTRY_DID }}
+          vtc-did:         ${{ vars.VTC_DID }}
+          resource-format: qualified
+```
+
+**Use `resource-format: qualified` from day one.** A new Forgejo repository has
+no legacy grants to keep working, and the qualified resource
+(`codeberg.org/acme/widgets`) cannot be confused with the same owner/repo on
+another forge. `verify-trust` takes the host from `FORGEJO_SERVER_URL` (falling
+back to `GITHUB_SERVER_URL`, which Forgejo also sets) and the repository from
+`FORGEJO_REPOSITORY`. Issue the grants in that form (§2).
+
+**The runner.** It needs outbound access to download the `verify-trust`
+release from GitHub. The action's install step was written for GitHub-hosted
+runners: it uses the `gh` CLI (which the runner image must provide), the
+`RUNNER_OS` / `RUNNER_ARCH` variables, and the job token — which on Forgejo is
+the instance's token, not a GitHub one. Codeberg and small instances may also
+offer no shared runner. Confirm on your instance that a runner picks the job up
+and the download succeeds before making the check required; Forgejo Actions
+aims for compatibility with GitHub's, not identity.
+
+**Merge commits.** The `web-flow` keyring above is GitHub-specific. On Forgejo,
+prefer **fast-forward-only** merges (the repository's allowed merge styles):
+the DID-signed commits then land unchanged, and no platform key is needed at
+all. If you need merge or squash commits, the instance must sign them
+(`[repository.signing]` in its configuration), and you commit the instance's
+public key as the exempt keyring:
+
+```sh
+curl -sS https://git.example.org/api/v1/signing-key.gpg > .forgejo/trusted-platform-keys.asc
+```
+
+and pass `exempt-keyring: .forgejo/trusted-platform-keys.asc`. With neither,
+every web-UI merge fails `pgpRejected` (or `unsigned`, if the instance does not
+sign at all).
+
+**Branch protection** — on the default branch: enable status checks and require
+the verify-trust job's context, disable force-push, and restrict who may push
+and merge. The context name may not match what GitHub would show;
+copy the one a completed run reports rather than guessing.
+
 ## 5. Verdicts and what to do about them
 
 `trusted` and `exempt` pass. Everything else fails, with a distinct status so
@@ -278,6 +374,11 @@ resource is the sole thing binding a signer to this repository. Widening
 `resource` or `fallback-resource` widens who may sign, and nothing in the
 repository will contradict it. Treat both as security-relevant configuration
 and review changes to them as you would a permissions change.
+
+Switching `resource-format` changes which grants count, so review it the same
+way: a repository moved to `qualified` before its qualified grants exist fails
+every commit `unauthorized`, and one moved back to `legacy` is governed by
+whatever legacy grants remain.
 
 **The registry is the single gate.** Enrolment, authorization and revocation
 all resolve to one TRQP answer. This is the design's premise, not an oversight

@@ -7,8 +7,9 @@ name: action-selftest
 # not happen is the marker appearing.
 #
 # Needs no secrets. The action's install step downloads a pinned VGI release
-# with the job's read-only GITHUB_TOKEN; the dummy range makes verify-trust
-# exit at `git rev-list`, before any DID resolution or registry query.
+# with the job's read-only GITHUB_TOKEN; verify-trust then exits on the dummy
+# inputs (the unknown resource-format, or the range at `git rev-list`) before
+# any DID resolution or registry query.
 on:
   pull_request:
 
@@ -34,6 +35,7 @@ jobs:
           vtc-did: did:example:vtc
           registry-url: 'http://127.0.0.1:9/$(touch "$RUNNER_TEMP/sec4045_pwned")'
           fallback-resource: '"; touch "$RUNNER_TEMP/sec4045_pwned"; echo "'
+          resource-format: 'qualified$(touch "$RUNNER_TEMP/sec4045_pwned")'
           # Pinned, not `latest`: the check is about the action's shell, so it
           # should not move when a release is cut.
           version: v0.4.8

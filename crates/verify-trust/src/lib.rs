@@ -34,6 +34,8 @@
 //! consequently the only thing scoping a signer to this repository, and is
 //! security-relevant input: widening it, or widening `--fallback-resource`,
 //! widens who may sign, with nothing in the repository to contradict it.
+//! [`resource`] decides which form it takes (`owner/repo`, or forge-qualified
+//! `github.com/owner/repo`) and derives its default from the CI environment.
 //!
 //! Failure is closed at every layer: an unsigned commit, a committer naming no
 //! DID, a DID that will not resolve, a signature by a key that DID does not
@@ -48,6 +50,7 @@
 //! surfaces use, so a DID is abbreviated identically wherever it appears.
 
 pub mod pgp_exempt;
+pub mod resource;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -107,7 +110,9 @@ pub struct VerifyTrustArgs {
     pub vtc_did: String,
     /// TRQP action, e.g. `git.commit.sign`.
     pub action: String,
-    /// TRQP resource, e.g. the `org/repo` slug.
+    /// TRQP resource: the `org/repo` slug, or forge-qualified
+    /// (`github.com/org/repo`) under `--resource-format qualified`. Already in
+    /// its final form here — [`resource::select_resources`] chooses it.
     ///
     /// With no committed signer index, this is the **only** thing scoping a
     /// signer to this repository: a grant is accepted exactly when the

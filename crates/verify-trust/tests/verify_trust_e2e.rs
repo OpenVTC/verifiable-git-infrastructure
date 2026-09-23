@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use verify_trust::{
     CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, build_resolver, list_commits,
-    pgp_exempt::ExemptKeyring, read_range, resolve_signer_keys, verify_prepared,
+    pgp_exempt::ExemptKeyring,
+    read_range, resolve_signer_keys,
+    resource::{CiEnv, ResourceFormat, select_resources},
+    verify_prepared,
 };
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
@@ -698,6 +701,139 @@ async fn denied_at_both_scopes_is_unauthorized() {
     let report = verify(&args, &signers_for(&key), None).await;
 
     assert!(!report.ok);
+    assert!(matches!(
+        report.commits[0].status,
+        CommitStatus::Unauthorized { .. }
+    ));
+}
+
+// --- forge-qualified resources ----------------------------------------------------
+
+/// A GitHub Actions environment for `Example/Repo`, as the runner sets it.
+fn github_actions_env() -> CiEnv {
+    CiEnv::from_lookup(|name| match name {
+        "GITHUB_SERVER_URL" => Some("https://github.com".to_string()),
+        "GITHUB_REPOSITORY" => Some("Example/Repo".to_string()),
+        _ => None,
+    })
+}
+
+/// `args_for`, with the resources chosen the way the binary chooses them.
+fn args_in_format(
+    repo: &Path,
+    range: String,
+    registry_url: String,
+    format: ResourceFormat,
+    fallback: Option<&str>,
+) -> VerifyTrustArgs {
+    let (resource, fallback_resource) = select_resources(
+        format,
+        None,
+        fallback.map(str::to_string),
+        &github_actions_env(),
+    )
+    .expect("resources select");
+    VerifyTrustArgs {
+        resource,
+        fallback_resource,
+        ..args_for(repo, range, registry_url)
+    }
+}
+
+#[tokio::test]
+async fn a_qualified_run_queries_the_forge_qualified_tuple() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let registry = stub_registry_with(vec![(
+        SIGNER.to_string(),
+        "github.com/example/repo".to_string(),
+    )])
+    .await;
+
+    let args = args_in_format(
+        dir.path(),
+        format!("{base}..{signed}"),
+        registry,
+        ResourceFormat::Qualified,
+        None,
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+
+    assert!(report.ok);
+    assert_eq!(
+        report.commits[0].status,
+        CommitStatus::Trusted {
+            signer_did: SIGNER.to_string(),
+            resource: "github.com/example/repo".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_qualified_org_fallback_authorizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let registry =
+        stub_registry_with(vec![(SIGNER.to_string(), "github.com/example".to_string())]).await;
+
+    let args = args_in_format(
+        dir.path(),
+        format!("{base}..{signed}"),
+        registry,
+        ResourceFormat::Qualified,
+        Some("GitHub.com/Example"),
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+
+    assert_eq!(
+        report.commits[0].status,
+        CommitStatus::Trusted {
+            signer_did: SIGNER.to_string(),
+            resource: "github.com/example".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn one_run_never_accepts_a_grant_in_the_other_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let range = format!("{base}..{signed}");
+
+    // Only a legacy grant: a qualified run must not fall back to it.
+    let legacy_only =
+        stub_registry_with(vec![(SIGNER.to_string(), "Example/Repo".to_string())]).await;
+    let args = args_in_format(
+        dir.path(),
+        range.clone(),
+        legacy_only,
+        ResourceFormat::Qualified,
+        None,
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+    assert!(matches!(
+        report.commits[0].status,
+        CommitStatus::Unauthorized { .. }
+    ));
+
+    // Only a qualified grant: a legacy run queries `Example/Repo`, verbatim.
+    let qualified_only = stub_registry_with(vec![(
+        SIGNER.to_string(),
+        "github.com/example/repo".to_string(),
+    )])
+    .await;
+    let args = args_in_format(
+        dir.path(),
+        range,
+        qualified_only,
+        ResourceFormat::Legacy,
+        None,
+    );
+    assert_eq!(args.resource, "Example/Repo");
+    let report = verify(&args, &signers_for(&key), None).await;
     assert!(matches!(
         report.commits[0].status,
         CommitStatus::Unauthorized { .. }

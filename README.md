@@ -57,7 +57,14 @@ support: **TSP, then DIDComm, then HTTPS**. `registry-url` exists only to
 override discovery for a registry that publishes no service entry.
 
 `resource` defaults to the current repo and is security-relevant — it is the
-only thing scoping a signer to this repository. `version` selects which release
+only thing scoping a signer to this repository. It comes in two forms, chosen
+by `resource-format`: `legacy` (the default today) is the bare `owner/repo`
+slug; `qualified` names the forge too — `github.com/owner/repo`, org fallback
+`github.com/owner`, lowercased — so `github.com/acme` and `codeberg.org/acme`
+can never be confused. Registry grants must be written in the form the check
+uses. The default flips to `qualified` in a later release and `legacy` is then
+removed; see the [runbook](docs/RUNBOOK.md#2-enrol-the-signers) for the
+migration. `version` selects which release
 to download (default `latest`). Verdicts: `trusted` / `exempt` pass;
 `unsigned`, `noSignerDid`, `unresolvedSigner`, `unknownKey`, `badSignature`,
 `unauthorized`, `registryUnavailable` fail. Fails closed at every layer.

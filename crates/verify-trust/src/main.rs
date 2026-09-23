@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use verify_trust::resource::{CiEnv, ResourceFormat, select_resources};
 use verify_trust::{VerifyTrustArgs, handle_verify_trust};
 
 #[derive(Parser)]
@@ -51,8 +52,10 @@ struct Cli {
     #[arg(long, default_value = "git.commit.sign")]
     action: String,
 
-    /// TRQP resource of the trust tuple (e.g. the `org/repo` slug). Defaults
-    /// to $GITHUB_REPOSITORY when unset.
+    /// TRQP resource of the trust tuple. Under `--resource-format legacy`, the
+    /// `org/repo` slug, defaulting to $GITHUB_REPOSITORY. Under `qualified`,
+    /// `<forge-host>/org/repo` (e.g. `github.com/acme/widgets`), defaulting to
+    /// the repository the CI environment names.
     ///
     /// Security-relevant: this is the only thing scoping a signer to this
     /// repository, so widening it widens who may sign.
@@ -65,6 +68,13 @@ struct Cli {
     /// only the primary resource is queried.
     #[arg(long)]
     fallback_resource: Option<String>,
+
+    /// Form of --resource and --fallback-resource. `legacy`: the bare
+    /// `owner/repo` slug, taken as given. `qualified`: forge-qualified
+    /// (`github.com/owner/repo`, org fallback `github.com/owner`), validated
+    /// and lowercased. Registry grants must be written in the same form.
+    #[arg(long, value_enum, default_value_t = ResourceFormat::Legacy)]
+    resource_format: ResourceFormat,
 
     /// Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow
     /// key, https://github.com/web-flow.gpg) committed to the repo. PGP-signed
@@ -99,10 +109,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let resource = cli
-        .resource
-        .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
-        .context("--resource is required (or set GITHUB_REPOSITORY)")?;
+    let (resource, fallback_resource) = select_resources(
+        cli.resource_format,
+        cli.resource,
+        cli.fallback_resource,
+        &CiEnv::from_env(),
+    )?;
     let repo_dir = match cli.repo_dir {
         Some(dir) => dir,
         None => std::env::current_dir().context("cannot determine current directory")?,
@@ -117,7 +129,7 @@ async fn main() -> Result<()> {
         vtc_did: cli.vtc_did,
         action: cli.action,
         resource,
-        fallback_resource: cli.fallback_resource,
+        fallback_resource,
         exempt_keyring: cli.exempt_keyring,
         resolve_agent_names: cli.resolve_agent_names,
         json: cli.json,
