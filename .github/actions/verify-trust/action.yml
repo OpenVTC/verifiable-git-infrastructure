@@ -41,7 +41,7 @@ inputs:
     required: false
     default: "32"
   exempt-keyring:
-    description: "Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow key). Only a PGP-signed merge commit can pass on it: its signature must verify against a key in this file, its parents must pass, and its tree must be their clean merge. Single-parent platform commits (web-UI edits, squash merges, Dependabot) fail platformSignedEdit. Omitted: no exemptions."
+    description: "Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow key). Only a PGP-signed merge commit can pass on it: its signature must verify against a key in this file, its parents must pass, and its tree must be their clean merge. Single-parent platform commits (web-UI edits, squash merges, Dependabot) fail platformSignedEdit. Checking merges needs git 2.40+ on the runner. Omitted: no exemptions."
     required: false
     default: ""
   resolve-agent-names:

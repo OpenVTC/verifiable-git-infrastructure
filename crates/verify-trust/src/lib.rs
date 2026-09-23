@@ -423,6 +423,14 @@ pub async fn verify_prepared(
 ///    conflicted files and have web-flow sign the result. A tree that differs,
 ///    or parents that do not merge cleanly, is `PlatformMergeAltered`.
 ///
+///    The recomputation ignores `.gitattributes`: a checked-out attribute such
+///    as `merge=union` would turn a conflict into a "clean" merge and so
+///    accept a hand-written resolution. Attributes are read from the empty
+///    tree (`--attr-source`, git 2.40+) with no global attributes file; an
+///    older git is a hard error rather than an unpinned recomputation. A
+///    repository whose real merges depend on committed merge attributes gets
+///    `PlatformMergeAltered` for them — failing closed.
+///
 /// The parent and tree headers are read from the commit object the platform
 /// signature covers, so they cannot be rewritten without breaking it.
 ///
@@ -437,7 +445,7 @@ pub async fn verify_prepared(
 /// maintainer re-signs a Dependabot PR's commits with `did-git-sign`, or the
 /// PR lands through a clean merge commit on top of a verified base.
 ///
-/// Parents can appear after their children in `rev-list` order when commit
+/// A merge can appear before a parent merge in `rev-list` order when commit
 /// dates are skewed, so verdicts are settled to a fixpoint rather than in one
 /// pass.
 fn apply_platform_merge_policy(
@@ -462,6 +470,8 @@ fn apply_platform_merge_policy(
         .collect();
     // Fetched only if some platform merge has a parent outside the range.
     let mut boundary: Option<BTreeSet<String>> = None;
+    // Checked once, before the first merge is recomputed.
+    let mut git_checked = false;
 
     while !undecided.is_empty() {
         let mut settled = Vec::new();
@@ -507,6 +517,10 @@ fn apply_platform_merge_policy(
             } else if waiting {
                 continue;
             } else {
+                if !git_checked {
+                    require_attr_source_git(repo_dir)?;
+                    git_checked = true;
+                }
                 match clean_merge_mismatch(repo_dir, &commits[i].raw, &parents) {
                     None => CommitStatus::Exempt { fingerprint },
                     Some(detail) => CommitStatus::PlatformMergeAltered {
@@ -541,10 +555,19 @@ fn apply_platform_merge_policy(
 
 /// The header block of a raw commit object: everything before the first
 /// blank line, without continuation lines (the `gpgsig` armor).
+///
+/// Split on bytes before decoding: the message (and an `encoding` header's
+/// charset) need not be UTF-8, and must not cost the commit its parents.
+/// A header line that is not UTF-8 is skipped; `tree` and `parent` are hex.
 fn commit_headers(raw: &[u8]) -> impl Iterator<Item = &str> {
-    let text = std::str::from_utf8(raw).unwrap_or("");
-    let headers = text.split_once("\n\n").map_or(text, |(h, _)| h);
-    headers.lines().filter(|line| !line.starts_with(' '))
+    let end = raw
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .unwrap_or(raw.len());
+    raw[..end]
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.starts_with(b" "))
+        .filter_map(|line| std::str::from_utf8(line).ok())
 }
 
 /// The commit's parent SHAs, in order.
@@ -570,6 +593,9 @@ fn clean_merge_mismatch(repo_dir: &Path, raw: &[u8], parents: &[String]) -> Opti
     let output = match Command::new("git")
         .arg("-C")
         .arg(repo_dir)
+        // Attributes from the empty tree only: see `apply_platform_merge_policy`.
+        .arg(format!("--attr-source={EMPTY_TREE}"))
+        .args(["-c", "core.attributesFile=/dev/null"])
         .args([
             "merge-tree",
             "--write-tree",
@@ -602,11 +628,41 @@ fn clean_merge_mismatch(repo_dir: &Path, raw: &[u8], parents: &[String]) -> Opti
                 .to_string(),
         ),
         _ => Some(format!(
-            "could not recompute the merge (git merge-tree needs git 2.38+ and the \
-             full history): {}",
+            "could not recompute the merge (it needs the full history, not a \
+             shallow clone): {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
+}
+
+/// git's well-known empty tree.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The oldest git whose merge recomputation can be pinned to no attributes:
+/// `--attr-source` arrived in 2.40 (`merge-tree --write-tree` in 2.38).
+const MIN_GIT: (u32, u32) = (2, 40);
+
+/// Refuse to recompute merges on a git that cannot ignore `.gitattributes`.
+fn require_attr_source_git(repo_dir: &Path) -> Result<()> {
+    let version = git(repo_dir, &["version"])?;
+    match parse_git_version(&version) {
+        Some(found) if found >= MIN_GIT => Ok(()),
+        _ => bail!(
+            "verifying platform-signed merges needs git {}.{} or newer (for \
+             --attr-source), found {version:?}; GitHub-hosted runners ship a newer git",
+            MIN_GIT.0,
+            MIN_GIT.1
+        ),
+    }
+}
+
+/// `(major, minor)` from `git version 2.50.1 (Apple Git-155)`.
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    let number = output.trim().strip_prefix("git version ")?;
+    let mut parts = number.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 // --- signature layer ---------------------------------------------------------
@@ -1093,8 +1149,8 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
                 println!(
                     "PLAT-EDIT    {short}  signed by platform key {fingerprint}, but not a merge: \
                      the platform signs any web or API edit, so only merges are exempt. \
-                     Re-sign it with did-git-sign, e.g. \
-                     `git rebase --exec 'git commit --amend --no-edit -S' <base>`"
+                     Re-sign this commit with did-git-sign: `git rebase -i <base>` and add \
+                     `exec git commit --amend --no-edit -S` after its pick (runbook §5)"
                 );
             }
             CommitStatus::PlatformMergeUnverifiedParent {
@@ -1570,6 +1626,42 @@ mod tests {
              -----END PGP SIGNATURE-----\n",
         );
         assert_eq!(commit_parents(signed.as_bytes()), vec!["1".repeat(40)]);
+    }
+
+    #[test]
+    fn a_non_utf8_message_does_not_cost_a_merge_its_parents() {
+        let mut merge = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                          parent 1111111111111111111111111111111111111111\n\
+                          parent 2222222222222222222222222222222222222222\n\
+                          author A U Thor <a@example.com> 1700000000 +0000\n\
+                          committer GitHub <noreply@github.com> 1700000000 +0000\n\
+                          encoding ISO-8859-1\n\
+                          \n\
+                          Merge "
+            .to_vec();
+        merge.extend_from_slice(&[0xe9, 0xe8, 0xff, b'\n']);
+        assert!(std::str::from_utf8(&merge).is_err());
+        assert_eq!(commit_parents(&merge).len(), 2);
+        assert_eq!(
+            commit_headers(&merge).find_map(|l| l.strip_prefix("tree ")),
+            Some(EMPTY_TREE)
+        );
+    }
+
+    #[test]
+    fn git_versions_parse_and_compare() {
+        assert_eq!(
+            parse_git_version("git version 2.50.1 (Apple Git-155)\n"),
+            Some((2, 50))
+        );
+        assert_eq!(parse_git_version("git version 2.39.5"), Some((2, 39)));
+        assert_eq!(
+            parse_git_version("git version 2.40.0.windows.1"),
+            Some((2, 40))
+        );
+        assert!(parse_git_version("git version 2.39.5").unwrap() < MIN_GIT);
+        assert!(parse_git_version("git version 3.0.0").unwrap() >= MIN_GIT);
+        assert_eq!(parse_git_version("not git"), None);
     }
 
     #[test]
