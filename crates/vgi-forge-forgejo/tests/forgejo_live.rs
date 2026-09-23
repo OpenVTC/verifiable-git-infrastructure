@@ -657,6 +657,12 @@ async fn the_adapter_against_a_real_forgejo() {
         )
         .await;
     }
+    // Forgejo works out a PR's mergeability — including which protected
+    // files it changes — in the background; wait for it, so the refusals
+    // below are about the rule and not about a check still running.
+    for (index, _) in [&evil, &harmless] {
+        wait_until_checked(&fj, *index).await;
+    }
     for who in [BOB, ALICE] {
         let (status, body) = fj
             .api(
@@ -666,21 +672,28 @@ async fn the_adapter_against_a_real_forgejo() {
                 Some(json!({ "Do": "fast-forward-only" })),
             )
             .await;
+        eprintln!("{} merging the workflow change: {status} {body}", who.0);
         assert!(
             !status.is_success(),
             "{} merged a PR that changes the workflow: {status} {body}",
             who.0
         );
+        assert!(
+            body.to_string().to_ascii_lowercase().contains("protected"),
+            "refused, but not for the protected files: {status} {body}"
+        );
     }
     // The same maintainer can merge a PR that leaves the workflow alone —
     // fast-forward, so the commit lands unchanged.
-    fj.ok(
-        BOB,
-        Method::POST,
-        &format!("repos/acme/widgets/pulls/{}/merge", harmless.0),
-        Some(json!({ "Do": "fast-forward-only" })),
-    )
-    .await;
+    let (status, body) = fj
+        .api(
+            BOB,
+            Method::POST,
+            &format!("repos/acme/widgets/pulls/{}/merge", harmless.0),
+            Some(json!({ "Do": "fast-forward-only" })),
+        )
+        .await;
+    assert!(status.is_success(), "harmless merge: {status} {body}");
     let main = fj
         .ok(ROOT, Method::GET, "repos/acme/widgets/branches/main", None)
         .await;
@@ -717,6 +730,29 @@ async fn the_adapter_against_a_real_forgejo() {
     let rotated_again = forge.rotate_token().await.unwrap();
     assert_eq!(rotated_again.deleted, [rotated.new_token]);
     forge.inspect(&widgets).await.unwrap();
+}
+
+/// Wait for Forgejo's background mergeability check on PR `index`.
+async fn wait_until_checked(fj: &Forgejo, index: u64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pr = fj
+            .ok(
+                ROOT,
+                Method::GET,
+                &format!("repos/acme/widgets/pulls/{index}"),
+                None,
+            )
+            .await;
+        if pr["mergeable"] == true {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PR {index} never became mergeable: {pr}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// A branch off `main` changing `path`, as `who`, and a PR for it:
