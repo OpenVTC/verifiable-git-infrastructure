@@ -813,6 +813,264 @@ mod pgp_platform {
         ));
     }
 
+    /// `main` and a DID-signed `feature` that both rewrite `a.txt`, so any
+    /// merge of the two conflicts. Returns `(main_tip, feature_tip)`; HEAD is
+    /// on `main`.
+    fn conflicting_branches(repo: &Path, did_key: &SigningKey) -> (String, String) {
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "root"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("a.txt"), "feature\n").unwrap();
+        git(repo, &["commit", "-q", "-am", "feature rewrites a"]);
+        let feature = sign_head_commit(repo, &git(repo, &["rev-parse", "HEAD"]), did_key);
+        git(repo, &["update-ref", "refs/heads/feature", &feature]);
+
+        git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("a.txt"), "main\n").unwrap();
+        git(repo, &["commit", "-q", "-am", "main rewrites a"]);
+        (git(repo, &["rev-parse", "HEAD"]), feature)
+    }
+
+    fn assert_not_a_clean_merge(report: &TrustReport, merge: &str) {
+        assert!(!report.ok);
+        match status_of(report, merge) {
+            CommitStatus::PlatformMergeAltered { detail, .. } => {
+                assert!(detail.contains("do not merge cleanly"), "{detail}");
+            }
+            other => panic!("expected platformMergeAltered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_platform_merge_of_conflicting_parents_is_refused() {
+        // Whatever the resolution, a conflicted merge's tree is content its
+        // parents do not determine.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature) = conflicting_branches(repo, &did_key);
+        git(
+            repo,
+            &[
+                "merge", "-q", "--no-ff", "-s", "ours", "-m", "Merge", &feature,
+            ],
+        );
+        let merge = pgp_sign_commit(repo, &git(repo, &["rev-parse", "HEAD"]), &platform_key());
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{merge}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(status_of(&report, &feature).is_trusted());
+        assert_not_a_clean_merge(&report, &merge);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_union_attribute_does_not_make_a_conflict_clean() {
+        // `merge=union` in the checked-out tree would let the recomputation
+        // "cleanly" reproduce a resolution that keeps both sides — accepting
+        // content the web conflict editor wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature) = conflicting_branches(repo, &did_key);
+        std::fs::write(repo.join(".gitattributes"), "a.txt merge=union\n").unwrap();
+        git(repo, &["merge", "-q", "--no-ff", "-m", "Merge", &feature]);
+        let merged = std::fs::read_to_string(repo.join("a.txt")).unwrap();
+        assert!(
+            merged.contains("main") && merged.contains("feature"),
+            "the attribute took effect here: {merged:?}"
+        );
+        let merge = pgp_sign_commit(repo, &git(repo, &["rev-parse", "HEAD"]), &platform_key());
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{merge}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert_not_a_clean_merge(&report, &merge);
+    }
+
+    #[tokio::test]
+    async fn a_platform_signed_octopus_merge_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "root"]);
+        let mut features = Vec::new();
+        for name in ["f1", "f2"] {
+            git(repo, &["checkout", "-q", "-b", name, "main"]);
+            std::fs::write(repo.join(format!("{name}.txt")), "x\n").unwrap();
+            git(repo, &["add", "."]);
+            git(repo, &["commit", "-q", "-m", name]);
+            let signed = sign_head_commit(repo, &git(repo, &["rev-parse", "HEAD"]), &did_key);
+            git(
+                repo,
+                &["update-ref", &format!("refs/heads/{name}"), &signed],
+            );
+            features.push(signed);
+        }
+        git(repo, &["checkout", "-q", "main"]);
+        let base = git(repo, &["rev-parse", "HEAD"]);
+        git(
+            repo,
+            &["merge", "-q", "--no-ff", "-m", "Octopus", "f1", "f2"],
+        );
+        let merge = pgp_sign_commit(repo, &git(repo, &["rev-parse", "HEAD"]), &platform_key());
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{base}..{merge}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(!report.ok);
+        for feature in &features {
+            assert!(status_of(&report, feature).is_trusted());
+        }
+        match status_of(&report, &merge) {
+            CommitStatus::PlatformMergeAltered { detail, .. } => {
+                assert!(detail.contains("3-parent"), "{detail}");
+            }
+            other => panic!("expected platformMergeAltered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parent_outside_the_range_but_not_on_its_base_is_refused() {
+        // A shallow clone: the merge's parents are absent, so neither is in
+        // the range nor on its boundary. Absence is not verification.
+        let full = tempfile::tempdir().unwrap();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, _, merge) = platform_merge_fixture(full.path(), &did_key, true);
+
+        let shallow = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", full.path().display());
+        git(shallow.path(), &["clone", "-q", "--depth", "1", &url, "."]);
+        assert_eq!(git(shallow.path(), &["rev-parse", "HEAD"]), merge);
+
+        let args = args_for(shallow.path(), "HEAD".into(), "http://127.0.0.1:1".into());
+        let report = verify(
+            &args,
+            &ResolvedSigners::default(),
+            Some(&platform_keyring()),
+        )
+        .await;
+
+        assert!(!report.ok);
+        assert_eq!(report.commits.len(), 1);
+        assert!(
+            matches!(
+                status_of(&report, &merge),
+                CommitStatus::PlatformMergeUnverifiedParent { parent, .. } if *parent == main_tip
+            ),
+            "{:#?}",
+            report.commits
+        );
+    }
+
+    /// `git` with both dates pinned, to control `rev-list`'s date order.
+    fn git_dated(repo: &Path, epoch: u64, args: &[&str]) -> String {
+        let date = format!("@{epoch} +0000");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "A U Thor")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_COMMITTER_NAME", "A U Thor")
+            .env("GIT_COMMITTER_EMAIL", format!("{SIGNER}#key-0"))
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_merge_listed_before_its_parent_merge_still_settles() {
+        // Skewed dates put platform merge B ahead of its parent merge A in
+        // `rev-list --reverse` order; B must wait for A, not fail on it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let platform = platform_key();
+        let head = |repo: &Path| git(repo, &["rev-parse", "HEAD"]);
+        let commit_file = |name: &str, epoch: u64| {
+            std::fs::write(repo.join(name), "x\n").unwrap();
+            git(repo, &["add", name]);
+            git_dated(repo, epoch, &["commit", "-q", "-m", name]);
+        };
+
+        git(repo, &["init", "-q", "-b", "main"]);
+        commit_file("root.txt", 100);
+        let root = head(repo);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file("f.txt", 2000);
+        let f = sign_head_commit(repo, &head(repo), &key);
+
+        git(repo, &["checkout", "-q", "main"]);
+        commit_file("m.txt", 200);
+        let main_tip = head(repo);
+
+        // A: the PR branch brought up to date with main.
+        git(repo, &["checkout", "-q", "--detach", &f]);
+        git_dated(
+            repo,
+            3000,
+            &["merge", "-q", "--no-ff", "-m", "A", &main_tip],
+        );
+        let a = pgp_sign_commit(repo, &head(repo), &platform);
+
+        // C: more work on top of A, dated after it.
+        git(repo, &["checkout", "-q", "--detach", &a]);
+        commit_file("c.txt", 4000);
+        let c = sign_head_commit(repo, &head(repo), &key);
+
+        // G, and B = merge(A, G), dated before A.
+        git(repo, &["checkout", "-q", "--detach", &root]);
+        commit_file("g.txt", 1500);
+        let g = sign_head_commit(repo, &head(repo), &key);
+        git(repo, &["checkout", "-q", "--detach", &a]);
+        git_dated(repo, 1000, &["merge", "-q", "--no-ff", "-m", "B", &g]);
+        let b = pgp_sign_commit(repo, &head(repo), &platform);
+
+        // S = merge(B, C): the tip.
+        git(repo, &["checkout", "-q", "--detach", &b]);
+        git_dated(repo, 5000, &["merge", "-q", "--no-ff", "-m", "S", &c]);
+        let s = pgp_sign_commit(repo, &head(repo), &platform);
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{s}"), registry);
+        let report = verify(&args, &signers_for(&key), Some(&platform_keyring())).await;
+
+        let at = |sha: &str| report.commits.iter().position(|v| v.sha == sha).unwrap();
+        assert!(
+            at(&b) < at(&a),
+            "precondition: B is listed before its parent A"
+        );
+        assert!(report.ok, "{:#?}", report.commits);
+        for merge in [&a, &b, &s] {
+            assert!(matches!(
+                status_of(&report, merge),
+                CommitStatus::Exempt { .. }
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn platform_signed_commit_fails_without_keyring() {
         let dir = tempfile::tempdir().unwrap();

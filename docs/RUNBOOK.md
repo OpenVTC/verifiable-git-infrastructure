@@ -253,13 +253,20 @@ a single-parent commit says nothing about who chose the content. Those fail
 
 - **Merge with a merge commit.** Squash merges, and a merge queue set to
   squash, produce single-parent `web-flow` commits that fail wherever they are
-  checked; use the *merge* method. (Rebase-and-merge is no better: GitHub
-  rewrites the commits and drops their signatures.)
+  checked; use the *merge* method. (Rebase-and-merge doesn't help either:
+  GitHub rewrites the commits, so their DID signatures are lost.)
 - **Don't edit files in the web UI** on a branch that is checked; commit
   locally with `did-git-sign`.
 - **Resolve conflicts locally**, not in the web conflict editor: a merge whose
   tree is not the clean merge of its parents fails `platformMergeAltered`.
 - **Dependabot pull requests** fail until a maintainer re-signs them (§5).
+
+Verifying a platform-signed merge recomputes it with `merge-tree`, pinned to
+ignore `.gitattributes` (so a `merge=union` attribute cannot make a conflict
+look clean). That needs **git 2.40 or newer** on the runner; GitHub-hosted
+runners ship a newer one, and an older git fails the run with an error saying
+so rather than checking unpinned. The checkout also needs full history
+(`fetch-depth: 0`, already required).
 
 **Repository variables** — plain variables, not secrets; they are public values
 and fork PRs must be able to read them:
@@ -387,7 +394,8 @@ back to `GITHUB_SERVER_URL`, which Forgejo also sets) and the repository from
 `FORGEJO_REPOSITORY`. Issue the grants in that form (§2).
 
 **The runner.** It needs outbound HTTPS to GitHub to download the
-`verify-trust` release, and a glibc new enough for the Linux binary. Codeberg
+`verify-trust` release, a glibc new enough for the Linux binary, and git 2.40
+or newer if instance-signed merges are exempted (see *Platform keyring* in §4). Codeberg
 and small instances may offer no shared runner, so confirm one picks the job up
 before making the check required. What the install needs and what it verifies
 there are under [Forgejo Actions runners](#forgejo-actions-runners) below.
@@ -533,18 +541,31 @@ the remediation is unambiguous:
 *Platform keyring* in §4).
 
 **Re-signing platform-written commits** (a Dependabot pull request, a web-UI
-edit). A maintainer who is an enrolled signer, with `did-git-sign` configured:
+edit). A maintainer who is an enrolled signer, with `did-git-sign` configured,
+re-signs **only the commits the check refused** — not the whole branch:
 
 ```sh
 gh pr checkout <number>
-git rebase --exec 'git commit --amend --no-edit -S' origin/main
+git rebase -i origin/main
+# in the todo list, after the `pick` of each refused commit, add a line:
+#   exec git commit --amend --no-edit -S
+# and leave every other pick as it is
 git push --force-with-lease
 ```
 
 `--amend` keeps the original author and makes the maintainer the committer, so
-each commit is signed by, and attributed to, the DID that vouched for it.
+each re-signed commit is signed by, and attributed to, the DID that vouched for
+it. Don't `--exec` across the whole branch: a commit another contributor
+already signed carries their `Signed-by-DID:` trailer, which the hook leaves in
+place, and `did-git-sign` then refuses to sign it as you. For the same reason,
+a refused commit whose message already carries someone else's
+`Signed-by-DID:` trailer (a squash of signed commits, say) needs that trailer
+removed first — use `exec git commit --amend -S` and delete the line in the
+editor.
+
 Dependabot stops updating a pull request once someone else has pushed to it;
-comment `@dependabot recreate` to start over. Dependabot commits are refused
+comment `@dependabot recreate` to start over. A VGI bridge bot that re-signs
+Dependabot pull requests is planned. Dependabot commits are refused
 rather than exempted because nothing binds a commit to Dependabot but its
 `author` header, and GitHub does not tie that header to the Dependabot app —
 any exemption keyed on it could be claimed by others.

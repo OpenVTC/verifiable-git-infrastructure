@@ -55,7 +55,8 @@ verify-trust \
 
 Exits `0` only when every commit is `trusted` (registry-authorized) or `exempt`
 (a platform-made merge commit verified against a committed PGP keyring, whose
-parents all pass and whose tree is their clean merge). Every other
+parents all pass and whose tree is their clean merge — recomputed ignoring
+`.gitattributes`, which needs git 2.40 or newer). Every other
 verdict fails, each with a distinct status so an operator can tell which
 remediation applies:
 
