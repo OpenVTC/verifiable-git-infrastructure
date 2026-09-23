@@ -25,13 +25,17 @@ inputs:
     required: false
     default: "git.commit.sign"
   resource:
-    description: "TRQP resource of the trust tuple. Defaults to this repository (owner/name). SECURITY-RELEVANT: with no committed signer list, this is the only thing scoping a signer to this repository — widening it widens who may sign."
-    required: false
-    default: ${{ github.repository }}
-  fallback-resource:
-    description: "Broader resource to also accept a grant under (e.g. the org). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`."
+    description: "TRQP resource of the trust tuple. Defaults to this repository: owner/name under resource-format legacy, or <forge-host>/owner/name (e.g. github.com/acme/widgets) under qualified. SECURITY-RELEVANT: with no committed signer list, this is the only thing scoping a signer to this repository — widening it widens who may sign."
     required: false
     default: ""
+  fallback-resource:
+    description: "Broader resource to also accept a grant under (e.g. the org: acme under legacy, github.com/acme under qualified). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`."
+    required: false
+    default: ""
+  resource-format:
+    description: "Form of resource and fallback-resource: 'legacy' (owner/name, as before) or 'qualified' (<forge-host>/owner/name, lowercased). Registry grants must use the same form. The default flips to 'qualified' in a later release, and 'legacy' is then removed."
+    required: false
+    default: "legacy"
   max-signers:
     description: "Ceiling on the number of distinct signer DIDs a range may claim. Each costs one DID resolution, to a host the commit's author chose, so this bounds what a pull request can make the runner resolve."
     required: false
@@ -105,6 +109,7 @@ runs:
         VT_MAX_SIGNERS: ${{ inputs.max-signers }}
         VT_REGISTRY_URL: ${{ inputs.registry-url }}
         VT_FALLBACK_RESOURCE: ${{ inputs.fallback-resource }}
+        VT_RESOURCE_FORMAT: ${{ inputs.resource-format }}
         VT_EXEMPT_KEYRING: ${{ inputs.exempt-keyring }}
         VT_RESOLVE_AGENT_NAMES: ${{ inputs.resolve-agent-names }}
         VT_JSON: ${{ inputs.json }}
@@ -121,9 +126,18 @@ runs:
           --registry-did "$VT_REGISTRY_DID"
           --vtc-did "$VT_VTC_DID"
           --action "$VT_ACTION"
-          --resource "$VT_RESOURCE"
           --max-signers "$VT_MAX_SIGNERS"
         )
+        # Unset, verify-trust derives the resource from the runner's
+        # environment (GITHUB_REPOSITORY, or the forge-qualified form).
+        if [ -n "$VT_RESOURCE" ]; then
+          args+=(--resource "$VT_RESOURCE")
+        fi
+        # Passed only when not the default, so a `version:` pinned to a release
+        # that predates the flag keeps working.
+        if [ -n "$VT_RESOURCE_FORMAT" ] && [ "$VT_RESOURCE_FORMAT" != "legacy" ]; then
+          args+=(--resource-format "$VT_RESOURCE_FORMAT")
+        fi
         if [ -n "$VT_REGISTRY_URL" ]; then
           args+=(--registry-url "$VT_REGISTRY_URL")
         fi
