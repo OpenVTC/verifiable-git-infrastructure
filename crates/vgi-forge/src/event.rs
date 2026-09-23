@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::MergeMethod;
 use crate::model::{
     ForgeAccount, Projection, ProtectionState, RepoState, RoleAssignment, Visibility,
 };
@@ -201,6 +202,20 @@ pub enum ProtectionGap {
         /// Who, as the forge describes them.
         actors: Vec<String>,
     },
+    /// A pull request could change these paths — the workflow or the exempt
+    /// keyring — and so rewrite the check it is judged by.
+    UnprotectedPaths {
+        /// The paths (forge glob syntax) that should be protected and are not.
+        paths: Vec<String>,
+    },
+    /// A merge method is allowed that lands commits the check never saw
+    /// (a forge-made merge, rebase or squash commit).
+    MergeMethodAllowed {
+        /// The method.
+        method: MergeMethod,
+    },
+    /// CI is disabled on the repository: the required check can never report.
+    CiDisabled,
 }
 
 /// A difference between forge state and the VTC projection (§5.6 table).
@@ -418,6 +433,7 @@ mod tests {
             blocks_force_push: true,
             blocks_deletion: true,
             bypass_actors: vec![],
+            ..ProtectionState::default()
         }
     }
 

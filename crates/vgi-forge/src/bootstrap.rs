@@ -34,6 +34,13 @@ pub struct VgiConfig {
     pub verify_trust_action: String,
     /// The VGI release the action downloads (`version:` input), e.g. `v0.5.0`.
     pub verify_trust_version: String,
+    /// SHA-256 of the release tarball the runner downloads (`sha256:` input,
+    /// 64 lowercase hex). Where the runner cannot verify the release's build
+    /// attestation (Forgejo), this pin in the reviewed workflow is what
+    /// survives a replaced release asset; an adapter for such a forge refuses
+    /// a plan without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_trust_sha256: Option<String>,
     /// Name of the required status check. The workflow's job is given this
     /// name, so the two cannot disagree.
     pub required_check: String,
@@ -61,10 +68,17 @@ impl VgiConfig {
             vtc_did: vtc_did.into(),
             verify_trust_action: verify_trust_action.into(),
             verify_trust_version: verify_trust_version.into(),
+            verify_trust_sha256: None,
             required_check: DEFAULT_REQUIRED_CHECK.into(),
             platform_keyring: None,
             extra_files: Vec::new(),
         }
+    }
+
+    /// Pin the release tarball's SHA-256.
+    pub fn with_verify_trust_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.verify_trust_sha256 = Some(sha256.into());
+        self
     }
 
     /// Set the platform keyring.
@@ -128,6 +142,13 @@ pub struct ProtectionSpec {
     pub block_force_push: bool,
     /// Block deletion.
     pub block_deletion: bool,
+    /// Paths (forge glob syntax) a pull request may not change and still
+    /// merge: the workflows and the exempt keyring. Without this a PR could
+    /// rewrite the check it is judged by — CI runs the PR's own copy of the
+    /// workflow — and pass itself. Empty where the forge enforces this some
+    /// other way or not at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_paths: Vec<String>,
 }
 
 impl ProtectionSpec {
@@ -140,6 +161,58 @@ impl ProtectionSpec {
             require_pull_request: true,
             block_force_push: true,
             block_deletion: true,
+            protected_paths: Vec::new(),
+        }
+    }
+
+    /// Also forbid pull requests that change `paths`.
+    pub fn with_protected_paths<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.protected_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// A way a pull request can land on the default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum MergeMethod {
+    /// Fast-forward only: the PR's own commits land unchanged, DID
+    /// signatures and all. The one method that needs no platform key.
+    FastForward,
+    /// A merge commit, made (and signed, if at all) by the forge.
+    MergeCommit,
+    /// The PR's commits re-created on the base by the forge.
+    Rebase,
+    /// Rebase, then a merge commit (Forgejo's `rebase-merge`).
+    RebaseMerge,
+    /// One new commit, made by the forge.
+    Squash,
+}
+
+/// Repository settings a bootstrap enforces alongside the protection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RepoSettings {
+    /// The only merge methods to allow; the first is the default. Empty
+    /// leaves the forge's merge settings alone.
+    pub merge_methods: Vec<MergeMethod>,
+    /// Turn the forge's CI on for the repository. Off, the required check
+    /// never reports and nothing can merge.
+    pub enable_ci: bool,
+}
+
+impl RepoSettings {
+    /// Allow exactly `methods` (the first the default) and enable CI.
+    pub fn merge_methods(methods: impl Into<Vec<MergeMethod>>) -> Self {
+        RepoSettings {
+            merge_methods: methods.into(),
+            enable_ci: true,
         }
     }
 }
@@ -167,6 +240,20 @@ pub enum StepAction {
     },
     /// Enforce protection on the default branch.
     ProtectDefaultBranch(ProtectionSpec),
+    /// Make the repository's settings (merge methods, CI) match.
+    ConfigureRepo(RepoSettings),
+    /// Rewrite files the default branch's protection forbids changing — the
+    /// managed workflow, the exempt keyring — through a temporary exception
+    /// for the bridge alone, restoring the protection exactly afterwards
+    /// (and attempting to even when a write failed). A maintenance job, not
+    /// part of a bootstrap: it is the one sanctioned way the bridge changes
+    /// a protected path, so it runs as one audited step.
+    RefreshProtectedFiles {
+        /// The files, each with its desired contents.
+        files: Vec<ExtraFile>,
+        /// Commit message for each file that changes.
+        message: String,
+    },
 }
 
 /// One step of a bootstrap plan.

@@ -33,7 +33,8 @@ mod rights;
 
 pub use bootstrap::{
     BootstrapComponent, BootstrapReport, BootstrapStep, DEFAULT_REQUIRED_CHECK, ExtraFile,
-    ProtectionSpec, StepAction, StepOutcome, VgiConfig, run_plan, validate_repo_path,
+    MergeMethod, ProtectionSpec, RepoSettings, StepAction, StepOutcome, VgiConfig, run_plan,
+    validate_repo_path,
 };
 pub use error::{ForgeError, Result};
 pub use event::{

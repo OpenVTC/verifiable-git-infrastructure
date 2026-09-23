@@ -323,7 +323,31 @@ sign at all).
 **Branch protection** — on the default branch: enable status checks and require
 the verify-trust job's context, disable force-push, and restrict who may push
 and merge. The context name may not match what GitHub would show;
-copy the one a completed run reports rather than guessing.
+copy the one a completed run reports rather than guessing. Forgejo names it
+`<workflow name> / <job name> (<event>)`, and matches required contexts as glob
+patterns — keep `*?[]{}\` out of the name. Also:
+
+- **Protect the workflows.** A pull request runs its *own* copy of the
+  workflow, so one that edits `verify-trust.yml` (or adds a workflow whose job
+  reports the same context) passes itself. List
+  `.forgejo/workflows/**;.gitea/workflows/**;.github/workflows/**` — and the
+  exempt keyring, if you commit one — under *protected file patterns*
+  (`**`, because Forgejo's `*` stops at `/` and `.`), and enable *apply to
+  administrators* so admins cannot merge past it.
+- **Disable direct pushes** rather than allow-listing pushers: a direct push
+  skips status checks entirely. Merges go through the *merge allow-list*.
+- **Only one rule may match the branch.** Forgejo compares plain rule names
+  case-insensitively and applies the oldest match, so a stray `Main` rule can
+  quietly replace your `main` rule.
+- **Anyone who can write can post the check's status** — maintainers, and any
+  workflow that runs pull-request code with a write token. Forgejo cannot pin
+  a required check to Actions, so those writers are trusted.
+
+To change a protected workflow later, lift the protection for the change and
+restore it exactly. A community bridge does this as one audited step
+(`refresh-managed-files`): it allows pushes from the bridge's bot alone, writes
+the files, restores the rule and reads it back; a rule left open shows as
+critical drift.
 
 ### Forgejo Actions runners
 

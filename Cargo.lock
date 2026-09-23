@@ -5806,6 +5806,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vgi-forge-forgejo"
+version = "0.4.12"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "hex",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "vgi-forge",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
 name = "vgi-forge-github"
 version = "0.4.12"
 dependencies = [

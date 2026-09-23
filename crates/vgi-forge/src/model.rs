@@ -11,6 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::MergeMethod;
 use crate::resource::Resource;
 use crate::rights::ForgeRole;
 
@@ -311,6 +312,18 @@ pub struct ProtectionState {
     pub blocks_deletion: bool,
     /// Actors allowed to bypass it. Must be empty (§5.3).
     pub bypass_actors: Vec<String>,
+    /// Paths a pull request may not change (forge glob syntax), for a forge
+    /// that protects the workflow this way. Empty when not read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_paths: Vec<String>,
+    /// The merge methods the repository allows, for an adapter that reads
+    /// them. `None`: not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_methods: Option<Vec<MergeMethod>>,
+    /// Whether the forge's CI is enabled on the repository, for an adapter
+    /// that reads it. `None`: not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_enabled: Option<bool>,
 }
 
 /// A repository as observed on the forge.
@@ -609,10 +622,18 @@ pub enum LinkCallback {
         /// From [`LinkStep::DeviceCode`]; polling stops at this deadline.
         expires_in: u64,
     },
-    /// An authorisation-code redirect.
+    /// An authorisation-code redirect. Build it with
+    /// [`LinkCallback::redirect`].
+    #[non_exhaustive]
     Redirect {
         /// Query parameters received.
         params: BTreeMap<String, String>,
+        /// The member (DID) the caller started this link for, from its own
+        /// session — never from the redirect. An adapter whose `state` is
+        /// bound to the member checks it, so a link started by one person
+        /// cannot be completed into another's session (login CSRF).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
     },
 }
 
@@ -629,15 +650,25 @@ impl fmt::Debug for LinkCallback {
                 .field("interval", interval)
                 .field("expires_in", expires_in)
                 .finish(),
-            LinkCallback::Redirect { params } => f
+            LinkCallback::Redirect { params, member } => f
                 .debug_struct("Redirect")
                 .field("params", &params.keys().collect::<Vec<_>>())
+                .field("member", member)
                 .finish(),
         }
     }
 }
 
 impl LinkCallback {
+    /// An authorisation-code redirect for `member`, the DID the caller
+    /// passed to [`crate::Forge::begin_account_link`].
+    pub fn redirect(params: BTreeMap<String, String>, member: impl Into<String>) -> LinkCallback {
+        LinkCallback::Redirect {
+            params,
+            member: Some(member.into()),
+        }
+    }
+
     /// The callback that polls the device flow `step` started. `None` for a
     /// step that is not a device flow.
     pub fn from_device_step(step: &LinkStep) -> Option<LinkCallback> {
