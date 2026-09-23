@@ -15,6 +15,11 @@ cannot drift.
   hint whose answer the caller then checks against the signature.
 - **`ed25519_keys_from_doc`** — extract Ed25519 verification keys from a DID
   document (`publicKeyMultibase`, multicodec `0xED01`).
+- **`normalize_resource` / `resource_contains`** — the forge-qualified
+  resource grammar (`github.com/acme/widgets`): lowercase, forge host first,
+  no empty or dot segments, with errors that say what to write instead; and
+  segment-prefix scope containment. One grammar, so the verifier, the VTC's
+  registry projection and the forge adapters produce the same bytes.
 
 Nothing here touches the network, a keyring, or a VTA — that is what lets the
 CI verifier stay small.
