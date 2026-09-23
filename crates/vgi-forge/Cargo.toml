@@ -1,0 +1,23 @@
+[package]
+name = "vgi-forge"
+description = "Forge-neutral adapter trait and types for VGI git namespaces: resources, rights, capabilities, bootstrap plans, events and drift."
+readme = "README.md"
+keywords = ["git", "forge", "did", "trust-registry", "github"]
+categories = ["development-tools"]
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vgi-core = { workspace = true }
+async-trait = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

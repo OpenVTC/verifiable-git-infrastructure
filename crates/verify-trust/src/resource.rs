@@ -13,6 +13,12 @@
 //! from `codeberg.org/acme` — which may belong to different people. The
 //! qualified form makes the forge explicit, never assumed.
 //!
+//! The grammar itself is [`vgi_core::normalize_resource`], shared with the
+//! VTC's registry projection and the forge adapters, so the resource this
+//! run queries is byte-for-byte the one a grant was written under. This
+//! module adds only what is verify-trust's own: the flag names in messages
+//! and a fix suggested from the CI environment.
+//!
 //! The change is staged so nothing deployed moves under an operator's feet:
 //! `legacy` is the default and behaves exactly as before; the default flips to
 //! `qualified` in a later release, and `legacy` is then removed. Registry
@@ -23,6 +29,7 @@
 //! `--resource`.
 
 use anyhow::{Context, Result, bail};
+use vgi_core::{ResourceErrorKind, normalize_resource};
 
 /// Which form the TRQP resource is written in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -130,71 +137,27 @@ pub fn forge_host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// Whether `segment` can be a forge host: a dotted DNS name (`github.com`,
-/// `git.example.org`) or `localhost`, for a forge under local test.
-fn is_forge_host(segment: &str) -> bool {
-    (segment == "localhost" || segment.contains('.'))
-        && segment.split('.').all(|label| {
-            !label.is_empty()
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-}
-
 /// Validate a qualified resource and return it normalised (lowercased).
 ///
 /// `what` names the value in errors (`--resource`, `--fallback-resource`, or
-/// where a derived one came from). Every rejection says how to fix it.
+/// where a derived one came from). Every rejection says how to fix it; an
+/// unqualified `owner/repo` gets the forge host this run is on suggested.
 pub fn normalize_qualified(what: &str, value: &str, ci: &CiEnv) -> Result<String> {
-    let lowered = value.to_lowercase();
-    if lowered.is_empty() {
-        bail!("{what} is empty; a qualified resource looks like `github.com/acme/widgets`");
-    }
-    if lowered.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        bail!("{what} `{value}` contains whitespace or control characters");
-    }
-    if let Some((_, rest)) = lowered.split_once("://") {
-        let suggestion = rest.trim_end_matches('/').trim_end_matches(".git");
-        bail!("{what} `{value}` is a URL, not a resource; did you mean `{suggestion}`?");
-    }
-    if lowered.starts_with('/') || lowered.ends_with('/') {
-        let suggestion = lowered.trim_matches('/');
-        bail!("{what} `{value}` has a leading or trailing `/`; did you mean `{suggestion}`?");
-    }
-    let segments: Vec<&str> = lowered.split('/').collect();
-    if segments.iter().any(|s| s.is_empty()) {
-        bail!("{what} `{value}` has an empty path segment (`//`)");
-    }
-    if segments.iter().any(|s| *s == "." || *s == "..") {
-        bail!("{what} `{value}` has a `.` or `..` segment; name the owner and repo directly");
-    }
-    let host = segments[0];
-    if !is_forge_host(host) {
-        if let Some((bare, _port)) = host.split_once(':')
-            && is_forge_host(bare)
-        {
-            let suggestion = lowered.replacen(host, bare, 1);
+    match normalize_resource(value) {
+        Ok(canonical) => Ok(canonical),
+        Err(e) if *e.kind() == ResourceErrorKind::MissingForgeHost => {
+            let bare = value.trim_matches('/').to_ascii_lowercase();
+            let fix = match ci.forge_host() {
+                Some(detected) => format!("did you mean `{detected}/{bare}`?"),
+                None => format!("prefix the forge host, e.g. `github.com/{bare}`"),
+            };
             bail!(
-                "{what} `{value}` carries a port; a resource names the forge by host alone — \
-                 did you mean `{suggestion}`?"
-            );
+                "{what} `{value}` is not forge-qualified (--resource-format qualified expects \
+                 `<forge-host>/<owner>[/<repo>]`); {fix}"
+            )
         }
-        let fix = match ci.forge_host() {
-            Some(detected) => format!("did you mean `{detected}/{lowered}`?"),
-            None => format!("prefix the forge host, e.g. `github.com/{lowered}`"),
-        };
-        bail!(
-            "{what} `{value}` is not forge-qualified (--resource-format qualified expects \
-             `<forge-host>/<owner>[/<repo>]`); {fix}"
-        );
+        Err(e) => bail!("{}", e.describe(what)),
     }
-    if segments.len() < 2 {
-        bail!(
-            "{what} `{value}` names a forge but no owner; e.g. `{host}/acme` or `{host}/acme/widgets`"
-        );
-    }
-    Ok(lowered)
 }
 
 /// The primary and fallback resources a run queries, in the chosen form.
@@ -422,7 +385,8 @@ mod tests {
                 "did you mean `git.example.org/acme`?",
             ),
             ("github.com", "names a forge but no owner"),
-            ("github..com/acme", "not forge-qualified"),
+            ("github..com/acme", "invalid forge host"),
+            ("github.com/acme@x", "may only contain"),
         ];
         for (value, expected) in cases {
             let message = err("--resource", value, &none);

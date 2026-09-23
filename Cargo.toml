@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/vgi-core", "crates/verify-trust", "crates/did-git-sign"]
+members = [
+    "crates/vgi-core",
+    "crates/verify-trust",
+    "crates/did-git-sign",
+    "crates/vgi-forge",
+    "crates/vgi-forge-github",
+]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +20,8 @@ publish = true
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
 vgi-core = { version = "0.4.12", path = "crates/vgi-core" }
+# Forge-neutral adapter trait and types for the git-namespaces bridge.
+vgi-forge = { version = "0.4.12", path = "crates/vgi-forge" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -252,3 +260,34 @@ proptest = "1"
 # YAML tree. Matching the text instead finds the same marker in a comment or a
 # description and reports it as a finding.
 yaml-rust2 = "0.13"
+
+# ── forge adapters (vgi-forge, vgi-forge-github) ────────────────────────────
+# Every crate below except wiremock was already in this workspace's graph
+# before the adapters arrived — through the TDK's HTTPS and TLS stack — so the
+# adapters add requirements, not new code to audit: `cargo tree -e normal`
+# gains no package. wiremock and its handful of dependencies are dev-only.
+#
+# `Forge` is object-safe through async-trait: the bridge holds adapters as
+# `Box<dyn Forge>` keyed by forge host, which native `async fn` in traits
+# cannot express without hand-boxing every method.
+async-trait = "0.1"
+# `HeaderMap` for webhook headers — the type every Rust HTTP server hands out.
+http = "1"
+# The GitHub adapter's HTTP client. Default features off: rustls with the
+# aws-lc-rs provider the TDK already builds, JSON bodies, HTTP/2 and system
+# proxies, and nothing else (no cookies, no native-tls, no decompression).
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "http2",
+    "system-proxy",
+] }
+url = "2.5"
+# RS256 for the GitHub App JWT, HMAC-SHA256 for webhook signatures and the
+# CSPRNG for bind nonces: the provider rustls already links here, rather than
+# the pure-Rust `rsa` crate, whose private-key operations carry the unfixed
+# Marvin timing advisory (RUSTSEC-2023-0071). Default features off: the
+# ring-compatibility shims pull `untrusted`, which nothing here needs.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
+# HTTP mocking for the adapter tests. Dev-only; no test touches the network.
+wiremock = "0.6"
