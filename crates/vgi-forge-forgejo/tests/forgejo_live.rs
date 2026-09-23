@@ -767,19 +767,22 @@ async fn wait_until_checked(fj: &Forgejo, index: u64) {
 /// A branch off `main` changing `path`, as `who`, and a PR for it:
 /// `(index, head sha)`.
 async fn open_pr(fj: &Forgejo, who: (&str, &str), branch: &str, path: &str) -> (u64, String) {
-    let file = fj
-        .ok(
-            who,
-            Method::POST,
-            &format!("repos/acme/widgets/contents/{path}"),
-            Some(json!({
-                "content": STANDARD.encode(format!("changed on {branch}\n")),
-                "message": format!("change {path}"),
-                "branch": "main",
-                "new_branch": branch,
-            })),
-        )
-        .await;
+    let url = format!("repos/acme/widgets/contents/{path}");
+    let mut body = json!({
+        "content": STANDARD.encode(format!("changed on {branch}\n")),
+        "message": format!("change {path}"),
+        "branch": "main",
+        "new_branch": branch,
+    });
+    // Changing an existing file is a PUT with its blob sha; a new one a POST.
+    let (status, existing) = fj.api(who, Method::GET, &url, None).await;
+    let method = if status.is_success() {
+        body["sha"] = existing["sha"].clone();
+        Method::PUT
+    } else {
+        Method::POST
+    };
+    let file = fj.ok(who, method, &url, Some(body)).await;
     let sha = file["commit"]["sha"].as_str().unwrap().to_string();
     let pr = fj
         .ok(
