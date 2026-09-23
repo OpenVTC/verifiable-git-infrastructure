@@ -1,10 +1,17 @@
 //! Exemption keyring for platform-signed commits.
 //!
 //! GitHub signs the commits it creates itself — web-UI merge and squash
-//! commits, Dependabot commits — with **PGP** (its `web-flow` key), not with
-//! a contributor's sshsig. Those commits can never carry a DID signature, so
-//! a repository that wants `verify-trust` as a required check needs a policy
-//! for them.
+//! commits, web-UI and API file edits, Dependabot commits — with **PGP** (its
+//! `web-flow` key), not with a contributor's sshsig. Merge commits can never
+//! carry a DID signature, so a repository that wants `verify-trust` as a
+//! required check needs a policy for them.
+//!
+//! This module answers only "did a trusted platform key sign this?". That is
+//! necessary but not sufficient: the platform signs whatever it writes on
+//! anyone's behalf, so the verifier accepts the signature only on a clean
+//! merge of parents that themselves pass (see `apply_platform_merge_policy`
+//! in the crate root). Single-parent platform commits are refused as
+//! `platformSignedEdit`.
 //!
 //! The policy here is cryptographic, never name-based: the repository commits
 //! an armored keyring of explicitly trusted platform keys (e.g. the key from

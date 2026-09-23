@@ -54,7 +54,8 @@ verify-trust \
 ```
 
 Exits `0` only when every commit is `trusted` (registry-authorized) or `exempt`
-(a platform commit verified against a committed PGP keyring). Every other
+(a platform-made merge commit verified against a committed PGP keyring, whose
+parents all pass and whose tree is their clean merge). Every other
 verdict fails, each with a distinct status so an operator can tell which
 remediation applies:
 
@@ -67,6 +68,10 @@ remediation applies:
 | `badSignature` | the DID publishes the key, but the signature fails |
 | `unauthorized` | valid signature, registry says no |
 | `registryUnavailable` | the registry could not be consulted |
+| `pgpRejected` | PGP-signed, but by no key in the exempt keyring (or none is configured) |
+| `platformSignedEdit` | platform-signed, but not a merge (web-UI or API edit, squash merge, Dependabot) — re-sign it with `did-git-sign` |
+| `platformMergeUnverifiedParent` | platform-signed merge with a parent that neither passes nor is on the base branch |
+| `platformMergeAltered` | platform-signed merge whose tree is not the clean merge of its parents (e.g. conflicts resolved in the web UI) |
 
 `--json` emits a machine-readable report, in which commits keep their full
 signer DIDs and `signerNames` maps each named signer to its name and that

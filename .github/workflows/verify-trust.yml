@@ -32,6 +32,7 @@ jobs:
           range: origin/${{ github.base_ref }}..HEAD
           registry-did: ${{ vars.TRUST_REGISTRY_DID }}
           vtc-did: ${{ vars.VTC_DID }}
-          # GitHub web-UI merge/squash commits are PGP-signed by web-flow;
-          # they pass only via this committed keyring.
+          # GitHub web-UI merge commits are PGP-signed by web-flow; they pass
+          # only via this committed keyring, and only as clean merges of
+          # passing parents. Other web-flow commits must be DID-signed.
           exempt-keyring: .github/trusted-platform-keys.asc

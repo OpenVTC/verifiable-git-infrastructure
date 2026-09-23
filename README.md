@@ -79,7 +79,12 @@ published with the release is checked, which catches transport corruption but
 not a replaced release, so pin `version` and set `sha256` there. See
 [the runbook](docs/RUNBOOK.md#forgejo-actions-runners). Verdicts: `trusted` / `exempt` pass;
 `unsigned`, `noSignerDid`, `unresolvedSigner`, `unknownKey`, `badSignature`,
-`unauthorized`, `registryUnavailable` fail. Fails closed at every layer.
+`unauthorized`, `registryUnavailable`, `pgpRejected`, `platformSignedEdit`,
+`platformMergeUnverifiedParent`, `platformMergeAltered` fail. Fails closed at
+every layer. `exempt` is only ever a clean merge commit signed by a committed
+platform key (GitHub's `web-flow`) whose parents all pass: web-UI edits and
+Dependabot commits must be DID-signed (see the
+[runbook](docs/RUNBOOK.md#5-verdicts-and-what-to-do-about-them)).
 
 ## Signing
 
