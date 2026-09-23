@@ -1,0 +1,31 @@
+[package]
+name = "vgi-forge-github"
+description = "GitHub adapter for VGI git namespaces: per-community GitHub App auth, repo creation and bootstrap, role projection, device-flow account linking and verified webhooks."
+readme = "README.md"
+keywords = ["git", "github", "github-app", "did", "trust-registry"]
+categories = ["development-tools", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vgi-forge = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

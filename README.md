@@ -18,6 +18,8 @@ activation flow.
 | [`vgi-core`](crates/vgi-core) | Shared, dependency-light primitives: the PROTOCOL.sshsig encoder, git commit-object handling, and DID-document Ed25519 key extraction. No network, keyring, or VTA. |
 | [`verify-trust`](crates/verify-trust) | The CI verifier (`verify-trust` binary). Checks a commit range against the registry. Depends on `vgi-core`, a DID resolver, the query client, and `vta-sdk`'s display-name rendering — it never opens a VTA session or touches a keyring, so PR runs stay small. |
 | [`did-git-sign`](crates/did-git-sign) | The signer (`did-git-sign`, a git `gpg.ssh.program`). Signs commits with a DID key held by your VTA; carries the dev-machine stack (VTA client, keyring, prompts). |
+| [`vgi-forge`](crates/vgi-forge) | Forge-neutral adapter layer for VTC-governed git namespaces: the `Forge` trait and `ForgeHooks`, capabilities, forge-qualified resources, rights → role projection, bootstrap plans, events and drift. No forge I/O. |
+| [`vgi-forge-github`](crates/vgi-forge-github) | The GitHub adapter: one community's own GitHub App (manifest registration, scoped per-job installation tokens), namespace binding, device-flow account linking, repo creation and the commit-trust bootstrap, role projection, verified webhooks. |
 
 ## The CI check
 

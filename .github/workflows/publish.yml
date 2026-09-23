@@ -121,6 +121,12 @@ jobs:
           # vgi-core has no internal deps; verify-trust and did-git-sign both
           # depend on it. `cargo publish` waits for each crate to appear in
           # the index before returning, so the next one resolves it.
+          #
+          # vgi-forge and vgi-forge-github are publishable but not listed yet:
+          # Trusted Publishing can only be configured for a crate that already
+          # exists on crates.io, so their first release is a manual publish,
+          # after which they join this list (vgi-forge after vgi-core,
+          # vgi-forge-github after vgi-forge).
           for crate in vgi-core verify-trust did-git-sign; do
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')
