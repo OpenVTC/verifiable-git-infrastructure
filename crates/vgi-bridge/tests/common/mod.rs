@@ -78,29 +78,28 @@ pub struct FakeVerifier {
 impl CommitVerifier for FakeVerifier {
     async fn verify(
         &self,
-        repo_dir: &std::path::Path,
-        commits: &[String],
+        commits: &[verify_trust::RangeCommit],
         resource: &str,
         fallback: &str,
     ) -> anyhow::Result<Vec<CommitLine>> {
         self.seen.lock().unwrap().push((
-            commits.to_vec(),
+            commits.iter().map(|c| c.sha.clone()).collect(),
             resource.to_string(),
             fallback.to_string(),
         ));
-        commits
+        Ok(commits
             .iter()
             .map(|c| {
-                // The object really is in the fetched repository.
-                verify_trust::read_commit_raw(repo_dir, c)?;
-                let ok = self.trusted.contains(c);
-                Ok(CommitLine::new(
-                    c.clone(),
+                // The fetcher handed over the real commit object.
+                assert!(c.raw.starts_with(b"tree "), "a raw commit object");
+                let ok = self.trusted.contains(&c.sha);
+                CommitLine::new(
+                    c.sha.clone(),
                     ok,
                     if ok { "trusted" } else { "unauthorized" },
-                ))
+                )
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -129,6 +128,10 @@ pub struct Options {
     /// The GitHub web base, when it must differ from the mock (an `https`
     /// URL for flows whose `next` the schema requires to be https).
     pub web_base: Option<String>,
+    /// Seal a registered App before start.
+    pub seed_app: bool,
+    /// Configure the `web-flow` keyring.
+    pub keyring: bool,
 }
 
 impl Default for Options {
@@ -146,13 +149,20 @@ impl Default for Options {
             seed_namespace: true,
             max_body: 2 * 1024 * 1024,
             web_base: None,
+            seed_app: true,
+            keyring: true,
         }
     }
 }
 
 pub fn config(server: &MockServer, dir: &std::path::Path, vtc: &str, o: &Options) -> BridgeConfig {
-    let keyring = dir.join("web-flow.asc");
-    std::fs::write(&keyring, KEYRING).unwrap();
+    let keyring_path = dir.join("web-flow.asc");
+    std::fs::write(&keyring_path, KEYRING).unwrap();
+    let keyring = if o.keyring {
+        format!("platform_keyring_file = \"{}\"", keyring_path.display())
+    } else {
+        String::new()
+    };
     BridgeConfig::parse(&format!(
         r#"
 vtc_did = "{vtc}"
@@ -169,13 +179,13 @@ version = "v0.5.0"
 [[github]]
 app_name = "acme-vgi-bridge"
 app_owner = "acme"
-platform_keyring_file = "{keyring}"
+{keyring}
 bridge_checks = {checks}
 api_base = "{uri}"
 web_base = "{web}"
 "#,
         vtc = vtc,
-        keyring = keyring.display(),
+        keyring = keyring,
         checks = o.bridge_checks,
         uri = server.uri(),
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
@@ -202,6 +212,17 @@ pub fn seed_app(store: &Store) {
 }
 
 pub fn seed_namespace(store: &Store, kind: NamespaceKind, required_workflow: bool) {
+    seed_namespace_ready(store, kind, required_workflow, Some(true));
+}
+
+/// A bound namespace whose installation's readiness for the bridge-posted
+/// check is `ready` (`None`: never probed).
+pub fn seed_namespace_ready(
+    store: &Store,
+    kind: NamespaceKind,
+    required_workflow: bool,
+    ready: Option<bool>,
+) {
     let ns_resource = match kind {
         NamespaceKind::User => Resource::parse("github.com/alice").unwrap(),
         _ => acme(),
@@ -213,6 +234,7 @@ pub fn seed_namespace(store: &Store, kind: NamespaceKind, required_workflow: boo
     rec.state = NamespaceState::Bound;
     rec.binding = Some(NamespaceBinding::new(namespace, vec![]));
     rec.required_workflow = Some(required_workflow);
+    rec.bridge_checks = ready;
     store.put(Table::Namespaces, NS, &rec).unwrap();
 }
 
@@ -260,7 +282,9 @@ pub async fn world(o: Options) -> World {
         Some(p) => Store::open(p, key).unwrap(),
         None => Store::in_memory(key).unwrap(),
     };
-    seed_app(&store);
+    if o.seed_app {
+        seed_app(&store);
+    }
     if o.seed_namespace {
         seed_namespace(&store, o.kind, o.required_workflow);
     }
@@ -421,4 +445,45 @@ pub async fn wait_for_request(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("no request: {what}");
+}
+
+/// Wait until delivery `id` on github.com is recorded as handled — every
+/// check it called for has ended (posted or deliberately skipped).
+pub async fn wait_delivery(w: &World, id: &str) {
+    for _ in 0..400 {
+        if w.bridge
+            .store()
+            .get::<i64>(Table::Deliveries, &format!("github.com#{id}"))
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("delivery {id} never completed");
+}
+
+/// Every check run the bridge posted (the POST bodies), in order.
+pub async fn posted_checks(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::POST && r.url.path().ends_with("/check-runs"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// Every check-run completion the bridge sent (the PATCH bodies), in order.
+pub async fn completed_checks(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path().contains("/check-runs/"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
 }

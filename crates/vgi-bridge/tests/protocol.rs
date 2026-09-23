@@ -148,6 +148,15 @@ async fn a_finished_job_repeated_is_not_run_again_and_its_result_is_resent() {
         "nothing touched the forge again"
     );
 
+    // Even after the VTC acknowledged it, a repeat has its result sent
+    // again, rebuilt from the ledger (spec, request rule 4).
+    w.ack_result(&again).await;
+    w.send_job(inspect_job("job_1")).await;
+    assert_eq!(w.next().await["payload"]["accepted"], false);
+    let rebuilt = w.next().await;
+    assert_eq!(rebuilt["type"], RESULT);
+    assert_eq!(rebuilt["payload"], again["payload"]);
+
     // Same id, other content: jobIdReused.
     let mut other = inspect_job("job_1");
     other["repo"] = json!("github.com/acme/gadgets");

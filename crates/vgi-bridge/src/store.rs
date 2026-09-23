@@ -207,6 +207,10 @@ pub struct NamespaceRecord {
     /// GitHub: the required-workflow pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<PinRecord>,
+    /// GitHub: whether the installation carries the bridge-posted check
+    /// (its permissions and event subscriptions). `None`: not probed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_checks: Option<bool>,
     /// Forge ids of the repositories the bridge manages here.
     #[serde(default)]
     pub managed: BTreeSet<u64>,
@@ -223,6 +227,7 @@ impl NamespaceRecord {
             capabilities: None,
             required_workflow: None,
             pin: None,
+            bridge_checks: None,
             managed: BTreeSet::new(),
         }
     }
@@ -383,6 +388,19 @@ pub struct OutboxEntry {
     pub attempts: u32,
 }
 
+impl OutboxEntry {
+    /// A result not sent yet.
+    pub fn result(payload: Value) -> Self {
+        OutboxEntry {
+            kind: OutboxKind::Result,
+            payload,
+            doc_ids: Vec::new(),
+            last_sent: 0,
+            attempts: 0,
+        }
+    }
+}
+
 /// What an [`OutboxEntry`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -509,6 +527,38 @@ impl Store {
         Ok(out)
     }
 
+    /// Close job `job_id` with `result` and queue it for sending, in **one**
+    /// transaction: a crash can leave the job either running (it runs again)
+    /// or finished with its result queued — never finished with the result
+    /// lost. `false` (and nothing written) if the job is unknown or already
+    /// finished.
+    pub fn finish_job(&self, job_id: &str, result: &Value, finished_at: i64) -> Result<bool> {
+        let w = self.db.begin_write()?;
+        {
+            let mut jobs = w.open_table(Table::Jobs.def())?;
+            let Some(current) = jobs.get(job_id)? else {
+                return Ok(false);
+            };
+            let mut rec: JobRecord = serde_json::from_slice(current.value())?;
+            drop(current);
+            if rec.state == JobState::Finished {
+                return Ok(false);
+            }
+            rec.state = JobState::Finished;
+            rec.result = Some(result.clone());
+            rec.payload = None;
+            rec.finished_at = Some(finished_at);
+            let bytes = serde_json::to_vec(&rec)?;
+            jobs.insert(job_id, bytes.as_slice())?;
+            let entry = OutboxEntry::result(result.clone());
+            let bytes = serde_json::to_vec(&entry)?;
+            w.open_table(Table::Outbox.def())?
+                .insert(format!("result:{job_id}").as_str(), bytes.as_slice())?;
+        }
+        w.commit()?;
+        Ok(true)
+    }
+
     /// Delete one record. `true` if it existed.
     pub fn delete(&self, table: Table, key: &str) -> Result<bool> {
         let w = self.db.begin_write()?;
@@ -615,6 +665,31 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn finishing_a_job_records_the_result_and_queues_it_together() {
+        let s = store();
+        let job = JobRecord::queued("j1", "d", "ns", "inspect", serde_json::json!({}), 0);
+        s.put(Table::Jobs, "j1", &job).unwrap();
+        let result = serde_json::json!({ "jobId": "j1", "outcome": "succeeded" });
+        assert!(s.finish_job("j1", &result, 5).unwrap());
+        let rec: JobRecord = s.get(Table::Jobs, "j1").unwrap().unwrap();
+        assert_eq!(rec.state, JobState::Finished);
+        assert_eq!(rec.result.as_ref(), Some(&result));
+        assert!(rec.payload.is_none());
+        let queued: OutboxEntry = s.get(Table::Outbox, "result:j1").unwrap().unwrap();
+        assert_eq!(queued.payload, result);
+        // Exactly once: a second close changes nothing, even after the
+        // entry was acknowledged.
+        s.delete(Table::Outbox, "result:j1").unwrap();
+        assert!(!s.finish_job("j1", &serde_json::json!({}), 6).unwrap());
+        assert!(
+            s.get::<OutboxEntry>(Table::Outbox, "result:j1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!s.finish_job("unknown", &result, 6).unwrap());
     }
 
     #[test]

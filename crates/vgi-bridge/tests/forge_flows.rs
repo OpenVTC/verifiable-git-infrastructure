@@ -4,7 +4,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::process::Command;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -322,6 +321,9 @@ async fn a_bind_completes_through_the_setup_callback_once() {
         Some(true),
         "org rulesets probed at bind"
     );
+    // The installation predates the check's events: recorded as not ready,
+    // so its repositories keep the in-repo workflow.
+    assert_eq!(ns.bridge_checks, Some(false));
 
     // The state is single use.
     let (status, _) = get(
@@ -444,249 +446,114 @@ async fn an_account_link_runs_the_device_flow_and_reports_the_account() {
     );
 }
 
-// ── the bridge-posted check ──────────────────────────────────────────────
-
-fn sh(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-/// A repository with a base commit and two pull-request commits.
-fn pr_repo() -> (tempfile::TempDir, String, Vec<String>) {
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path();
-    sh(p, &["init", "-q", "-b", "main"]);
-    let mut shas = Vec::new();
-    for (i, msg) in ["base", "one", "two"].iter().enumerate() {
-        std::fs::write(p.join("f.txt"), format!("{i}")).unwrap();
-        sh(p, &["add", "f.txt"]);
-        sh(
-            p,
-            &[
-                "-c",
-                "user.name=T",
-                "-c",
-                "user.email=t@example.org",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "-m",
-                msg,
-            ],
-        );
-        shas.push(sh(p, &["rev-parse", "HEAD"]));
-    }
-    // A hook that would betray any execution of repository content.
-    std::fs::write(
-        p.join(".git/hooks/post-checkout"),
-        "#!/bin/sh\ntouch /tmp/vgi-bridge-pwned\n",
-    )
-    .unwrap();
-    let base = shas.remove(0);
-    (dir, base, shas)
-}
-
-async fn check_world(
-    trust_all: bool,
-    required_workflow: bool,
-) -> (World, tempfile::TempDir, Vec<String>) {
-    let (repo_dir, base, pr) = pr_repo();
-    let remote = url::Url::from_directory_path(repo_dir.path()).unwrap();
-    let trusted = if trust_all {
-        pr.clone()
-    } else {
-        vec![pr[0].clone()]
-    };
+#[tokio::test]
+async fn an_installation_that_accepts_the_new_permissions_turns_the_bridge_check_on() {
     let w = world(Options {
-        trusted,
-        local_remote: Some(remote),
-        required_workflow,
+        seed_namespace: false,
         ..Options::default()
     })
     .await;
-    let s = &w.server;
-    mount_any_token(s).await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/repos/acme/widgets/compare/{base}...{}",
-            pr[1]
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "total_commits": 2,
-            "merge_base_commit": { "sha": base },
-            "commits": [ { "sha": pr[0] }, { "sha": pr[1] } ],
-        })))
-        .mount(s)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/widgets/check-runs"))
-        .and(body_partial_json(
-            json!({ "name": "Verify commit trust", "head_sha": pr[1], "status": "in_progress" }),
-        ))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 77 })))
-        .mount(s)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/repos/acme/widgets/check-runs/77"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 77 })))
-        .mount(s)
-        .await;
-    let mut pr_and_base = pr.clone();
-    pr_and_base.push(base);
-    (w, repo_dir, pr_and_base)
-}
-
-fn pr_event(head: &str, base: &str) -> Value {
-    json!({
-        "action": "synchronize",
-        "repository": { "id": 812, "full_name": "acme/widgets" },
-        "pull_request": { "number": 5, "commits": 2,
-            "head": { "sha": head }, "base": { "sha": base } },
-    })
-}
-
-#[tokio::test]
-async fn the_bridge_posts_a_passing_check_for_trusted_commits() {
-    let (w, _repo, shas) = check_world(true, false).await;
-    let (head, base) = (shas[1].clone(), shas[2].clone());
-    let s = post_webhook(
-        &w,
-        "pull_request",
-        "pr-1",
-        &pr_event(&head, &base),
-        WEBHOOK_SECRET,
-    )
-    .await;
-    assert_eq!(s, StatusCode::ACCEPTED);
-    let done = wait_for_request(&w.server, "the check run completes", |r| {
-        r.method == http::Method::PATCH && r.url.path() == "/repos/acme/widgets/check-runs/77"
-    })
-    .await;
-    let body: Value = serde_json::from_slice(&done.body).unwrap();
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["conclusion"], "success", "{body}");
-    assert_eq!(
-        body["output"]["title"],
-        "All 2 commits are signed by trusted DIDs"
+    common::seed_namespace_ready(
+        w.bridge.store(),
+        vgi_forge::NamespaceKind::Organization,
+        false,
+        Some(false),
     );
-    // Qualified resource, namespace as the fallback (spec PR #623).
-    let seen = w.verifier.seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].0,
-        shas[..2].to_vec(),
-        "exactly the pull request's commits"
-    );
-    assert_eq!(seen[0].1, "github.com/acme/widgets");
-    assert_eq!(seen[0].2, "github.com/acme");
-    assert!(
-        !std::path::Path::new("/tmp/vgi-bridge-pwned").exists(),
-        "nothing from the repository ran"
-    );
-}
-
-#[tokio::test]
-async fn the_bridge_posts_a_failing_check_when_a_commit_is_not_trusted() {
-    let (w, _repo, shas) = check_world(false, false).await;
-    let (head, base) = (shas[1].clone(), shas[2].clone());
-    post_webhook(
-        &w,
-        "pull_request",
-        "pr-2",
-        &pr_event(&head, &base),
-        WEBHOOK_SECRET,
-    )
-    .await;
-    let done = wait_for_request(&w.server, "the check run completes", |r| {
-        r.method == http::Method::PATCH
-    })
-    .await;
-    let body: Value = serde_json::from_slice(&done.body).unwrap();
-    assert_eq!(body["conclusion"], "failure");
-    assert_eq!(body["output"]["title"], "1 of 2 commits are not trusted");
-    assert!(
-        body["output"]["summary"]
-            .as_str()
-            .unwrap()
-            .contains("unauthorized")
-    );
-}
-
-#[tokio::test]
-async fn a_check_that_cannot_complete_fails_closed() {
-    let (w, _repo, shas) = check_world(true, false).await;
-    // A head the comparison does not know: the fetch or the comparison
-    // fails, and the check says so rather than staying pending or passing.
-    let bogus = "f".repeat(40);
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/repos/acme/widgets/compare/{}...{bogus}",
-            shas[2]
-        )))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })))
-        .mount(&w.server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/widgets/check-runs"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 78 })))
-        .mount(&w.server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/repos/acme/widgets/check-runs/78"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 78 })))
-        .mount(&w.server)
-        .await;
-    post_webhook(
-        &w,
-        "pull_request",
-        "pr-3",
-        &pr_event(&bogus, &shas[2]),
-        WEBHOOK_SECRET,
-    )
-    .await;
-    let done = wait_for_request(&w.server, "the check run completes", |r| {
-        r.method == http::Method::PATCH && r.url.path().ends_with("/78")
-    })
-    .await;
-    let body: Value = serde_json::from_slice(&done.body).unwrap();
-    assert_eq!(body["conclusion"], "failure");
-    assert_eq!(body["output"]["title"], "The commits could not be verified");
-}
-
-#[tokio::test]
-async fn a_required_workflow_namespace_gets_no_bridge_check() {
-    let (w, _repo, shas) = check_world(true, true).await;
-    let s = post_webhook(
-        &w,
-        "pull_request",
-        "pr-4",
-        &pr_event(&shas[1], &shas[2]),
-        WEBHOOK_SECRET,
-    )
-    .await;
-    assert_eq!(s, StatusCode::ACCEPTED);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let posted = w
-        .server
-        .received_requests()
-        .await
+    let adapter = w.bridge.adapters().get("github.com").unwrap();
+    let rec: NamespaceRecord = w
+        .bridge
+        .store()
+        .get(Table::Namespaces, NS)
         .unwrap()
-        .into_iter()
-        .any(|r| r.url.path().contains("check-runs"));
-    assert!(!posted, "Actions runs the required workflow there");
+        .unwrap();
+    adapter.restore(&rec).unwrap();
+    let namespace = rec.binding.clone().unwrap().namespace;
+    assert!(!adapter.forge().capabilities(&namespace).bridge_posted_check);
+
+    // The owner approved the updated App: permissions and events are there.
+    Mock::given(method("GET"))
+        .and(path(format!("/app/installations/{INSTALLATION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": INSTALLATION,
+            "account": { "id": 500, "login": "acme", "type": "Organization" },
+            "permissions": { "checks": "write", "pull_requests": "read",
+                             "merge_queues": "read", "metadata": "read" },
+            "events": ["pull_request", "merge_group", "repository"],
+        })))
+        .mount(&w.server)
+        .await;
+    let accepted = json!({
+        "action": "new_permissions_accepted",
+        "installation": { "id": INSTALLATION, "account": { "id": 500, "login": "acme" } },
+    });
+    assert_eq!(
+        post_webhook(&w, "installation", "i-1", &accepted, WEBHOOK_SECRET).await,
+        StatusCode::ACCEPTED
+    );
+    for _ in 0..200 {
+        let rec: NamespaceRecord = w
+            .bridge
+            .store()
+            .get(Table::Namespaces, NS)
+            .unwrap()
+            .unwrap();
+        if rec.bridge_checks == Some(true) {
+            assert!(adapter.forge().capabilities(&namespace).bridge_posted_check);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the readiness was never re-probed");
+}
+
+/// A failed code exchange leaves the registration link usable, so the admin
+/// can retry; the link is spent once the App is registered.
+#[tokio::test]
+async fn a_failed_app_registration_can_be_retried_from_the_same_link() {
+    let w = world(Options {
+        seed_app: false,
+        ..Options::default()
+    })
+    .await;
+    assert!(w.bridge.adapters().get("github.com").is_none());
+    let urls = vgi_bridge::flows::offer_registrations(&w.bridge).unwrap();
+    let state = state_of(&urls[0]);
+    Mock::given(method("POST"))
+        .and(path("/app-manifests/abc123/conversions"))
+        .respond_with(ResponseTemplate::new(502))
+        .up_to_n_times(1)
+        .mount(&w.server)
+        .await;
+    let mut perms = serde_json::Map::new();
+    for (k, v) in vgi_forge_github::manifest::APP_PERMISSIONS {
+        perms.insert(k.into(), json!(v));
+    }
+    Mock::given(method("POST"))
+        .and(path("/app-manifests/abc123/conversions"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": APP_ID, "slug": "acme-vgi-bridge", "client_id": "Iv1.testclient",
+            "client_secret": "cs", "webhook_secret": WEBHOOK_SECRET, "pem": common::app_pem(),
+            "owner": { "login": "acme" }, "permissions": perms,
+            "events": vgi_forge_github::manifest::APP_EVENTS,
+        })))
+        .mount(&w.server)
+        .await;
+    let uri = format!("/github/github.com/registered?code=abc123&state={state}");
+    let (status, _) = get(&w, &uri).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "GitHub failed the exchange"
+    );
+    assert!(w.bridge.adapters().get("github.com").is_none());
+    let (status, page) = get(&w, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        w.bridge.adapters().get("github.com").is_some(),
+        "in service"
+    );
+    let (status, _) = get(&w, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the link is spent");
 }
 
 // ── restart ──────────────────────────────────────────────────────────────

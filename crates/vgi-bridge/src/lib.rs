@@ -61,11 +61,14 @@ pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registr
     let adapters = registry::Adapters::new();
     #[cfg(feature = "forge-github")]
     for g in &cfg.github {
-        let keyring = registry::read_keyring(&g.platform_keyring_file)?;
+        let keyring = match &g.platform_keyring_file {
+            Some(p) => Some(registry::read_keyring(p)?),
+            None => None,
+        };
         match registry::build_github(store, g)? {
             Some(forge) => adapters.insert(
                 registry::Adapter::GitHub(forge),
-                registry::vgi_config(cfg, Some(keyring)),
+                registry::vgi_config(cfg, keyring),
             ),
             None => tracing::warn!(host = %g.host, "no GitHub App registered yet"),
         }
@@ -105,12 +108,10 @@ pub async fn proof_checker() -> Result<Arc<dyn wire::ProofCheck>> {
     ))))
 }
 
-/// Run the bridge until SIGINT/SIGTERM.
-pub async fn run(cfg: BridgeConfig) -> Result<()> {
-    let key = seal::MasterKey::load(
-        cfg.master_key_file.as_deref(),
-        cfg.master_key_env.as_deref(),
-    )?;
+/// Run the bridge until SIGINT/SIGTERM, with the master `key` the caller
+/// loaded (and, when it came from the environment, cleared from it — which
+/// only the single-threaded `main` can do safely).
+pub async fn run(cfg: BridgeConfig, key: seal::MasterKey) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     let store = Store::open(&cfg.store_path(), key)?;

@@ -256,6 +256,10 @@ pub(crate) async fn bind_callback(
             record.required_workflow = binding.capabilities.as_ref().map(|c| c.required_workflow);
             record.capabilities = Some(caps);
             record.binding = Some(binding.clone());
+            #[cfg(feature = "forge-github")]
+            if let Some(g) = adapter.github() {
+                record.bridge_checks = g.bridge_checks_ready(&record.resource);
+            }
             bridge.store.put(Table::Namespaces, &namespace, &record)?;
             adapter.restore(&record)?;
             let kind = match binding.namespace.kind {
@@ -488,7 +492,7 @@ pub fn offer_registrations(bridge: &Bridge) -> Result<Vec<String>> {
                     &s,
                     &PendingFlow::Manifest {
                         host: g.host.clone(),
-                        owner: g.app_owner.clone(),
+                        owner: Some(g.app_owner.clone()),
                         expires_at: now() + 86_400,
                     },
                 )?;
@@ -501,7 +505,7 @@ pub fn offer_registrations(bridge: &Bridge) -> Result<Vec<String>> {
         tracing::warn!(
             host = %g.host,
             "the GitHub App is not registered yet; an admin of `{}` opens {url} to register it",
-            g.app_owner.as_deref().unwrap_or("their account")
+            g.app_owner
         );
         urls.push(url.to_string());
     }
@@ -564,7 +568,14 @@ pub(crate) fn manifest_page(bridge: &Bridge, host: &str, state: &str) -> Result<
     )
     .with_setup_url(bridge.cfg.url(&format!("github/{host}/setup")).to_string());
     let manifest = app_manifest(&params).to_string();
-    let action = registration_url(&web, owner.as_deref(), state);
+    // An organisation's App is registered from its settings; a personal
+    // account's from the admin's own.
+    let org = if g.app_owner_is_user {
+        None
+    } else {
+        owner.as_deref()
+    };
+    let action = registration_url(&web, org, state);
     Ok(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Register the GitHub App</title></head>\
          <body><form id=\"f\" method=\"post\" action=\"{}\">\
@@ -587,7 +598,16 @@ pub(crate) async fn manifest_callback(
     state: &str,
 ) -> Result<String> {
     use vgi_forge_github::manifest::exchange_code;
-    let flow = take(bridge, state)?;
+    // Read, not taken: the state is consumed only once the exchange has
+    // succeeded, so a failed exchange (GitHub down, a network error) can be
+    // retried from the same link. GitHub's `code` is single-use itself.
+    let flow = bridge
+        .store
+        .get::<PendingFlow>(Table::Pending, state)?
+        .ok_or_else(|| anyhow!("this link is unknown, used, or expired"))?;
+    if flow.expires_at() < now() {
+        bail!("this link has expired; start again");
+    }
     let PendingFlow::Manifest { host: h, owner, .. } = flow else {
         bail!("not a registration link");
     };
@@ -606,8 +626,9 @@ pub(crate) async fn manifest_callback(
         .context("not configured")?
         .clone();
     let (api, web) = github_bases(&g)?;
-    let expected_owner = owner.context("`app_owner` is required to register an App")?;
+    let expected_owner = owner.unwrap_or_else(|| g.app_owner.clone());
     let creds = exchange_code(&api, code, &expected_owner).await?;
+    bridge.store.delete(Table::Pending, state)?;
     let stored = crate::registry::StoredApp {
         app_id: creds.app_id,
         slug: creds.slug.clone(),
@@ -621,17 +642,24 @@ pub(crate) async fn manifest_callback(
     drop(stored);
     let forge = crate::registry::build_github(&bridge.store, &g)?
         .context("the App was sealed but does not load")?;
-    let keyring = crate::registry::read_keyring(&g.platform_keyring_file)?;
+    let keyring = match &g.platform_keyring_file {
+        Some(p) => Some(crate::registry::read_keyring(p)?),
+        None => None,
+    };
     bridge.adapters.insert(
         crate::registry::Adapter::GitHub(forge),
-        crate::registry::vgi_config(&bridge.cfg, Some(keyring)),
+        crate::registry::vgi_config(&bridge.cfg, keyring),
     );
     bridge.restore_host(host)?;
     let settings = web
-        .join(&format!(
-            "organizations/{expected_owner}/settings/apps/{}",
-            creds.slug
-        ))
+        .join(&if g.app_owner_is_user {
+            format!("settings/apps/{}", creds.slug)
+        } else {
+            format!(
+                "organizations/{expected_owner}/settings/apps/{}",
+                creds.slug
+            )
+        })
         .map(|u| u.to_string())
         .unwrap_or_default();
     Ok(format!(

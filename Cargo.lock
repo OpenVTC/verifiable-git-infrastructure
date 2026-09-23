@@ -5985,6 +5985,7 @@ dependencies = [
  "trust-tasks-rs 0.22.3",
  "url",
  "verify-trust",
+ "vgi-core",
  "vgi-forge",
  "vgi-forge-forgejo",
  "vgi-forge-github",

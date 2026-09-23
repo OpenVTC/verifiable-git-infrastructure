@@ -21,7 +21,7 @@ VTC and refuses a job signed by anyone else.
 | The **VTC's DID** and **mediator DID** | the bridge accepts jobs only from that DID, over DIDComm through that mediator |
 | The **Trust Registry's DID** | written into every bootstrapped repository, and used by the check the bridge posts itself |
 | A **public HTTPS URL** behind a TLS-terminating proxy | the forges send App-setup and OAuth redirects and signed webhooks to it |
-| A **master key** (32 bytes, base64) | seals every secret in the store |
+| A **master key** (32 bytes, base64) | seals every secret in the store; from a file, or an environment variable that the bridge clears once read |
 | A writable **data directory** | one redb file, `state.redb` |
 | `git` on the path (the container has it) | the bridge-posted check fetches commit objects — never runs anything from them |
 
@@ -98,9 +98,14 @@ as the command before the first `run`.
 One App per community, registered by the bridge itself so nobody copies a
 key by hand.
 
-1. Put GitHub's `web-flow` key where the config says:
+1. Set `app_owner` (required) to the organisation that will own the App —
+   or to your account, with `app_owner_is_user = true`. Optionally put
+   GitHub's `web-flow` key where `platform_keyring_file` says:
    `curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc`.
-   It is the exempt keyring for merge commits made in GitHub's web UI.
+   It is the exempt keyring for commits GitHub signs (web-UI merges, merge
+   queues). The in-repo and required-workflow plans refuse to plan without
+   it; the bridge-posted check works without it, and then fails any
+   platform-signed commit.
 2. Start the bridge. With no App registered for a configured host, it logs
    a **one-time registration URL** (valid 24 hours):
    `…/github/github.com/register?state=…`.
@@ -109,17 +114,44 @@ key by hand.
    `/github/github.com/registered`, and the bridge exchanges the code for the
    App's id, private key and webhook secret, **seals them**, and puts the
    adapter in service. It refuses an App registered under another account,
-   a public App, or one with any permission beyond the reviewed set.
+   a public App, or one with any permission beyond the reviewed set. If the
+   exchange fails (GitHub unavailable, say), open the same link again: it is
+   spent only once the App is registered.
 4. **Enable Device Flow** on the App's settings page (the manifest format
    cannot): *Settings → Developer settings → GitHub Apps → the App → Enable
    Device Flow*. Members link their accounts with it.
 
 The App asks for: repository Administration, Contents, Variables and Checks
-(write), Metadata (read); organisation Members (read) and Administration
-(write). Organisation Administration is for the org ruleset that makes
-verify-trust a required workflow; Checks is for the check the bridge posts
-itself where there is none (§6). No secrets, Actions logs, code scanning or
-packages.
+(write), Metadata, Pull requests and Merge queues (read); organisation
+Members (read) and Administration (write); and the events
+`branch_protection_rule`, `check_run`, `check_suite`, `member`,
+`membership`, `merge_group`, `organization`, `pull_request`, `repository`,
+`repository_ruleset`. Organisation Administration is for the org ruleset
+that makes verify-trust a required workflow; Checks, Pull requests, Merge
+queues and the `pull_request` / `merge_group` / `check_*` events are for the
+check the bridge posts itself where there is none (§6). No secrets, Actions
+logs, code scanning or packages.
+
+### Upgrading an App registered before the bridge-posted check
+
+A manifest change does not reach an App that already exists: GitHub only
+applies it to new registrations. Until the App has Checks (write), Pull
+requests and Merge queues (read) and the `pull_request` and `merge_group`
+events, the bridge **keeps the in-repo Actions workflow** for namespaces
+without a required workflow, and says so in its log and in the bind's
+`missing_permissions`. To upgrade:
+
+1. On the App's settings page (*Permissions & events*), add those
+   permissions and subscribe to `pull_request`, `merge_group`, `check_run`
+   and `check_suite`. Save.
+2. An owner of each organisation (or account) the App is installed on
+   approves the new permissions (GitHub shows a banner on the installation).
+3. GitHub tells the bridge (`installation` `new_permissions_accepted`); the
+   bridge reads the installation again and switches the namespace to the
+   bridge-posted check. Each repository's next inspection reports its
+   ruleset as drift (the check is still pinned to Actions), and the VTC's
+   bootstrap job moves it over: the ruleset is pinned to the App and the
+   in-repo workflow removed.
 
 **Binding a namespace** starts at the VTC (`git-ns/namespace/bind`): the VTC
 sends the bridge a `beginBind` job, the admin follows the `next` URL to the
@@ -190,22 +222,40 @@ Where GitHub offers no org required workflow — personal accounts, and
 organisations on plans without org rulesets — a check pinned to the GitHub
 Actions App is forgeable by any writer (a workflow on another branch can post
 a passing "Verify commit trust" onto someone else's pull request). There the
-bridge posts the check itself (§9, "forged check runs"):
+bridge posts the check itself (§9, "forged check runs"), once the App has the
+permissions and events above:
 
-- on `pull_request` (`opened`, `synchronize`, `reopened`) and `merge_group`
-  webhooks it lists the commits in `base...head`, fetches exactly those
-  objects into a throwaway bare repository with a read-only token for that
-  repository, and runs verify-trust against them — the repository's
-  qualified resource, with the namespace as the fallback resource;
-- it completes "Verify commit trust" as **success** or **failure** with a
-  per-commit table. Anything that goes wrong fails the check (closed);
-- the repository ruleset requires the check **from the App's own
+- **Only against the protected branch.** A check run attaches to a commit,
+  not to a pull request, so a success on a head commit counts for every
+  pull request with that head. The bridge therefore posts only for pull
+  requests and merge groups whose base is the repository's **default
+  branch** — the branch the managed ruleset protects — read from GitHub at
+  check time, never from the delivery. For any other base it posts nothing.
+  A pull request's current base and head are re-read from GitHub; a base
+  change (`pull_request` `edited`) is checked again against the new base; a
+  pull request that moved on is left to the delivery for its new head. Runs
+  are keyed by repository, head and base branch (`external_id` is
+  `<base>@<head>`).
+- **What it checks.** The commits in `base...head` (all pages, at most
+  `checks.max_commits`; a truncated list fails), fetched as **commit objects
+  only** (a partial clone with `--filter=tree:0`, falling back to
+  `blob:none`, stopped past `checks.max_fetch_bytes`) into a throwaway bare
+  repository with a read-only token, and verified by verify-trust — the
+  repository's qualified resource, with the namespace as the fallback
+  resource. An empty range (the head is already in the base) is a success
+  only when the head *is* the base tip; otherwise it is a failure.
+- It completes "Verify commit trust" as **success** or **failure** with a
+  per-commit table. Anything that goes wrong fails the check (closed).
+- **Re-running.** "Re-run" on the check in GitHub (`check_run` /
+  `check_suite` `rerequested`) runs it again. A delivery whose check could
+  not be posted (GitHub unavailable) is not recorded as handled, so GitHub's
+  redelivery — automatic, or from the App's *Advanced* page — runs it again.
+- The repository ruleset requires the check **from the App's own
   integration id**, and the bootstrap commits no workflow.
 
-Nothing from the pull request runs: git is invoked with no config from the
-repository, hooks pointed at nothing, redirects refused and only `https`
-allowed. Work is bounded by `checks.max_commits` (default 250) and
-`checks.max_signers` (16 distinct signer DIDs).
+Nothing from the pull request runs: git is invoked with a cleared
+environment, no config from the repository, hooks pointed at nothing, lazy
+fetching off, redirects refused and only `https` allowed.
 
 This makes the bridge a **merge dependency** for those namespaces, as the
 registry already is: while it is down, pull requests wait for their check.

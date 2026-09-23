@@ -116,6 +116,10 @@ pub struct CheckConfig {
     /// Seconds a fetch may take.
     #[serde(default = "default_fetch_timeout")]
     pub fetch_timeout_secs: u64,
+    /// Bytes one fetch may write before it is stopped. The fetch asks for
+    /// commit objects only, so this is generous for any honest range.
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: u64,
     /// Checks run at once; more wait.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -128,6 +132,7 @@ impl Default for CheckConfig {
             max_signers: default_max_signers(),
             git: default_git(),
             fetch_timeout_secs: default_fetch_timeout(),
+            max_fetch_bytes: default_max_fetch_bytes(),
             concurrency: default_concurrency(),
         }
     }
@@ -143,13 +148,21 @@ pub struct GitHubForgeConfig {
     pub host: String,
     /// The App's name for the manifest (`acme-vgi-bridge`).
     pub app_name: String,
-    /// The org to register the App under (it is then owned by the org);
-    /// `None` registers it under whoever does it.
+    /// The organisation (or, with `app_owner_is_user`, the personal account)
+    /// the App is registered under and owned by. The manifest exchange
+    /// refuses an App registered anywhere else.
+    pub app_owner: String,
+    /// `app_owner` is a personal account, not an organisation.
     #[serde(default)]
-    pub app_owner: Option<String>,
-    /// The `web-flow` public key, armored — the exempt keyring for web-UI
-    /// merge commits (https://github.com/web-flow.gpg).
-    pub platform_keyring_file: PathBuf,
+    pub app_owner_is_user: bool,
+    /// The `web-flow` public key, armored — the exempt keyring for commits
+    /// GitHub signs (web-UI merges, merge queues)
+    /// (https://github.com/web-flow.gpg). Optional: the bridge-posted check
+    /// needs it only to pass such commits, and the in-repo workflow and
+    /// required-workflow plans refuse to plan without it. `None`: platform
+    /// signed commits fail the check.
+    #[serde(default)]
+    pub platform_keyring_file: Option<PathBuf>,
     /// Post the check from the bridge where there is no org required
     /// workflow (§9). On by default: without it a writer can forge the check.
     #[serde(default = "yes")]
@@ -229,6 +242,9 @@ fn default_max_signers() -> usize {
 }
 fn default_git() -> PathBuf {
     PathBuf::from("git")
+}
+fn default_max_fetch_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 fn default_fetch_timeout() -> u64 {
     120
@@ -387,6 +403,18 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
+    fn the_app_owner_is_required_and_the_keyring_is_not() {
+        let no_owner = EXAMPLE.replace("app_owner = \"acme\"\n", "");
+        assert!(BridgeConfig::parse(&no_owner).is_err());
+        let no_keyring = EXAMPLE.replace(
+            "platform_keyring_file = \"/etc/vgi-bridge/web-flow.asc\"\n",
+            "",
+        );
+        let c = BridgeConfig::parse(&no_keyring).unwrap();
+        assert!(c.github[0].platform_keyring_file.is_none());
+    }
+
+    #[test]
     fn the_shipped_example_parses() {
         let c = BridgeConfig::parse(include_str!("../bridge.example.toml")).unwrap();
         assert_eq!(c.github.len(), 1);
@@ -401,8 +429,7 @@ oauth_client_id = "0b6e3a0c"
         assert!(BridgeConfig::parse(&http).is_err());
         let not_did = EXAMPLE.replace("did:webvh:QmVtc:acme-vtc.example", "acme");
         assert!(BridgeConfig::parse(&not_did).is_err());
-        let twice =
-            format!("{EXAMPLE}\n[[github]]\napp_name = \"x\"\nplatform_keyring_file = \"/k\"\n");
+        let twice = format!("{EXAMPLE}\n[[github]]\napp_name = \"x\"\napp_owner = \"acme\"\n");
         assert!(BridgeConfig::parse(&twice).is_err());
     }
 }

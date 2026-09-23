@@ -180,6 +180,21 @@ impl BridgeIdentity {
     }
 }
 
+impl BridgeIdentity {
+    /// Sign with a chosen `proofPurpose` — for tests of the purpose check
+    /// only; every document the bridge sends is an `assertionMethod` proof.
+    #[doc(hidden)]
+    pub async fn sign_with_purpose(&self, doc: &Value, purpose: &str) -> Result<Value> {
+        sign_trust_task(
+            doc,
+            &self.signing,
+            SignOptions::new().with_proof_purpose(purpose),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

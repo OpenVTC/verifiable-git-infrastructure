@@ -43,14 +43,28 @@ pub(crate) async fn on_webhook(
     #[cfg(feature = "forge-github")]
     if let Some(g) = adapter.github() {
         match g.parse_check_trigger(headers, body) {
-            Ok(Some(trigger)) => {
-                if seen(bridge, host, trigger.delivery_id.as_deref()) {
+            Ok(triggers) if !triggers.is_empty() => {
+                let key = triggers[0]
+                    .delivery_id
+                    .as_deref()
+                    .map(|d| format!("{host}#{d}"));
+                if let Some(k) = &key
+                    && already_seen(bridge, k)
+                {
                     return StatusCode::OK;
                 }
-                crate::checks::spawn(bridge, trigger);
+                // Recorded as handled only once every check it called for
+                // was posted (or deliberately skipped): a delivery whose
+                // check failed to post is processed again when GitHub
+                // redelivers it.
+                crate::checks::spawn(bridge, triggers, move |b| {
+                    if let Some(k) = key {
+                        let _ = b.store.put(Table::Deliveries, &k, &now());
+                    }
+                });
                 return StatusCode::ACCEPTED;
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(%host, error = %e, "refused a webhook");
                 return StatusCode::UNAUTHORIZED;
@@ -81,6 +95,11 @@ pub(crate) async fn on_webhook(
     // Answer the forge now; the inspection that follows may take a while.
     tokio::spawn(async move { handle(&me, event.kind).await });
     StatusCode::ACCEPTED
+}
+
+/// Whether delivery `key` was already handled.
+fn already_seen(bridge: &Bridge, key: &str) -> bool {
+    matches!(bridge.store.get::<i64>(Table::Deliveries, key), Ok(Some(_)))
 }
 
 /// Record a delivery id; `true` if it was already handled.
@@ -303,12 +322,18 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
         ForgeEventKind::InstallationChanged {
             namespace, change, ..
         } => {
-            if matches!(
-                change,
-                InstallationChange::Deleted | InstallationChange::Suspended
-            ) && let Some(ns) = namespace_for(bridge, &namespace)
-            {
-                report(bridge, &ns.id, json!({ "type": "installationRemoved" })).await;
+            let Some(ns) = namespace_for(bridge, &namespace) else {
+                return;
+            };
+            match change {
+                InstallationChange::Deleted | InstallationChange::Suspended => {
+                    report(bridge, &ns.id, json!({ "type": "installationRemoved" })).await;
+                }
+                // The owner approved new permissions (or the installation
+                // came back): the bridge-posted check may be possible now.
+                // A change of guard shows up as drift on the next inspect,
+                // which the VTC answers with a bootstrap.
+                _ => bridge.probe_bridge_checks(&ns.id).await,
             }
         }
         other => tracing::debug!(event = ?other, "no event to report for this delivery"),

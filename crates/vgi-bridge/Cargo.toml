@@ -77,4 +77,6 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+# Signs real commits for the verify-trust path test.
+vgi-core = { workspace = true }
 tower = { workspace = true }

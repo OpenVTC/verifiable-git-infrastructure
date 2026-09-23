@@ -47,15 +47,20 @@ version = "v0.5.0"
 # max_signers = 16
 # git = "git"
 # fetch_timeout_secs = 120
+# max_fetch_bytes = 67108864
 # concurrency = 4
 
 [[github]]
 host = "github.com"
 # The App the manifest flow registers.
 app_name = "acme-vgi-bridge"
-# The org it is registered under (and owned by).
+# Required: the org the App is registered under (and owned by). For a
+# personal account, name it and set app_owner_is_user = true.
 app_owner = "acme"
-# GitHub's web-flow key: the exempt keyring for web-UI merge commits.
+# app_owner_is_user = false
+# Optional: GitHub's web-flow key, the exempt keyring for commits GitHub
+# signs (web-UI merges, merge queues). The bridge-posted check works without
+# it (such commits then fail); the in-repo and required-workflow plans need it.
 # curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc
 platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # Post the check from the bridge where no org required workflow is

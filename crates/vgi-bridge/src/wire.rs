@@ -195,6 +195,17 @@ impl DocChecker {
                 Some(doc),
             ));
         }
+        // The specification asks for an assertion: a proof made for any
+        // other purpose (authentication, say) is not the issuer asserting
+        // this document, however valid its signature. Checked here, before
+        // the signature, and bound by it (the purpose is signed).
+        if raw.pointer("/proof/proofPurpose").and_then(Value::as_str) != Some("assertionMethod") {
+            return Err(Refusal::standard(
+                StandardCode::ProofInvalid,
+                "the proof's purpose must be assertionMethod",
+                Some(doc),
+            ));
+        }
         if let Err(e) = self.proof.verify_raw(raw).await {
             tracing::warn!(error = %e, id = %doc.id, "refusing a document whose proof does not verify");
             let payload: ErrorPayload = RejectReason::ProofInvalid {
@@ -490,6 +501,27 @@ mod tests {
         assert_eq!(
             code(c.check(&raw, None).await.unwrap_err()),
             "proofRequired"
+        );
+
+        // Signed, but for authentication rather than as an assertion.
+        let auth = vtc
+            .sign_with_purpose(
+                &json!({
+                    "id": new_id(), "type": job::Payload::TYPE_URI, "issuer": vtc.did(),
+                    "recipient": bridge.did(), "issuedAt": Utc::now().to_rfc3339(),
+                    "payload": {"jobId": "j", "namespace": "n", "kind": "inspect"},
+                }),
+                "authentication",
+            )
+            .await
+            .unwrap();
+        let r = c.check(&auth, None).await.unwrap_err();
+        assert_eq!(r.payload.code.to_string(), "proofInvalid");
+        assert!(
+            r.payload
+                .message
+                .unwrap_or_default()
+                .contains("assertionMethod")
         );
 
         // Stale.

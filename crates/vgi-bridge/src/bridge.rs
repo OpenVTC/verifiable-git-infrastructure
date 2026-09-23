@@ -204,6 +204,12 @@ impl Bridge {
             {
                 tracing::error!(namespace = %ns.id, error = %e, "could not restore a namespace");
             }
+            // A namespace bound before its readiness for the bridge-posted
+            // check was recorded: find out, in the background.
+            if ns.state == NamespaceState::Bound && ns.bridge_checks.is_none() {
+                let me = Arc::clone(self);
+                tokio::spawn(async move { me.probe_bridge_checks(&ns.id).await });
+            }
         }
         for (id, job) in self.store.list::<JobRecord>(Table::Jobs)? {
             if matches!(job.state, JobState::Queued | JobState::Running) {
@@ -214,6 +220,56 @@ impl Bridge {
         crate::flows::resume_device_polls(self)?;
         self.resend_unacknowledged(true).await;
         Ok(())
+    }
+
+    /// Ask GitHub whether namespace `ns_id`'s installation carries the
+    /// bridge-posted check (checks, pull requests and merge queue
+    /// permissions, `pull_request` and `merge_group` events), and record the
+    /// answer. Called after a restart for a namespace never probed, and when
+    /// an installation accepts new permissions (the upgrade path for an App
+    /// registered before these were in its manifest).
+    pub(crate) async fn probe_bridge_checks(&self, ns_id: &str) {
+        #[cfg(feature = "forge-github")]
+        {
+            let Ok(Some(ns)) = self.store.get::<NamespaceRecord>(Table::Namespaces, ns_id) else {
+                return;
+            };
+            let Some(adapter) = self.adapters.for_resource(&ns.resource) else {
+                return;
+            };
+            let Some(g) = adapter.github() else {
+                return;
+            };
+            match g.detect_bridge_checks(&ns.resource).await {
+                Ok(ready) => {
+                    let _ =
+                        self.store
+                            .update::<NamespaceRecord, _>(Table::Namespaces, ns_id, |n| {
+                                Ok((
+                                    n.map(|mut n| {
+                                        n.bridge_checks = Some(ready);
+                                        n
+                                    }),
+                                    (),
+                                ))
+                            });
+                    if !ready {
+                        tracing::warn!(
+                            namespace = %ns_id,
+                            "the installation lacks what the bridge-posted check needs \
+                             (checks: write, pull_requests: read, merge_queues: read, and the \
+                             pull_request and merge_group events); its repositories keep the \
+                             in-repo workflow until the App is updated and the change approved"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(namespace = %ns_id, error = %e, "could not read the installation")
+                }
+            }
+        }
+        #[cfg(not(feature = "forge-github"))]
+        let _ = ns_id;
     }
 
     /// Put an adapter's namespaces back after it came into service later
@@ -349,8 +405,17 @@ impl Bridge {
                 }
                 self.respond(&v.doc, resp).await;
                 if finished {
-                    // How a VTC that lost the result recovers it.
-                    self.send_outbox(&format!("result:{job_id}")).await;
+                    // How a VTC that lost the result recovers it (spec,
+                    // request rule 4): the result is rebuilt from the
+                    // ledger and sent again, even if an earlier copy was
+                    // acknowledged.
+                    let key = format!("result:{job_id}");
+                    if let Some(result) = existing.result {
+                        let _ =
+                            self.store
+                                .put_new(Table::Outbox, &key, &OutboxEntry::result(result));
+                    }
+                    self.send_outbox(&key).await;
                 }
                 return;
             }
@@ -590,37 +655,15 @@ impl Bridge {
             }
         };
         let payload = serde_json::to_value(&result).expect("serialisable");
-        let first = self
-            .store
-            .update::<JobRecord, _>(Table::Jobs, job_id, |r| {
-                let Some(mut r) = r else {
-                    return Ok((None, false));
-                };
-                if r.state == JobState::Finished {
-                    return Ok((Some(r), false));
-                }
-                r.state = JobState::Finished;
-                r.result = Some(payload.clone());
-                r.payload = None;
-                r.finished_at = Some(now());
-                Ok((Some(r), true))
-            })
-            .unwrap_or(false);
-        if !first {
-            return;
+        match self.store.finish_job(job_id, &payload, now()) {
+            Ok(true) => self.send_outbox(&format!("result:{job_id}")).await,
+            Ok(false) => {}
+            Err(e) => {
+                // Nothing was written: the job is still open, and runs (or
+                // expires) again.
+                tracing::error!(job = %job_id, error = %e, "could not record a result");
+            }
         }
-        let key = format!("result:{job_id}");
-        let entry = OutboxEntry {
-            kind: OutboxKind::Result,
-            payload,
-            doc_ids: Vec::new(),
-            last_sent: 0,
-            attempts: 0,
-        };
-        if let Err(e) = self.store.put(Table::Outbox, &key, &entry) {
-            tracing::error!(job = %job_id, error = %e, "could not queue a result");
-        }
-        self.send_outbox(&key).await;
     }
 
     /// Report an event in `namespace` (queued until the VTC acknowledges

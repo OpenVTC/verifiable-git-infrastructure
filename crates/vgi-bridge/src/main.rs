@@ -83,11 +83,27 @@ fn settable(name: &str) -> bool {
     )
 }
 
-fn open_store(cfg: &BridgeConfig) -> Result<Store> {
+/// Load the master key, and clear the environment variable it came from so
+/// no child process (git, for the check) or crash dump inherits it. Called
+/// from `main` before any thread is started: `remove_var` is only sound
+/// while the process is single-threaded.
+fn load_key(cfg: &BridgeConfig) -> Result<MasterKey> {
     let key = MasterKey::load(
         cfg.master_key_file.as_deref(),
         cfg.master_key_env.as_deref(),
     )?;
+    if cfg.master_key_file.is_none()
+        && let Some(var) = cfg.master_key_env.as_deref()
+    {
+        // SAFETY: `main` calls this before building the tokio runtime or
+        // spawning any thread, so nothing reads the environment concurrently.
+        unsafe { std::env::remove_var(var) };
+    }
+    Ok(key)
+}
+
+fn open_store(cfg: &BridgeConfig) -> Result<Store> {
+    let key = load_key(cfg)?;
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     Store::open(&cfg.store_path(), key)
@@ -130,7 +146,10 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("/etc/vgi-bridge/bridge.toml"));
     let cfg = BridgeConfig::load(&path)?;
     match cli.command {
-        Cmd::Run => tokio::runtime::Runtime::new()?.block_on(vgi_bridge::run(cfg)),
+        Cmd::Run => {
+            let key = load_key(&cfg)?;
+            tokio::runtime::Runtime::new()?.block_on(vgi_bridge::run(cfg, key))
+        }
         Cmd::Init => init(&cfg),
         Cmd::Identity { command } => {
             let store = open_store(&cfg)?;

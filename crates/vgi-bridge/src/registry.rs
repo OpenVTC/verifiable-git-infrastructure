@@ -107,6 +107,9 @@ impl Adapter {
                     g.set_required_workflow(&record.resource, rw);
                 }
                 g.set_managed_repositories(&record.resource, record.managed.iter().copied());
+                if let Some(ready) = record.bridge_checks {
+                    g.set_bridge_checks_ready(&record.resource, ready);
+                }
                 if let Some(pin) = &record.pin {
                     g.set_required_workflow_pin(
                         &record.resource,
