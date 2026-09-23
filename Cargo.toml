@@ -11,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.12"
+version = "0.4.13"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -21,13 +21,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.4.12", path = "crates/vgi-core" }
+vgi-core = { version = "0.4.13", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.4.12", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.4.13", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.4.12", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.4.12", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.4.12", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.4.13", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.4.13", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.4.13", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -205,7 +205,7 @@ trql-client = "0.18"
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
-vta-sdk = { version = "0.50", default-features = false }
+vta-sdk = { version = "0.51", default-features = false }
 affinidi-tdk = "0.16"
 # Named directly for one reason: the **floor**. The verifier resolves DIDs a
 # pull-request author chose — the `Signed-by-DID` trailer and the committer
