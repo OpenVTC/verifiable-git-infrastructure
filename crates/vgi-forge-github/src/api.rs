@@ -76,6 +76,64 @@ impl Api {
         body: Option<&Value>,
         what: &str,
     ) -> Result<Response> {
+        let resp = self.dispatch(method, url, auth, body).await?;
+        check(resp, what).await
+    }
+
+    /// Like [`Api::send`], but a 403 or 422 comes back as a [`Refusal`] the
+    /// caller can classify (a plan without a feature, say), next to the
+    /// error [`Api::send`] would have returned.
+    pub(crate) async fn send_or_refusal(
+        &self,
+        method: Method,
+        url: Url,
+        auth: Auth<'_>,
+        body: Option<&Value>,
+        what: &str,
+    ) -> Result<std::result::Result<Response, Refusal>> {
+        let resp = self.dispatch(method, url, auth, body).await?;
+        let status = resp.status();
+        let refusable = status == StatusCode::UNPROCESSABLE_ENTITY
+            || (status == StatusCode::FORBIDDEN
+                && resp
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok())
+                    != Some("0")
+                && !resp.headers().contains_key(header::RETRY_AFTER));
+        if !refusable {
+            return check(resp, what).await.map(Ok);
+        }
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        let message = message_of(&body);
+        let documentation_url = body
+            .get("documentation_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let error = if status == StatusCode::FORBIDDEN {
+            ForgeError::Forbidden(format!("{what}: {message}"))
+        } else {
+            ForgeError::Rejected {
+                status: status.as_u16(),
+                message: format!("{what}: {message}"),
+            }
+        };
+        Ok(Err(Refusal {
+            status: status.as_u16(),
+            message,
+            documentation_url,
+            error,
+        }))
+    }
+
+    async fn dispatch(
+        &self,
+        method: Method,
+        url: Url,
+        auth: Auth<'_>,
+        body: Option<&Value>,
+    ) -> Result<Response> {
         let writes = matches!(method, Method::POST | Method::PUT | Method::PATCH);
         let mut req = self
             .client
@@ -101,11 +159,10 @@ impl Api {
             }
             None => {}
         }
-        let resp = req.send().await.map_err(|e| {
+        req.send().await.map_err(|e| {
             // Strip the URL: it is ours, but errors travel to the VTC's log.
             ForgeError::Unavailable(e.without_url().to_string())
-        })?;
-        check(resp, what).await
+        })
     }
 
     /// Send and decode a JSON body.
@@ -280,12 +337,28 @@ async fn check(resp: Response, what: &str) -> Result<Response> {
     })
 }
 
+/// A 403 or 422 from [`Api::send_or_refusal`].
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) status: u16,
+    /// GitHub's message and first validation error, truncated.
+    pub(crate) message: String,
+    /// GitHub's `documentation_url`, if any.
+    pub(crate) documentation_url: String,
+    /// What [`Api::send`] would have returned.
+    pub(crate) error: ForgeError,
+}
+
 /// GitHub's `message` (and first validation error), truncated. Never the raw
 /// body: it is shown to people and logged.
 async fn error_message(resp: Response) -> String {
     let Ok(body) = resp.json::<Value>().await else {
         return "(no message)".into();
     };
+    message_of(&body)
+}
+
+fn message_of(body: &Value) -> String {
     let mut msg = body
         .get("message")
         .and_then(Value::as_str)

@@ -202,6 +202,13 @@ pub enum ProtectionGap {
         /// Who, as the forge describes them.
         actors: Vec<String>,
     },
+    /// The check's own workflow is within reach of the change under test:
+    /// the namespace required workflow is missing, weakened or re-pinned, or
+    /// the owner review that guards the repository's workflow is off.
+    CheckSourceUnprotected {
+        /// What is wrong, in the forge's terms.
+        detail: String,
+    },
     /// A pull request could change these paths — the workflow or the exempt
     /// keyring — and so rewrite the check it is judged by.
     UnprotectedPaths {
@@ -283,6 +290,13 @@ pub enum Drift {
         /// Observed.
         observed: Visibility,
     },
+    /// The repository was bootstrapped for a different shape than it has
+    /// now (its owner count crossed one ↔ two, say): run its bootstrap plan
+    /// again. Not critical by itself; a weakening is reported separately.
+    ReplanNeeded {
+        /// Why.
+        reason: String,
+    },
 }
 
 impl Drift {
@@ -301,7 +315,9 @@ impl Drift {
 /// Protection shortfalls of `observed` against a required `check`.
 pub fn protection_gaps(observed: &ProtectionState, check: &str) -> Vec<ProtectionGap> {
     if !observed.present {
-        return vec![ProtectionGap::Missing];
+        let mut gaps = vec![ProtectionGap::Missing];
+        gaps.extend(observed.other_gaps.iter().cloned());
+        return gaps;
     }
     let mut gaps = Vec::new();
     if !observed.enforced {
@@ -329,6 +345,7 @@ pub fn protection_gaps(observed: &ProtectionState, check: &str) -> Vec<Protectio
             actors: observed.bypass_actors.clone(),
         });
     }
+    gaps.extend(observed.other_gaps.iter().cloned());
     gaps
 }
 
@@ -530,6 +547,36 @@ mod tests {
             vec![Drift::ProtectionWeakened {
                 gaps: vec![ProtectionGap::Missing]
             }]
+        );
+    }
+
+    #[test]
+    fn gaps_in_what_guards_the_workflow_are_reported_too() {
+        let mut state = RepoState::new(res("github.com/acme/w"), 9);
+        let unprotected = ProtectionGap::CheckSourceUnprotected {
+            detail: "the org ruleset is missing".into(),
+        };
+        state.protection = protected("Verify commit trust");
+        state.protection.other_gaps = vec![unprotected.clone()];
+        let mut want = Projection::new(res("github.com/acme/w"));
+        want.required_check = Some("Verify commit trust".into());
+        let drift = default_diff(&state, &want);
+        assert_eq!(
+            drift,
+            vec![Drift::ProtectionWeakened {
+                gaps: vec![unprotected.clone()]
+            }]
+        );
+        assert!(drift[0].is_critical());
+
+        // Alongside a missing repo rule, not instead of it.
+        state.protection = ProtectionState {
+            other_gaps: vec![unprotected.clone()],
+            ..ProtectionState::default()
+        };
+        assert_eq!(
+            protection_gaps(&state.protection, "Verify commit trust"),
+            vec![ProtectionGap::Missing, unprotected]
         );
     }
 

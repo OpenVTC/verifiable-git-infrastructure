@@ -75,6 +75,8 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
             "actions_variables": "write",
             "metadata": "read",
             "members": "read",
+            // §9: the org ruleset that makes verify-trust a required workflow.
+            "organization_administration": "write",
         })
     );
     assert_eq!(m["public"], false);
@@ -102,7 +104,7 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
     ] {
         assert!(APP_EVENTS.contains(&event), "{event} feeds drift detection");
     }
-    assert_eq!(APP_PERMISSIONS.len(), 5, "no permission beyond §5.7's set");
+    assert_eq!(APP_PERMISSIONS.len(), 6, "no permission beyond §5.7's set");
 }
 
 #[test]
@@ -141,7 +143,7 @@ async fn manifest_code_exchange_returns_credentials_that_never_print() {
         .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(201).set_body_json(conversion(json!({
             "administration": "write", "contents": "write", "actions_variables": "write",
-            "metadata": "read", "members": "read",
+            "metadata": "read", "members": "read", "organization_administration": "write",
         }))))
         .expect(1)
         .mount(&server)
@@ -173,6 +175,7 @@ async fn manifest_exchange_refuses_an_app_with_more_than_the_reviewed_permission
         .respond_with(ResponseTemplate::new(201).set_body_json(conversion(json!({
             "administration": "write", "contents": "write", "actions_variables": "write",
             "metadata": "read", "members": "write", "secrets": "write",
+            "organization_administration": "write", "organization_secrets": "write",
         }))))
         .mount(&server)
         .await;
@@ -182,7 +185,10 @@ async fn manifest_exchange_refuses_an_app_with_more_than_the_reviewed_permission
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("members:write") && err.contains("secrets:write"),
+        err.contains("members:write")
+            && err.contains("secrets:write")
+            && err.contains("organization_secrets:write")
+            && !err.contains("organization_administration"),
         "{err}"
     );
     assert!(
@@ -265,6 +271,23 @@ async fn bind_sends_the_admin_to_the_install_page_with_state() {
 async fn complete_bind_records_installation_owner_and_kind() {
     let (server, forge) = server_and_forge().await;
     mount_installation(&server, 77, "NewCo", "Organization").await;
+    // The bind also asks whether the org has org rulesets (§9): a token
+    // with organization Administration only, and no repository.
+    mount_token(
+        &server,
+        77,
+        None,
+        json!({ "organization_administration": "write" }),
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/orgs/newco/rulesets"))
+        .and(InstallationToken)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
     let state = GitHubForge::new_state().unwrap();
     let ns = Resource::parse("github.com/newco").unwrap();
     let binding = forge
@@ -279,10 +302,23 @@ async fn complete_bind_records_installation_owner_and_kind() {
     assert_eq!(binding.namespace.installation_id, Some(77));
     assert_eq!(binding.namespace.owner_id, Some(500));
     assert_eq!(binding.namespace.kind, NamespaceKind::Organization);
-    // The mock installation lacks the members permission.
+    // The mock installation lacks the members and org administration
+    // permissions.
     assert_eq!(
         binding.missing_permissions,
-        vec!["members:read".to_string()]
+        vec![
+            "members:read".to_string(),
+            "organization_administration:write".to_string()
+        ]
+    );
+    forge.register_namespace(binding.namespace.clone()).unwrap();
+    assert!(forge.capabilities(&binding.namespace).required_workflow);
+    // Handed back as data for the bridge to persist, too.
+    assert!(
+        binding
+            .capabilities
+            .as_ref()
+            .is_some_and(|c| c.required_workflow)
     );
 }
 
@@ -483,7 +519,7 @@ async fn device_flow_stops_on_expiry_denial_or_deadline() {
 fn good_permissions() -> serde_json::Value {
     json!({
         "administration": "write", "contents": "write", "actions_variables": "write",
-        "metadata": "read", "members": "read",
+        "metadata": "read", "members": "read", "organization_administration": "write",
     })
 }
 
@@ -630,4 +666,22 @@ async fn a_caller_cannot_stretch_polling_past_the_device_code_lifetime() {
         matches!(e, ForgeError::LinkFailed(ref m) if m.contains("expired")),
         "{e}"
     );
+}
+
+#[tokio::test]
+async fn a_member_bound_redirect_link_is_refused_by_the_device_flow_adapter() {
+    let (server, forge) = server_and_forge().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // GitHub links through the device flow; a redirect callback (which now
+    // names the member it was started for) is not something it issues.
+    let cb = LinkCallback::redirect(
+        BTreeMap::from([("code".to_string(), "abc".to_string())]),
+        "did:webvh:member.example",
+    );
+    let e = forge.complete_account_link(cb).await.unwrap_err();
+    assert!(matches!(e, ForgeError::Unsupported { .. }), "{e:?}");
 }

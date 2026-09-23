@@ -5,8 +5,11 @@ implements [`vgi-forge`][vgi-forge]'s `Forge` for github.com and GitHub
 Enterprise Server, acting as **one community's own GitHub App**.
 
 - **App registration** through the manifest flow, with a fixed permission set
-  — Administration, Contents and Variables (write), Metadata and organisation
-  Members (read), nothing else. The code exchange refuses an App that GitHub
+  — repository Administration, Contents and Variables (write), Metadata
+  (read); organisation Members (read) and Administration (write), nothing
+  else. Organisation Administration is there for one thing, the org ruleset
+  that makes verify-trust a required workflow (below); an owner who declines
+  it gets the owner-review fallback. The code exchange refuses an App that GitHub
   registered with more than that, and returns the key and secrets in a type
   that zeroizes on drop and never prints them.
 - **Auth.** An RS256 App JWT (`iat` backdated 60 s, nine-minute lifetime)
@@ -24,12 +27,95 @@ Enterprise Server, acting as **one community's own GitHub App**.
   reduced capability set and gets manual instructions), inspect (people,
   pending invitations, ruleset), archive, and role convergence keyed on
   numeric account ids, never logins.
-- **Bootstrap** (check-then-apply, idempotent): the verify-trust workflow
-  (actions pinned by SHA, `resource-format: qualified`, no dormant `if:`
-  guard so a missing variable fails closed), the `web-flow` exempt keyring
-  (supplied by configuration), `TRUST_REGISTRY_DID` / `VTC_DID` variables,
-  and a ruleset — PR required, "Verify commit trust" required **and pinned to
-  the GitHub Actions App**, no force-push, no deletion, no bypass actors.
+- **Bootstrap** (check-then-apply, idempotent), with a ruleset on the default
+  branch — PR required, no force-push, no deletion, no bypass actors — and a
+  guard so that **a pull request cannot satisfy its own check**. A
+  `pull_request` workflow runs from the pull request's own files, so a writer
+  could edit it (or add any job named "Verify commit trust") to pass; pinning
+  the check to the Actions App does not help, the forged run is an Actions run
+  too. The guard is chosen per namespace (`Capabilities`) and per repository
+  (`ProtectionState::check_source_guard`):
+  - **Required workflow** (organisations with org rulesets,
+    `required_workflow: true`). The workflow lives in a bridge-managed,
+    public `<org>/.vgi` repository, itself protected by a ruleset (PRs only,
+    no force-push, no deletion, no bypass), and an org ruleset (`VGI
+    required workflow`: `workflows` rule, **pinned commit SHA**, enforced on
+    creation, default branch, the bridge's managed repositories by numeric
+    id, enforcement `active`, no bypass actors) requires it on every managed
+    repository. Nothing is committed to the repository itself; a repository
+    that had the fallback guard gets its workflow, keyring, variables and
+    status-check rule cleaned up. The DIDs are literals in the workflow (a
+    repository variable would override an org one) and the `web-flow`
+    keyring is written from it, not read from the repository. The pin only
+    moves to a commit whose workflow the bridge has read back as its own.
+    The org ruleset is read, changed and written under a per-namespace lock,
+    lists exactly the managed set the bridge hands the adapter
+    (`set_managed_repositories`; archived repositories drop out), and is read
+    back afterwards — a concurrent edit that lost the repository is a
+    retryable error.
+  - **Owner review** (personal accounts and organisations without org
+    rulesets, repositories with **two or more** owners). The workflow and
+    keyring are committed, with the DIDs as literals and the check required
+    **and pinned to the GitHub Actions App**. The `CODEOWNERS` GitHub reads
+    (`.github/`, else root, else `docs/`; an adopted file keeps its rules and
+    its place) ends with a managed block giving `/.github/` — and the file
+    itself, if it is not under `.github/` — to every owner (logins looked up
+    from numeric ids at run time), and the ruleset requires one approving
+    review from a code owner, dismissed by later pushes and never the last
+    pusher's own.
+  - **Solo** (the same namespaces, a repository with **one** owner): the
+    check alone, no review requirement — the owner could weaken their own
+    workflow, which is accepted since they control the repository anyway.
+    `single_owner_repos_unreviewed` lets the UI say "solo: workflow edits
+    not review-protected". A change of owner count across one ↔ two is a
+    `Drift::ReplanNeeded`.
+- **Availability** of the required workflow is probed at bind (the result is
+  also returned in `NamespaceBinding::capabilities`, for the bridge to
+  persist) or with `detect_required_workflow`: `GET /orgs/{org}/rulesets`
+  with an organisation Administration token. GitHub offers org rulesets on
+  Team and Enterprise plans only, so a Free organisation (403), or an owner
+  who declined the permission (422 on the token), falls back. GitHub
+  documents the `workflows` rule for Enterprise Cloud: if creating the org
+  ruleset is refused *because of the plan* (a 403/422 whose message or
+  documentation link says so), the step returns
+  `ForgeError::CapabilityChanged` for the bridge to persist and re-plan;
+  any other refusal is returned as it is and changes nothing.
+- **Drift** is reported by `inspect` as critical
+  (`ProtectionGap::CheckSourceUnprotected`) and put back by the bootstrap:
+  - required workflow: the org ruleset missing, not `active`, with bypass
+    actors, pinning another commit, not enforced on creation, selecting
+    repositories by name or property, or no longer including the
+    repository; `.vgi` missing, not public, unprotected, or without the
+    pinned commit; the pin unknown to the bridge (fail closed);
+  - owner review (against the projection's owners): `CODEOWNERS` gone, not
+    ending with the managed block, naming other accounts than the owners,
+    or with an error GitHub reports on the managed lines
+    (`GET /repos/{o}/{r}/codeowners/errors`); the review rule weakened in
+    any of its four parts;
+  - either: GitHub Actions disabled, or an allowed-actions policy that
+    blocks `actions/checkout` or the verify-trust action.
+
+  **Limits.**
+  - Organisation owners can still edit or delete the org ruleset, and
+    repository admins their ruleset — inherent to GitHub; the drift monitor
+    catches it and re-applies.
+  - **Outside a required workflow, repository writers are trusted not to
+    forge check runs.** Anyone who can push a branch can add a workflow
+    there whose job is named "Verify commit trust"; its run is a GitHub
+    Actions check run like the real one, and GitHub cannot tell them apart
+    for the required status check. Owner review stops edits to *this*
+    workflow, not that. Only the required workflow closes it.
+  - What GitHub does with a required workflow in a repository whose Actions
+    are disabled has not been verified against a live organisation yet;
+    `inspect` reports disabled Actions as drift either way.
+  - Once a branch is protected, the bridge's own rewrite of a protected file
+    (`CODEOWNERS`, the in-repo workflow, a clean-up, or `.vgi`'s workflow) is
+    refused and lands through a pull request a human merges; `.vgi`'s new
+    commit is pinned once merged.
+  - After a restart the bridge must hand back the pin
+    (`required_workflow_pin` / `set_required_workflow_pin`) and the managed
+    set, or `inspect` reports the pin as unverified and the step refuses to
+    run.
 - **Webhooks**: `X-Hub-Signature-256` verified in constant time over the raw
   body before parsing; repository, member, team membership, organization
   membership, ruleset, branch protection and installation events become

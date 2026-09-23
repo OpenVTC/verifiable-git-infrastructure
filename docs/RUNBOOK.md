@@ -262,6 +262,75 @@ ruleset for `main`:
 - require the **"Verify commit trust"** status check to pass
 - block force-pushes and branch deletion
 
+**Protect the check from the pull request it checks.** The workflow above runs
+on `pull_request`, which means it runs *from the pull request's own files*.
+Anyone who can push a branch can edit `verify-trust.yml` in their PR (or add
+any job named "Verify commit trust") so that it passes, and merge unsigned
+commits. Requiring the check "from GitHub Actions" does not help: the forged
+run is an Actions run too. The same goes for
+`.github/trusted-platform-keys.asc`: a PR that adds its own key to it exempts
+its own commits. Pick one:
+
+- **Organisation with org rulesets (recommended).** Keep the workflow out of
+  the repository. Put it in a separate repository in the org (the VGI bridge
+  uses a public `<org>/.vgi`; public, because a private repository's workflow
+  may only be required on private repositories), with the DIDs written in as
+  literals rather than `vars.*` (a repository variable overrides an org one of
+  the same name) and the `web-flow` key embedded in the workflow rather than
+  read from the repository. Then add an **org ruleset** with *Require
+  workflows to pass before merging*, pointing at that file **pinned to a
+  commit SHA**, targeting the default branch of the enrolled repositories,
+  with no bypass list. The PR cannot change what runs. Org rulesets need
+  GitHub Team or Enterprise, and GitHub documents the workflows rule for
+  Enterprise Cloud; if the org cannot create it, use the next option.
+- **Personal account, or an org without org rulesets — two or more
+  owners.** Write the DIDs into the workflow as literals too (not
+  `vars.*`: any repository admin can change a repository variable). Make the
+  `CODEOWNERS` GitHub actually reads — `.github/CODEOWNERS`, else
+  `CODEOWNERS` at the root, else `docs/CODEOWNERS`; GitHub uses the first it
+  finds, so don't add a second one that shadows an existing file — end with
+
+  ```
+  /.github/ @owner1 @owner2
+  /CODEOWNERS @owner1 @owner2    # only if the file is not under .github/
+  ```
+
+  (last, so no later rule narrows it; every name a person with write access,
+  or GitHub skips the line — check the file's page, or
+  `GET /repos/{owner}/{repo}/codeowners/errors`). In the ruleset's pull
+  request rule set **all four**: required approvals **1**, **require review
+  from Code Owners**, **dismiss stale approvals when new commits are
+  pushed**, and **require approval of the most recent reviewable push** —
+  without the last two, a reviewed change can be swapped after approval, or
+  approved by the person who pushed it. Every change to the workflow, the
+  keyring or `CODEOWNERS` then needs another owner's approval.
+- **The same, with a single owner.** Skip the review rule: nobody else could
+  approve, and the owner controls the repository anyway. The check is still
+  required, but its owner could weaken their own workflow; the VGI bridge
+  shows such repositories as *solo: workflow edits not review-protected*,
+  and switches to the two-owner setup when a second owner arrives.
+
+Whichever you choose, keep **GitHub Actions enabled** on the repository and
+let it run `actions/checkout` and the verify-trust action (Settings →
+Actions → General). A repository admin who switches Actions off or narrows
+the allowed actions stops the check from running; the bridge reports it as
+drift. (What GitHub does with a *required workflow* when Actions is off in the
+target repository has not been verified against a live org yet.)
+
+**Limits.**
+
+- Org owners and repository admins can still edit the rulesets themselves:
+  that is inherent to GitHub. Watch them (`repository_ruleset` webhooks, or
+  the VGI bridge's drift monitor, which re-applies them) rather than assuming
+  they stay put.
+- **Without a required workflow, repository writers are trusted not to forge
+  check runs.** Anyone who can push a branch can add a workflow on that
+  branch whose job is named "Verify commit trust"; its run is a GitHub
+  Actions check run like the real one, and the required status check cannot
+  tell them apart. Owner review protects the real workflow file, not the
+  check's name. Only the org required workflow closes this; outside it, give
+  write access only to people you would trust with that.
+
 ## 4a. Set up a Forgejo repository
 
 The same composite action runs on Forgejo Actions (Codeberg or a self-hosted
@@ -348,6 +417,14 @@ restore it exactly. A community bridge does this as one audited step
 (`refresh-managed-files`): it allows pushes from the bridge's bot alone, writes
 the files, restores the rule and reads it back; a rule left open shows as
 critical drift.
+
+The same problem as on GitHub applies (§4, *Protect the check from the pull
+request it checks*): a Forgejo `pull_request` workflow also runs from the PR's
+own files, and Forgejo has no required workflows. Add
+`.forgejo/workflows/*`, `.gitea/workflows/*`, `.github/workflows/*` and the
+exempt keyring's path to the branch protection's **protected file patterns**,
+so no PR that touches them can merge through the UI; change them with a
+direct, audited push by a namespace admin instead.
 
 ### Forgejo Actions runners
 

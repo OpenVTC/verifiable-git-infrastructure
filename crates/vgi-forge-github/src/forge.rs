@@ -1,6 +1,6 @@
 //! [`GitHubForge`]: the `Forge` implementation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use base64::Engine;
@@ -11,20 +11,25 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use vgi_forge::{
     ApplyReport, BindCallback, BindRequest, BindStep, BootstrapStep, Capabilities, Collaborator,
-    Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind, ForgeRole, HookDecision,
-    LinkCallback, LinkMethod, LinkStep, Namespace, NamespaceBinding, NamespaceKind, ProtectionSpec,
-    ProtectionState, RepoSpec, RepoState, RequiredCheckKind, Resource, Result, RoleAssignment,
-    RoleChange, RoleOutcome, StepAction, StepOutcome, Unlisted, VgiConfig, Visibility, async_trait,
-    collapse_to_ladder, validate_repo_path,
+    Drift, Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind, ForgeRole,
+    HookDecision, LinkCallback, LinkMethod, LinkStep, Namespace, NamespaceBinding, NamespaceKind,
+    Projection, ProtectionSpec, ProtectionState, RepoSpec, RepoState, RequiredCheckKind, Resource,
+    Result, RoleAssignment, RoleChange, RoleOutcome, StepAction, StepOutcome, Unlisted, VgiConfig,
+    Visibility, async_trait, collapse_to_ladder, default_diff, validate_repo_path,
 };
 
 use crate::api::{Api, Auth};
 use crate::config::{GitHubConfig, JwtIssuer};
 use crate::jwt::{AppKeySigner, app_jwt};
 use crate::manifest::missing_permissions;
-use crate::plan::{RULESET_NAME, github_plan};
+use crate::plan::{
+    CENTRAL_REPO, CODEOWNERS_PATH, CheckGuard, GUARDED_PATH, ORG_RULESET_NAME, RULESET_NAME,
+    WORKFLOW_PATH, github_plan, render_codeowners,
+};
 use crate::secret::Secret;
 use crate::webhook;
+
+mod guard;
 
 /// The role ladder of an organisation repository.
 const ORG_LADDER: [ForgeRole; 5] = [
@@ -49,6 +54,44 @@ const USER_LADDER: [ForgeRole; 1] = [ForgeRole::Write];
 const PERMS_ADMIN: &[(&str, &str)] = &[("administration", "write"), ("metadata", "read")];
 const PERMS_CONTENTS: &[(&str, &str)] = &[("contents", "write"), ("metadata", "read")];
 const PERMS_VARIABLES: &[(&str, &str)] = &[("actions_variables", "write"), ("metadata", "read")];
+const PERMS_READ_CONTENTS: &[(&str, &str)] = &[("contents", "read"), ("metadata", "read")];
+const PERMS_METADATA: &[(&str, &str)] = &[("metadata", "read")];
+/// Org rulesets. *Write* even to read them: GitHub lists every
+/// `/orgs/{org}/rulesets` endpoint under organization Administration
+/// (write), and shows bypass actors only to a caller who could edit them.
+/// Minted with no repositories: it grants nothing on any repository.
+const PERMS_ORG_RULESETS: &[(&str, &str)] = &[("organization_administration", "write")];
+
+/// The namespace workflow an org ruleset pins (§9): which `.vgi` commit it
+/// runs, and the check name its job reports.
+///
+/// The bridge records one per namespace when the `required-workflow` step
+/// runs, and `inspect` compares the org ruleset against it: a pin the bridge
+/// did not make is drift. Persist it (it is small and not secret) and hand it
+/// back with [`GitHubForge::set_required_workflow_pin`] after a restart;
+/// without it, `inspect` reports the pin as unverified until the step runs
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RequiredWorkflowPin {
+    /// Numeric id of `<org>/.vgi`.
+    pub repository_id: u64,
+    /// The pinned commit.
+    pub sha: String,
+    /// The check (job) name the workflow reports.
+    pub check: String,
+}
+
+impl RequiredWorkflowPin {
+    /// A pin.
+    pub fn new(repository_id: u64, sha: impl Into<String>, check: impl Into<String>) -> Self {
+        RequiredWorkflowPin {
+            repository_id,
+            sha: sha.into(),
+            check: check.into(),
+        }
+    }
+}
 
 /// How long GitHub lets a device code live (15 minutes). Polling never runs
 /// longer, whatever the caller says.
@@ -72,6 +115,19 @@ pub struct GitHubForge {
     namespaces: RwLock<BTreeMap<Resource, Namespace>>,
     actions_app_id: Mutex<Option<u64>>,
     client_secret: Option<Secret>,
+    /// Per organisation: whether org rulesets (and so a required workflow)
+    /// are available. Absent means not known, which plans the owner-review
+    /// fallback — safe everywhere.
+    required_workflow: RwLock<BTreeMap<Resource, bool>>,
+    pins: RwLock<BTreeMap<Resource, RequiredWorkflowPin>>,
+    /// Per organisation: the forge ids of the repositories the bridge
+    /// manages — what the org ruleset lists. From the bridge's store.
+    managed: RwLock<BTreeMap<Resource, BTreeSet<u64>>>,
+    /// One org-ruleset read-modify-write at a time per namespace.
+    org_locks: Mutex<BTreeMap<Resource, Arc<tokio::sync::Mutex<()>>>>,
+    /// The verify-trust action the last plan used, for the Actions-policy
+    /// check in `inspect`.
+    verify_trust_action: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for GitHubForge {
@@ -121,6 +177,11 @@ impl GitHubForge {
             namespaces: RwLock::new(BTreeMap::new()),
             actions_app_id,
             client_secret: None,
+            required_workflow: RwLock::new(BTreeMap::new()),
+            pins: RwLock::new(BTreeMap::new()),
+            managed: RwLock::new(BTreeMap::new()),
+            org_locks: Mutex::new(BTreeMap::new()),
+            verify_trust_action: Mutex::new(None),
         })
     }
 
@@ -164,6 +225,119 @@ impl GitHubForge {
             .write()
             .expect("namespace lock poisoned")
             .remove(ns);
+        self.required_workflow
+            .write()
+            .expect("lock poisoned")
+            .remove(ns);
+        self.pins.write().expect("lock poisoned").remove(ns);
+        self.managed.write().expect("lock poisoned").remove(ns);
+    }
+
+    /// Tell the adapter which repositories (by forge id) it manages in
+    /// organisation `ns`, from the bridge's store: at start-up and whenever
+    /// the set changes. The org ruleset lists exactly these (plus a
+    /// repository being bootstrapped); ids GitHub lists that are not here —
+    /// archived, deleted or never managed — are dropped from it. Until it
+    /// is set, the `required-workflow` step refuses to run rather than
+    /// guess the set from GitHub.
+    pub fn set_managed_repositories(&self, ns: &Resource, ids: impl IntoIterator<Item = u64>) {
+        self.managed
+            .write()
+            .expect("lock poisoned")
+            .insert(ns.clone(), ids.into_iter().collect());
+    }
+
+    /// The managed set as the adapter holds it (it adds each repository it
+    /// bootstraps under a required workflow, and drops each it archives).
+    pub fn managed_repositories(&self, ns: &Resource) -> Option<BTreeSet<u64>> {
+        self.managed.read().expect("lock poisoned").get(ns).cloned()
+    }
+
+    fn org_lock(&self, ns: &Resource) -> Arc<tokio::sync::Mutex<()>> {
+        self.org_locks
+            .lock()
+            .expect("lock poisoned")
+            .entry(ns.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Record whether org rulesets — and so a required workflow — are
+    /// available in organisation `ns` (from [`GitHubForge::detect_required_workflow`],
+    /// or from the bridge's store after a restart). Until it is known the
+    /// namespace plans the owner-review fallback.
+    pub fn set_required_workflow(&self, ns: &Resource, available: bool) {
+        self.required_workflow
+            .write()
+            .expect("lock poisoned")
+            .insert(ns.clone(), available);
+    }
+
+    /// Restore the pin the `required-workflow` step last made in `ns`.
+    pub fn set_required_workflow_pin(&self, ns: &Resource, pin: RequiredWorkflowPin) {
+        self.pins
+            .write()
+            .expect("lock poisoned")
+            .insert(ns.clone(), pin);
+    }
+
+    /// The pin the `required-workflow` step last made in `ns`, to persist.
+    pub fn required_workflow_pin(&self, ns: &Resource) -> Option<RequiredWorkflowPin> {
+        self.pins.read().expect("lock poisoned").get(ns).cloned()
+    }
+
+    /// Find out whether organisation `ns` can have a required workflow, and
+    /// record the answer.
+    ///
+    /// The probe is `GET /orgs/{org}/rulesets` with an organization
+    /// Administration token. Org rulesets exist on GitHub Team and
+    /// Enterprise plans only; on a Free organisation, or where the owner has
+    /// not granted the App organization Administration, GitHub refuses
+    /// (403/404, or 422 when minting the token) and the answer is `false`.
+    /// A personal account, or manual mode, is always `false`. Network and
+    /// rate-limit failures are returned, not guessed at.
+    ///
+    /// A `true` here is necessary, not sufficient: GitHub documents the
+    /// workflows rule for Enterprise Cloud. If the org ruleset is then
+    /// refused, the `required-workflow` step records `false` and asks for a
+    /// re-plan.
+    pub async fn detect_required_workflow(&self, ns: &Resource) -> Result<bool> {
+        let namespace = self.namespace(ns)?;
+        let available = self.probe_org_rulesets(&namespace).await?;
+        self.set_required_workflow(ns, available);
+        Ok(available)
+    }
+
+    async fn probe_org_rulesets(&self, ns: &Namespace) -> Result<bool> {
+        if ns.kind != NamespaceKind::Organization || ns.installation_id.is_none() {
+            return Ok(false);
+        }
+        let token = match self.installation_token(ns, None, PERMS_ORG_RULESETS).await {
+            Ok(t) => t,
+            Err(ForgeError::Rejected { status: 422, .. } | ForgeError::Forbidden(_)) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        let url = self.api.url(&["orgs", ns.resource.owner(), "rulesets"]);
+        match self
+            .api
+            .get_all::<Value>(url, Auth::Bearer(&token), "org rulesets")
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ForgeError::Forbidden(_) | ForgeError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn required_workflow_known(&self, ns: &Resource) -> bool {
+        self.required_workflow
+            .read()
+            .expect("lock poisoned")
+            .get(ns)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// A fresh bind `state` nonce: 256 bits from the system CSPRNG,
@@ -415,7 +589,7 @@ impl GitHubForge {
         &self,
         rs: &RulesetJson,
         default_branch: Option<&str>,
-        actions_id: u64,
+        actions_id: Option<u64>,
     ) -> ProtectionState {
         let mut p = ProtectionState::default();
         p.present = true;
@@ -464,8 +638,8 @@ impl GitHubForge {
                     // unpinned one is satisfied by any status of that name,
                     // which anyone with write access can post.
                     p.required_checks.extend(checks.iter().filter_map(|c| {
-                        let pinned =
-                            c.get("integration_id").and_then(Value::as_u64) == Some(actions_id);
+                        let pinned = actions_id.is_some()
+                            && c.get("integration_id").and_then(Value::as_u64) == actions_id;
                         pinned
                             .then(|| c.get("context").and_then(Value::as_str))
                             .flatten()
@@ -512,7 +686,22 @@ impl GitHubForge {
     ) -> Result<StepOutcome> {
         validate_repo_path(path)?;
         let (token, owner, name) = self.repo_token(repo, PERMS_CONTENTS).await?;
-        let mut segments = vec!["repos", owner.as_str(), name.as_str(), "contents"];
+        self.write_file_with(&token, &owner, &name, path, contents, message)
+            .await
+    }
+
+    /// [`GitHubForge::write_file`] with a contents token already in hand.
+    async fn write_file_with(
+        &self,
+        token: &Secret,
+        owner: &str,
+        name: &str,
+        path: &str,
+        contents: &[u8],
+        message: &str,
+    ) -> Result<StepOutcome> {
+        validate_repo_path(path)?;
+        let mut segments = vec!["repos", owner, name, "contents"];
         segments.extend(path.split('/'));
         let url = self.api.url(&segments);
 
@@ -520,7 +709,7 @@ impl GitHubForge {
         // object: read it untyped first so the conflict is reported as one.
         let existing: Option<Value> = self
             .api
-            .get_opt(url.clone(), Auth::Bearer(&token), path)
+            .get_opt(url.clone(), Auth::Bearer(token), path)
             .await?;
         let existing = match existing {
             Some(Value::Array(_)) => {
@@ -556,7 +745,7 @@ impl GitHubForge {
             body["sha"] = json!(sha);
         }
         self.api
-            .send(Method::PUT, url, Auth::Bearer(&token), Some(&body), path)
+            .send(Method::PUT, url, Auth::Bearer(token), Some(&body), path)
             .await
             .map_err(|e| match e {
                 ForgeError::Rejected { status, message } => ForgeError::Rejected {
@@ -577,15 +766,7 @@ impl GitHubForge {
     }
 
     async fn set_variable(&self, repo: &Resource, var: &str, value: &str) -> Result<StepOutcome> {
-        if var.is_empty()
-            || !var
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-        {
-            return Err(ForgeError::Config(format!(
-                "variable name `{var}` must be [A-Z0-9_]"
-            )));
-        }
+        check_variable_name(var)?;
         let (token, owner, name) = self.repo_token(repo, PERMS_VARIABLES).await?;
         let url = self
             .api
@@ -621,34 +802,52 @@ impl GitHubForge {
 
     async fn protect(&self, repo: &Resource, spec: &ProtectionSpec) -> Result<StepOutcome> {
         let (token, owner, name) = self.repo_token(repo, PERMS_ADMIN).await?;
-        let actions_id = self.actions_app_id(&token).await?;
+        self.protect_with(&token, &owner, &name, spec).await
+    }
+
+    /// Converge the managed ruleset on `owner/name` to `spec`, with a token
+    /// holding administration on it.
+    async fn protect_with(
+        &self,
+        token: &Secret,
+        owner: &str,
+        name: &str,
+        spec: &ProtectionSpec,
+    ) -> Result<StepOutcome> {
+        // Looked up only when this rule carries the check: under a required
+        // workflow the org ruleset does.
+        let actions_id = if spec.require_status_check {
+            Some(self.actions_app_id(token).await?)
+        } else {
+            None
+        };
         let repo_json: RepoJson = self
             .api
             .json(
                 Method::GET,
-                self.api.url(&["repos", &owner, &name]),
-                Auth::Bearer(&token),
+                self.api.url(&["repos", owner, name]),
+                Auth::Bearer(token),
                 None,
-                repo.as_str(),
+                name,
             )
             .await?;
         let body = ruleset_body(spec, actions_id);
 
-        match self.managed_ruleset(&token, &owner, &name).await? {
+        match self.managed_ruleset(token, owner, name).await? {
             Some(rs) => {
                 let observed =
                     self.protection(&rs, repo_json.default_branch.as_deref(), actions_id);
-                if satisfies(&observed, spec) {
+                if satisfies(&observed, spec) && rules_match(&rs, spec) {
                     return Ok(StepOutcome::Unchanged);
                 }
                 let url = self
                     .api
-                    .url(&["repos", &owner, &name, "rulesets", &rs.id.to_string()]);
+                    .url(&["repos", owner, name, "rulesets", &rs.id.to_string()]);
                 self.api
                     .send(
                         Method::PUT,
                         url,
-                        Auth::Bearer(&token),
+                        Auth::Bearer(token),
                         Some(&body),
                         "ruleset",
                     )
@@ -656,12 +855,12 @@ impl GitHubForge {
                 Ok(StepOutcome::Updated)
             }
             None => {
-                let url = self.api.url(&["repos", &owner, &name, "rulesets"]);
+                let url = self.api.url(&["repos", owner, name, "rulesets"]);
                 self.api
                     .send(
                         Method::POST,
                         url,
-                        Auth::Bearer(&token),
+                        Auth::Bearer(token),
                         Some(&body),
                         "ruleset",
                     )
@@ -669,6 +868,59 @@ impl GitHubForge {
                 Ok(StepOutcome::Created)
             }
         }
+    }
+
+    /// Make sure `path` is absent from the default branch.
+    async fn remove_file(&self, repo: &Resource, path: &str, message: &str) -> Result<StepOutcome> {
+        validate_repo_path(path)?;
+        let (token, owner, name) = self.repo_token(repo, PERMS_CONTENTS).await?;
+        let Some((_, sha)) = self.file_at(&token, &owner, &name, path, None).await? else {
+            return Ok(StepOutcome::Unchanged);
+        };
+        let mut segments = vec!["repos", owner.as_str(), name.as_str(), "contents"];
+        segments.extend(path.split('/'));
+        let body = json!({ "message": message, "sha": sha });
+        self.api
+            .send(
+                Method::DELETE,
+                self.api.url(&segments),
+                Auth::Bearer(&token),
+                Some(&body),
+                path,
+            )
+            .await
+            .map_err(|e| match e {
+                ForgeError::Rejected { status, message } => ForgeError::Rejected {
+                    status,
+                    message: format!(
+                        "{message} — the default branch is protected, so this clean-up has to \
+                         land through a pull request"
+                    ),
+                },
+                e => e,
+            })?;
+        Ok(StepOutcome::Updated)
+    }
+
+    /// Make sure CI variable `var` is absent.
+    async fn remove_variable(&self, repo: &Resource, var: &str) -> Result<StepOutcome> {
+        check_variable_name(var)?;
+        let (token, owner, name) = self.repo_token(repo, PERMS_VARIABLES).await?;
+        let url = self
+            .api
+            .url(&["repos", &owner, &name, "actions", "variables", var]);
+        if self
+            .api
+            .get_opt::<Value>(url.clone(), Auth::Bearer(&token), var)
+            .await?
+            .is_none()
+        {
+            return Ok(StepOutcome::Unchanged);
+        }
+        self.api
+            .send(Method::DELETE, url, Auth::Bearer(&token), None, var)
+            .await?;
+        Ok(StepOutcome::Updated)
     }
 
     // ── roles ────────────────────────────────────────────────────────────
@@ -809,6 +1061,13 @@ impl Forge for GitHubForge {
         c.account_link = LinkMethod::DeviceFlow;
         c.webhooks = automated;
         c.per_repo_tokens = automated;
+        c.required_workflow = automated
+            && ns.kind == NamespaceKind::Organization
+            && self.required_workflow_known(&ns.resource);
+        // Without a namespace workflow, a single-owner repository gets no
+        // review requirement (the user's decision: there is nobody else to
+        // review, and its owner controls the repository anyway).
+        c.single_owner_repos_unreviewed = !c.required_workflow;
         match ns.kind {
             NamespaceKind::User => {
                 // §8: only the account holder can create repositories, and
@@ -927,10 +1186,28 @@ impl Forge for GitHubForge {
         let namespace = Namespace::new(cb.expected_namespace.clone(), kind)
             .with_owner_id(inst.account.id)
             .with_installation(installation_id);
-        Ok(NamespaceBinding::new(
-            namespace,
-            missing_permissions(&inst.permissions),
-        ))
+        // Whether this org can have a required workflow (§9). Best effort:
+        // a failure leaves it unknown, which plans the owner-review fallback
+        // until `detect_required_workflow` is run again.
+        let probed = match self.probe_org_rulesets(&namespace).await {
+            Ok(available) => {
+                self.set_required_workflow(&namespace.resource, available);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not tell whether org rulesets are available");
+                false
+            }
+        };
+        let binding = NamespaceBinding::new(namespace, missing_permissions(&inst.permissions));
+        // Handed back as data for the bridge to persist; the adapter's copy
+        // is in memory only.
+        Ok(if probed {
+            let caps = self.capabilities(&binding.namespace);
+            binding.with_capabilities(caps)
+        } else {
+            binding
+        })
     }
 
     async fn begin_account_link(&self, member: &str) -> Result<LinkStep> {
@@ -1046,9 +1323,28 @@ impl Forge for GitHubForge {
                 ));
             }
         }
-        if let Some(rs) = self.managed_ruleset(&token, &owner, &name).await? {
+        let rs = self.managed_ruleset(&token, &owner, &name).await?;
+        if let Some(rs) = &rs {
             let actions_id = self.actions_app_id(&token).await?;
-            state.protection = self.protection(&rs, r.default_branch.as_deref(), actions_id);
+            state.protection = self.protection(rs, r.default_branch.as_deref(), Some(actions_id));
+        }
+        self.inspect_actions_policy(&token, &owner, &name, &mut state.protection)
+            .await?;
+        drop(token);
+        let caps = self.capabilities(&ns);
+        if caps.required_workflow {
+            self.inspect_required_workflow(&ns, r.id, &mut state.protection)
+                .await?;
+        } else if caps.automation {
+            self.inspect_owner_review(
+                repo,
+                &owner,
+                &name,
+                rs.as_ref(),
+                r.default_branch.as_deref(),
+                &mut state.protection,
+            )
+            .await?;
         }
         Ok(state)
     }
@@ -1137,6 +1433,16 @@ impl Forge for GitHubForge {
                 repo.as_str(),
             )
             .await?;
+        if let Some(set) = self
+            .managed
+            .write()
+            .expect("lock poisoned")
+            .get_mut(&repo.namespace())
+        {
+            // An archived repository takes no pull requests: the org ruleset
+            // drops it on its next convergence.
+            set.remove(&r.id);
+        }
         if r.archived {
             return Ok(());
         }
@@ -1262,7 +1568,11 @@ impl Forge for GitHubForge {
             });
         }
         repo.resource.require_owner_repo()?;
-        github_plan(repo, cfg, &self.config.checkout_action)
+        let ns = self.namespace(&repo.resource.namespace())?;
+        let guard = self.check_guard(&ns, repo);
+        *self.verify_trust_action.lock().expect("lock poisoned") =
+            Some(cfg.verify_trust_action.clone());
+        github_plan(repo, cfg, &self.config.checkout_action, &guard)
     }
 
     async fn run_step(&self, repo: &Resource, step: &BootstrapStep) -> Result<StepOutcome> {
@@ -1274,6 +1584,25 @@ impl Forge for GitHubForge {
             } => self.write_file(repo, path, contents, message).await,
             StepAction::SetVariable { name, value } => self.set_variable(repo, name, value).await,
             StepAction::ProtectDefaultBranch(spec) => self.protect(repo, spec).await,
+            StepAction::RequireNamespaceWorkflow {
+                contents,
+                check,
+                message,
+            } => {
+                self.require_namespace_workflow(repo, contents, check, message)
+                    .await
+            }
+            StepAction::RequireOwnerReview {
+                paths,
+                owners,
+                community_rules,
+                message,
+            } => {
+                self.require_owner_review(repo, paths, owners, community_rules, message)
+                    .await
+            }
+            StepAction::RemoveFile { path, message } => self.remove_file(repo, path, message).await,
+            StepAction::RemoveVariable { name } => self.remove_variable(repo, name).await,
             other => Err(ForgeError::Unsupported {
                 operation: format!("bootstrap step {other:?}"),
                 hint: "this GitHub adapter does not know that step".into(),
@@ -1283,6 +1612,20 @@ impl Forge for GitHubForge {
 
     fn parse_event(&self, headers: &HeaderMap, body: &[u8]) -> Result<Option<ForgeEvent>> {
         webhook::parse(&self.webhook_secret, &self.config.host, headers, body)
+    }
+
+    /// The default comparison, plus the owner-review guard against the
+    /// projection's owners (§9, the user's decision on solo repositories):
+    /// two or more owners must all be reviewers of a healthy guard; one
+    /// owner needs no guard, and a guard left over from when there were
+    /// more is a re-plan (it would lock the solo owner out).
+    fn diff(&self, observed: &RepoState, desired: &Projection) -> Vec<Drift> {
+        let mut drift = default_diff(observed, desired);
+        if desired.required_check.is_some() {
+            let ns = self.namespace(&desired.resource.namespace()).ok();
+            drift.extend(guard::owner_review_drift(ns.as_ref(), observed, desired));
+        }
+        guard::merge_protection_drift(drift)
     }
 }
 
@@ -1311,7 +1654,7 @@ impl ForgeHooks for GitHubForge {
 /// The ruleset GitHub is asked for: default branch, PR required, the check
 /// required and pinned to the Actions App, no force-push, no deletion, and
 /// an empty bypass list.
-fn ruleset_body(spec: &ProtectionSpec, actions_id: u64) -> Value {
+fn ruleset_body(spec: &ProtectionSpec, actions_id: Option<u64>) -> Value {
     let mut rules = Vec::new();
     if spec.block_deletion {
         rules.push(json!({ "type": "deletion" }));
@@ -1323,23 +1666,29 @@ fn ruleset_body(spec: &ProtectionSpec, actions_id: u64) -> Value {
         rules.push(json!({
             "type": "pull_request",
             "parameters": {
-                "required_approving_review_count": 0,
-                "dismiss_stale_reviews_on_push": false,
-                "require_code_owner_review": false,
-                "require_last_push_approval": false,
+                // Owner review (§9): one approval, a code owner's where one
+                // is named, dismissed by any later push, and not the last
+                // pusher's own — or a reviewed change could be swapped after
+                // approval.
+                "required_approving_review_count": u8::from(spec.require_code_owner_review),
+                "dismiss_stale_reviews_on_push": spec.require_code_owner_review,
+                "require_code_owner_review": spec.require_code_owner_review,
+                "require_last_push_approval": spec.require_code_owner_review,
                 "required_review_thread_resolution": false,
             }
         }));
     }
-    rules.push(json!({
-        "type": "required_status_checks",
-        "parameters": {
-            "strict_required_status_checks_policy": false,
-            "required_status_checks": [
-                { "context": spec.required_check, "integration_id": actions_id }
-            ],
-        }
-    }));
+    if let (true, Some(actions_id)) = (spec.require_status_check, actions_id) {
+        rules.push(json!({
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": false,
+                "required_status_checks": [
+                    { "context": spec.required_check, "integration_id": actions_id }
+                ],
+            }
+        }));
+    }
     json!({
         "name": RULESET_NAME,
         "target": "branch",
@@ -1350,12 +1699,48 @@ fn ruleset_body(spec: &ProtectionSpec, actions_id: u64) -> Value {
     })
 }
 
+fn check_variable_name(var: &str) -> Result<()> {
+    if var.is_empty()
+        || !var
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(ForgeError::Config(format!(
+            "variable name `{var}` must be [A-Z0-9_]"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the ruleset's pull-request parameters and status-check rule are
+/// exactly what `spec` asks for — no stricter either: a leftover code-owner
+/// requirement locks a solo owner out, and a leftover status check is the
+/// old guard's (L4).
+fn rules_match(rs: &RulesetJson, spec: &ProtectionSpec) -> bool {
+    let has_status = rs.rules.iter().any(|r| r.kind == "required_status_checks");
+    let review = spec.require_code_owner_review;
+    let pr_ok = !spec.require_pull_request
+        || rs.rules.iter().any(|r| {
+            let param = |k: &str| r.parameters.as_ref().and_then(|p| p.get(k)).cloned();
+            let flag = |k: &str| param(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            r.kind == "pull_request"
+                && param("required_approving_review_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    == u64::from(review)
+                && flag("require_code_owner_review") == review
+                && flag("dismiss_stale_reviews_on_push") == review
+                && flag("require_last_push_approval") == review
+        });
+    has_status == spec.require_status_check && pr_ok
+}
+
 fn satisfies(observed: &ProtectionState, spec: &ProtectionSpec) -> bool {
     observed.present
         && observed.enforced
         && observed.covers_default_branch
         && observed.bypass_actors.is_empty()
-        && observed.required_checks.contains(&spec.required_check)
+        && (!spec.require_status_check || observed.required_checks.contains(&spec.required_check))
         && (!spec.require_pull_request || observed.requires_pull_request)
         && (!spec.block_force_push || observed.blocks_force_push)
         && (!spec.block_deletion || observed.blocks_deletion)

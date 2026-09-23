@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ForgeError, Result};
 use crate::forge::Forge;
+use crate::model::ForgeAccount;
 use crate::resource::Resource;
 
 /// The required status check's default name: the verify-trust job's `name`.
@@ -142,6 +143,16 @@ pub struct ProtectionSpec {
     pub block_force_push: bool,
     /// Block deletion.
     pub block_deletion: bool,
+    /// Require [`ProtectionSpec::required_check`] in this rule. `false` when
+    /// the check is enforced at the namespace level instead (a required
+    /// workflow, [`StepAction::RequireNamespaceWorkflow`]), so this rule
+    /// carries only the PR, force-push and deletion parts.
+    #[serde(default = "yes")]
+    pub require_status_check: bool,
+    /// Pull requests need an approving review, including a code owner's for
+    /// files that have one ([`StepAction::RequireOwnerReview`]).
+    #[serde(default)]
+    pub require_code_owner_review: bool,
     /// Paths (forge glob syntax) a pull request may not change and still
     /// merge: the workflows and the exempt keyring. Without this a PR could
     /// rewrite the check it is judged by — CI runs the PR's own copy of the
@@ -149,6 +160,10 @@ pub struct ProtectionSpec {
     /// other way or not at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protected_paths: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl ProtectionSpec {
@@ -161,6 +176,8 @@ impl ProtectionSpec {
             require_pull_request: true,
             block_force_push: true,
             block_deletion: true,
+            require_status_check: true,
+            require_code_owner_review: false,
             protected_paths: Vec::new(),
         }
     }
@@ -172,6 +189,19 @@ impl ProtectionSpec {
         S: Into<String>,
     {
         self.protected_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Leave the check out of this rule: a namespace-level required workflow
+    /// enforces it.
+    pub fn with_check_enforced_by_namespace(mut self) -> Self {
+        self.require_status_check = false;
+        self
+    }
+
+    /// Require an approving review, and a code owner's where one is named.
+    pub fn with_code_owner_review(mut self) -> Self {
+        self.require_code_owner_review = true;
         self
     }
 }
@@ -240,6 +270,48 @@ pub enum StepAction {
     },
     /// Enforce protection on the default branch.
     ProtectDefaultBranch(ProtectionSpec),
+    /// Run the check from a workflow the namespace holds outside the
+    /// repository, pinned to a revision, and require it on this repository's
+    /// default branch. The change under test cannot alter what checks it
+    /// (§9: the PR must not be able to satisfy its own check).
+    RequireNamespaceWorkflow {
+        /// The workflow's contents.
+        contents: Vec<u8>,
+        /// The check (job) name it reports, for inspection.
+        check: String,
+        /// Commit message if the workflow has to be (re)written.
+        message: String,
+    },
+    /// Make every change to `paths` need an approving review from one of
+    /// `owners` — the fallback where no namespace-level workflow is
+    /// available (§9). The adapter resolves each account's current login at
+    /// run time; the numeric id is what is planned.
+    RequireOwnerReview {
+        /// Repository paths (directories end in `/`), e.g. `/.github/`.
+        paths: Vec<String>,
+        /// Who may approve. Never empty.
+        owners: Vec<ForgeAccount>,
+        /// The community's own owner rules, in the forge's format, kept
+        /// ahead of the managed rule (which therefore wins for `paths`).
+        /// Rules already in the repository take their place when present.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        community_rules: Vec<u8>,
+        /// Commit message if the rules have to be (re)written.
+        message: String,
+    },
+    /// Make sure a file is absent from the default branch (clean-up after
+    /// a change of guard).
+    RemoveFile {
+        /// Repository-relative path.
+        path: String,
+        /// Commit message if a commit is needed.
+        message: String,
+    },
+    /// Make sure a CI variable is absent.
+    RemoveVariable {
+        /// Variable name.
+        name: String,
+    },
     /// Make the repository's settings (merge methods, CI) match.
     ConfigureRepo(RepoSettings),
     /// Rewrite files the default branch's protection forbids changing — the
