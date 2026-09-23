@@ -1133,3 +1133,283 @@ async fn bootstrap_refuses_what_it_cannot_see_or_did_not_write() {
     assert!(e.to_string().contains("too large"), "{e}");
     let _ = WORKFLOW_PATH;
 }
+
+// ── rules Forgejo may apply instead of the managed one ─────────────────
+
+fn protection_gaps(
+    forge: &vgi_forge_forgejo::ForgejoForge,
+    state: &vgi_forge::RepoState,
+) -> Vec<ProtectionGap> {
+    let mut want = Projection::new(repo("widgets"));
+    want.required_check = Some("Verify commit trust".into());
+    forge
+        .diff(state, &want)
+        .into_iter()
+        .find_map(|d| match d {
+            Drift::ProtectionWeakened { gaps } => Some(gaps),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn bypass(gaps: &[ProtectionGap]) -> Vec<String> {
+    gaps.iter()
+        .find_map(|g| match g {
+            ProtectionGap::BypassActors { actors } => Some(actors.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_same_name_rule_in_another_case_shadows_the_managed_one() {
+    let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "widgets", repo_json(812, "acme/widgets", false)).await;
+    mount_people(&server, "widgets", &[]).await;
+    let mut other = good_rule(&[]);
+    other["rule_name"] = json!("Main");
+    other["branch_name"] = json!("Main");
+    other["enable_push"] = json!(true);
+    let mut glob = good_rule(&[]);
+    glob["rule_name"] = json!("ma*");
+    mount_rules(&server, "widgets", json!([other, good_rule(&[]), glob])).await;
+
+    let state = forge.inspect(&repo("widgets")).await.unwrap();
+    let gaps = protection_gaps(&forge, &state);
+    assert!(
+        gaps.contains(&ProtectionGap::DefaultBranchNotCovered),
+        "{gaps:?}"
+    );
+    // A glob rule never outranks a plain one; only `Main` is reported.
+    assert_eq!(bypass(&gaps), ["shadowing-rule:Main"]);
+
+    // The protection step refuses rather than trusting a rule that may
+    // never apply.
+    forbid_writes(&server).await;
+    let plan = forge
+        .bootstrap_plan(&RepoSpec::new(repo("widgets")), &vgi_config())
+        .unwrap();
+    let step = plan.iter().find(|s| s.id == "protection").unwrap();
+    let e = forge.run_step(&repo("widgets"), step).await.unwrap_err();
+    assert!(
+        matches!(&e, ForgeError::Rejected { message, .. } if message.contains("Main")),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_merge_allow_list_lets_every_writer_merge() {
+    let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "widgets", repo_json(812, "acme/widgets", false)).await;
+    mount_people(&server, "widgets", &[]).await;
+    let mut rule = good_rule(&[]);
+    rule["enable_merge_whitelist"] = json!(false);
+    mount_rules(&server, "widgets", json!([rule])).await;
+    let state = forge.inspect(&repo("widgets")).await.unwrap();
+    assert_eq!(
+        bypass(&protection_gaps(&forge, &state)),
+        ["merge: everyone with write access"]
+    );
+}
+
+#[tokio::test]
+async fn a_rule_left_open_for_the_bridge_is_critical_drift() {
+    let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "widgets", repo_json(812, "acme/widgets", false)).await;
+    mount_people(&server, "widgets", &[]).await;
+    let mut open = good_rule(&[]);
+    open["enable_push"] = json!(true);
+    open["enable_push_whitelist"] = json!(true);
+    open["push_whitelist_usernames"] = json!([BOT]);
+    open["protected_file_patterns"] = json!("");
+    mount_rules(&server, "widgets", json!([open])).await;
+    let state = forge.inspect(&repo("widgets")).await.unwrap();
+    let gaps = protection_gaps(&forge, &state);
+    assert!(gaps.contains(&ProtectionGap::PullRequestNotRequired));
+    assert_eq!(bypass(&gaps), [format!("push:{BOT}")]);
+    assert!(
+        gaps.iter()
+            .any(|g| matches!(g, ProtectionGap::UnprotectedPaths { .. }))
+    );
+}
+
+// ── refreshing protected files ───────────────────────────────────────────
+
+const WF: &str = "/api/v1/repos/acme/gadgets/contents/.forgejo/workflows/verify-trust.yml";
+
+fn refresh_step(forge: &vgi_forge_forgejo::ForgejoForge) -> vgi_forge::BootstrapStep {
+    let mut plan = forge
+        .refresh_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .unwrap();
+    assert_eq!(plan.len(), 1, "one audited step");
+    plan.remove(0)
+}
+
+fn workflow_now(forge: &vgi_forge_forgejo::ForgejoForge) -> Vec<u8> {
+    let StepAction::RefreshProtectedFiles { files, .. } = refresh_step(forge).action else {
+        panic!()
+    };
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, WORKFLOW_PATH);
+    files[0].contents.clone()
+}
+
+async fn mount_stale_workflow(server: &MockServer) {
+    mount_repo(server, "gadgets", repo_json(9001, "acme/gadgets", false)).await;
+    Mock::given(method("GET"))
+        .and(path(WF))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "file", "sha": "abc", "encoding": "base64",
+            "content": STANDARD.encode("an older workflow\n"),
+        })))
+        .mount(server)
+        .await;
+    mount_rules(server, "gadgets", json!([good_rule(&["alice"])])).await;
+}
+
+fn open_body() -> Value {
+    json!({
+        "enable_push": true,
+        "enable_push_whitelist": true,
+        "push_whitelist_usernames": [BOT],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "protected_file_patterns": "",
+    })
+}
+
+fn restore_body() -> Value {
+    json!({
+        "enable_push": false,
+        "enable_push_whitelist": false,
+        "push_whitelist_usernames": [],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "protected_file_patterns": PATTERNS,
+    })
+}
+
+async fn mount_open_and_restore(server: &MockServer, restore: ResponseTemplate, restores: u64) {
+    let rule = "/api/v1/repos/acme/gadgets/branch_protections/main";
+    Mock::given(method("PATCH"))
+        .and(path(rule))
+        .and(BotToken)
+        .and(body_json(open_body()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(good_rule(&["alice"])))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(rule))
+        .and(BotToken)
+        .and(body_json(restore_body()))
+        .respond_with(restore)
+        .expect(restores)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn refresh_opens_for_the_bot_alone_writes_and_restores_exactly() {
+    let (server, forge) = server_and_forge().await;
+    mount_stale_workflow(&server).await;
+    mount_open_and_restore(
+        &server,
+        ResponseTemplate::new(200).set_body_json(good_rule(&["alice"])),
+        1,
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path(WF))
+        .and(BotToken)
+        .and(body_json(json!({
+            "message": "ci: update the VGI commit-trust check",
+            "content": STANDARD.encode(workflow_now(&forge)),
+            "sha": "abc",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let StepAction::RefreshProtectedFiles { files, message } = refresh_step(&forge).action else {
+        panic!()
+    };
+    let report = forge
+        .refresh_managed_files(&repo("gadgets"), &files, &message)
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, StepOutcome::Updated);
+    assert!(report.opened);
+    assert_eq!(
+        report.files,
+        [(WORKFLOW_PATH.to_string(), StepOutcome::Updated)]
+    );
+    assert!(
+        report.detail.contains("restored and verified"),
+        "{}",
+        report.detail
+    );
+}
+
+#[tokio::test]
+async fn refresh_restores_even_when_a_write_fails() {
+    let (server, forge) = server_and_forge().await;
+    mount_stale_workflow(&server).await;
+    mount_open_and_restore(
+        &server,
+        ResponseTemplate::new(200).set_body_json(good_rule(&["alice"])),
+        1,
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path(WF))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    let e = forge
+        .run_step(&repo("gadgets"), &refresh_step(&forge))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ForgeError::Forbidden(_)), "{e}");
+}
+
+#[tokio::test]
+async fn a_failed_restore_is_loud() {
+    let (server, forge) = server_and_forge().await;
+    mount_stale_workflow(&server).await;
+    // Both restore attempts fail.
+    mount_open_and_restore(&server, ResponseTemplate::new(500), 2).await;
+    Mock::given(method("PUT"))
+        .and(path(WF))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let e = forge
+        .run_step(&repo("gadgets"), &refresh_step(&forge))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("PROTECTION LEFT OPEN"), "{e}");
+}
+
+#[tokio::test]
+async fn refresh_of_current_files_opens_nothing() {
+    let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "gadgets", repo_json(9001, "acme/gadgets", false)).await;
+    Mock::given(method("GET"))
+        .and(path(WF))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "file", "sha": "abc", "encoding": "base64",
+            "content": STANDARD.encode(workflow_now(&forge)),
+        })))
+        .mount(&server)
+        .await;
+    forbid_writes(&server).await;
+    assert_eq!(
+        forge
+            .run_step(&repo("gadgets"), &refresh_step(&forge))
+            .await
+            .unwrap(),
+        StepOutcome::Unchanged
+    );
+}

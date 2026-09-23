@@ -90,11 +90,14 @@ jobs:
 
   # The Forgejo adapter against a real Forgejo in Docker: bind through the
   # OAuth consent pages, create, bootstrap, roles, the protected-workflow
-  # guarantee, archive and token rotation, plus a swagger check of every
-  # endpoint the adapter uses. The image major is pinned in the test.
+  # guarantee, the audited refresh, archive and token rotation, plus a
+  # swagger check of every endpoint the adapter uses. The image is pinned by
+  # digest in crates/vgi-forge-forgejo/tests/forgejo/Dockerfile (Dependabot
+  # keeps it current); this job pulls exactly that.
   forgejo-live:
     name: Forgejo integration
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -104,6 +107,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pull the pinned Forgejo image
+        run: |
+          set -euo pipefail
+          image="$(sed -n 's/^FROM //p' crates/vgi-forge-forgejo/tests/forgejo/Dockerfile)"
+          case "$image" in *@sha256:*) ;; *) echo "::error::Forgejo image not pinned by digest: $image"; exit 1 ;; esac
+          docker pull "$image"
       - name: Adapter against a live Forgejo
         env:
           VGI_FORGEJO_IT: "1"

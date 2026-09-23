@@ -218,7 +218,8 @@ pub enum TokenRotation {
     Manual,
     /// The bridge also holds the bot's password (sealed like the App key on
     /// GitHub) and rotates on its own with
-    /// [`crate::ForgejoForge::rotate_token`]. The bot must not have 2FA
+    /// [`crate::ForgejoForge::mint_token`] and
+    /// [`crate::ForgejoForge::retire_token`]. The bot must not have 2FA
     /// enabled, which Forgejo requires for basic auth.
     WithPassword(Secret),
 }

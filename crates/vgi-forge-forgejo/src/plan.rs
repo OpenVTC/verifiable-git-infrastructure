@@ -207,9 +207,9 @@ pub fn render_workflow(
         MergePlan::FastForwardOnly => String::new(),
     };
     format!(
-        r#"# Managed by this community's VGI bridge. It is rewritten on bootstrap;
-# propose changes to the VTC rather than editing it here. Branch protection
-# refuses pull requests that change it.
+        r#"# Managed by this community's VGI bridge. Branch protection refuses
+# pull requests that change it; the bridge updates it only through its
+# audited refresh-managed-files step. Propose changes to the VTC.
 name: {name}
 
 on:
@@ -348,7 +348,16 @@ fn check_sha256(s: &str) -> Result<()> {
     }
 }
 
-fn check_check_name(name: &str) -> Result<()> {
+pub(crate) fn check_check_name(name: &str) -> Result<()> {
+    // Forgejo matches required status contexts as glob patterns, and one
+    // that does not compile is skipped — the requirement silently falls
+    // away. A literal name is the only safe one.
+    if crate::forge::is_glob(name) {
+        return Err(ForgeError::Config(format!(
+            "check name `{name}` contains a glob character (`*?[]{{}}\\`); Forgejo would \
+             read the required context as a pattern"
+        )));
+    }
     // `${{` would make the job name an Actions expression.
     if name.trim().is_empty()
         || name.len() > 200
@@ -538,6 +547,14 @@ mod tests {
         let mut c = cfg();
         c.verify_trust_action = format!("http://github.com/o/r@{SHA}");
         assert!(err(&c).contains("pinned"));
+        for bad in ["Verify [trust]", "Verify *", "a{b}", "a?b", "a\\b"] {
+            let mut c = cfg();
+            c.required_check = bad.into();
+            assert!(err(&c).contains("glob"), "{bad}");
+            let mut o2 = o.clone();
+            o2.status_context = format!("{bad} / x (pull_request)");
+            assert!(forgejo_plan(&spec(), &cfg(), &o2).is_err(), "{bad}");
+        }
         let mut c = cfg();
         c.vtc_did = "did:web:x\n  evil: true".into();
         assert!(forgejo_plan(&spec(), &c, &o).is_err());

@@ -8,7 +8,8 @@
 //! - **Identity.** A dedicated bot user with an access token scoped to
 //!   [`BOT_TOKEN_SCOPES`]. It is long-lived, so it is held as a [`Secret`]
 //!   (zeroized, never printed), swappable in place, and rotated by the
-//!   bridge ([`ForgejoForge::rotate_token`]) — which needs the bot's
+//!   bridge in two phases ([`ForgejoForge::mint_token`], then
+//!   [`ForgejoForge::retire_token`] once the new one is persisted) — which needs the bot's
 //!   password, because Forgejo mints tokens only under basic auth. Whether
 //!   the bridge holds that password is an explicit choice
 //!   ([`TokenRotation`]).
@@ -49,6 +50,8 @@ pub use config::{
     Credentials, DEFAULT_ACTIONS_BASE, DEFAULT_CHECKOUT_ACTION, DEFAULT_RUNS_ON, DEFAULT_TEAM,
     ForgejoConfig, MergeFallback, TokenRotation,
 };
-pub use forge::{BOT_TOKEN_SCOPES, ForgejoForge, TOKEN_NAME_PREFIX, TokenRotationReport};
+pub use forge::{
+    BOT_TOKEN_SCOPES, ForgejoForge, MintedToken, RefreshReport, TOKEN_NAME_PREFIX, TokenRef,
+};
 pub use secret::Secret;
 pub use version::{Features, Flavor, InstanceInfo};

@@ -39,8 +39,8 @@ use crate::webhook::{self, HOOK_EVENTS};
 ///   on logins the VTC recorded, which a rename can hand to someone else.
 pub const BOT_TOKEN_SCOPES: [&str; 3] = ["write:organization", "write:repository", "read:user"];
 
-/// Name prefix of the tokens [`ForgejoForge::rotate_token`] mints; older
-/// ones with this prefix are deleted once the new one is verified.
+/// Name prefix of the tokens [`ForgejoForge::mint_token`] mints. Only for
+/// recognising them in the bot's token list; nothing is deleted by prefix.
 pub const TOKEN_NAME_PREFIX: &str = "vgi-bridge-";
 
 /// The role ladder. Forgejo has `read`, `write` and `admin` collaborators;
@@ -69,14 +69,44 @@ struct Probed {
     signing_key: Option<Vec<u8>>,
 }
 
-/// What [`ForgejoForge::rotate_token`] did.
+/// What [`ForgejoForge::refresh_managed_files`] did, for the audit log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct TokenRotationReport {
-    /// Name of the token now in use.
-    pub new_token: String,
-    /// Names of the tokens deleted: earlier rotations' and the one replaced.
-    pub deleted: Vec<String>,
+pub struct RefreshReport {
+    /// The step's outcome: `Updated` if any file was written.
+    pub outcome: StepOutcome,
+    /// Each file and what happened to it.
+    pub files: Vec<(String, StepOutcome)>,
+    /// Whether the protection was opened for the bridge at all.
+    pub opened: bool,
+    /// One line for the audit log: what was opened, written and restored.
+    pub detail: String,
+}
+
+/// One of the bot's access tokens, by the id and name Forgejo lists it
+/// under. Holds no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TokenRef {
+    /// Forgejo's id for the token.
+    pub id: u64,
+    /// Its name.
+    pub name: String,
+}
+
+/// What [`ForgejoForge::mint_token`] minted, now in use.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct MintedToken {
+    /// The new token.
+    pub token: TokenRef,
+    /// Its secret, for the caller to persist (sealed) before retiring the
+    /// old one. Never printed.
+    pub secret: Secret,
+    /// The token it replaced, when it could be identified — what to pass to
+    /// [`ForgejoForge::retire_token`] once the new one is persisted
+    /// everywhere it is used. `None`: find and delete it by hand.
+    pub previous: Option<TokenRef>,
 }
 
 /// The Forgejo adapter: one bot user on one Forgejo (or Gitea) instance.
@@ -89,6 +119,8 @@ pub struct ForgejoForge {
     config: ForgejoConfig,
     api: Api,
     token: RwLock<Arc<Secret>>,
+    /// The token in use, when this adapter minted it.
+    current_token: RwLock<Option<TokenRef>>,
     rotation: TokenRotation,
     oauth_secret: Secret,
     oauth_keys: OAuthKeys,
@@ -135,6 +167,9 @@ impl ForgejoForge {
         if config.oauth_client_id.is_empty() {
             return Err(ForgeError::Config("empty OAuth client id".into()));
         }
+        if let Some(context) = &config.status_check_context {
+            crate::plan::check_check_name(context)?;
+        }
         check_login(&config.team_name)
             .map_err(|_| ForgeError::Config(format!("bad team name `{}`", config.team_name)))?;
         vgi_forge::Resource::namespace_of(&config.host, "x").map_err(|e| {
@@ -151,6 +186,7 @@ impl ForgejoForge {
             config,
             api,
             token: RwLock::new(Arc::new(bot_token)),
+            current_token: RwLock::new(None),
             rotation,
             oauth_secret: oauth_client_secret,
             oauth_keys,
@@ -247,63 +283,86 @@ impl ForgejoForge {
             )));
         }
         *self.token.write().expect("token lock poisoned") = Arc::new(new);
+        *self.current_token.write().expect("token lock poisoned") = None;
         Ok(())
     }
 
-    /// Rotate the bot token: mint a new one (basic auth with the bot's
-    /// password), verify it is the bot's, swap it in, then delete every
-    /// earlier `vgi-bridge-*` token and the one it replaced. Needs
-    /// [`TokenRotation::WithPassword`]. On any failure before the swap the
-    /// new token is deleted and the old one stays in use.
-    pub async fn rotate_token(&self) -> Result<TokenRotationReport> {
-        let TokenRotation::WithPassword(password) = &self.rotation else {
-            return Err(ForgeError::Unsupported {
-                operation: "bot token rotation".into(),
-                hint: format!(
-                    "Forgejo mints tokens only under basic auth and this bridge holds no bot \
-                     password: create a token for `{}` with scopes {} and pass it to \
-                     `replace_token`",
-                    self.config.bot_login,
-                    BOT_TOKEN_SCOPES.join(", ")
-                ),
-            });
-        };
+    /// Rotation, phase 1: mint a new bot token (basic auth with the bot's
+    /// password), verify it is the bot's, and put it in use. Needs
+    /// [`TokenRotation::WithPassword`].
+    ///
+    /// The new secret is returned: **persist it (sealed) before calling
+    /// [`ForgejoForge::retire_token`]**, or a restart after the old token is
+    /// deleted comes back with a dead credential. Nothing is deleted here —
+    /// other bridge replicas using the old token keep working until the
+    /// caller has distributed the new one and retires the old. The token it
+    /// replaced is identified before anything is minted (by the id this
+    /// adapter recorded when it minted it, or else by its last eight
+    /// characters in the bot's token list), so once the new token is in use
+    /// nothing is left that can fail.
+    pub async fn mint_token(&self) -> Result<MintedToken> {
+        let password = self.bot_password()?;
         let bot = self.bot();
         let basic = Auth::Basic {
             user: &bot.login,
             password,
         };
+        let tokens_url = self.api.url(&["users", &bot.login, "tokens"]);
+        let tracked = self
+            .current_token
+            .read()
+            .expect("token lock poisoned")
+            .clone();
+        let previous = match tracked {
+            Some(t) => Some(t),
+            None => {
+                let tail = last_eight(self.token().expose());
+                let listed: Vec<TokenInfoJson> = self
+                    .api
+                    .get_all(tokens_url.clone(), basic, "bot access tokens")
+                    .await?;
+                let mut matching = listed
+                    .into_iter()
+                    .filter(|t| tail.is_some() && t.token_last_eight.as_deref() == tail.as_deref());
+                // Only an unambiguous match is named; two tokens sharing
+                // their last eight characters are left for a human.
+                match (matching.next(), matching.next()) {
+                    (Some(t), None) => Some(TokenRef {
+                        id: t.id,
+                        name: t.name,
+                    }),
+                    _ => None,
+                }
+            }
+        };
+
         let mut suffix = [0u8; 4];
         aws_lc_rs::rand::fill(&mut suffix)
             .map_err(|_| ForgeError::Config("system RNG unavailable".into()))?;
         let name = format!("{TOKEN_NAME_PREFIX}{}-{}", unix_now(), hex::encode(suffix));
-        let tokens_url = self.api.url(&["users", &bot.login, "tokens"]);
         let created: NewTokenJson = self
             .api
             .json_secret(
                 Method::POST,
-                tokens_url.clone(),
+                tokens_url,
                 basic,
                 Some(&json!({ "name": name, "scopes": BOT_TOKEN_SCOPES })),
                 "bot access token",
             )
             .await?;
-        let new_id = created.id;
-        let new = Secret::new(created.sha1.clone());
+        let minted = TokenRef {
+            id: created.id,
+            name: name.clone(),
+        };
+        let for_caller = Secret::new(created.sha1.clone());
+        let in_use = Secret::new(created.sha1.clone());
         drop(created);
 
-        let delete = |id: u64| {
-            let url = self
-                .api
-                .url(&["users", &bot.login, "tokens", &id.to_string()]);
-            self.api
-                .send(Method::DELETE, url, basic, None, "bot access token")
-        };
-        match whoami(&self.api, Auth::Token(&new)).await {
+        match whoami(&self.api, Auth::Token(&in_use)).await {
             Ok(who) if who.id == bot.id => {}
             other => {
                 // Best effort: the error that matters is the one below.
-                let _ = delete(new_id).await;
+                let _ = self.delete_token(&bot.login, password, minted.id).await;
                 return Err(match other {
                     Ok(who) => ForgeError::Protocol(format!(
                         "the new token authenticates as `{}`, not the bot",
@@ -313,32 +372,71 @@ impl ForgejoForge {
                 });
             }
         }
-        let old = std::mem::replace(
-            &mut *self.token.write().expect("token lock poisoned"),
-            Arc::new(new),
-        );
-        let old_tail = last_eight(old.expose());
-        drop(old);
-
-        let listed: Vec<TokenInfoJson> = self
-            .api
-            .get_all(tokens_url, basic, "bot access tokens")
-            .await?;
-        let mut deleted = Vec::new();
-        for t in listed {
-            let ours = t.name.starts_with(TOKEN_NAME_PREFIX)
-                || old_tail
-                    .as_deref()
-                    .is_some_and(|tail| t.token_last_eight.as_deref() == Some(tail));
-            if t.id != new_id && ours {
-                delete(t.id).await?;
-                deleted.push(t.name);
-            }
-        }
-        Ok(TokenRotationReport {
-            new_token: name,
-            deleted,
+        *self.token.write().expect("token lock poisoned") = Arc::new(in_use);
+        *self.current_token.write().expect("token lock poisoned") = Some(minted.clone());
+        Ok(MintedToken {
+            token: minted,
+            secret: for_caller,
+            previous,
         })
+    }
+
+    /// Rotation, phase 2: delete a token this bridge replaced — exactly the
+    /// one named, never a pattern, so another bridge's (or a person's)
+    /// tokens on the same bot are never touched. Refuses the token in use.
+    /// A token already gone is not an error.
+    pub async fn retire_token(&self, old: &TokenRef) -> Result<()> {
+        let password = self.bot_password()?;
+        if self
+            .current_token
+            .read()
+            .expect("token lock poisoned")
+            .as_ref()
+            .is_some_and(|t| t.id == old.id)
+        {
+            return Err(ForgeError::Config(format!(
+                "token `{}` is the one in use; mint a new one first",
+                old.name
+            )));
+        }
+        let bot = self.bot();
+        match self.delete_token(&bot.login, password, old.id).await {
+            Ok(()) | Err(ForgeError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn bot_password(&self) -> Result<&Secret> {
+        match &self.rotation {
+            TokenRotation::WithPassword(p) => Ok(p),
+            _ => Err(ForgeError::Unsupported {
+                operation: "bot token rotation".into(),
+                hint: format!(
+                    "Forgejo mints and deletes tokens only under basic auth and this bridge \
+                     holds no bot password: create a token for `{}` with scopes {}, pass it to \
+                     `replace_token`, and delete the old one yourself",
+                    self.config.bot_login,
+                    BOT_TOKEN_SCOPES.join(", ")
+                ),
+            }),
+        }
+    }
+
+    async fn delete_token(&self, login: &str, password: &Secret, id: u64) -> Result<()> {
+        let url = self.api.url(&["users", login, "tokens", &id.to_string()]);
+        self.api
+            .send(
+                Method::DELETE,
+                url,
+                Auth::Basic {
+                    user: login,
+                    password,
+                },
+                None,
+                "bot access token",
+            )
+            .await?;
+        Ok(())
     }
 
     // ── locating ─────────────────────────────────────────────────────────
@@ -467,15 +565,23 @@ impl ForgejoForge {
         Ok(out)
     }
 
-    /// The branch protection rule named exactly `branch`. A glob rule that
-    /// happens to match is not the managed rule and never counts as it.
+    /// The branch protection rule named exactly `branch` — the managed rule
+    /// — and the names of any other rules that could apply to the branch
+    /// in its place.
+    ///
+    /// Forgejo applies the *first* matching rule: plain-name rules before
+    /// glob rules, and among those the oldest, with a plain name matching
+    /// the branch case-insensitively. So another plain rule whose name
+    /// equals the branch ignoring case (`Main` for `main`) may win over the
+    /// managed one and is reported; a glob rule never outranks a plain one
+    /// and is not.
     async fn protection_rule(
         &self,
         token: &Secret,
         owner: &str,
         name: &str,
         branch: &str,
-    ) -> Result<Option<ProtectionJson>> {
+    ) -> Result<(Option<ProtectionJson>, Vec<String>)> {
         let rules: Vec<ProtectionJson> = self
             .api
             .json(
@@ -486,10 +592,27 @@ impl ForgejoForge {
                 "branch protections",
             )
             .await?;
-        Ok(rules.into_iter().find(|r| r.name() == Some(branch)))
+        let folded = branch.to_lowercase();
+        let mut managed = None;
+        let mut shadowing = Vec::new();
+        for rule in rules {
+            match rule.name() {
+                Some(n) if n == branch => managed = Some(rule),
+                Some(n) if !is_glob(n) && n.to_lowercase() == folded => {
+                    shadowing.push(n.to_string())
+                }
+                _ => {}
+            }
+        }
+        Ok((managed, shadowing))
     }
 
-    fn protection_state(&self, rule: Option<&ProtectionJson>, repo: &RepoJson) -> ProtectionState {
+    fn protection_state(
+        &self,
+        rule: Option<&ProtectionJson>,
+        shadowing: &[String],
+        repo: &RepoJson,
+    ) -> ProtectionState {
         let mut p = ProtectionState::default();
         p.merge_methods = Some(repo.merge_methods());
         p.ci_enabled = repo.has_actions;
@@ -498,9 +621,10 @@ impl ForgejoForge {
         };
         p.present = true;
         // A Forgejo rule has no disabled state, and it is only ever looked
-        // up by the default branch's exact name.
+        // up by the default branch's exact name — but another rule that
+        // Forgejo may apply first means it cannot be relied on to cover it.
         p.enforced = true;
-        p.covers_default_branch = true;
+        p.covers_default_branch = shadowing.is_empty();
         p.requires_pull_request = !rule.enable_push;
         if rule.enable_status_check {
             p.required_checks = rule.status_check_contexts.clone();
@@ -512,6 +636,8 @@ impl ForgejoForge {
         p.blocks_deletion = true;
         p.protected_paths = patterns(&rule.protected_file_patterns);
         p.bypass_actors = rule.bypass_actors();
+        p.bypass_actors
+            .extend(shadowing.iter().map(|n| format!("shadowing-rule:{n}")));
         p
     }
 
@@ -569,31 +695,9 @@ impl ForgejoForge {
         segments.extend(path.split('/'));
         let url = self.api.url(&segments);
 
-        let existing: Option<Value> = self
-            .api
-            .get_opt(url.clone(), Auth::Token(&token), path)
-            .await?;
-        let sha = match existing {
-            Some(Value::Array(_)) => {
-                return Err(ForgeError::Rejected {
-                    status: 409,
-                    message: format!("`{path}` exists and is a directory, not a file"),
-                });
-            }
-            Some(v) => {
-                let c: ContentJson = serde_json::from_value(v)
-                    .map_err(|e| ForgeError::Protocol(format!("{path}: {e}")))?;
-                if c.kind != "file" {
-                    return Err(ForgeError::Rejected {
-                        status: 409,
-                        message: format!("`{path}` exists and is a {}, not a file", c.kind),
-                    });
-                }
-                if decode_content(&c)? == contents {
-                    return Ok(StepOutcome::Unchanged);
-                }
-                Some(c.sha)
-            }
+        let sha = match self.current_file(&token, owner, name, path).await? {
+            Some((_, current)) if current == contents => return Ok(StepOutcome::Unchanged),
+            Some((sha, _)) => Some(sha),
             None => None,
         };
 
@@ -623,6 +727,261 @@ impl ForgejoForge {
         } else {
             StepOutcome::Created
         })
+    }
+
+    /// The file at `path` on the default branch: `None` when absent, its
+    /// blob sha and contents otherwise. A directory, or a file too large to
+    /// return inline, is refused.
+    async fn current_file(
+        &self,
+        token: &Secret,
+        owner: &str,
+        name: &str,
+        path: &str,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let mut segments = vec!["repos", owner, name, "contents"];
+        segments.extend(path.split('/'));
+        let existing: Option<Value> = self
+            .api
+            .get_opt(self.api.url(&segments), Auth::Token(token), path)
+            .await?;
+        match existing {
+            Some(Value::Array(_)) => Err(ForgeError::Rejected {
+                status: 409,
+                message: format!("`{path}` exists and is a directory, not a file"),
+            }),
+            Some(v) => {
+                let c: ContentJson = serde_json::from_value(v)
+                    .map_err(|e| ForgeError::Protocol(format!("{path}: {e}")))?;
+                if c.kind != "file" {
+                    return Err(ForgeError::Rejected {
+                        status: 409,
+                        message: format!("`{path}` exists and is a {}, not a file", c.kind),
+                    });
+                }
+                let contents = decode_content(&c)?;
+                Ok(Some((c.sha, contents)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The Forgejo job for [`StepAction::RefreshProtectedFiles`]: the one
+    /// sanctioned way the bridge changes a protected path (the managed
+    /// workflow, the keyring) after bootstrap.
+    ///
+    /// If every file already matches, nothing is touched. Otherwise the
+    /// managed rule is opened for the bot alone — pushes enabled with a push
+    /// allow-list of just the bot, the protected-file patterns cleared,
+    /// since Forgejo refuses protected files even to an allowed pusher —
+    /// the files are written, and the rule's exact prior push and
+    /// protected-file settings are restored and read back. The restore is
+    /// attempted (twice) whatever happened to the writes. While open, an
+    /// `inspect` reports the bot as a bypass actor and the paths as
+    /// unprotected: critical drift, so a restore that failed is re-applied
+    /// by the next sweep's protection step.
+    pub async fn refresh_managed_files(
+        &self,
+        repo: &Resource,
+        files: &[vgi_forge::ExtraFile],
+        message: &str,
+    ) -> Result<RefreshReport> {
+        for f in files {
+            validate_repo_path(&f.path)?;
+        }
+        let (token, owner, name) = self.repo_token(repo)?;
+        let r = self.get_repo(&token, owner, name).await?;
+        let branch = r.default_branch().ok_or_else(|| ForgeError::Rejected {
+            status: 409,
+            message: format!("{repo} is empty: nothing to refresh"),
+        })?;
+        let mut stale = Vec::new();
+        for f in files {
+            let current = self.current_file(&token, owner, name, &f.path).await?;
+            if current.map(|(_, c)| c) != Some(f.contents.clone()) {
+                stale.push(f);
+            }
+        }
+        let mut report = RefreshReport {
+            outcome: StepOutcome::Unchanged,
+            files: files
+                .iter()
+                .map(|f| (f.path.clone(), StepOutcome::Unchanged))
+                .collect(),
+            opened: false,
+            detail: format!("{repo}: managed files already current"),
+        };
+        if stale.is_empty() {
+            return Ok(report);
+        }
+
+        let (rule, shadowing) = self.protection_rule(&token, owner, name, &branch).await?;
+        if !shadowing.is_empty() {
+            return Err(ForgeError::Rejected {
+                status: 409,
+                message: format!(
+                    "{repo}: rule(s) {} shadow the managed protection; resolve that first",
+                    shadowing.join(", ")
+                ),
+            });
+        }
+        let bot = self.bot();
+        let rule_url = |rule_name: &str| {
+            self.api
+                .url(&["repos", owner, name, "branch_protections", rule_name])
+        };
+        let prior = rule.as_ref().map(|r| {
+            (
+                r.name().unwrap_or(&branch).to_string(),
+                json!({
+                    "enable_push": r.enable_push,
+                    "enable_push_whitelist": r.enable_push_whitelist,
+                    "push_whitelist_usernames": r.push_whitelist_usernames,
+                    "push_whitelist_teams": r.push_whitelist_teams,
+                    "push_whitelist_deploy_keys": r.push_whitelist_deploy_keys,
+                    "protected_file_patterns": r.protected_file_patterns,
+                }),
+                r.clone(),
+            )
+        });
+        if let Some((rule_name, _, _)) = &prior {
+            tracing::warn!(
+                repo = %repo,
+                bot = %bot.login,
+                files = ?stale.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                "opening the default-branch protection to the bridge alone to refresh managed files"
+            );
+            let open = json!({
+                "enable_push": true,
+                "enable_push_whitelist": true,
+                "push_whitelist_usernames": [bot.login],
+                "push_whitelist_teams": [],
+                "push_whitelist_deploy_keys": false,
+                "protected_file_patterns": "",
+            });
+            self.api
+                .send(
+                    Method::PATCH,
+                    rule_url(rule_name),
+                    Auth::Token(&token),
+                    Some(&open),
+                    "branch protection (open for refresh)",
+                )
+                .await?;
+            report.opened = true;
+        }
+
+        let mut write_error = None;
+        for (i, f) in files.iter().enumerate() {
+            if !stale.iter().any(|s| s.path == f.path) {
+                continue;
+            }
+            match self.write_file(repo, &f.path, &f.contents, message).await {
+                Ok(o) => report.files[i].1 = o,
+                Err(e) => {
+                    write_error = Some((f.path.clone(), e));
+                    break;
+                }
+            }
+        }
+
+        let mut restore_error = None;
+        if let Some((rule_name, body, before)) = &prior {
+            for _ in 0..2 {
+                let result: Result<ProtectionJson> = self
+                    .api
+                    .json(
+                        Method::PATCH,
+                        rule_url(rule_name),
+                        Auth::Token(&token),
+                        Some(body),
+                        "branch protection (restore after refresh)",
+                    )
+                    .await;
+                restore_error = match result {
+                    Ok(after) if same_push_settings(&after, before) => None,
+                    Ok(_) => Some(ForgeError::Rejected {
+                        status: 200,
+                        message: "the restored protection does not read back as it was".into(),
+                    }),
+                    Err(e) => Some(e),
+                };
+                if restore_error.is_none() {
+                    break;
+                }
+            }
+        }
+
+        let written: Vec<&str> = report
+            .files
+            .iter()
+            .filter(|(_, o)| *o != StepOutcome::Unchanged)
+            .map(|(p, _)| p.as_str())
+            .collect();
+        report.detail = format!(
+            "{repo}: protection {} for `{}`; wrote {:?}; {}",
+            if report.opened {
+                "opened"
+            } else {
+                "absent, not opened"
+            },
+            bot.login,
+            written,
+            match (&restore_error, report.opened) {
+                (None, true) => "protection restored and verified".to_string(),
+                (None, false) => "nothing to restore".to_string(),
+                (Some(e), _) => format!("PROTECTION LEFT OPEN: {e}"),
+            }
+        );
+        if let Some(e) = &restore_error {
+            tracing::error!(repo = %repo, error = %e, "refresh could not restore the protection");
+            return Err(ForgeError::Rejected {
+                status: 500,
+                message: report.detail,
+            });
+        }
+        tracing::info!(repo = %repo, detail = %report.detail, "managed files refreshed");
+        if let Some((path, e)) = write_error {
+            return Err(match e {
+                ForgeError::Rejected { status, message } => ForgeError::Rejected {
+                    status,
+                    message: format!("{path}: {message} (protection restored)"),
+                },
+                other => other,
+            });
+        }
+        report.outcome = if written.is_empty() {
+            StepOutcome::Unchanged
+        } else {
+            StepOutcome::Updated
+        };
+        Ok(report)
+    }
+
+    /// The single maintenance step that brings the managed workflow (and, in
+    /// the signing-key fallback, the keyring) up to date on a bootstrapped
+    /// repository — see [`ForgejoForge::refresh_managed_files`].
+    pub fn refresh_plan(&self, repo: &RepoSpec, cfg: &VgiConfig) -> Result<Vec<BootstrapStep>> {
+        let files: Vec<vgi_forge::ExtraFile> = self
+            .bootstrap_plan(repo, cfg)?
+            .into_iter()
+            .filter_map(|s| match s.action {
+                StepAction::WriteFile { path, contents, .. }
+                    if path == crate::plan::WORKFLOW_PATH || path == crate::plan::KEYRING_PATH =>
+                {
+                    Some(vgi_forge::ExtraFile { path, contents })
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(vec![BootstrapStep::new(
+            "refresh-managed-files",
+            vgi_forge::BootstrapComponent::Workflow,
+            StepAction::RefreshProtectedFiles {
+                files,
+                message: "ci: update the VGI commit-trust check".into(),
+            },
+        )])
     }
 
     async fn set_variable(&self, repo: &Resource, var: &str, value: &str) -> Result<StepOutcome> {
@@ -747,7 +1106,29 @@ impl ForgejoForge {
             status: 409,
             message: format!("{repo} is empty: there is no default branch to protect yet"),
         })?;
-        let existing = self.protection_rule(&token, owner, name, &branch).await?;
+        if is_glob(&branch) {
+            return Err(ForgeError::Unsupported {
+                operation: "protecting the default branch".into(),
+                hint: format!(
+                    "the default branch `{branch}` contains glob characters, so Forgejo would \
+                     read a rule for it as a pattern; rename the branch"
+                ),
+            });
+        }
+        let (existing, shadowing) = self.protection_rule(&token, owner, name, &branch).await?;
+        if !shadowing.is_empty() {
+            // Never adopt or rely on a rule Forgejo may not apply; deleting
+            // someone else's rule is a human's decision.
+            return Err(ForgeError::Rejected {
+                status: 409,
+                message: format!(
+                    "{repo}: branch protection rule(s) {} also match `{branch}` (Forgejo compares \
+                     rule names case-insensitively and applies the oldest), so the managed rule \
+                     may never apply; remove them and re-run",
+                    shadowing.join(", ")
+                ),
+            });
+        }
         if let Some(rule) = &existing
             && satisfies_protection(rule, spec)
         {
@@ -988,7 +1369,8 @@ async fn fetch_signing_key(api: &Api, token: &Secret) -> Result<Vec<u8>> {
 
 const PROTECTED_HINT: &str = " — if the default branch is already protected, this file can only \
                               change through a pull request, and the workflow and keyring not \
-                              even then (they are protected paths, by design)";
+                              even then (they are protected paths, by design): update those \
+                              with the audited refresh-managed-files step";
 
 #[async_trait]
 impl Forge for ForgejoForge {
@@ -1094,7 +1476,7 @@ impl Forge for ForgejoForge {
 
     async fn begin_account_link(&self, member: &str) -> Result<LinkStep> {
         tracing::debug!(member, "starting Forgejo account link");
-        let state = self.oauth_keys.issue_link_state(unix_now())?;
+        let state = self.oauth_keys.issue_link_state(member, unix_now())?;
         let verifier = self.oauth_keys.verifier(Purpose::Link, &state);
         Ok(LinkStep::Redirect {
             url: self
@@ -1104,7 +1486,7 @@ impl Forge for ForgejoForge {
     }
 
     async fn complete_account_link(&self, cb: LinkCallback) -> Result<ForgeAccount> {
-        let LinkCallback::Redirect { params } = cb else {
+        let LinkCallback::Redirect { params, member, .. } = cb else {
             return Err(ForgeError::Unsupported {
                 operation: "device-flow account link".into(),
                 hint: "Forgejo has no device flow; members link through the browser \
@@ -1113,8 +1495,15 @@ impl Forge for ForgejoForge {
             });
         };
         let state = params.get("state").map(String::as_str).unwrap_or("");
+        let member = member.ok_or_else(|| {
+            ForgeError::LinkFailed(
+                "the callback does not say which member started this link (build it with \
+                 LinkCallback::redirect and the member from the caller's session)"
+                    .into(),
+            )
+        })?;
         self.oauth_keys
-            .check_link_state(state, unix_now(), self.config.link_state_ttl)?;
+            .check_link_state(state, &member, unix_now(), self.config.link_state_ttl)?;
         if let Some(err) = params.get("error") {
             return Err(ForgeError::LinkFailed(format!(
                 "the member did not authorise the bridge: {err}"
@@ -1149,9 +1538,9 @@ impl Forge for ForgejoForge {
         let ns = self.namespace(&repo.namespace())?;
         let r = self.get_repo(&token, owner, name).await?;
         let mut state = self.repo_state(&r)?;
-        let rule = match r.default_branch() {
+        let (rule, shadowing) = match r.default_branch() {
             Some(branch) => self.protection_rule(&token, owner, name, &branch).await?,
-            None => None,
+            None => (None, Vec::new()),
         };
         let allow = rule
             .as_ref()
@@ -1165,7 +1554,7 @@ impl Forge for ForgejoForge {
             let role = perm.observed(contains_login(&allow, &account.login));
             state.collaborators.push(Collaborator::new(account, role));
         }
-        state.protection = self.protection_state(rule.as_ref(), &r);
+        state.protection = self.protection_state(rule.as_ref(), &shadowing, &r);
         Ok(state)
     }
 
@@ -1284,7 +1673,7 @@ impl Forge for ForgejoForge {
         let token = self.token();
         let r = self.get_repo(&token, owner, name).await?;
         let rule = match r.default_branch() {
-            Some(branch) => self.protection_rule(&token, owner, name, &branch).await?,
+            Some(branch) => self.protection_rule(&token, owner, name, &branch).await?.0,
             None => None,
         };
         let allow: Vec<String> = rule
@@ -1554,6 +1943,10 @@ impl Forge for ForgejoForge {
             StepAction::SetVariable { name, value } => self.set_variable(repo, name, value).await,
             StepAction::ProtectDefaultBranch(spec) => self.protect(repo, spec).await,
             StepAction::ConfigureRepo(settings) => self.configure_repo(repo, settings).await,
+            StepAction::RefreshProtectedFiles { files, message } => self
+                .refresh_managed_files(repo, files, message)
+                .await
+                .map(|r| r.outcome),
             other => Err(ForgeError::Unsupported {
                 operation: format!("bootstrap step {other:?}"),
                 hint: "this Forgejo adapter does not know that step".into(),
@@ -1771,10 +2164,38 @@ impl ForgejoForge {
             "includes_all_repositories": true,
             "units": TEAM_UNITS,
         });
-        match teams
+        let existing = teams
             .into_iter()
-            .find(|t| t.name.eq_ignore_ascii_case(&self.config.team_name))
-        {
+            .find(|t| t.name.eq_ignore_ascii_case(&self.config.team_name));
+        if let Some(t) = &existing {
+            // The team is granted admin on every repository. Adopting one
+            // someone else already uses would hand that to its members, so
+            // only a team that is empty or holds just the bot is taken over.
+            let bot = self.bot();
+            let members: Vec<UserJson> = self
+                .api
+                .get_all(
+                    self.api.url(&["teams", &t.id.to_string(), "members"]),
+                    auth,
+                    "team members",
+                )
+                .await?;
+            let others: Vec<String> = members
+                .into_iter()
+                .filter(|m| m.id != bot.id)
+                .map(|m| m.login)
+                .collect();
+            if !others.is_empty() {
+                return Err(ForgeError::BindRejected(format!(
+                    "`{org}` already has a team named `{}` with other members ({}); the bridge \
+                     will not adopt it and grant them admin on every repository. Rename that \
+                     team or configure another team name",
+                    t.name,
+                    others.join(", ")
+                )));
+            }
+        }
+        match existing {
             Some(t)
                 if t.permission == "admin"
                     && t.can_create_org_repo
@@ -1948,6 +2369,14 @@ fn is_personal_owner(ns: &Namespace, id: u64) -> bool {
     ns.kind == NamespaceKind::User && ns.owner_id == Some(id)
 }
 
+/// Whether Forgejo reads `name` as a glob pattern rather than a plain name
+/// (gobwas `syntax.Special`). The same characters in a required status
+/// context make it a pattern too — and an invalid pattern there matches as
+/// if nothing were required, so the plan refuses them.
+pub(crate) fn is_glob(name: &str) -> bool {
+    name.contains(['*', '?', '[', ']', '{', '}', '\\'])
+}
+
 fn contains_login(list: &[String], login: &str) -> bool {
     list.iter().any(|l| l.eq_ignore_ascii_case(login))
 }
@@ -1990,6 +2419,22 @@ fn satisfies_settings(r: &RepoJson, s: &RepoSettings) -> bool {
             want
         }
         && r.default_merge_style.as_deref() == Some(merge_style(s.merge_methods[0]))
+}
+
+/// Whether two readings of a rule agree on everything a refresh opens.
+fn same_push_settings(a: &ProtectionJson, b: &ProtectionJson) -> bool {
+    let set = |v: &[String]| {
+        let mut v: Vec<String> = v.iter().map(|s| s.to_lowercase()).collect();
+        v.sort();
+        v
+    };
+    a.enable_push == b.enable_push
+        && (!a.enable_push
+            || (a.enable_push_whitelist == b.enable_push_whitelist
+                && set(&a.push_whitelist_usernames) == set(&b.push_whitelist_usernames)
+                && set(&a.push_whitelist_teams) == set(&b.push_whitelist_teams)
+                && a.push_whitelist_deploy_keys == b.push_whitelist_deploy_keys))
+        && patterns(&a.protected_file_patterns) == patterns(&b.protected_file_patterns)
 }
 
 /// Whether an existing rule already is what the protection step writes.
@@ -2198,7 +2643,7 @@ struct TokenInfoJson {
     token_last_eight: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 #[serde(default)]
 struct ProtectionJson {
     rule_name: Option<String>,
@@ -2268,6 +2713,10 @@ impl ProtectionJson {
             // Pushes touching only these files skip the protection.
             out.push(format!("unprotected-files:{}", unprotected.join(";")));
         }
+        // Without the allow-list, everyone with write access may merge.
+        if !self.enable_merge_whitelist {
+            out.push("merge: everyone with write access".into());
+        }
         // A team on the merge allow-list lets people the VTC never made
         // maintainers merge.
         out.extend(
@@ -2321,7 +2770,20 @@ mod tests {
         assert_eq!(p.apply_to_admins, None);
         assert_eq!(
             p.bypass_actors(),
-            ["repository admins (the rule does not apply to admins)"]
+            [
+                "repository admins (the rule does not apply to admins)",
+                "merge: everyone with write access",
+            ]
         );
+    }
+
+    #[test]
+    fn glob_characters_are_forgejos() {
+        for g in ["main*", "rel?", "[ab]", "{a,b}", "a\\b"] {
+            assert!(is_glob(g), "{g}");
+        }
+        for plain in ["main", "release/1.0", "feature-x_y", "Verify commit trust"] {
+            assert!(!is_glob(plain), "{plain}");
+        }
     }
 }

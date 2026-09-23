@@ -10,10 +10,18 @@
 //! so a party that intercepts the code and the state still cannot compute
 //! the verifier.
 //!
-//! A bind's `state` is the caller's nonce (it stores and expires it, like the
-//! GitHub adapter). A link has no caller-side store, so its state is
-//! self-authenticating: a random nonce and an issue time, MACed, checked for
-//! age on the way back.
+//! A bind's `state` is the caller's nonce: it stores it with its expiry and
+//! the namespace, consumes it on the callback, and hands both back, so a bind
+//! is single-use and cannot land on another namespace.
+//!
+//! A link has no caller-side store, so its state is self-authenticating: a
+//! random nonce and an issue time, MACed together with a hash of the member
+//! the link was started for. The callback must name that member again (from
+//! the caller's session, never the redirect), so a link one person started
+//! cannot be completed into someone else's session — login CSRF. It is not
+//! single-use without a store; what bounds a replay is the TTL and that the
+//! authorisation `code` it must pair with is single-use at the forge and
+//! redeemable only with the verifier derived from this very state.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -85,29 +93,48 @@ impl OAuthKeys {
         ))
     }
 
-    /// A fresh link state issued at `now` (seconds since the epoch).
-    pub(crate) fn issue_link_state(&self, now: u64) -> Result<String> {
+    /// The MAC over a link state's body and the member it is for.
+    fn link_tag(&self, body: &[u8], member: &str) -> hmac::Tag {
+        let mut ctx = hmac::Context::with_key(&self.state);
+        ctx.update(body);
+        ctx.update(digest::digest(&digest::SHA256, member.as_bytes()).as_ref());
+        ctx.sign()
+    }
+
+    /// A fresh link state for `member`, issued at `now` (seconds since the
+    /// epoch).
+    pub(crate) fn issue_link_state(&self, member: &str, now: u64) -> Result<String> {
         let mut nonce = [0u8; LINK_NONCE];
         aws_lc_rs::rand::fill(&mut nonce)
             .map_err(|_| ForgeError::Config("system RNG unavailable".into()))?;
         let mut raw = Vec::with_capacity(LINK_NONCE + 8 + LINK_TAG);
         raw.extend_from_slice(&nonce);
         raw.extend_from_slice(&now.to_be_bytes());
-        let tag = hmac::sign(&self.state, &raw);
+        let tag = self.link_tag(&raw, member);
         raw.extend_from_slice(&tag.as_ref()[..LINK_TAG]);
         Ok(URL_SAFE_NO_PAD.encode(raw))
     }
 
-    /// Check a link state: ours (MAC, in constant time), and issued no more
-    /// than `ttl` before `now`.
-    pub(crate) fn check_link_state(&self, state: &str, now: u64, ttl: Duration) -> Result<()> {
-        let bad = || ForgeError::LinkFailed("the `state` is not one this bridge issued".into());
+    /// Check a link state: ours, for `member` (MAC, in constant time), and
+    /// issued no more than `ttl` before `now`.
+    pub(crate) fn check_link_state(
+        &self,
+        state: &str,
+        member: &str,
+        now: u64,
+        ttl: Duration,
+    ) -> Result<()> {
+        let bad = || {
+            ForgeError::LinkFailed(
+                "the `state` is not one this bridge issued for this member".into(),
+            )
+        };
         let raw = URL_SAFE_NO_PAD.decode(state).map_err(|_| bad())?;
         if raw.len() != LINK_NONCE + 8 + LINK_TAG {
             return Err(bad());
         }
         let (body, tag) = raw.split_at(LINK_NONCE + 8);
-        let expected = hmac::sign(&self.state, body);
+        let expected = self.link_tag(body, member);
         constant_time::verify_slices_are_equal(tag, &expected.as_ref()[..LINK_TAG])
             .map_err(|_| bad())?;
         let issued = u64::from_be_bytes(body[LINK_NONCE..].try_into().expect("8 bytes"));
@@ -207,19 +234,34 @@ mod tests {
     fn link_states_verify_and_expire() {
         let k = keys();
         let ttl = Duration::from_secs(900);
-        let s = k.issue_link_state(1_000).unwrap();
-        k.check_link_state(&s, 1_000, ttl).unwrap();
-        k.check_link_state(&s, 1_900, ttl).unwrap();
-        assert!(k.check_link_state(&s, 1_901, ttl).is_err(), "expired");
-        assert!(k.check_link_state(&s, 800, ttl).is_err(), "from the future");
-        assert!(keys().check_link_state(&s, 1_000, ttl).is_ok());
+        let m = "did:example:alice";
+        let s = k.issue_link_state(m, 1_000).unwrap();
+        k.check_link_state(&s, m, 1_000, ttl).unwrap();
+        k.check_link_state(&s, m, 1_900, ttl).unwrap();
+        assert!(k.check_link_state(&s, m, 1_901, ttl).is_err(), "expired");
+        assert!(
+            k.check_link_state(&s, m, 800, ttl).is_err(),
+            "from the future"
+        );
+        assert!(keys().check_link_state(&s, m, 1_000, ttl).is_ok());
+        assert!(
+            k.check_link_state(&s, "did:example:mallory", 1_000, ttl)
+                .is_err(),
+            "another member's session"
+        );
         let other = OAuthKeys::new(&Secret::new("x"));
-        assert!(other.check_link_state(&s, 1_000, ttl).is_err(), "not ours");
+        assert!(
+            other.check_link_state(&s, m, 1_000, ttl).is_err(),
+            "not ours"
+        );
         let mut raw = URL_SAFE_NO_PAD.decode(&s).unwrap();
         raw[20] ^= 1;
         let forged = URL_SAFE_NO_PAD.encode(raw);
-        assert!(k.check_link_state(&forged, 1_000, ttl).is_err(), "tampered");
-        assert!(k.check_link_state("short", 1_000, ttl).is_err());
+        assert!(
+            k.check_link_state(&forged, m, 1_000, ttl).is_err(),
+            "tampered"
+        );
+        assert!(k.check_link_state("short", m, 1_000, ttl).is_err());
     }
 
     #[test]

@@ -7,8 +7,8 @@
 //! VGI_FORGEJO_IT=1 cargo test -p vgi-forge-forgejo --test forgejo_live -- --ignored
 //! ```
 //!
-//! It starts `codeberg.org/forgejo/forgejo:<FORGEJO_MAJOR>` (override with
-//! `VGI_FORGEJO_IMAGE`), creates an admin, the bot and two members with the
+//! It starts the Forgejo image pinned by digest in `tests/forgejo/Dockerfile`
+//! (override with `VGI_FORGEJO_IMAGE`), creates an admin, the bot and two members with the
 //! container's CLI, an org and the bridge's OAuth app through the API, and
 //! then drives the whole lifecycle as a bridge would: bind (through the real
 //! OAuth consent pages) → create → bootstrap (twice: the re-run writes
@@ -39,8 +39,16 @@ use vgi_forge_forgejo::{
     BOT_TOKEN_SCOPES, Credentials, ForgejoConfig, ForgejoForge, Secret, plan::PROTECTED_PATHS,
 };
 
-/// The Forgejo major the test pins (the current LTS line).
-const FORGEJO_MAJOR: &str = "15";
+/// The pinned image: the `FROM` of `tests/forgejo/Dockerfile`, which CI
+/// pulls too and Dependabot keeps current.
+fn pinned_image() -> String {
+    include_str!("forgejo/Dockerfile")
+        .lines()
+        .find_map(|l| l.strip_prefix("FROM "))
+        .expect("tests/forgejo/Dockerfile has a FROM line")
+        .trim()
+        .to_string()
+}
 
 const ROOT: (&str, &str) = ("root", "root-Passw0rd-1");
 const BOT: (&str, &str) = ("acme-vgi-bot", "bot-Passw0rd-1");
@@ -91,8 +99,11 @@ fn free_port() -> u16 {
 }
 
 async fn start() -> Forgejo {
-    let image = std::env::var("VGI_FORGEJO_IMAGE")
-        .unwrap_or_else(|_| format!("codeberg.org/forgejo/forgejo:{FORGEJO_MAJOR}"));
+    let image = std::env::var("VGI_FORGEJO_IMAGE").unwrap_or_else(|_| pinned_image());
+    assert!(
+        image.contains("@sha256:") || std::env::var("VGI_FORGEJO_IMAGE").is_ok(),
+        "the default image must be pinned by digest: {image}"
+    );
     let port = free_port();
     let root_url = format!("http://localhost:{port}/");
     let publish = format!("127.0.0.1:{port}:3000");
@@ -597,7 +608,7 @@ async fn the_adapter_against_a_real_forgejo() {
             let mut b = Browser::sign_in(&base, who).await;
             let params = b.authorize(&url).await;
             forge
-                .complete_account_link(LinkCallback::Redirect { params })
+                .complete_account_link(LinkCallback::redirect(params, "did:example:m"))
                 .await
                 .unwrap()
         }
@@ -653,9 +664,21 @@ async fn the_adapter_against_a_real_forgejo() {
     assert!(drift.is_empty(), "{drift:?}");
 
     // ── no PR can rewrite the check it is judged by ─────────────────────
-    let evil = open_pr(&fj, BOB, "evil", ".forgejo/workflows/verify-trust.yml").await;
-    let harmless = open_pr(&fj, BOB, "docs", "docs/README.md").await;
-    for (_, sha) in [&evil, &harmless] {
+    // Changing the workflow, adding one in a subdirectory, and deleting the
+    // whole workflows directory are all refused.
+    let mut evil = Vec::new();
+    for (branch, edit) in [
+        ("evil", Edit::Write(".forgejo/workflows/verify-trust.yml")),
+        ("evil-add", Edit::Write(".forgejo/workflows/sub/x.yaml")),
+        (
+            "evil-delete",
+            Edit::Delete(".forgejo/workflows/verify-trust.yml"),
+        ),
+    ] {
+        evil.push((branch, open_pr(&fj, BOB, branch, edit).await));
+    }
+    let harmless = open_pr(&fj, BOB, "docs", Edit::Write("docs/README.md")).await;
+    for (_, sha) in evil.iter().map(|(_, pr)| pr).chain([&harmless]) {
         // No runner here: report the check's context by hand, as a PR that
         // rewrote the workflow would get its own job to.
         fj.ok(
@@ -669,28 +692,30 @@ async fn the_adapter_against_a_real_forgejo() {
     // Forgejo works out a PR's mergeability — including which protected
     // files it changes — in the background; wait for it, so the refusals
     // below are about the rule and not about a check still running.
-    for (index, _) in [&evil, &harmless] {
+    for (index, _) in evil.iter().map(|(_, pr)| pr).chain([&harmless]) {
         wait_until_checked(&fj, *index).await;
     }
-    for who in [BOB, ALICE] {
-        let (status, body) = fj
-            .api(
-                who,
-                Method::POST,
-                &format!("repos/acme/widgets/pulls/{}/merge", evil.0),
-                Some(json!({ "Do": "fast-forward-only" })),
-            )
-            .await;
-        eprintln!("{} merging the workflow change: {status} {body}", who.0);
-        assert!(
-            !status.is_success(),
-            "{} merged a PR that changes the workflow: {status} {body}",
-            who.0
-        );
-        assert!(
-            body.to_string().to_ascii_lowercase().contains("protected"),
-            "refused, but not for the protected files: {status} {body}"
-        );
+    for (branch, (index, _)) in &evil {
+        for who in [BOB, ALICE] {
+            let (status, body) = fj
+                .api(
+                    who,
+                    Method::POST,
+                    &format!("repos/acme/widgets/pulls/{index}/merge"),
+                    Some(json!({ "Do": "fast-forward-only" })),
+                )
+                .await;
+            eprintln!("{} merging `{branch}`: {status} {body}", who.0);
+            assert!(
+                !status.is_success(),
+                "{} merged `{branch}`, which changes the workflows: {status} {body}",
+                who.0
+            );
+            assert!(
+                body.to_string().to_ascii_lowercase().contains("protected"),
+                "`{branch}` refused, but not for the protected files: {status} {body}"
+            );
+        }
     }
     // The same maintainer can merge a PR that leaves the workflow alone —
     // fast-forward, so the commit lands unchanged.
@@ -718,27 +743,116 @@ async fn the_adapter_against_a_real_forgejo() {
         .await;
     assert!(!status.is_success(), "a direct write to main went through");
 
+    // ── the audited refresh of the managed workflow ─────────────────────
+    let rule_path = "repos/acme/widgets/branch_protections/main";
+    let before = fj.ok(ROOT, Method::GET, rule_path, None).await;
+    let newer = VgiConfig::new(
+        "did:webvh:registry.example",
+        "did:webvh:vtc.example",
+        "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@0123456789abcdef0123456789abcdef01234567",
+        "v0.4.13",
+    )
+    .with_verify_trust_sha256("5f1c0a5e9d0b8b1f3c5f8a0d2e7b6c9a1d3e5f7a9b0c2d4e6f8a1b3c5d7e9f0a");
+    let refresh = forge
+        .refresh_plan(&RepoSpec::new(widgets.clone()), &newer)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        forge.run_step(&widgets, &refresh).await.unwrap(),
+        StepOutcome::Updated
+    );
+    let after = fj.ok(ROOT, Method::GET, rule_path, None).await;
+    for key in [
+        "enable_push",
+        "enable_push_whitelist",
+        "push_whitelist_usernames",
+        "protected_file_patterns",
+        "merge_whitelist_usernames",
+        "status_check_contexts",
+        "apply_to_admins",
+    ] {
+        assert_eq!(before[key], after[key], "`{key}` was not restored");
+    }
+    let wf = fj
+        .ok(
+            ROOT,
+            Method::GET,
+            "repos/acme/widgets/contents/.forgejo/workflows/verify-trust.yml",
+            None,
+        )
+        .await;
+    let wf = String::from_utf8(
+        STANDARD
+            .decode(wf["content"].as_str().unwrap().replace('\n', ""))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(wf.contains("version: v0.4.13"), "{wf}");
+    let drift = forge.diff(&forge.inspect(&widgets).await.unwrap(), &projection);
+    assert!(drift.is_empty(), "{drift:?}");
+    assert_eq!(
+        forge.run_step(&widgets, &refresh).await.unwrap(),
+        StepOutcome::Unchanged
+    );
+    let plan = forge
+        .bootstrap_plan(&RepoSpec::new(widgets.clone()), &newer)
+        .unwrap();
+    let report = run_plan(&forge, &widgets, &plan).await;
+    assert!(
+        report.is_complete()
+            && report
+                .completed
+                .iter()
+                .all(|(_, o)| *o == StepOutcome::Unchanged),
+        "{report:?}"
+    );
+
     // ── archive, rotate ──────────────────────────────────────────────────
     forge.archive_repo(&widgets).await.unwrap();
     forge.archive_repo(&widgets).await.unwrap();
     assert!(forge.inspect(&widgets).await.unwrap().archived);
 
-    let rotated = forge.rotate_token().await.unwrap();
-    assert_eq!(rotated.deleted, ["setup"]);
-    let tokens = fj
-        .ok(BOT, Method::GET, &format!("users/{}/tokens", BOT.0), None)
-        .await;
-    let names: Vec<_> = tokens
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(names, std::slice::from_ref(&rotated.new_token));
+    let token_names = || async {
+        fj.ok(BOT, Method::GET, &format!("users/{}/tokens", BOT.0), None)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Phase 1 mints and hands back; nothing is deleted yet.
+    let minted = forge.mint_token().await.unwrap();
+    let previous = minted
+        .previous
+        .clone()
+        .expect("the setup token was identified");
+    assert_eq!(previous.name, "setup");
+    assert_eq!(token_names().await.len(), 2);
     forge.inspect(&widgets).await.unwrap();
-    let rotated_again = forge.rotate_token().await.unwrap();
-    assert_eq!(rotated_again.deleted, [rotated.new_token]);
+    // Phase 2, once the caller has persisted `minted.secret`.
+    forge.retire_token(&previous).await.unwrap();
+    assert_eq!(
+        token_names().await,
+        std::slice::from_ref(&minted.token.name)
+    );
+    let again = forge.mint_token().await.unwrap();
+    assert_eq!(again.previous.as_ref(), Some(&minted.token));
+    forge
+        .retire_token(again.previous.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(token_names().await, std::slice::from_ref(&again.token.name));
     forge.inspect(&widgets).await.unwrap();
+}
+
+/// A change a PR branch makes.
+#[derive(Clone, Copy)]
+enum Edit<'a> {
+    /// Add or change a file.
+    Write(&'a str),
+    /// Delete a file.
+    Delete(&'a str),
 }
 
 /// Wait for Forgejo's background mergeability check on PR `index`.
@@ -764,23 +878,34 @@ async fn wait_until_checked(fj: &Forgejo, index: u64) {
     }
 }
 
-/// A branch off `main` changing `path`, as `who`, and a PR for it:
+/// A branch off `main` making `edit`, as `who`, and a PR for it:
 /// `(index, head sha)`.
-async fn open_pr(fj: &Forgejo, who: (&str, &str), branch: &str, path: &str) -> (u64, String) {
+async fn open_pr(fj: &Forgejo, who: (&str, &str), branch: &str, edit: Edit<'_>) -> (u64, String) {
+    let (path, deleting) = match edit {
+        Edit::Write(p) => (p, false),
+        Edit::Delete(p) => (p, true),
+    };
     let url = format!("repos/acme/widgets/contents/{path}");
     let mut body = json!({
-        "content": STANDARD.encode(format!("changed on {branch}\n")),
         "message": format!("change {path}"),
         "branch": "main",
         "new_branch": branch,
     });
-    // Changing an existing file is a PUT with its blob sha; a new one a POST.
     let (status, existing) = fj.api(who, Method::GET, &url, None).await;
-    let method = if status.is_success() {
+    if status.is_success() {
         body["sha"] = existing["sha"].clone();
-        Method::PUT
+    }
+    // Deleting is a DELETE; changing an existing file a PUT with its blob
+    // sha; a new one a POST.
+    let method = if deleting {
+        Method::DELETE
     } else {
-        Method::POST
+        body["content"] = json!(STANDARD.encode(format!("changed on {branch}\n")));
+        if status.is_success() {
+            Method::PUT
+        } else {
+            Method::POST
+        }
     };
     let file = fj.ok(who, method, &url, Some(body)).await;
     let sha = file["commit"]["sha"].as_str().unwrap().to_string();
@@ -789,7 +914,7 @@ async fn open_pr(fj: &Forgejo, who: (&str, &str), branch: &str, path: &str) -> (
             who,
             Method::POST,
             "repos/acme/widgets/pulls",
-            Some(json!({ "head": branch, "base": "main", "title": format!("change {path}") })),
+            Some(json!({ "head": branch, "base": "main", "title": format!("{branch}: {path}") })),
         )
         .await;
     (pr["number"].as_u64().unwrap(), sha)

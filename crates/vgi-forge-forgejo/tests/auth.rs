@@ -361,7 +361,8 @@ async fn a_rebind_is_idempotent_and_repairs_the_team_and_hook() {
         .expect(1)
         .mount(&server)
         .await;
-    // The bot is already in it.
+    // The bot is already in it, alone.
+    mount_team_members(&server, &[user(BOT_ID, BOT)]).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/teams/7/members/acme-vgi-bot"))
         .respond_with(ResponseTemplate::new(200).set_body_json(user(BOT_ID, BOT)))
@@ -401,6 +402,48 @@ async fn a_rebind_is_idempotent_and_repairs_the_team_and_hook() {
         .complete_bind(callback(&[("code", "the-code"), ("state", STATE)]))
         .await
         .unwrap();
+}
+
+async fn mount_team_members(server: &MockServer, members: &[serde_json::Value]) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/7/members"))
+        .and(BearerToken(ADMIN_TOKEN))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", members.len().to_string())
+                .set_body_json(members),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_same_named_team_with_other_members_is_not_adopted() {
+    let (server, forge) = server_and_forge().await;
+    let q = begin(&forge).await;
+    mount_exchange(&server, q["code_challenge"].clone(), BIND_REDIRECT).await;
+    mount_admin(&server, true).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/acme/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([team("write", false)])))
+        .mount(&server)
+        .await;
+    mount_team_members(&server, &[user(BOT_ID, BOT), user(66, "carol")]).await;
+    for m in ["POST", "PUT", "PATCH"] {
+        Mock::given(method(m))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+    let e = forge
+        .complete_bind(callback(&[("code", "the-code"), ("state", STATE)]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, ForgeError::BindRejected(m) if m.contains("carol")),
+        "{e}"
+    );
 }
 
 #[tokio::test]
@@ -555,6 +598,7 @@ async fn a_disabled_webhook_is_reported_not_fatal() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([team("admin", true)])))
         .mount(&server)
         .await;
+    mount_team_members(&server, &[]).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/teams/7/members/acme-vgi-bot"))
         .respond_with(ResponseTemplate::new(200).set_body_json(user(BOT_ID, BOT)))
@@ -616,8 +660,18 @@ async fn members_link_through_the_browser_with_pkce() {
         ("state".to_string(), q["state"].clone()),
     ]
     .into();
+    // Completed from another member's session, the same state is refused
+    // before the code is spent.
+    let e = forge
+        .complete_account_link(LinkCallback::redirect(
+            params.clone(),
+            "did:example:mallory",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ForgeError::LinkFailed(_)), "{e}");
     let account = forge
-        .complete_account_link(LinkCallback::Redirect { params })
+        .complete_account_link(LinkCallback::redirect(params, "did:example:alice"))
         .await
         .unwrap();
     assert_eq!(account.id, ALICE_ID);
@@ -641,7 +695,7 @@ async fn a_link_with_a_forged_state_or_a_device_code_is_refused() {
         .into();
         assert!(matches!(
             forge
-                .complete_account_link(LinkCallback::Redirect { params })
+                .complete_account_link(LinkCallback::redirect(params, "did:x"))
                 .await,
             Err(ForgeError::LinkFailed(_))
         ));
@@ -649,6 +703,14 @@ async fn a_link_with_a_forged_state_or_a_device_code_is_refused() {
     let LinkStep::Redirect { url } = forge.begin_account_link("did:x").await.unwrap() else {
         panic!()
     };
+    // A callback that does not name the member is refused outright.
+    let anonymous: LinkCallback = serde_json::from_value(json!({
+        "type": "redirect",
+        "params": { "code": "c", "state": query(&url)["state"] },
+    }))
+    .unwrap();
+    let e = forge.complete_account_link(anonymous).await.unwrap_err();
+    assert!(e.to_string().contains("which member"), "{e}");
     let params: BTreeMap<_, _> = [
         ("error".to_string(), "access_denied".to_string()),
         ("state".to_string(), query(&url)["state"].clone()),
@@ -656,7 +718,7 @@ async fn a_link_with_a_forged_state_or_a_device_code_is_refused() {
     .into();
     assert!(matches!(
         forge
-            .complete_account_link(LinkCallback::Redirect { params })
+            .complete_account_link(LinkCallback::redirect(params, "did:x"))
             .await,
         Err(ForgeError::LinkFailed(_))
     ));
@@ -710,51 +772,60 @@ async fn rotating_forge() -> (MockServer, ForgejoForge) {
     (server, forge)
 }
 
-#[tokio::test]
-async fn rotation_mints_verifies_swaps_and_cleans_up() {
-    let (server, forge) = rotating_forge().await;
+const NEWER_TOKEN: &str = "newer-token-22222222222222222222222222zzzz";
+
+async fn mount_mint(server: &MockServer, id: u64, secret: &str, times: u64) {
     Mock::given(method("POST"))
         .and(path("/api/v1/users/acme-vgi-bot/tokens"))
         .and(BotBasic)
         .and(NewTokenRequest)
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-            "id": 44, "name": "vgi-bridge-new", "sha1": NEW_TOKEN, "token_last_eight": "1111wxyz",
-            "scopes": BOT_TOKEN_SCOPES,
+            "id": id, "name": format!("vgi-bridge-{id}"), "sha1": secret,
+            "token_last_eight": &secret[secret.len() - 8..], "scopes": BOT_TOKEN_SCOPES,
         })))
+        .up_to_n_times(times)
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn rotation_mints_and_hands_back_before_anything_is_deleted() {
+    let (server, forge) = rotating_forge().await;
+    // The previous token is found by its last eight characters — once,
+    // before anything is minted.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/acme-vgi-bot/tokens"))
+        .and(BotBasic)
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", "3")
+                .set_body_json(json!([
+                    { "id": 40, "name": "setup", "token_last_eight": "0000abcd" },
+                    { "id": 41, "name": "vgi-bridge-1700000000-aa", "token_last_eight": "zzzzzzzz" },
+                    { "id": 42, "name": "someone's laptop", "token_last_eight": "yyyyyyyy" },
+                ])),
+        )
         .expect(1)
         .mount(&server)
         .await;
+    mount_mint(&server, 44, NEW_TOKEN, 1).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/user"))
         .and(TokenOf(NEW_TOKEN))
         .respond_with(ResponseTemplate::new(200).set_body_json(user(BOT_ID, BOT)))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/users/acme-vgi-bot/tokens"))
+    // Only the one named token is ever deleted — never another replica's
+    // `vgi-bridge-*` token, never a person's.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/users/acme-vgi-bot/tokens/40"))
         .and(BotBasic)
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("x-total-count", "4")
-                .set_body_json(json!([
-                    { "id": 40, "name": "setup", "token_last_eight": "0000abcd" },
-                    { "id": 41, "name": "vgi-bridge-1700000000-aa", "token_last_eight": "zzzzzzzz" },
-                    { "id": 42, "name": "someone's laptop", "token_last_eight": "yyyyyyyy" },
-                    { "id": 44, "name": "vgi-bridge-new", "token_last_eight": "1111wxyz" },
-                ])),
-        )
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
         .mount(&server)
         .await;
-    for id in [40, 41] {
-        Mock::given(method("DELETE"))
-            .and(path(format!("/api/v1/users/acme-vgi-bot/tokens/{id}")))
-            .and(BotBasic)
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
-    for id in [42, 44] {
+    for id in [41, 42] {
         Mock::given(method("DELETE"))
             .and(path(format!("/api/v1/users/acme-vgi-bot/tokens/{id}")))
             .respond_with(ResponseTemplate::new(204))
@@ -762,14 +833,53 @@ async fn rotation_mints_verifies_swaps_and_cleans_up() {
             .mount(&server)
             .await;
     }
-    let report = forge.rotate_token().await.unwrap();
-    assert!(report.new_token.starts_with(TOKEN_NAME_PREFIX));
-    assert_eq!(report.deleted, ["setup", "vgi-bridge-1700000000-aa"]);
 
-    // Later requests carry the new token.
+    let minted = forge.mint_token().await.unwrap();
+    assert_eq!(minted.token.id, 44);
+    assert!(minted.token.name.starts_with(TOKEN_NAME_PREFIX));
+    assert_eq!(
+        minted.secret.expose(),
+        NEW_TOKEN,
+        "the caller gets the secret to persist"
+    );
+    assert!(!format!("{minted:?}").contains(NEW_TOKEN));
+    let previous = minted
+        .previous
+        .clone()
+        .expect("the setup token was identified");
+    assert_eq!(previous.name, "setup");
+    assert!(
+        forge.retire_token(&minted.token).await.is_err(),
+        "the token in use cannot be retired"
+    );
+    forge.retire_token(&previous).await.unwrap();
+
+    // The next rotation knows the token it replaces without listing, and
+    // retiring one already gone is fine.
+    mount_mint(&server, 45, NEWER_TOKEN, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(TokenOf(NEWER_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(user(BOT_ID, BOT)))
+        .mount(&server)
+        .await;
+    let again = forge.mint_token().await.unwrap();
+    assert_eq!(again.previous.as_ref().map(|t| t.id), Some(44));
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/users/acme-vgi-bot/tokens/44"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    forge
+        .retire_token(again.previous.as_ref().unwrap())
+        .await
+        .unwrap();
+
+    // Later requests carry the newest token.
     Mock::given(method("GET"))
         .and(path("/api/v1/version"))
-        .and(TokenOf(NEW_TOKEN))
+        .and(TokenOf(NEWER_TOKEN))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "version": "10.0.0+gitea-1.22.0" })),
         )
@@ -780,6 +890,29 @@ async fn rotation_mints_verifies_swaps_and_cleans_up() {
         forge.refresh().await.unwrap().version,
         "10.0.0+gitea-1.22.0"
     );
+}
+
+#[tokio::test]
+async fn an_ambiguous_previous_token_is_left_for_a_human() {
+    let (server, forge) = rotating_forge().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/acme-vgi-bot/tokens"))
+        .and(BotBasic)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 40, "name": "a", "token_last_eight": "0000abcd" },
+            { "id": 41, "name": "b", "token_last_eight": "0000abcd" },
+        ])))
+        .mount(&server)
+        .await;
+    mount_mint(&server, 44, NEW_TOKEN, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(TokenOf(NEW_TOKEN))
+        .respond_with(ResponseTemplate::new(200).set_body_json(user(BOT_ID, BOT)))
+        .mount(&server)
+        .await;
+    let minted = forge.mint_token().await.unwrap();
+    assert_eq!(minted.previous, None);
 }
 
 /// `Authorization: token <t>`.
@@ -797,6 +930,11 @@ impl Match for TokenOf {
 #[tokio::test]
 async fn a_new_token_that_fails_verification_is_deleted_and_the_old_one_kept() {
     let (server, forge) = rotating_forge().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/acme-vgi-bot/tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/v1/users/acme-vgi-bot/tokens"))
         .and(BotBasic)
@@ -820,7 +958,7 @@ async fn a_new_token_that_fails_verification_is_deleted_and_the_old_one_kept() {
         .mount(&server)
         .await;
     assert!(matches!(
-        forge.rotate_token().await,
+        forge.mint_token().await,
         Err(ForgeError::Unauthorized(_))
     ));
     // Still the old token.
@@ -830,7 +968,7 @@ async fn a_new_token_that_fails_verification_is_deleted_and_the_old_one_kept() {
 #[tokio::test]
 async fn manual_rotation_verifies_the_replacement() {
     let (server, forge) = server_and_forge().await;
-    let e = forge.rotate_token().await.unwrap_err();
+    let e = forge.mint_token().await.unwrap_err();
     assert!(
         matches!(&e, ForgeError::Unsupported { hint, .. } if hint.contains("replace_token")),
         "{e}"
