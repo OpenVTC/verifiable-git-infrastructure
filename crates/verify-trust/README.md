@@ -113,10 +113,54 @@ Two inputs carry weight that a committed signer list used to:
   signer to this repository. A grant is accepted exactly when the registry
   authorizes the tuple under it, so widening either widens who may sign, with
   nothing in the repository to contradict it.
+- **`--resource-format`** (default `legacy`) picks the form of both
+  resources — see [Resource format](#resource-format).
 - **`--max-signers`** (default 32) bounds the distinct DIDs one range may
   claim. The set is chosen by whoever wrote the commits, and for the
   network-resolved methods each entry is an outbound fetch to a host the author
   picked. DIDs are deduplicated first; exceeding the cap fails the run.
+
+## Resource format
+
+A resource either names the forge or leaves it implied:
+
+| `--resource-format` | Resource | Org fallback | Default `--resource` |
+|---|---|---|---|
+| `legacy` (default) | `acme/widgets` | `acme` | `$GITHUB_REPOSITORY`, verbatim |
+| `qualified` | `github.com/acme/widgets` | `github.com/acme` | derived from the CI environment |
+
+The qualified grammar is `<forge-host>/<owner>[/<repo>]`: the first segment is
+the forge's host (a dotted name such as `github.com`, a GitHub Enterprise
+Server host, `codeberg.org`, or `localhost`), followed by one or more path
+segments — a forge with nested groups keeps its full path. Everything is
+lowercased. Empty segments, `.` and `..`, a leading or trailing `/`, a URL
+scheme and a port are rejected, and so is an unqualified value, with the fix
+suggested:
+
+```
+$ GITHUB_SERVER_URL=https://github.com verify-trust --resource-format qualified --resource acme/widgets …
+Error: --resource `acme/widgets` is not forge-qualified (--resource-format qualified expects `<forge-host>/<owner>[/<repo>]`); did you mean `github.com/acme/widgets`?
+```
+
+Under `qualified`, the default resource comes from the CI environment: the
+host of `FORGEJO_SERVER_URL` plus `FORGEJO_REPOSITORY` on Forgejo Actions,
+otherwise the host of `GITHUB_SERVER_URL` plus `GITHUB_REPOSITORY` (which
+gives a GitHub Enterprise Server its own host). Only the host is kept — a port
+in the server URL is dropped. Elsewhere, pass `--resource` explicitly.
+
+A run uses **one form only**. It never tries the qualified resource and then
+the legacy one: accepting a grant under either would widen who may sign while
+both forms exist in the registry, and silently.
+
+**Migration.** Registry grants must be written in the form the check uses:
+
+1. Now: `legacy` is the default, so nothing deployed changes. Opt in with
+   `--resource-format qualified` (`resource-format: qualified` on the Action)
+   once the grants exist in qualified form — during the window the VTC can
+   write both forms for each grant.
+2. A later minor release flips the default to `qualified`. Pin
+   `resource-format: legacy` to keep the old behaviour for one more release.
+3. The release after that removes `legacy`.
 
 ## Signer names
 
