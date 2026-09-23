@@ -18,6 +18,7 @@ use vgi_forge::{
 use crate::bridge::Bridge;
 use crate::mapping::{self, Report, StepStatus};
 use crate::registry::Adapter;
+use crate::status::Guard;
 use crate::store::{NamespaceRecord, PinRecord, RepoRecord, Table, repo_key};
 use crate::wire::job;
 
@@ -338,6 +339,7 @@ async fn create_repo(
     }
     if !run_bootstrap(bridge, ctx, &spec, extra, None, report).await {
         report.step("roles", StepStatus::Skipped, None);
+        refresh_guard(bridge, ctx, report).await;
         return;
     }
     apply_roles(
@@ -350,6 +352,7 @@ async fn create_repo(
         report,
     )
     .await;
+    refresh_guard(bridge, ctx, report).await;
 }
 
 /// Record a repository as managed, in the store and (GitHub) the adapter's
@@ -565,6 +568,7 @@ async fn bootstrap(
         spec = spec.with_owner(o);
     }
     run_bootstrap(bridge, ctx, &spec, Vec::new(), only, report).await;
+    refresh_guard(bridge, ctx, report).await;
 }
 
 async fn archive(bridge: &Bridge, ctx: &Ctx, repo: &Resource, report: &mut Report) {
@@ -707,8 +711,14 @@ pub(crate) async fn inspect_repo(
         _ => true,
     }) && proj.required_check.is_some();
     let items = mapping::drift_items(ctx.host(), &state.resource, &drift);
+    // The guard in force, for the status report; a change of guard alone is
+    // news too.
+    let guard = Guard::in_force(&state, &drift).as_str();
+    if let Some(r) = &rec {
+        record_guard(bridge, &r.key(), guard);
+    }
     let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&items).unwrap_or_default(),
+        serde_json::to_vec(&json!([items, guard])).unwrap_or_default(),
     ));
     let changed = rec.as_ref().and_then(|r| r.last_drift.as_deref()) != Some(digest.as_str());
     if let Some(report) = report.as_deref_mut() {
@@ -751,6 +761,44 @@ pub(crate) async fn inspect_repo(
         }
     }
     Ok(())
+}
+
+/// Record the guard found in force on the repository stored under `key`.
+fn record_guard(bridge: &Bridge, key: &str, guard: &str) {
+    let _ = bridge
+        .store
+        .update::<RepoRecord, _>(Table::Repos, key, |x| {
+            Ok((
+                x.map(|mut x| {
+                    x.guard = Some(guard.to_string());
+                    x
+                }),
+                (),
+            ))
+        });
+}
+
+/// After a create or bootstrap: read which guard the repository ended up
+/// with, for the result's status report. Best effort — a read that fails
+/// leaves what was recorded before.
+async fn refresh_guard(bridge: &Bridge, ctx: &Ctx, report: &Report) {
+    let Some((resource, forge_id)) = &report.repo else {
+        return;
+    };
+    let Some(rec) = repo_record(bridge, ctx.host(), *forge_id) else {
+        return;
+    };
+    let state = match ctx.adapter.forge().inspect(resource).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(repo = %resource, error = %e, "could not read the guard in force");
+            return;
+        }
+    };
+    let mut proj = projection(bridge, ctx, &state, Some(&rec));
+    proj.resource = state.resource.clone();
+    let drift = ctx.adapter.forge().diff(&state, &proj);
+    record_guard(bridge, &rec.key(), Guard::in_force(&state, &drift).as_str());
 }
 
 /// Inspect every repository the bridge manages in the namespace.

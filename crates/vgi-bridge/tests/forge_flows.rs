@@ -220,6 +220,12 @@ async fn create_repo_creates_bootstraps_projects_and_reports_each_step() {
         "{steps:?}"
     );
     assert_eq!(steps.last().unwrap(), &("roles".into(), "unchanged".into()));
+    // The guard the repository ended up with, read back after the
+    // bootstrap, and the namespace's standing, in the result's `ext`.
+    let ext = &p["ext"]["org.openvtc.git-ns"];
+    assert_eq!(ext["repo"], json!({ "guard": "bridgePostedCheck" }), "{p}");
+    assert_eq!(ext["namespace"]["installationId"], "42");
+    assert_eq!(ext["namespace"]["bridgePostedCheck"], true);
 
     // Managed from now on — in the store and in the adapter.
     let ns: NamespaceRecord = w
@@ -307,8 +313,34 @@ async fn a_bind_completes_through_the_setup_callback_once() {
         ev["payload"]["event"],
         json!({ "type": "bindCompleted", "jobId": "job_b", "ownerId": "600", "kind": "organization" })
     );
+    // What the bind found, for the VTC's console: the installation, what it
+    // lacks (the check's events), org rulesets on the plan.
+    let ns_report = ev["payload"]["ext"]["org.openvtc.git-ns"]["namespace"].clone();
+    assert_eq!(ns_report["installationId"], "77", "{ev}");
+    assert_eq!(ns_report["appName"], "acme-vgi-bridge");
+    assert_eq!(ns_report["appSlug"], "acme-vgi-bridge");
+    assert_eq!(ns_report["appRegistration"], "registered");
+    assert_eq!(ns_report["orgRulesets"], true);
+    assert_eq!(ns_report["requiredWorkflow"], true);
+    assert_eq!(ns_report["bridgePostedCheck"], false);
+    assert_eq!(ns_report["permissionUpgradePending"], true);
+    let missing = ns_report["missingPermissions"].as_array().unwrap();
+    assert!(
+        missing.contains(&json!("event:pull_request")),
+        "{missing:?}"
+    );
+    assert!(
+        ev["payload"]["ext"]["org.openvtc.git-ns"]
+            .get("repo")
+            .is_none(),
+        "no repository to report on"
+    );
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded");
+    assert_eq!(
+        result["payload"]["ext"]["org.openvtc.git-ns"]["namespace"],
+        ns_report
+    );
     let ns: NamespaceRecord = w
         .bridge
         .store()
@@ -499,6 +531,14 @@ async fn an_installation_that_accepts_the_new_permissions_turns_the_bridge_check
             .unwrap();
         if rec.bridge_checks == Some(true) {
             assert!(adapter.forge().capabilities(&namespace).bridge_posted_check);
+            // What the installation lacks was read again with it: the
+            // check's events are no longer missing.
+            let missing = rec.binding.unwrap().missing_permissions;
+            assert!(!missing.is_empty(), "this installation lacks others");
+            assert!(
+                missing.iter().all(|m| !m.starts_with("event:")),
+                "{missing:?}"
+            );
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

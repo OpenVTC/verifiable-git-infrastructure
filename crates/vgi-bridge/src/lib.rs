@@ -44,6 +44,7 @@ pub mod registry;
 #[cfg(feature = "forge-github")]
 pub mod resign;
 pub mod seal;
+pub mod status;
 pub mod store;
 pub mod transport;
 pub mod wire;

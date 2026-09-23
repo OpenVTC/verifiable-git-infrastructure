@@ -6,58 +6,8 @@ mod common;
 use common::*;
 use serde_json::{Value, json};
 use vgi_bridge::store::{JobRecord, JobState, OutboxEntry, Table};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// The GitHub reads `inspect` makes for `acme/widgets` (forge id 812) in a
-/// bridge-posted-check namespace, with a healthy ruleset pinned to the App.
-async fn mount_inspect(server: &MockServer) {
-    mount_any_token(server).await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/widgets"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 812, "full_name": "acme/widgets", "private": false,
-            "visibility": "public", "archived": false, "default_branch": "main",
-        })))
-        .mount(server)
-        .await;
-    for p in ["collaborators", "invitations"] {
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/acme/widgets/{p}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .mount(server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/widgets/rulesets"))
-        .and(query_param("includes_parents", "false"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!([{ "id": 9, "name": "VGI commit trust" }])),
-        )
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/widgets/rulesets/9"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 9, "name": "VGI commit trust", "target": "branch", "enforcement": "active",
-            "bypass_actors": [], "current_user_can_bypass": "never",
-            "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
-            "rules": [
-                { "type": "deletion" }, { "type": "non_fast_forward" },
-                { "type": "pull_request", "parameters": {
-                    "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": false,
-                    "require_code_owner_review": false, "require_last_push_approval": false,
-                    "required_review_thread_resolution": false } },
-                { "type": "required_status_checks", "parameters": {
-                    "strict_required_status_checks_policy": false,
-                    "required_status_checks": [
-                        { "context": "Verify commit trust", "integration_id": APP_ID } ] } }
-            ],
-        })))
-        .mount(server)
-        .await;
-}
 
 fn inspect_job(id: &str) -> Value {
     json!({ "jobId": id, "namespace": NS, "kind": "inspect", "repo": "github.com/acme/widgets" })
@@ -316,4 +266,103 @@ async fn a_redirect_from_the_forge_is_not_followed() {
     assert_eq!(result["payload"]["outcome"], "failed");
     assert_eq!(result["payload"]["error"]["code"], "notFound");
     // `elsewhere` verifies on drop that it saw nothing.
+}
+
+// ── the status report in `ext` ───────────────────────────────────────────
+
+/// The bridge's namespace report for the default world: a registered App,
+/// installation 42 granting everything, no org rulesets, the bridge-posted
+/// check in force.
+fn default_namespace_report() -> Value {
+    json!({
+        "appName": "acme-vgi-bridge", "appSlug": "acme-vgi-bridge",
+        "appRegistration": "registered", "installationId": "42",
+        "permissionUpgradePending": false, "orgRulesets": false,
+        "requiredWorkflow": false, "bridgePostedCheck": true,
+    })
+}
+
+#[tokio::test]
+async fn an_inspection_reports_the_namespace_and_the_guard_in_force_in_ext() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    mount_inspect(&w.server).await;
+    w.send_job(inspect_job("job_x")).await;
+
+    let want = json!({ "org.openvtc.git-ns": {
+        "namespace": default_namespace_report(),
+        "repo": { "guard": "bridgePostedCheck" },
+    } });
+    // The protectionChanged event, and the result, each carry it — signed
+    // with the rest of the payload (`next` verifies every proof).
+    let event = w.next_of(EVENT).await;
+    assert_eq!(event["payload"]["event"]["type"], "protectionChanged");
+    assert_eq!(event["payload"]["ext"], want, "{event}");
+    let result = w.next_of(RESULT).await;
+    assert_eq!(result["payload"]["ext"], want, "{result}");
+    assert_no_nulls(&result["payload"]["ext"]);
+
+    // Tampering with the report breaks the proof like any other member.
+    let mut forged = result.clone();
+    forged["payload"]["ext"]["org.openvtc.git-ns"]["repo"]["guard"] = json!("requiredWorkflow");
+    assert!(
+        trust_tasks_proof::affinidi::Verifier::for_did_key()
+            .verify_raw(&forged)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn what_the_bridge_does_not_know_is_left_out_of_ext() {
+    let mut w = world(Options {
+        seed_namespace: false,
+        ..Options::default()
+    })
+    .await;
+    // Never probed: neither the installation's readiness nor the plan.
+    seed_namespace_ready(
+        w.bridge.store(),
+        vgi_forge::NamespaceKind::Organization,
+        false,
+        None,
+    );
+    w.bridge
+        .store()
+        .update::<vgi_bridge::store::NamespaceRecord, _>(Table::Namespaces, NS, |n| {
+            Ok((
+                n.map(|mut n| {
+                    n.required_workflow = None;
+                    n
+                }),
+                (),
+            ))
+        })
+        .unwrap();
+    // A sweep of a namespace with no repositories: a result about no
+    // repository.
+    w.send_job(json!({ "jobId": "job_s", "namespace": NS, "kind": "inspect" }))
+        .await;
+    let result = w.next_of(RESULT).await;
+    let ext = &result["payload"]["ext"]["org.openvtc.git-ns"];
+    assert_eq!(
+        ext,
+        &json!({ "namespace": {
+            "appName": "acme-vgi-bridge", "appSlug": "acme-vgi-bridge",
+            "appRegistration": "registered", "installationId": "42",
+            "requiredWorkflow": false, "bridgePostedCheck": false,
+        } }),
+        "no permissionUpgradePending, orgRulesets or repo: {result}"
+    );
+    assert_no_nulls(ext);
+}
+
+/// No member of the report is `null` — absent data is omitted.
+fn assert_no_nulls(v: &Value) {
+    match v {
+        Value::Null => panic!("a null in the status report"),
+        Value::Object(m) => m.values().for_each(assert_no_nulls),
+        Value::Array(a) => a.iter().for_each(assert_no_nulls),
+        _ => {}
+    }
 }

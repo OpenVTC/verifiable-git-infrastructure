@@ -275,6 +275,37 @@ pub struct RepoRecord {
     /// drift again sends nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_drift: Option<String>,
+    /// The check-source guard the last inspection found in force, in the
+    /// VTC's words ([`crate::status::Guard`]). Reported, never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    /// The last check the bridge posted on the repository itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<LastCheck>,
+}
+
+/// A check the bridge posted (GitHub fallback mode), as it reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct LastCheck {
+    /// The commit the check run is on.
+    pub sha: String,
+    /// `success` or `failure`.
+    pub conclusion: String,
+    /// Unix seconds, when it was completed.
+    pub at: i64,
+}
+
+impl LastCheck {
+    /// A check completed on `sha` at `at`.
+    pub fn new(sha: impl Into<String>, conclusion: impl Into<String>, at: i64) -> Self {
+        LastCheck {
+            sha: sha.into(),
+            conclusion: conclusion.into(),
+            at,
+        }
+    }
 }
 
 impl RepoRecord {
@@ -290,6 +321,8 @@ impl RepoRecord {
             required_check: None,
             archived: false,
             last_drift: None,
+            guard: None,
+            last_check: None,
         }
     }
 

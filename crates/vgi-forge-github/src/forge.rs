@@ -315,10 +315,19 @@ impl GitHubForge {
     /// the App's settings and each installation approves the change; the
     /// bridge probes again when an installation accepts new permissions.
     pub async fn detect_bridge_checks(&self, ns: &Resource) -> Result<bool> {
+        Ok(self.detect_installation(ns).await?.0)
+    }
+
+    /// [`GitHubForge::detect_bridge_checks`], and what the installation
+    /// lacks of what the App asks for (as `name:level`, and `event:<name>`
+    /// for a missing subscription) — the same list a bind reports in
+    /// [`NamespaceBinding::missing_permissions`], read again now (after an
+    /// owner approved an upgrade, say).
+    pub async fn detect_installation(&self, ns: &Resource) -> Result<(bool, Vec<String>)> {
         let namespace = self.namespace(ns)?;
         let Some(installation) = namespace.installation_id else {
             self.set_bridge_checks_ready(ns, false);
-            return Ok(false);
+            return Ok((false, Vec::new()));
         };
         let jwt = self.jwt().await?;
         let inst: InstallationJson = self
@@ -334,7 +343,7 @@ impl GitHubForge {
             .await?;
         let ready = crate::manifest::check_ready(&inst.permissions, &inst.events);
         self.set_bridge_checks_ready(ns, ready);
-        Ok(ready)
+        Ok((ready, installation_missing(&inst)))
     }
 
     /// Record whether org rulesets — and so a required workflow — are
@@ -1303,14 +1312,7 @@ impl Forge for GitHubForge {
             &namespace.resource,
             crate::manifest::check_ready(&inst.permissions, &inst.events),
         );
-        let mut missing = missing_permissions(&inst.permissions);
-        missing.extend(
-            crate::manifest::CHECK_EVENTS
-                .iter()
-                .filter(|e| !inst.events.iter().any(|x| x == *e))
-                .map(|e| format!("event:{e}")),
-        );
-        let binding = NamespaceBinding::new(namespace, missing);
+        let binding = NamespaceBinding::new(namespace, installation_missing(&inst));
         // Handed back as data for the bridge to persist; the adapter's copy
         // is in memory only.
         Ok(if probed {
@@ -2077,6 +2079,19 @@ struct InstallationJson {
     events: Vec<String>,
     #[serde(default)]
     suspended_at: Option<String>,
+}
+
+/// What an installation lacks of what the App asks for: permissions as
+/// `name:level`, subscriptions as `event:<name>`.
+fn installation_missing(inst: &InstallationJson) -> Vec<String> {
+    let mut missing = missing_permissions(&inst.permissions);
+    missing.extend(
+        crate::manifest::CHECK_EVENTS
+            .iter()
+            .filter(|e| !inst.events.iter().any(|x| x == *e))
+            .map(|e| format!("event:{e}")),
+    );
+    missing
 }
 
 #[derive(Deserialize)]
