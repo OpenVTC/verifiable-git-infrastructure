@@ -31,7 +31,7 @@ verify-trust \
   --resource      your-org/your-repo
 ```
 
-In a GitHub PR check, use the composite action instead — it downloads the
+In a GitHub (or Forgejo) PR check, use the composite action instead — it downloads the
 prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
 
 ```yaml
@@ -64,8 +64,17 @@ slug; `qualified` names the forge too — `github.com/owner/repo`, org fallback
 can never be confused. Registry grants must be written in the form the check
 uses. The default flips to `qualified` in a later release and `legacy` is then
 removed; see the [runbook](docs/RUNBOOK.md#2-enrol-the-signers) for the
-migration. `version` selects which release
-to download (default `latest`). Verdicts: `trusted` / `exempt` pass;
+migration. `version` selects which release to download (default `latest`).
+
+The action also runs on **Forgejo Actions** runners, referenced by full URL
+(`uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z`).
+It downloads the release anonymously with `curl` — no `gh`, no token — so the
+runner needs only bash, curl, tar, `sha256sum` or `shasum`, and outbound HTTPS
+to github.com. Integrity differs by runner: on GitHub runners the tarball's
+build-provenance attestation is verified with `gh`; elsewhere only the SHA-256
+published with the release is checked, which catches transport corruption but
+not a replaced release, so pin `version` and set `sha256` there. See
+[the runbook](docs/RUNBOOK.md#forgejo-actions-runners). Verdicts: `trusted` / `exempt` pass;
 `unsigned`, `noSignerDid`, `unresolvedSigner`, `unknownKey`, `badSignature`,
 `unauthorized`, `registryUnavailable` fail. Fails closed at every layer.
 

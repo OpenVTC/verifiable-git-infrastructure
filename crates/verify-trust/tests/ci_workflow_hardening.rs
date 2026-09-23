@@ -9,6 +9,17 @@
 //! 1. no `${{ }}` expression appears inside any `run:` scalar;
 //! 2. every `uses:` names a 40-hex commit SHA.
 //!
+//! A later change made the action portable to Forgejo runners, which have no
+//! `gh` and whose job token belongs to the Forgejo instance (so it must never
+//! be sent to GitHub). The install now downloads anonymously with `curl`, and
+//! the gate also asks:
+//!
+//! 3. every `curl` in a composite action is HTTPS-only (`--proto '=https'`,
+//!    `--tlsv1.2`), fails on an HTTP error (`--fail`) and is never `--insecure`;
+//! 4. the action's install step needs no `gh` and exports no token: the only
+//!    `gh` it runs is the optional `gh attestation verify`, and no step binds
+//!    `GH_TOKEN` or `GITHUB_TOKEN` for every command in its script.
+//!
 //! It is a parser, not a grep, for a concrete reason: the fix for the injection
 //! left a comment in `.github/actions/verify-trust/action.yml` explaining that
 //! `${{ }}` must not appear in a script body. A text search reports that
@@ -42,6 +53,10 @@ struct Audit {
     injections: Vec<String>,
     /// One entry per `uses:` that is not pinned to a commit SHA.
     unpinned: Vec<String>,
+    /// One entry per `curl` invocation examined, naming where it is.
+    curls: Vec<String>,
+    /// One entry per `curl` invocation missing a transport safeguard.
+    weak_curls: Vec<String>,
 }
 
 impl Audit {
@@ -165,6 +180,7 @@ fn walk(node: &Yaml, file: &str, trail: &str, audit: &mut Audit) {
                         "run" => {
                             audit.run_scalars += 1;
                             check_run(scalar, &at, audit);
+                            check_curl(scalar, &at, audit);
                         }
                         "uses" => {
                             audit.uses_scalars += 1;
@@ -229,6 +245,100 @@ fn check_uses(reference: &str, at: &str, audit: &mut Audit) {
     }
 }
 
+/// A script's commands, with backslash-continued lines joined, so a `curl`
+/// whose flags span several lines is read as the one command it is.
+fn logical_lines(script: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for line in script.lines() {
+        if let Some(continued) = line.trim_end().strip_suffix('\\') {
+            current.push_str(continued);
+            current.push(' ');
+        } else {
+            current.push_str(line);
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// The shell words of `line`, comment dropped, with command substitutions and
+/// separators split out so that `x=$(curl …)` yields `x=` then `curl`.
+fn command_words(line: &str) -> Vec<String> {
+    let code = line.split_once(" #").map_or(line, |(code, _)| code);
+    let code = if code.trim_start().starts_with('#') {
+        ""
+    } else {
+        code
+    };
+    code.replace("$(", " ")
+        .replace(['`', '(', ')', ';', '{', '}'], " ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Positions in [`command_words`] at which `line` runs `program`, as opposed
+/// to naming it: `command -v gh`, a comment, or a word in a message do not
+/// count. A command word is the first word, or follows an environment
+/// assignment, `||`, `&&`, `!`, `then`, `do` or `else`.
+fn invocations(line: &str, program: &str) -> Vec<usize> {
+    let words = command_words(line);
+    (0..words.len())
+        .filter(|&i| words[i] == program)
+        .filter(|&i| {
+            i == 0
+                || words[i - 1].ends_with('=')
+                || (words[i - 1].contains('=') && !words[i - 1].starts_with('-'))
+                || matches!(
+                    words[i - 1].as_str(),
+                    "then" | "do" | "else" | "||" | "&&" | "!" | "|"
+                )
+        })
+        .collect()
+}
+
+/// Every `curl` a script runs must be HTTPS-only (redirects included), use
+/// TLS 1.2 or later, fail on an HTTP error status rather than keep the error
+/// page, and never skip certificate checks.
+///
+/// Recorded for every file; the gate holds composite actions to it, since they
+/// run on whatever runner calls them.
+fn check_curl(script: &str, at: &str, audit: &mut Audit) {
+    for line in logical_lines(script) {
+        for _ in invocations(&line, "curl") {
+            audit.curls.push(at.to_string());
+            let mut missing = Vec::new();
+            if !(line.contains("--proto '=https'") || line.contains("--proto =https")) {
+                missing.push("--proto '=https'");
+            }
+            if !line.contains("--tlsv1.2") && !line.contains("--tlsv1.3") {
+                missing.push("--tlsv1.2");
+            }
+            if !line.contains("--fail") {
+                missing.push("--fail");
+            }
+            let insecure = command_words(&line)
+                .iter()
+                .any(|w| *w == "-k" || *w == "--insecure");
+            if !missing.is_empty() || insecure {
+                audit.weak_curls.push(format!(
+                    "{at}: `{}` — missing {missing:?}{}",
+                    line.trim(),
+                    if insecure {
+                        ", and disables certificate verification"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+}
+
 // --- the gates ---------------------------------------------------------------
 
 #[test]
@@ -251,6 +361,167 @@ fn every_action_reference_is_pinned_to_a_commit_sha() {
         audit.unpinned.len(),
         Audit::report(&audit.unpinned)
     );
+}
+
+/// A composite action runs on whatever runner calls it — including Forgejo
+/// runners, where it fetches its binary anonymously from github.com — so its
+/// downloads must not fall back to plain HTTP, old TLS, or a saved error page.
+#[test]
+fn every_curl_in_a_composite_action_is_https_only() {
+    let audit = audit_repository();
+    let in_actions = |f: &&String| f.starts_with(".github/actions/");
+
+    assert!(
+        audit.curls.iter().filter(in_actions).count() > 0,
+        "no `curl` was found in any composite action, so this check examined \
+         nothing; the action's install step downloads with curl"
+    );
+    let weak: Vec<String> = audit
+        .weak_curls
+        .iter()
+        .filter(in_actions)
+        .cloned()
+        .collect();
+    assert!(
+        weak.is_empty(),
+        "{} `curl` invocation(s) in composite actions lack a transport safeguard:{}",
+        weak.len(),
+        Audit::report(&weak)
+    );
+}
+
+/// The action's step named `name`, as a YAML hash.
+fn action_step(name: &str) -> Yaml {
+    action_steps()
+        .into_iter()
+        .find(|step| step["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("action.yml has no step named {name:?}"))
+}
+
+/// The install must work where there is no `gh` and no GitHub token — a
+/// Forgejo runner, whose job token belongs to the Forgejo instance and must
+/// never reach GitHub. So: no `gh` on the download path, the only `gh` run is
+/// the optional attestation check, and the token is handed to that command
+/// alone rather than exported to the whole script.
+#[test]
+fn the_action_installs_without_gh_or_an_exported_token() {
+    let step = action_step("Install verify-trust");
+    let script = step["run"].as_str().expect("install step has a run script");
+
+    // Every input the install reads arrives through `env:`.
+    assert!(
+        !script.contains("${{"),
+        "the install script interpolates a GitHub expression"
+    );
+
+    let lines = logical_lines(script);
+    let mut gh_runs = 0;
+    for line in &lines {
+        let words = command_words(line);
+        for i in invocations(line, "gh") {
+            gh_runs += 1;
+            assert_eq!(
+                words.get(i + 1..i + 3),
+                Some(&["attestation".to_string(), "verify".to_string()][..]),
+                "the install step runs `gh` for something other than the \
+                 optional attestation check: `{}`",
+                line.trim()
+            );
+        }
+    }
+    assert_eq!(
+        gh_runs, 1,
+        "expected exactly one `gh attestation verify`, found {gh_runs} `gh` invocation(s)"
+    );
+    assert!(
+        lines.iter().any(|l| !invocations(l, "curl").is_empty()),
+        "the install step does not download with curl"
+    );
+
+    // No ambient token: neither well-known name is bound for the step, and the
+    // job token reaches only the `gh attestation verify` command line.
+    for step in action_steps() {
+        let env = step["env"].as_hash().cloned().unwrap_or_default();
+        for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                !env.contains_key(&Yaml::String(key.to_string())),
+                "step {:?} exports {key} to its whole script",
+                step["name"].as_str()
+            );
+        }
+    }
+    let env = step["env"].as_hash().expect("install step has env");
+    let token_vars: Vec<&str> = env
+        .iter()
+        .filter(|(_, v)| v.as_str().is_some_and(|v| v.contains("github.token")))
+        .filter_map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(
+        token_vars,
+        ["VGI_GITHUB_TOKEN"],
+        "the job token must be bound once, under a name no tool reads by default"
+    );
+    for line in lines.iter().filter(|l| l.contains("VGI_GITHUB_TOKEN")) {
+        assert!(
+            line.contains("gh attestation verify"),
+            "the job token is used outside the attestation check: `{}`",
+            line.trim()
+        );
+    }
+}
+
+/// Every step of the verify-trust action.
+fn action_steps() -> Vec<Yaml> {
+    let path = repo_root().join(".github/actions/verify-trust/action.yml");
+    let text = std::fs::read_to_string(&path).expect("read action.yml");
+    let doc = YamlLoader::load_from_str(&text)
+        .expect("action.yml parses")
+        .remove(0);
+    doc["runs"]["steps"]
+        .as_vec()
+        .expect("runs.steps is a list")
+        .clone()
+}
+
+/// The curl and `gh` checks must see through line continuations and command
+/// substitutions, and not mistake a name for a command.
+#[test]
+fn the_curl_check_flags_weak_downloads_and_ignores_mentions() {
+    let script = r#"
+# curl http://example.com is only a comment
+if ! command -v curl >/dev/null; then echo "curl is required"; fi
+fetch() {
+  curl --fail --silent --location --proto '=https' --tlsv1.2 \
+    --retry 5 "$@"
+}
+landed="$(curl --fail --proto '=https' --tlsv1.2 -o /dev/null https://example.com)"
+body=$(curl -sSf https://example.com)
+curl --fail --proto '=https' --tlsv1.2 -k https://example.com
+GH_TOKEN="$T" gh attestation verify x --repo o/r
+command -v gh
+"#;
+    let mut audit = Audit::default();
+    check_curl(script, "fixture", &mut audit);
+    assert_eq!(
+        audit.curls.len(),
+        4,
+        "four curl commands are run; mentions are not:{}",
+        Audit::report(&audit.curls)
+    );
+    assert_eq!(
+        audit.weak_curls.len(),
+        2,
+        "the bare one and the --insecure one must be reported:{}",
+        Audit::report(&audit.weak_curls)
+    );
+    assert!(audit.weak_curls[0].contains("body=$(curl -sSf"));
+    assert!(audit.weak_curls[1].contains("certificate verification"));
+
+    let gh: usize = logical_lines(script)
+        .iter()
+        .map(|l| invocations(l, "gh").len())
+        .sum();
+    assert_eq!(gh, 1, "only the attestation command runs gh");
 }
 
 /// Both gates above pass when they find nothing, so this asserts they found

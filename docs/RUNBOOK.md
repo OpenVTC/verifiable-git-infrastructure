@@ -282,12 +282,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.6
+      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
         with:
           range:           origin/${{ github.base_ref }}..HEAD
           registry-did:    ${{ vars.TRUST_REGISTRY_DID }}
           vtc-did:         ${{ vars.VTC_DID }}
           resource-format: qualified
+          version:         vX.Y.Z             # pin it on Forgejo
+          sha256:          <SHA-256 of the Linux tarball, see below>
 ```
 
 **Use `resource-format: qualified` from day one.** A new Forgejo repository has
@@ -297,14 +299,11 @@ another forge. `verify-trust` takes the host from `FORGEJO_SERVER_URL` (falling
 back to `GITHUB_SERVER_URL`, which Forgejo also sets) and the repository from
 `FORGEJO_REPOSITORY`. Issue the grants in that form (§2).
 
-**The runner.** It needs outbound access to download the `verify-trust`
-release from GitHub. The action's install step was written for GitHub-hosted
-runners: it uses the `gh` CLI (which the runner image must provide), the
-`RUNNER_OS` / `RUNNER_ARCH` variables, and the job token — which on Forgejo is
-the instance's token, not a GitHub one. Codeberg and small instances may also
-offer no shared runner. Confirm on your instance that a runner picks the job up
-and the download succeeds before making the check required; Forgejo Actions
-aims for compatibility with GitHub's, not identity.
+**The runner.** It needs outbound HTTPS to GitHub to download the
+`verify-trust` release, and a glibc new enough for the Linux binary. Codeberg
+and small instances may offer no shared runner, so confirm one picks the job up
+before making the check required. What the install needs and what it verifies
+there are under [Forgejo Actions runners](#forgejo-actions-runners) below.
 
 **Merge commits.** The `web-flow` keyring above is GitHub-specific. On Forgejo,
 prefer **fast-forward-only** merges (the repository's allowed merge styles):
@@ -325,6 +324,70 @@ sign at all).
 the verify-trust job's context, disable force-push, and restrict who may push
 and merge. The context name may not match what GitHub would show;
 copy the one a completed run reports rather than guessing.
+
+### Forgejo Actions runners
+
+The same action runs on a Forgejo runner (forgejo-runner), referenced by full
+URL — Forgejo resolves a bare `owner/repo` against the instance's configured
+default actions URL, which is usually not GitHub:
+
+```yaml
+      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
+        with:
+          range:        origin/${{ github.base_ref }}..HEAD
+          registry-did: ${{ vars.TRUST_REGISTRY_DID }}
+          vtc-did:      ${{ vars.VTC_DID }}
+          version:      vX.Y.Z            # pin it; `latest` moves under you
+          sha256:       <SHA-256 of verify-trust-x86_64-unknown-linux-gnu.tar.gz in vX.Y.Z>
+```
+
+This needs a release of the action that includes the portable installer;
+earlier ones install with `gh` and the job token, which a Forgejo runner lacks.
+
+**What the runner needs.** bash, curl, tar, `sha256sum` or `shasum`, and
+outbound HTTPS to `github.com` (and the release-asset CDN it redirects to).
+No `gh` and no token: the release is public and downloaded anonymously. The
+platform is taken from `RUNNER_OS`/`RUNNER_ARCH`, or from `uname` when the
+runner does not set them; prebuilt binaries exist for Linux x86-64, macOS
+(arm64, x86-64) and Windows x86-64, and any other platform fails naming
+itself. The Linux binary is built on GitHub's `ubuntu-latest` and needs
+**glibc 2.39 or newer** — Ubuntu 24.04 or Debian 13 (trixie) job images work;
+Debian 12 (bookworm)-based images such as `node:20-bookworm` do not.
+
+**The job token stays on Forgejo.** On a Forgejo runner `github.token` is the
+Forgejo instance's token. The action hands it only to `gh attestation verify`,
+and only when `GITHUB_SERVER_URL` is `https://github.com` — so on Forgejo it is
+never sent anywhere.
+
+**Integrity is weaker unless you pin a checksum.** What the install checks:
+
+| Runner | Checks | Protects against |
+|---|---|---|
+| GitHub (`gh` present, `verify-attestation: auto`) | SHA-256 published with the release, **and** the build-provenance attestation: signed by this repo's `release.yml` on a GitHub-hosted runner, for the release tag | transport corruption **and** a release asset replaced after the build |
+| Forgejo (no `gh`, no GitHub token) | SHA-256 published with the release | transport corruption only — whoever can replace a release asset can replace its checksum too |
+| Either, with `sha256:` set | the above, plus the checksum pinned in your workflow | a replaced asset, provided your workflow is reviewed |
+
+Attestation verification is not available on a Forgejo runner: it needs
+GitHub's attestation API and a GitHub token. `verify-attestation: true` fails
+there rather than quietly downgrading. So on Forgejo, pin `version` and set
+`sha256` to the tarball's hash — taken from a machine where you have verified
+the attestation:
+
+```sh
+gh release download vX.Y.Z --repo OpenVTC/verifiable-git-infrastructure \
+  --pattern verify-trust-x86_64-unknown-linux-gnu.tar.gz
+gh attestation verify verify-trust-x86_64-unknown-linux-gnu.tar.gz \
+  --repo OpenVTC/verifiable-git-infrastructure \
+  --signer-workflow OpenVTC/verifiable-git-infrastructure/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+sha256sum verify-trust-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Pinning the action itself to a commit SHA rather than a tag (`…/verify-trust@<sha>`)
+closes the remaining gap: the installer's own code.
+
+Releases before v0.4.9 carry no attestation; on a GitHub runner they need
+`verify-attestation: false`.
 
 ## 5. Verdicts and what to do about them
 

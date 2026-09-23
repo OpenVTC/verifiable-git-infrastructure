@@ -56,43 +56,182 @@ inputs:
     description: "VGI release to download the verify-trust binary from — a tag like v0.1.0, or 'latest'."
     required: false
     default: "latest"
+  verify-attestation:
+    description: "Verify the downloaded tarball's build-provenance attestation (signed by this repository's release workflow, for the release tag). 'auto' verifies when the gh CLI is installed and the runner is on github.com; elsewhere (e.g. Forgejo runners) only the SHA-256 published with the release is checked, which guards against transport corruption, not a compromised release. 'true' fails the step when the attestation cannot be verified; 'false' skips it. Releases before v0.4.9 carry no attestation."
+    required: false
+    default: "auto"
+  sha256:
+    description: "Expected SHA-256 of this runner's release tarball (verify-trust-<target>.tar.gz). Optional. A checksum pinned in your own reviewed workflow still holds if the release itself is compromised, unlike the one published alongside it — recommended, with an explicit `version`, wherever attestation cannot be verified (e.g. Forgejo runners)."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
   steps:
     - name: Install verify-trust
       shell: bash
+      # Portable across GitHub Actions and Forgejo Actions runners. Needs bash,
+      # curl, tar, sha256sum or shasum, and outbound HTTPS to github.com — no
+      # `gh`, and no token: the release is public and fetched anonymously.
+      #
+      # Integrity, by runner:
+      #   * Always: the tarball must match the SHA-256 published next to it in
+      #     the same release. Fetched from the same place as the tarball, this
+      #     only catches transport corruption — whoever can replace a release
+      #     asset can replace its checksum too.
+      #   * `sha256` input set: the tarball must also match a checksum pinned in
+      #     the caller's own reviewed workflow, which does survive a
+      #     compromised release.
+      #   * `gh` present and the runner on github.com (verify-attestation:
+      #     auto): the tarball's build-provenance attestation must verify —
+      #     signed by this repository's release.yml, on a GitHub-hosted runner,
+      #     for this tag. That also survives a replaced release asset. It needs
+      #     GitHub's attestation API and a GitHub token, which a Forgejo runner
+      #     does not have (its job token belongs to the Forgejo instance).
       env:
-        GH_TOKEN: ${{ github.token }}
         VGI_VERSION: ${{ inputs.version }}
+        VGI_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
+        VGI_EXPECTED_SHA256: ${{ inputs.sha256 }}
+        # Given to `gh` alone, and only when the runner is on github.com: on
+        # Forgejo this is the Forgejo instance's token, which must never be
+        # sent to GitHub. Deliberately not named GH_TOKEN, so no other command
+        # in the script picks it up.
+        VGI_GITHUB_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+
+        fail() { echo "::error::verify-trust: $*" >&2; exit 1; }
+
+        # Every download goes through here: HTTPS only, redirects included
+        # (the release CDN is reached by redirect), TLS 1.2 or later, retried,
+        # and no credentials.
+        fetch() {
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 20 "$@"
+        }
+
+        repo="OpenVTC/verifiable-git-infrastructure"
+        releases="https://github.com/${repo}/releases"
+
+        # --- platform: RUNNER_OS/RUNNER_ARCH when the runner sets them, else uname
+        os="${RUNNER_OS:-}"
+        if [ -z "$os" ]; then
+          case "$(uname -s)" in
+            Linux)                os=Linux ;;
+            Darwin)               os=macOS ;;
+            MINGW*|MSYS*|CYGWIN*) os=Windows ;;
+            *)                    os="$(uname -s)" ;;
+          esac
+        fi
+        arch="${RUNNER_ARCH:-}"
+        if [ -z "$arch" ]; then
+          case "$(uname -m)" in
+            x86_64|amd64)  arch=X64 ;;
+            arm64|aarch64) arch=ARM64 ;;
+            *)             arch="$(uname -m)" ;;
+          esac
+        fi
+        case "${os}-${arch}" in
           Linux-X64)   target=x86_64-unknown-linux-gnu ;;
           macOS-ARM64) target=aarch64-apple-darwin ;;
           macOS-X64)   target=x86_64-apple-darwin ;;
           Windows-X64) target=x86_64-pc-windows-msvc ;;
-          *) echo "::error::verify-trust: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+          *) fail "unsupported platform ${os}-${arch}: prebuilt binaries exist for Linux-X64, macOS-ARM64, macOS-X64 and Windows-X64" ;;
         esac
-        repo="OpenVTC/verifiable-git-infrastructure"
-        asset="verify-trust-${target}.tar.gz"
+
+        # --- inputs
+        case "$VGI_VERIFY_ATTESTATION" in
+          auto|true|false) ;;
+          *) fail "verify-attestation must be auto, true or false" ;;
+        esac
+        expected=""
+        if [ -n "$VGI_EXPECTED_SHA256" ]; then
+          expected="$(printf '%s' "$VGI_EXPECTED_SHA256" | tr 'A-F' 'a-f')"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "sha256 must be 64 hex digits"
+        fi
+
+        # --- release tag. `latest` redirects to releases/tag/<tag>; read the
+        # tag off where it lands. Either way it must look like a release tag
+        # before it goes into a URL.
         tag="$VGI_VERSION"
         if [ "$tag" = "latest" ]; then
-          tag="$(gh release view --repo "$repo" --json tagName -q .tagName)"
+          landed="$(fetch --output /dev/null --write-out '%{url_effective}' "${releases}/latest")" \
+            || fail "could not resolve the latest release of ${repo}"
+          tag="${landed##*/}"
         fi
+        [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+          || fail "version must be a release tag like v0.4.12, or 'latest'"
+
+        # --- download
+        if [ -n "${RUNNER_TEMP:-}" ]; then
+          work="${RUNNER_TEMP}/vgi-verify-trust"
+          rm -rf "$work"
+          mkdir -p "$work"
+        else
+          work="$(mktemp -d)"
+        fi
+        cd "$work"
+        asset="verify-trust-${target}.tar.gz"
         echo "Downloading ${asset} from ${repo}@${tag}"
-        gh release download "$tag" --repo "$repo" \
-          --pattern "$asset" --pattern "${asset}.sha256" --dir "$RUNNER_TEMP"
-        (
-          cd "$RUNNER_TEMP"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum -c "${asset}.sha256"
-          else
-            shasum -a 256 -c "${asset}.sha256"
-          fi
-          tar xzf "$asset"
-        )
-        echo "${RUNNER_TEMP}/verify-trust-${target}" >> "$GITHUB_PATH"
+        fetch --output "$asset" "${releases}/download/${tag}/${asset}" \
+          || fail "could not download ${asset} from release ${tag}"
+        fetch --output "${asset}.sha256" "${releases}/download/${tag}/${asset}.sha256" \
+          || fail "could not download ${asset}.sha256 from release ${tag}"
+
+        # --- integrity
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$asset")"
+        elif command -v shasum >/dev/null 2>&1; then
+          actual="$(shasum -a 256 "$asset")"
+        else
+          fail "neither sha256sum nor shasum is available on this runner"
+        fi
+        actual="${actual%% *}"
+        published="$(cat "${asset}.sha256")"
+        published="$(printf '%s' "${published%% *}" | tr 'A-F' 'a-f')"
+        [[ "$published" =~ ^[0-9a-f]{64}$ ]] || fail "the release's ${asset}.sha256 is malformed"
+        [ "$actual" = "$published" ] \
+          || fail "${asset} does not match the SHA-256 published with ${tag} (got ${actual}, expected ${published})"
+        checks="SHA-256 published with the release (transport integrity only)"
+
+        if [ -n "$expected" ]; then
+          [ "$actual" = "$expected" ] \
+            || fail "${asset} does not match the pinned sha256 input (got ${actual}, expected ${expected})"
+          checks="${checks}; pinned sha256 input"
+        fi
+
+        on_github=false
+        if [ "${GITHUB_SERVER_URL:-}" = "https://github.com" ]; then on_github=true; fi
+        have_gh=false
+        if command -v gh >/dev/null 2>&1; then have_gh=true; fi
+        attest=false
+        case "$VGI_VERIFY_ATTESTATION" in
+          true)
+            [ "$have_gh" = true ] || fail "verify-attestation is true but the gh CLI is not installed"
+            [ "$on_github" = true ] \
+              || fail "verify-attestation is true but this runner is not on github.com, so it has no token for GitHub's attestation API"
+            attest=true ;;
+          auto)
+            if [ "$have_gh" = true ] && [ "$on_github" = true ]; then attest=true; fi ;;
+        esac
+        if [ "$attest" = true ]; then
+          GH_TOKEN="$VGI_GITHUB_TOKEN" gh attestation verify "$asset" \
+            --repo "$repo" \
+            --signer-workflow "${repo}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${tag}" \
+            --deny-self-hosted-runners \
+            || fail "${asset} has no valid build-provenance attestation from ${repo}'s release workflow for ${tag}"
+          checks="${checks}; build-provenance attestation (release.yml @ refs/tags/${tag})"
+        fi
+        echo "verify-trust ${tag} (${target}) verified: ${checks}"
+
+        # --- install
+        tar xzf "$asset"
+        dir="${work}/verify-trust-${target}"
+        [ -f "${dir}/verify-trust" ] || [ -f "${dir}/verify-trust.exe" ] \
+          || fail "${asset} did not contain verify-trust"
+        [ -n "${GITHUB_PATH:-}" ] || fail "GITHUB_PATH is not set, so verify-trust cannot be put on PATH"
+        echo "$dir" >> "$GITHUB_PATH"
 
     - name: Run verify-trust
       shell: bash
