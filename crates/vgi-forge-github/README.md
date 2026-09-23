@@ -17,8 +17,8 @@ Enterprise Server, acting as **one community's own GitHub App**.
   compared in constant time; the installation must be this App's and on the
   expected owner.
 - **Account linking** with the OAuth device flow (`authorization_pending` and
-  `slow_down` handled); the bridge keeps the numeric id and login and discards
-  the user token. Enable *Device Flow* on the App's settings page — the
+  `slow_down` handled); the bridge keeps the numeric id and login and revokes
+  the user token (given the App's client secret) or, without it, discards it. Enable *Device Flow* on the App's settings page — the
   manifest format cannot.
 - **Repositories**: create (organisations; a personal account reports the
   reduced capability set and gets manual instructions), inspect (people,
@@ -31,8 +31,9 @@ Enterprise Server, acting as **one community's own GitHub App**.
   and a ruleset — PR required, "Verify commit trust" required **and pinned to
   the GitHub Actions App**, no force-push, no deletion, no bypass actors.
 - **Webhooks**: `X-Hub-Signature-256` verified in constant time over the raw
-  body before parsing; repository, member, membership, ruleset, branch
-  protection and installation events become `ForgeEvent`s.
+  body before parsing; repository, member, team membership, organization
+  membership, ruleset, branch protection and installation events become
+  `ForgeEvent`s.
 
 ## Why not octocrab
 

@@ -79,20 +79,30 @@ pub fn parse(
                 change,
             })
         }
-        "membership" | "organization" => {
+        // `membership` is *team* membership; `organization` carries joining
+        // and leaving the org itself.
+        "membership" => {
             let change = match action {
-                "added" | "member_added" => MemberChange::Added,
-                "removed" | "member_removed" => MemberChange::Removed,
+                "added" => MemberChange::Added,
+                "removed" => MemberChange::Removed,
                 _ => return Ok(None),
             };
-            let who = if event == "membership" {
-                &payload["member"]
-            } else {
-                &payload["membership"]["user"]
+            Some(ForgeEventKind::TeamMembershipChanged {
+                namespace: namespace(host, &payload["organization"])?,
+                team: str_at(payload.get("team").unwrap_or(&Value::Null), &["slug"])?.to_string(),
+                account: account(&payload["member"])?,
+                change,
+            })
+        }
+        "organization" => {
+            let change = match action {
+                "member_added" => MemberChange::Added,
+                "member_removed" => MemberChange::Removed,
+                _ => return Ok(None),
             };
             Some(ForgeEventKind::OrgMembershipChanged {
                 namespace: namespace(host, &payload["organization"])?,
-                account: account(who)?,
+                account: account(&payload["membership"]["user"])?,
                 change,
             })
         }

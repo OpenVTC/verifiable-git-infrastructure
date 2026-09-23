@@ -76,6 +76,7 @@ impl Api {
         body: Option<&Value>,
         what: &str,
     ) -> Result<Response> {
+        let writes = matches!(method, Method::POST | Method::PUT | Method::PATCH);
         let mut req = self
             .client
             .request(method, url)
@@ -88,8 +89,17 @@ impl Api {
             value.set_sensitive(true);
             req = req.header(header::AUTHORIZATION, value);
         }
-        if let Some(body) = body {
-            req = req.json(body);
+        match body {
+            Some(body) => req = req.json(body),
+            // A write with no body still says so: hyper sends neither
+            // Content-Length nor Transfer-Encoding for an empty body, and
+            // GitHub answers such a POST/PUT with 411 Length Required.
+            None if writes => {
+                req = req
+                    .header(header::CONTENT_LENGTH, "0")
+                    .body(Vec::<u8>::new());
+            }
+            None => {}
         }
         let resp = req.send().await.map_err(|e| {
             // Strip the URL: it is ours, but errors travel to the VTC's log.
@@ -126,6 +136,27 @@ impl Api {
             .map_err(|e| ForgeError::Unavailable(e.without_url().to_string()))?;
         let resp = check(resp, "OAuth device flow").await?;
         decode(resp, "OAuth device flow").await
+    }
+
+    /// `DELETE` with HTTP basic auth (OAuth app credentials) and a JSON body.
+    pub(crate) async fn basic_delete(
+        &self,
+        url: Url,
+        user: &str,
+        password: &Secret,
+        body: &Value,
+    ) -> Result<()> {
+        let resp = self
+            .client
+            .delete(url)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .basic_auth(user, Some(password.expose()))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ForgeError::Unavailable(e.without_url().to_string()))?;
+        check(resp, "token revocation").await.map(|_| ())
     }
 
     /// `GET` that maps 404 to `None`.

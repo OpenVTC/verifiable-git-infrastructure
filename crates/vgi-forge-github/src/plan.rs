@@ -122,6 +122,9 @@ name: verify-trust
 
 on:
   pull_request:
+  # A merge queue runs required checks on its own merge commits; without
+  # this trigger the check never reports there and queued merges stall.
+  merge_group:
 
 # Reads the repository and downloads a public release; writes nothing.
 permissions:
@@ -141,7 +144,9 @@ jobs:
       - name: verify-trust
         uses: {action}
         with:
-          range: origin/${{{{ github.base_ref }}}}..HEAD
+          # merge_group events have no base_ref; the queue names its base
+          # commit instead.
+          range: ${{{{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || format('origin/{{0}}', github.base_ref) }}}}..HEAD
           registry-did: ${{{{ vars.TRUST_REGISTRY_DID }}}}
           vtc-did: ${{{{ vars.VTC_DID }}}}
           resource-format: qualified
@@ -294,7 +299,11 @@ mod tests {
         let wf = render_workflow(&cfg(), crate::config::DEFAULT_CHECKOUT_ACTION);
         assert!(wf.contains("    name: 'Verify commit trust'\n"));
         assert!(wf.contains("resource-format: qualified"));
-        assert!(wf.contains("range: origin/${{ github.base_ref }}..HEAD"));
+        assert!(wf.contains("  merge_group:\n"));
+        assert!(wf.contains(
+            "range: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha \
+             || format('origin/{0}', github.base_ref) }}..HEAD"
+        ));
         assert!(wf.contains(&format!("verify-trust@{SHA}")));
         assert!(wf.contains("uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
         assert!(!wf.contains("if:"));

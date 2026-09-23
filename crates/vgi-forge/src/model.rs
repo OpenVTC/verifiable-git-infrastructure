@@ -543,7 +543,10 @@ impl NamespaceBinding {
 }
 
 /// Where a member goes to link their account.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written: `device_code` redeems the member's authorisation
+/// once they approve, so it must not reach a log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 #[non_exhaustive]
 pub enum LinkStep {
@@ -569,8 +572,31 @@ pub enum LinkStep {
     },
 }
 
-/// Completion input for a link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for LinkStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinkStep::DeviceCode {
+                user_code,
+                verification_uri,
+                expires_in,
+                interval,
+                ..
+            } => f
+                .debug_struct("DeviceCode")
+                .field("device_code", &"<redacted>")
+                .field("user_code", user_code)
+                .field("verification_uri", verification_uri)
+                .field("expires_in", expires_in)
+                .field("interval", interval)
+                .finish(),
+            LinkStep::Redirect { url } => f.debug_struct("Redirect").field("url", url).finish(),
+        }
+    }
+}
+
+/// Completion input for a link. `Debug` redacts the device code, as for
+/// [`LinkStep`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 #[non_exhaustive]
 pub enum LinkCallback {
@@ -588,6 +614,27 @@ pub enum LinkCallback {
         /// Query parameters received.
         params: BTreeMap<String, String>,
     },
+}
+
+impl fmt::Debug for LinkCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinkCallback::DeviceCode {
+                interval,
+                expires_in,
+                ..
+            } => f
+                .debug_struct("DeviceCode")
+                .field("device_code", &"<redacted>")
+                .field("interval", interval)
+                .field("expires_in", expires_in)
+                .finish(),
+            LinkCallback::Redirect { params } => f
+                .debug_struct("Redirect")
+                .field("params", &params.keys().collect::<Vec<_>>())
+                .finish(),
+        }
+    }
 }
 
 impl LinkCallback {

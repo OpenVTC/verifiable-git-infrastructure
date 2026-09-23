@@ -19,7 +19,7 @@ use vgi_forge::{
 };
 
 use crate::api::{Api, Auth};
-use crate::config::GitHubConfig;
+use crate::config::{GitHubConfig, JwtIssuer};
 use crate::jwt::{AppKeySigner, app_jwt};
 use crate::manifest::missing_permissions;
 use crate::plan::{RULESET_NAME, github_plan};
@@ -50,6 +50,10 @@ const PERMS_ADMIN: &[(&str, &str)] = &[("administration", "write"), ("metadata",
 const PERMS_CONTENTS: &[(&str, &str)] = &[("contents", "write"), ("metadata", "read")];
 const PERMS_VARIABLES: &[(&str, &str)] = &[("actions_variables", "write"), ("metadata", "read")];
 
+/// How long GitHub lets a device code live (15 minutes). Polling never runs
+/// longer, whatever the caller says.
+const DEVICE_CODE_MAX_LIFETIME_SECS: u64 = 900;
+
 /// Shortest bind `state` accepted: 128 bits of base64url.
 const MIN_STATE_LEN: usize = 22;
 
@@ -67,6 +71,7 @@ pub struct GitHubForge {
     webhook_secret: Secret,
     namespaces: RwLock<BTreeMap<Resource, Namespace>>,
     actions_app_id: Mutex<Option<u64>>,
+    client_secret: Option<Secret>,
 }
 
 impl std::fmt::Debug for GitHubForge {
@@ -115,7 +120,18 @@ impl GitHubForge {
             webhook_secret,
             namespaces: RwLock::new(BTreeMap::new()),
             actions_app_id,
+            client_secret: None,
         })
+    }
+
+    /// Give the adapter the App's OAuth client secret (from the manifest
+    /// exchange). With it, the member's user token from an account link is
+    /// revoked as soon as their id is read; without it the token is only
+    /// dropped and lapses on its own (eight hours for an expiring App user
+    /// token), because revocation is authenticated with the client secret.
+    pub fn with_client_secret(mut self, secret: Secret) -> Self {
+        self.client_secret = Some(secret);
+        self
     }
 
     /// The configuration.
@@ -179,7 +195,11 @@ impl GitHubForge {
     // ── credentials ──────────────────────────────────────────────────────
 
     async fn jwt(&self) -> Result<Secret> {
-        app_jwt(self.signer.as_ref(), &self.config.client_id).await
+        let issuer = match self.config.jwt_issuer {
+            JwtIssuer::AppId => self.config.app_id.to_string(),
+            _ => self.config.client_id.clone(),
+        };
+        app_jwt(self.signer.as_ref(), &issuer).await
     }
 
     /// Mint an installation token for `ns`, limited to `repo` (when given)
@@ -261,6 +281,10 @@ impl GitHubForge {
                 expected: format!("a repository on `{}`", self.config.host),
             });
         }
+        // A `Resource` from a bridge job was validated against the general
+        // grammar (any depth). Splitting `github.com/acme/evil/widgets` into
+        // first and last segment would act on `acme/widgets`.
+        repo.require_owner_repo()?;
         let name = repo.repo_name().ok_or_else(|| ForgeError::WrongResource {
             resource: repo.to_string(),
             expected: "a repository (`<host>/<owner>/<repo>`), not a namespace".into(),
@@ -299,6 +323,27 @@ impl GitHubForge {
             .await?;
         *self.actions_app_id.lock().expect("lock poisoned") = Some(app.id);
         Ok(app.id)
+    }
+
+    /// `DELETE /applications/{client_id}/token`, authenticated with the
+    /// client id and secret. Best effort: the link already succeeded, and a
+    /// token that could not be revoked still lapses on its own — so a
+    /// failure is logged, not returned.
+    async fn revoke_user_token(&self, token: &Secret) {
+        let Some(secret) = &self.client_secret else {
+            return;
+        };
+        let url = self
+            .api
+            .url(&["applications", &self.config.client_id, "token"]);
+        let body = json!({ "access_token": token.expose() });
+        if let Err(e) = self
+            .api
+            .basic_delete(url, &self.config.client_id, secret, &body)
+            .await
+        {
+            tracing::warn!(error = %e, "could not revoke a member's user token after linking");
+        }
     }
 
     // ── reads ────────────────────────────────────────────────────────────
@@ -395,9 +440,12 @@ impl GitHubForge {
             default_names.push(format!("refs/heads/{b}"));
         }
         let (include, exclude) = (refs("include"), refs("exclude"));
+        // Any exclusion at all counts as not covering: `refs/heads/*` or a
+        // pattern matching the default branch excludes it as surely as its
+        // literal name, and the managed ruleset is created with none.
         p.covers_default_branch = rs.target.as_deref().unwrap_or("branch") == "branch"
             && include.iter().any(|r| default_names.contains(r))
-            && !exclude.iter().any(|r| default_names.contains(r));
+            && exclude.is_empty();
 
         for rule in &rs.rules {
             match rule.kind.as_str() {
@@ -468,10 +516,25 @@ impl GitHubForge {
         segments.extend(path.split('/'));
         let url = self.api.url(&segments);
 
-        let existing: Option<ContentJson> = self
+        // A directory at `path` answers with a JSON array, a file with an
+        // object: read it untyped first so the conflict is reported as one.
+        let existing: Option<Value> = self
             .api
             .get_opt(url.clone(), Auth::Bearer(&token), path)
             .await?;
+        let existing = match existing {
+            Some(Value::Array(_)) => {
+                return Err(ForgeError::Rejected {
+                    status: 409,
+                    message: format!("`{path}` exists and is a directory, not a file"),
+                });
+            }
+            Some(v) => Some(
+                serde_json::from_value::<ContentJson>(v)
+                    .map_err(|e| ForgeError::Protocol(format!("{path}: {e}")))?,
+            ),
+            None => None,
+        };
         let sha = match existing {
             Some(c) if c.kind != "file" => {
                 return Err(ForgeError::Rejected {
@@ -610,12 +673,19 @@ impl GitHubForge {
 
     // ── roles ────────────────────────────────────────────────────────────
 
+    /// Whether `id` is the account holder of a personal-account namespace:
+    /// the repository's implicit admin, never a collaborator to add, report
+    /// or remove.
+    fn is_personal_owner(ns: &Namespace, id: u64) -> bool {
+        ns.kind == NamespaceKind::User && Some(id) == ns.owner_id
+    }
+
     /// Drop assignments GitHub cannot express: the owner of a personal
     /// account is its implicit admin and cannot be added as a collaborator.
     fn expressible(&self, ns: &Namespace, desired: &[RoleAssignment]) -> Vec<RoleAssignment> {
         desired
             .iter()
-            .filter(|a| !(ns.kind == NamespaceKind::User && Some(a.account.id) == ns.owner_id))
+            .filter(|a| !Self::is_personal_owner(ns, a.account.id))
             .cloned()
             .collect()
     }
@@ -904,6 +974,9 @@ impl Forge for GitHubForge {
             "device_code": device_code,
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         });
+        // `expires_in` comes back from the caller, not from GitHub; never
+        // poll longer than GitHub lets a device code live.
+        let expires_in = expires_in.min(DEVICE_CODE_MAX_LIFETIME_SECS);
         let mut waited = 0u64;
         let token = loop {
             if waited >= expires_in {
@@ -933,12 +1006,15 @@ impl Forge for GitHubForge {
                 "authenticated user",
             )
             .await?;
-        // `token` is dropped (and wiped) here: the bridge needs the id, not
-        // a standing credential for the member's account.
+        // The bridge needs the id, not a standing credential for the
+        // member's account: revoke the token when we can, and drop (wipe) it
+        // either way.
+        self.revoke_user_token(&token).await;
         Ok(ForgeAccount::new(user.id, user.login))
     }
 
     async fn inspect(&self, repo: &Resource) -> Result<RepoState> {
+        let (ns, _, _) = self.locate(repo)?;
         let (token, owner, name) = self.repo_token(repo, PERMS_ADMIN).await?;
         let auth = Auth::Bearer(&token);
         let r: RepoJson = self
@@ -954,6 +1030,9 @@ impl Forge for GitHubForge {
         let mut state = self.repo_state(&r)?;
 
         for c in self.collaborators(&token, &owner, &name).await? {
+            if Self::is_personal_owner(&ns, c.id) {
+                continue;
+            }
             let role = c.role();
             state
                 .collaborators
@@ -987,7 +1066,11 @@ impl Forge for GitHubForge {
             });
         }
         // No repository to scope to yet: this token is org-wide, but only
-        // for administration.
+        // for administration. Accepted residual (review F6): for the life of
+        // this one call the token could administer every repository the
+        // installation covers. GitHub offers no narrower grant for
+        // `POST /orgs/{org}/repos`; the token is not reused and is dropped on
+        // return.
         let token = self.installation_token(&ns, None, PERMS_ADMIN).await?;
         let auth = Auth::Bearer(&token);
         if let Some(existing) = self
@@ -1098,6 +1181,9 @@ impl Forge for GitHubForge {
             .await?;
         let mut current: BTreeMap<u64, (ForgeAccount, Current)> = BTreeMap::new();
         for c in self.collaborators(&token, owner, name).await? {
+            if Self::is_personal_owner(&ns, c.id) {
+                continue;
+            }
             let role = c.role();
             current.insert(
                 c.id,
@@ -1175,6 +1261,7 @@ impl Forge for GitHubForge {
                 expected: format!("a repository on `{}`", self.config.host),
             });
         }
+        repo.resource.require_owner_repo()?;
         github_plan(repo, cfg, &self.config.checkout_action)
     }
 
@@ -1315,9 +1402,19 @@ fn decode_content(c: &ContentJson) -> Result<Vec<u8>> {
                 .decode(compact)
                 .map_err(|e| ForgeError::Protocol(format!("file content: {e}")))
         }
-        // Over 1 MB GitHub returns no inline content; treat as different so
-        // the step rewrites it rather than trusting an unseen file.
-        _ => Ok(Vec::new()),
+        // Over 1 MB GitHub returns `encoding: "none"` and no content. Nothing
+        // the bootstrap writes is that large, so a file that is must have
+        // been put there by someone else: refuse rather than overwrite what
+        // we cannot see.
+        Some("none") => Err(ForgeError::Rejected {
+            status: 409,
+            message: "the existing file is too large for GitHub to return inline (over 1 MB); \
+                      it was not written by the bootstrap — remove or rename it"
+                .into(),
+        }),
+        other => Err(ForgeError::Protocol(format!(
+            "file content in unknown encoding {other:?}"
+        ))),
     }
 }
 

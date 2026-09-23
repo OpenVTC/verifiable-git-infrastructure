@@ -41,7 +41,7 @@ mod secret;
 pub mod webhook;
 
 pub use api::API_VERSION;
-pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig};
+pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig, JwtIssuer};
 pub use forge::GitHubForge;
 pub use jwt::{AppKeySigner, InProcessKey};
 pub use secret::Secret;

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use url::Url;
 use vgi_forge::{Namespace, NamespaceKind, Resource};
 use vgi_forge_github::{GitHubConfig, GitHubForge, InProcessKey, Secret};
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 pub const CLIENT_ID: &str = "Iv1.testclient";
@@ -110,6 +110,15 @@ pub struct ValidAppJwt;
 
 impl Match for ValidAppJwt {
     fn matches(&self, req: &Request) -> bool {
+        ValidAppJwtFor(CLIENT_ID).matches(req)
+    }
+}
+
+/// [`ValidAppJwt`] for a given issuer.
+pub struct ValidAppJwtFor(pub &'static str);
+
+impl Match for ValidAppJwtFor {
+    fn matches(&self, req: &Request) -> bool {
         let Some(auth) = req
             .headers
             .get("authorization")
@@ -124,7 +133,7 @@ impl Match for ValidAppJwt {
             claims["iat"].as_u64().unwrap(),
             claims["exp"].as_u64().unwrap(),
         );
-        claims["iss"] == CLIENT_ID && exp > iat && exp - iat <= 600
+        claims["iss"] == self.0 && exp > iat && exp - iat <= 600
     }
 }
 
@@ -155,10 +164,20 @@ pub async fn server_and_forge() -> (MockServer, GitHubForge) {
 }
 
 pub fn forge_for(server: &MockServer) -> GitHubForge {
+    forge_with(server, |cfg| {
+        cfg.with_actions_integration_id(ACTIONS_APP_ID)
+    })
+}
+
+/// A forge for `server` with `adjust` applied to its config.
+pub fn forge_with(
+    server: &MockServer,
+    adjust: impl FnOnce(GitHubConfig) -> GitHubConfig,
+) -> GitHubForge {
     let base = Url::parse(&server.uri()).unwrap();
-    let mut cfg = GitHubConfig::github_com(1001, CLIENT_ID, "acme-vgi")
-        .with_endpoints(base.clone(), base)
-        .with_actions_integration_id(ACTIONS_APP_ID);
+    let mut cfg = adjust(
+        GitHubConfig::github_com(1001, CLIENT_ID, "acme-vgi").with_endpoints(base.clone(), base),
+    );
     cfg.device_poll_unit = Duration::from_millis(1);
     let signer = Arc::new(InProcessKey::from_pem(&key().pkcs1_pem).unwrap());
     let forge = GitHubForge::new(cfg, signer, Secret::new(WEBHOOK_SECRET)).unwrap();
@@ -183,7 +202,8 @@ pub fn forge_for(server: &MockServer) -> GitHubForge {
 }
 
 /// Mount the installation-token endpoint for `installation`, expecting the
-/// request to name `repo` (when given) and include `perms`, `times` times.
+/// request body to be *exactly* `repo` (when given) and `perms` — no extra
+/// permission, no extra repository — `times` times.
 pub async fn mount_token(
     server: &MockServer,
     installation: u64,
@@ -200,7 +220,7 @@ pub async fn mount_token(
             "/app/installations/{installation}/access_tokens"
         )))
         .and(ValidAppJwt)
-        .and(body_partial_json(body))
+        .and(body_json(body))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "token": TOKEN,
             "expires_at": "2099-01-01T00:00:00Z",

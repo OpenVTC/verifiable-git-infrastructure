@@ -96,6 +96,7 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
         "repository",
         "member",
         "membership",
+        "organization",
         "repository_ruleset",
         "branch_protection_rule",
     ] {
@@ -136,6 +137,8 @@ async fn manifest_code_exchange_returns_credentials_that_never_print() {
     let server = wiremock::MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/app-manifests/abc123/conversions"))
+        // Bodyless, but it must still say so: GitHub answers 411 otherwise.
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(201).set_body_json(conversion(json!({
             "administration": "write", "contents": "write", "actions_variables": "write",
             "metadata": "read", "members": "read",
@@ -144,7 +147,7 @@ async fn manifest_code_exchange_returns_credentials_that_never_print() {
         .mount(&server)
         .await;
     let base = Url::parse(&server.uri()).unwrap();
-    let creds = exchange_code(&base, "abc123").await.unwrap();
+    let creds = exchange_code(&base, "abc123", "acme").await.unwrap();
     assert_eq!(creds.app_id, 1001);
     assert_eq!(creds.slug, "acme-vgi-bridge");
     assert_eq!(creds.client_id, CLIENT_ID);
@@ -174,7 +177,7 @@ async fn manifest_exchange_refuses_an_app_with_more_than_the_reviewed_permission
         .mount(&server)
         .await;
     let base = Url::parse(&server.uri()).unwrap();
-    let err = exchange_code(&base, "abc123")
+    let err = exchange_code(&base, "abc123", "acme")
         .await
         .unwrap_err()
         .to_string();
@@ -183,7 +186,7 @@ async fn manifest_exchange_refuses_an_app_with_more_than_the_reviewed_permission
         "{err}"
     );
     assert!(
-        exchange_code(&base, "../x").await.is_err(),
+        exchange_code(&base, "../x", "acme").await.is_err(),
         "code must be alphanumeric"
     );
 }
@@ -469,6 +472,160 @@ async fn device_flow_stops_on_expiry_denial_or_deadline() {
         .mount(&server)
         .await;
     let e = forge.complete_account_link(cb(12)).await.unwrap_err();
+    assert!(
+        matches!(e, ForgeError::LinkFailed(ref m) if m.contains("expired")),
+        "{e}"
+    );
+}
+
+// ── review follow-ups ────────────────────────────────────────────────────
+
+fn good_permissions() -> serde_json::Value {
+    json!({
+        "administration": "write", "contents": "write", "actions_variables": "write",
+        "metadata": "read", "members": "read",
+    })
+}
+
+async fn exchange_with(
+    reply: serde_json::Value,
+    expected_owner: &str,
+) -> vgi_forge::Result<String> {
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app-manifests/abc123/conversions"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(reply))
+        .mount(&server)
+        .await;
+    let base = Url::parse(&server.uri()).unwrap();
+    exchange_code(&base, "abc123", expected_owner)
+        .await
+        .map(|c| c.slug)
+}
+
+#[tokio::test]
+async fn manifest_exchange_checks_owner_events_visibility_and_requires_permissions() {
+    assert!(
+        exchange_with(conversion(good_permissions()), "ACME")
+            .await
+            .is_ok()
+    );
+
+    let e = exchange_with(conversion(good_permissions()), "newco")
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("registered under `acme`, not `newco`"),
+        "{e}"
+    );
+
+    let mut no_perms = conversion(good_permissions());
+    no_perms.as_object_mut().unwrap().remove("permissions");
+    assert!(
+        exchange_with(no_perms, "acme").await.is_err(),
+        "absent permissions fail closed"
+    );
+
+    let mut no_owner = conversion(good_permissions());
+    no_owner.as_object_mut().unwrap().remove("owner");
+    assert!(exchange_with(no_owner, "acme").await.is_err());
+
+    let mut fewer_events = conversion(good_permissions());
+    fewer_events["events"] = json!(["repository"]);
+    let e = exchange_with(fewer_events, "acme").await.unwrap_err();
+    assert!(e.to_string().contains("events"), "{e}");
+
+    let mut public = conversion(good_permissions());
+    public["public"] = json!(true);
+    let e = exchange_with(public, "acme").await.unwrap_err();
+    assert!(e.to_string().contains("public"), "{e}");
+}
+
+#[tokio::test]
+async fn jwt_issuer_can_be_the_numeric_app_id() {
+    let server = wiremock::MockServer::start().await;
+    let forge = forge_with(&server, |cfg| cfg.with_app_id_issuer());
+    Mock::given(method("GET"))
+        .and(path("/app/installations/77"))
+        .and(ValidAppJwtFor("1001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "account": { "id": 500, "login": "newco", "type": "Organization" },
+            "permissions": good_permissions(),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let state = GitHubForge::new_state().unwrap();
+    let ns = Resource::parse("github.com/newco").unwrap();
+    let binding = forge
+        .complete_bind(BindCallback::new(
+            callback(&state, "77", "install"),
+            state.clone(),
+            ns,
+        ))
+        .await
+        .unwrap();
+    assert!(binding.missing_permissions.is_empty());
+}
+
+#[tokio::test]
+async fn device_code_never_prints_and_the_user_token_is_revoked() {
+    let server = wiremock::MockServer::start().await;
+    let forge = forge_for(&server).with_client_secret(vgi_forge_github::Secret::new("cs-secret"));
+    mount_device_code(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(poll_reply(
+            json!({ "access_token": "ghu_user_token", "token_type": "bearer" }),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 7, "login": "bob" })))
+        .mount(&server)
+        .await;
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{CLIENT_ID}:cs-secret"));
+    Mock::given(method("DELETE"))
+        .and(path(format!("/applications/{CLIENT_ID}/token")))
+        .and(header("authorization", format!("Basic {basic}").as_str()))
+        .and(body_json(json!({ "access_token": "ghu_user_token" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let step = forge.begin_account_link("did:webvh:bob").await.unwrap();
+    let cb = LinkCallback::from_device_step(&step).unwrap();
+    for printed in [format!("{step:?}"), format!("{cb:?}")] {
+        assert!(!printed.contains("dev-code-1"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+    let account = forge.complete_account_link(cb).await.unwrap();
+    assert_eq!(account.id, 7);
+}
+
+#[tokio::test]
+async fn a_caller_cannot_stretch_polling_past_the_device_code_lifetime() {
+    let (server, forge) = server_and_forge().await;
+    // 900 s / 5 s per poll: at most 180 polls, however long the caller asks.
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(poll_reply(json!({ "error": "authorization_pending" })))
+        .expect(1..=180)
+        .mount(&server)
+        .await;
+    let e = forge
+        .complete_account_link(LinkCallback::DeviceCode {
+            device_code: "dev-code-1".into(),
+            interval: 5,
+            expires_in: u64::MAX,
+        })
+        .await
+        .unwrap_err();
     assert!(
         matches!(e, ForgeError::LinkFailed(ref m) if m.contains("expired")),
         "{e}"

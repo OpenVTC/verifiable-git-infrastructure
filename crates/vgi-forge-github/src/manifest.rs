@@ -40,12 +40,14 @@ pub const APP_PERMISSIONS: [(&str, &str); 5] = [
     ("metadata", "read"),
 ];
 
-/// Webhook events for drift (§5.6). `installation` events are always
-/// delivered to an App and need no subscription.
-pub const APP_EVENTS: [&str; 5] = [
+/// Webhook events for drift (§5.6), plus `organization` for members joining
+/// and leaving the org. `installation` events are always delivered to an App
+/// and need no subscription. Sorted.
+pub const APP_EVENTS: [&str; 6] = [
     "branch_protection_rule",
     "member",
     "membership",
+    "organization",
     "repository",
     "repository_ruleset",
 ];
@@ -183,10 +185,15 @@ struct Conversion {
     client_secret: String,
     webhook_secret: Option<String>,
     pem: String,
-    #[serde(default)]
-    owner: Option<Owner>,
-    #[serde(default)]
+    // Required, not defaulted: a response without these cannot be checked
+    // against what the admin approved, and must not pass as "no excess".
+    owner: Owner,
     permissions: BTreeMap<String, String>,
+    events: Vec<String>,
+    /// Not part of GitHub's documented conversion response today; checked
+    /// when present so a public App is never accepted silently.
+    #[serde(default)]
+    public: Option<bool>,
 }
 
 /// Rank of a GitHub permission level; unknown levels rank highest so they
@@ -236,7 +243,15 @@ struct Owner {
 /// Exchange the redirect's `code` for the App's credentials
 /// (`POST /app-manifests/{code}/conversions`). The code is single-use and
 /// expires after an hour.
-pub async fn exchange_code(api_base: &Url, code: &str) -> Result<AppCredentials> {
+///
+/// `expected_owner` is the org (or user) the admin set out to register the
+/// App under — the one passed to [`registration_url`]. An App registered
+/// anywhere else is refused: its key would act for the wrong account.
+pub async fn exchange_code(
+    api_base: &Url,
+    code: &str,
+    expected_owner: &str,
+) -> Result<AppCredentials> {
     if code.is_empty() || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(ForgeError::Config(
             "manifest code is not alphanumeric".into(),
@@ -259,20 +274,42 @@ pub async fn exchange_code(api_base: &Url, code: &str) -> Result<AppCredentials>
         client_secret: Secret::new(c.client_secret),
         webhook_secret: Secret::new(c.webhook_secret.unwrap_or_default()),
         pem: Secret::new(c.pem),
-        owner_login: c.owner.map(|o| o.login),
+        owner_login: Some(c.owner.login),
     };
+    let refuse = |why: String| {
+        Err(ForgeError::Config(format!(
+            "{why}; delete App `{}` on GitHub and register again",
+            creds.slug
+        )))
+    };
+
+    let owner = creds.owner_login.as_deref().unwrap_or_default();
+    if !owner.eq_ignore_ascii_case(expected_owner) {
+        return refuse(format!(
+            "the App was registered under `{owner}`, not `{expected_owner}`"
+        ));
+    }
+    if c.public == Some(true) {
+        return refuse("the registered App is public; the manifest asks for a private one".into());
+    }
+    let mut events = c.events;
+    events.sort();
+    events.dedup();
+    if events != APP_EVENTS {
+        return refuse(format!(
+            "the registered App's events {events:?} differ from the reviewed manifest {APP_EVENTS:?}"
+        ));
+    }
 
     // Fewer permissions than reviewed is harmless (the adapter reports what
     // it cannot do); any permission beyond the set, or at a higher level, is
     // not what the admin was shown.
     let excess = excess_permissions(&c.permissions);
     if !excess.is_empty() {
-        return Err(ForgeError::Config(format!(
-            "the registered App has permissions beyond the reviewed manifest ({}); delete App \
-             `{}` on GitHub and register again",
-            excess.join(", "),
-            creds.slug
-        )));
+        return refuse(format!(
+            "the registered App has permissions beyond the reviewed manifest ({})",
+            excess.join(", ")
+        ));
     }
     if creds.webhook_secret.expose().is_empty() {
         return Err(ForgeError::Config(

@@ -53,6 +53,22 @@ impl Resource {
         Ok(Self(canonical))
     }
 
+    /// Check that this is exactly `host/owner/repo` under the owner/repo
+    /// grammar. A `Resource` that arrived by deserialisation was validated
+    /// against the general grammar only (any depth), so an adapter for an
+    /// owner/repo forge must call this before splitting it into owner and
+    /// name — `github.com/acme/evil/widgets` is not `acme/widgets`.
+    pub fn require_owner_repo(&self) -> Result<()> {
+        let reparsed = Resource::parse_owner_repo(&self.0)?;
+        if reparsed.is_namespace() {
+            return Err(ForgeError::WrongResource {
+                resource: self.0.clone(),
+                expected: "a repository (`<host>/<owner>/<repo>`), not a namespace".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Build `host/owner` from parts, validating the result.
     pub fn namespace_of(host: &str, owner: &str) -> Result<Self> {
         Self::parse_owner_repo(&format!("{host}/{owner}"))
@@ -189,6 +205,24 @@ mod tests {
         assert!(
             err.to_string().contains("`github.com/acme/widgets`"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn deep_resources_are_not_owner_repo() {
+        let deep: Resource = serde_json::from_str("\"github.com/acme/evil/widgets\"").unwrap();
+        assert!(deep.require_owner_repo().is_err());
+        assert!(
+            Resource::parse("github.com/acme")
+                .unwrap()
+                .require_owner_repo()
+                .is_err()
+        );
+        assert!(
+            Resource::parse("github.com/acme/w")
+                .unwrap()
+                .require_owner_repo()
+                .is_ok()
         );
     }
 

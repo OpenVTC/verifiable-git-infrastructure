@@ -492,13 +492,26 @@ async fn apply_roles_in_a_personal_account_collapses_to_write_and_skips_the_owne
         1,
     )
     .await;
-    for list in ["collaborators", "invitations"] {
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/alice/gadgets/{list}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .mount(&server)
-            .await;
-    }
+    // The listing includes the account holder herself (id 1).
+    Mock::given(method("GET"))
+        .and(path("/repos/alice/gadgets/collaborators"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "login": "alice", "role_name": "admin" }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/alice/gadgets/invitations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/alice/gadgets/collaborators/alice"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .named("the owner is never removed")
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/user/2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 2, "login": "bob" })))
@@ -508,6 +521,8 @@ async fn apply_roles_in_a_personal_account_collapses_to_write_and_skips_the_owne
     Mock::given(method("PUT"))
         .and(path("/repos/alice/gadgets/collaborators/bob"))
         .and(|req: &wiremock::Request| req.body.is_empty())
+        // hyper sends no length for an empty body; GitHub would answer 411.
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&server)
@@ -524,10 +539,15 @@ async fn apply_roles_in_a_personal_account_collapses_to_write_and_skips_the_owne
     };
     assert_eq!(filtered, desired[1..]);
 
+    // Enforce mode: even removing unlisted people leaves the owner alone.
     let report = forge
-        .apply_roles(&gadgets, &desired, Unlisted::Keep)
+        .apply_roles(&gadgets, &desired, Unlisted::Remove)
         .await
         .unwrap();
+    assert!(
+        report.kept_unlisted.is_empty(),
+        "the owner is not reported either"
+    );
     assert_eq!(report.changes.len(), 1);
     assert_eq!(
         report.changes[0].to,
@@ -771,7 +791,7 @@ async fn bootstrap_repairs_drifted_state_in_place() {
         &server,
         INSTALLATION,
         Some("gadgets"),
-        json!({ "contents": "write" }),
+        json!({ "contents": "write", "metadata": "read" }),
         1,
     )
     .await;
@@ -804,7 +824,7 @@ async fn bootstrap_repairs_drifted_state_in_place() {
         &server,
         INSTALLATION,
         Some("gadgets"),
-        json!({ "actions_variables": "write" }),
+        json!({ "actions_variables": "write", "metadata": "read" }),
         1,
     )
     .await;
@@ -885,7 +905,7 @@ async fn a_protected_branch_explains_why_a_file_write_was_refused() {
         &server,
         INSTALLATION,
         Some("gadgets"),
-        json!({ "contents": "write" }),
+        json!({ "contents": "write", "metadata": "read" }),
         1,
     )
     .await;
@@ -981,6 +1001,199 @@ async fn http_failures_map_to_decisions_the_core_can_make() {
     let e = forge.inspect(&repo("renamed")).await.unwrap_err();
     assert!(
         matches!(e, ForgeError::Moved { ref location, .. } if location.ends_with("/repositories/812")),
+        "{e:?}"
+    );
+}
+
+// ── review follow-ups ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_deserialized_deep_resource_never_reaches_github() {
+    let (server, forge) = server_and_forge().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // Valid under the general grammar, so it deserialises — but it is not
+    // `acme/widgets`, and must not be acted on as if it were.
+    let deep: Resource = serde_json::from_str("\"github.com/acme/evil/widgets\"").unwrap();
+    for e in [
+        forge.inspect(&deep).await.unwrap_err(),
+        forge.archive_repo(&deep).await.unwrap_err(),
+        forge
+            .apply_roles(&deep, &[], Unlisted::Keep)
+            .await
+            .unwrap_err(),
+        forge
+            .create_repo(&RepoSpec::new(deep.clone()))
+            .await
+            .unwrap_err(),
+        forge
+            .bootstrap_plan(&RepoSpec::new(deep.clone()), &vgi_config())
+            .unwrap_err(),
+    ] {
+        assert!(matches!(e, ForgeError::InvalidResource(_)), "{e:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_ruleset_with_any_exclusion_does_not_cover_the_default_branch() {
+    let (server, forge) = server_and_forge().await;
+    let mut excluded = good_ruleset(9);
+    excluded["conditions"]["ref_name"]["exclude"] = json!(["refs/heads/*"]);
+    mount_inspect(&server, excluded.clone()).await;
+    let state = forge.inspect(&repo("widgets")).await.unwrap();
+    assert!(!state.protection.covers_default_branch);
+    let drift = forge.diff(&state, &projection());
+    assert!(drift.iter().any(|d| matches!(d,
+        vgi_forge::Drift::ProtectionWeakened { gaps } if gaps.contains(&ProtectionGap::DefaultBranchNotCovered))));
+
+    // …and the ruleset step puts the managed one back.
+    let server = MockServer::start().await;
+    let forge = forge_for(&server);
+    mount_token(&server, INSTALLATION, Some("widgets"), admin_perms(), 1).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repo_json(
+            812,
+            "acme/widgets",
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/rulesets"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{ "id": 9, "name": "VGI commit trust" }])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/rulesets/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(excluded))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/widgets/rulesets/9"))
+        .and(body_partial_json(json!({
+            "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(good_ruleset(9)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let step = forge
+        .bootstrap_plan(&RepoSpec::new(repo("widgets")), &vgi_config())
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == "ruleset")
+        .unwrap();
+    assert_eq!(
+        forge.run_step(&repo("widgets"), &step).await.unwrap(),
+        StepOutcome::Updated
+    );
+}
+
+#[tokio::test]
+async fn the_actions_app_id_is_looked_up_when_not_configured() {
+    let server = MockServer::start().await;
+    let forge = forge_with(&server, |cfg| cfg);
+    mount_token(&server, INSTALLATION, Some("gadgets"), admin_perms(), 1).await;
+    Mock::given(method("GET"))
+        .and(path("/apps/github-actions"))
+        .and(InstallationToken)
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": 424242, "slug": "github-actions" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/gadgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repo_json(
+            9001,
+            "acme/gadgets",
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/gadgets/rulesets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/gadgets/rulesets"))
+        .and(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            body["rules"][3]["parameters"]["required_status_checks"][0]
+                == json!({ "context": "Verify commit trust", "integration_id": 424242 })
+        })
+        .respond_with(ResponseTemplate::new(201).set_body_json(good_ruleset(9)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let step = forge
+        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == "ruleset")
+        .unwrap();
+    assert_eq!(
+        forge.run_step(&repo("gadgets"), &step).await.unwrap(),
+        StepOutcome::Created
+    );
+}
+
+async fn write_file_against(content_reply: serde_json::Value) -> ForgeError {
+    let (server, forge) = server_and_forge().await;
+    mount_token(
+        &server,
+        INSTALLATION,
+        Some("gadgets"),
+        json!({ "contents": "write", "metadata": "read" }),
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/gadgets/contents/CODEOWNERS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(content_reply))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let step = forge
+        .bootstrap_plan(
+            &RepoSpec::new(repo("gadgets")),
+            &vgi_config().with_extra_file("CODEOWNERS", "* @acme/owners\n"),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == "file:CODEOWNERS")
+        .unwrap();
+    forge.run_step(&repo("gadgets"), &step).await.unwrap_err()
+}
+
+#[tokio::test]
+async fn a_directory_or_an_oversized_file_at_the_path_is_refused_not_overwritten() {
+    let e = write_file_against(json!([{ "type": "file", "name": "a", "sha": "x" }])).await;
+    assert!(
+        matches!(e, ForgeError::Rejected { status: 409, ref message } if message.contains("directory")),
+        "{e:?}"
+    );
+
+    let e = write_file_against(
+        json!({ "type": "file", "sha": "big", "encoding": "none", "content": "" }),
+    )
+    .await;
+    assert!(
+        matches!(e, ForgeError::Rejected { status: 409, ref message } if message.contains("too large")),
         "{e:?}"
     );
 }

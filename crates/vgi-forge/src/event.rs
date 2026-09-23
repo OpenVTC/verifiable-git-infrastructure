@@ -130,10 +130,23 @@ pub enum ForgeEventKind {
         /// How.
         change: MemberChange,
     },
-    /// Someone joined or left the organisation (or a team in it).
+    /// Someone joined or left the organisation.
     OrgMembershipChanged {
         /// The namespace.
         namespace: Resource,
+        /// Who.
+        account: ForgeAccount,
+        /// How.
+        change: MemberChange,
+    },
+    /// Someone joined or left a team in the organisation. Distinct from
+    /// [`ForgeEventKind::OrgMembershipChanged`]: leaving a team does not mean
+    /// leaving the organisation.
+    TeamMembershipChanged {
+        /// The namespace.
+        namespace: Resource,
+        /// The team's slug.
+        team: String,
         /// Who.
         account: ForgeAccount,
         /// How.

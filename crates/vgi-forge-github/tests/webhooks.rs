@@ -221,11 +221,35 @@ async fn member_ruleset_and_installation_events_translate() {
         }
     );
 
+    // `membership` is team membership, not the org.
     let ev = parse(
         "membership",
         json!({
             "action": "removed",
+            "scope": "team",
             "member": { "id": 4, "login": "dave" },
+            "team": { "id": 11, "slug": "maintainers" },
+            "organization": { "login": "acme" },
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        ev.kind,
+        ForgeEventKind::TeamMembershipChanged {
+            namespace: acme(),
+            team: "maintainers".into(),
+            account: ForgeAccount::new(4, "dave"),
+            change: MemberChange::Removed,
+        }
+    );
+
+    let ev = parse(
+        "organization",
+        json!({
+            "action": "member_added",
+            "membership": { "user": { "id": 5, "login": "erin" }, "role": "member" },
             "organization": { "login": "acme" },
         }),
     )
@@ -236,8 +260,8 @@ async fn member_ruleset_and_installation_events_translate() {
         ev.kind,
         ForgeEventKind::OrgMembershipChanged {
             namespace: acme(),
-            account: ForgeAccount::new(4, "dave"),
-            change: MemberChange::Removed,
+            account: ForgeAccount::new(5, "erin"),
+            change: MemberChange::Added,
         }
     );
 
