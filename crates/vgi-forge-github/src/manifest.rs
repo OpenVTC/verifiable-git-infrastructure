@@ -29,7 +29,8 @@ use crate::api::{Api, Auth};
 use crate::secret::Secret;
 
 /// The App's permissions: repository Administration (write), Contents
-/// (write, for the bootstrap commit), Variables (write), Metadata (read);
+/// (write, for the bootstrap commit and for pushing re-signed Dependabot
+/// commits, §9), Variables (write), Metadata (read);
 /// organisation Members (read) and Administration (write). No secrets,
 /// Actions logs, code scanning or packages.
 ///
@@ -87,12 +88,22 @@ pub const CHECK_PERMISSIONS: [(&str, &str); 3] = [
 /// [`CHECK_PERMISSIONS`]).
 pub const CHECK_EVENTS: [&str; 2] = ["merge_group", "pull_request"];
 
+/// The events the Dependabot re-sign needs (§9, "Dependabot re-sign bot"):
+/// `push`, the signed record of who moved each `dependabot/*` branch, from
+/// which the bridge decides whether a branch is Dependabot's alone. GitHub
+/// delivers it under Contents, which the App already holds (write, for the
+/// bootstrap commit and the re-signed push). An App registered before `push`
+/// was in the manifest sees no pushes, so no branch is ever clean and nothing
+/// is re-signed until the owner subscribes it — failing safe.
+pub const RESIGN_EVENTS: [&str; 1] = ["push"];
+
 /// Webhook events for drift (§5.6), plus `organization` for members joining
-/// and leaving the org, and `pull_request` / `merge_group` / `check_run` /
+/// and leaving the org, `pull_request` / `merge_group` / `check_run` /
 /// `check_suite` so the bridge can post (and re-post, on a rerequest) the
-/// check where it runs it itself. `installation` events are always delivered
-/// to an App and need no subscription. Sorted.
-pub const APP_EVENTS: [&str; 10] = [
+/// check where it runs it itself, and `push` for the Dependabot re-sign's
+/// provenance ledger ([`RESIGN_EVENTS`]). `installation` events are always
+/// delivered to an App and need no subscription. Sorted.
+pub const APP_EVENTS: [&str; 11] = [
     "branch_protection_rule",
     "check_run",
     "check_suite",
@@ -101,6 +112,7 @@ pub const APP_EVENTS: [&str; 10] = [
     "merge_group",
     "organization",
     "pull_request",
+    "push",
     "repository",
     "repository_ruleset",
 ];
