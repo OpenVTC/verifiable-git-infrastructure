@@ -42,6 +42,15 @@ pub(crate) async fn on_webhook(
 
     #[cfg(feature = "forge-github")]
     if let Some(g) = adapter.github() {
+        // A push: the Dependabot re-sign's provenance ledger.
+        match g.parse_push(headers, body) {
+            Ok(Some(push)) => return crate::resign::on_push(bridge, host, push),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(%host, error = %e, "refused a webhook");
+                return StatusCode::UNAUTHORIZED;
+            }
+        }
         match g.parse_check_trigger(headers, body) {
             Ok(triggers) if !triggers.is_empty() => {
                 let key = triggers[0]
@@ -53,6 +62,9 @@ pub(crate) async fn on_webhook(
                 {
                     return StatusCode::OK;
                 }
+                // A Dependabot pull request may be re-signed; that runs on
+                // its own, beside the check.
+                crate::resign::on_pull_request_triggers(bridge, &triggers);
                 // Recorded as handled only once every check it called for
                 // was posted (or deliberately skipped): a delivery whose
                 // check failed to post is processed again when GitHub

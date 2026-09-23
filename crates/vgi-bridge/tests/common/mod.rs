@@ -13,11 +13,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::rsa::{KeyPair, KeySize};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tower::ServiceExt;
 use trust_tasks_proof::affinidi::Verifier;
 use vgi_bridge::checks::{CommitLine, CommitVerifier, GitFetcher};
 use vgi_bridge::registry::{StoredApp, github_app_secret};
@@ -28,6 +32,8 @@ use vgi_bridge::transport::memory::ChannelLink;
 use vgi_bridge::wire::new_id;
 use vgi_bridge::{Bridge, BridgeConfig, BridgeIdentity, BridgeParts, Store};
 use vgi_forge::{Namespace, NamespaceBinding, NamespaceKind, Resource};
+use vgi_forge_github::Secret;
+use vgi_forge_github::webhook::sign_body;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -132,6 +138,8 @@ pub struct Options {
     pub seed_app: bool,
     /// Configure the `web-flow` keyring.
     pub keyring: bool,
+    /// Appended to the `[[github]]` table (e.g. per-namespace settings).
+    pub github_extra: String,
 }
 
 impl Default for Options {
@@ -151,6 +159,7 @@ impl Default for Options {
             web_base: None,
             seed_app: true,
             keyring: true,
+            github_extra: String::new(),
         }
     }
 }
@@ -183,6 +192,7 @@ app_owner = "acme"
 bridge_checks = {checks}
 api_base = "{uri}"
 web_base = "{web}"
+{extra}
 "#,
         vtc = vtc,
         keyring = keyring,
@@ -190,6 +200,7 @@ web_base = "{web}"
         uri = server.uri(),
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
         max_body = o.max_body,
+        extra = o.github_extra,
     ))
     .unwrap()
 }
@@ -486,4 +497,83 @@ pub async fn completed_checks(server: &MockServer) -> Vec<Value> {
         .filter(|r| r.method == http::Method::PATCH && r.url.path().contains("/check-runs/"))
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect()
+}
+
+/// Deliver a signed GitHub webhook to the bridge's router.
+pub async fn post_webhook(w: &World, event: &str, delivery: &str, body: &Value) -> StatusCode {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let sig = sign_body(&Secret::new(WEBHOOK_SECRET), &bytes);
+    let req = Request::post("/github/github.com/webhook")
+        .header("x-github-event", event)
+        .header("x-github-delivery", delivery)
+        .header("x-hub-signature-256", sig)
+        .body(Body::from(bytes))
+        .unwrap();
+    vgi_bridge::http::router(w.bridge.clone())
+        .oneshot(req)
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Serve the registry's `POST /trust-tasks`: `authorized` exactly for the
+/// `(entity, resource)` grants.
+pub async fn stub_registry(grants: Vec<(String, String)>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let grants = grants.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + len {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap();
+                let entity = req["payload"]["entity_id"].as_str().unwrap_or_default();
+                let resource = req["payload"]["resource"].as_str().unwrap_or_default();
+                let granted = grants.iter().any(|(e, r)| e == entity && r == resource);
+                let body = json!({
+                    "id": "urn:uuid:stub", "threadId": req["id"],
+                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                    "payload": {
+                        "entity_id": entity, "authority_id": req["payload"]["authority_id"],
+                        "action": req["payload"]["action"], "resource": resource,
+                        "authorized": granted, "time_evaluated": "2026-09-23T00:00:00Z",
+                    }
+                })
+                .to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
 }

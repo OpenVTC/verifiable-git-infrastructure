@@ -262,6 +262,22 @@ pub(crate) async fn bind_callback(
             }
             bridge.store.put(Table::Namespaces, &namespace, &record)?;
             adapter.restore(&record)?;
+            // The VTC grants the bridge's DID `git.commit.sign` on the
+            // namespace once it hears the bind completed; look a little
+            // later, and warn if the Dependabot re-sign would lack it.
+            #[cfg(feature = "forge-github")]
+            if adapter.github().is_some() {
+                // Weak: a pending warning must not keep a stopped bridge
+                // (and its store's lock) alive.
+                let me = Arc::downgrade(bridge);
+                let id = namespace.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    if let Some(me) = me.upgrade() {
+                        crate::resign::warn_if_ungranted(&me, &id).await;
+                    }
+                });
+            }
             let kind = match binding.namespace.kind {
                 NamespaceKind::User => "user",
                 _ => "organization",

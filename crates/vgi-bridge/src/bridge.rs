@@ -104,6 +104,8 @@ pub struct Bridge {
     ns_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(feature = "forge-github")]
     pub(crate) checks: crate::checks::CheckRunner,
+    #[cfg(feature = "forge-github")]
+    pub(crate) resign: crate::resign::ResignRunner,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -164,6 +166,8 @@ impl Bridge {
             ns_locks: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "forge-github")]
             checks,
+            #[cfg(feature = "forge-github")]
+            resign: crate::resign::ResignRunner::default(),
         })
     }
 
@@ -809,6 +813,19 @@ impl Bridge {
         let mut sweep_tick = tokio::time::interval(sweep);
         let mut maint_tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         let mut shutdown = shutdown;
+        // The Dependabot re-sign needs the VTC to grant this bridge's DID
+        // `git.commit.sign` on each namespace: say so at start if it has not.
+        #[cfg(feature = "forge-github")]
+        {
+            let me = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Ok(all) = me.store.list::<NamespaceRecord>(Table::Namespaces) {
+                    for (id, _) in all {
+                        crate::resign::warn_if_ungranted(&me, &id).await;
+                    }
+                }
+            });
+        }
         loop {
             tokio::select! {
                 _ = resend_tick.tick() => self.resend_unacknowledged(false).await,
@@ -847,6 +864,8 @@ impl Bridge {
                 }
             }
         }
+        #[cfg(feature = "forge-github")]
+        crate::resign::prune(self);
         #[cfg(feature = "forge-forgejo")]
         crate::flows::rotate_forgejo_tokens(self).await;
     }

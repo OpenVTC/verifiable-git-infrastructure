@@ -180,7 +180,58 @@ impl BridgeIdentity {
     }
 }
 
+/// The key the bridge signs git commits with (the Dependabot re-sign): its
+/// DID's Ed25519 signing key, and the verification method that names it.
+/// The key is wiped when this is dropped.
+pub struct GitSigningKey {
+    /// The verification method id (`<did>#<fragment>`), for the
+    /// `Signed-by-DID:` trailer.
+    pub verification_method: String,
+    /// The key.
+    pub key: ed25519_dalek::SigningKey,
+}
+
+impl fmt::Debug for GitSigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitSigningKey")
+            .field("verification_method", &self.verification_method)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BridgeIdentity {
+    /// The key the bridge signs git commits with: the same Ed25519 key that
+    /// signs its Trust Task documents, which its DID document publishes as a
+    /// verification method (a `did:key` always does; a VTA-provisioned
+    /// `did:webvh` does for the key in its bundle). verify-trust resolves the
+    /// DID and accepts a commit signature only from a key the document
+    /// publishes. The sshsig `git` namespace keeps a commit signature from
+    /// ever being mistaken for a document proof, and the other way round.
+    pub fn git_signing_key(&self) -> Result<GitSigningKey> {
+        let private = self.signing.get_private_bytes();
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+            private
+                .get(..32)
+                .and_then(|s| <[u8; 32]>::try_from(s).ok())
+                .context("the signing key is not an Ed25519 seed")?,
+        );
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        if key.verifying_key().as_bytes().as_slice() != self.signing.get_public_bytes() {
+            bail!("the signing key's public half does not match the identity");
+        }
+        if !self.signing.id.starts_with(&format!("{}#", self.did)) {
+            bail!(
+                "the signing key `{}` is not a verification method of `{}`",
+                self.signing.id,
+                self.did
+            );
+        }
+        Ok(GitSigningKey {
+            verification_method: self.signing.id.clone(),
+            key,
+        })
+    }
+
     /// Sign with a chosen `proofPurpose` — for tests of the purpose check
     /// only; every document the bridge sends is an `assertionMethod` proof.
     #[doc(hidden)]
@@ -220,6 +271,19 @@ mod tests {
         assert_eq!(back.did(), id.did());
         assert_eq!(back.messaging_secrets().len(), 2);
         assert!(!format!("{back:?}").contains(&hex::encode(*seed)));
+    }
+
+    #[test]
+    fn the_git_signing_key_is_the_did_key() {
+        let id = BridgeIdentity::from_seed(&[5u8; 32]).unwrap();
+        let k = id.git_signing_key().unwrap();
+        assert_eq!(k.key.to_bytes(), [5u8; 32]);
+        let mb = id.did().strip_prefix("did:key:").unwrap();
+        assert_eq!(k.verification_method, format!("{}#{mb}", id.did()));
+        assert!(
+            format!("{k:?}").ends_with(", .. }"),
+            "no key material in Debug"
+        );
     }
 
     #[tokio::test]
