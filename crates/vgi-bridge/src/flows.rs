@@ -39,7 +39,7 @@ fn device_secret(state: &str) -> String {
     format!("pending/{state}/device")
 }
 
-fn rfc3339(unix: i64) -> String {
+pub(crate) fn rfc3339(unix: i64) -> String {
     Utc.timestamp_opt(unix, 0)
         .single()
         .unwrap_or_else(Utc::now)

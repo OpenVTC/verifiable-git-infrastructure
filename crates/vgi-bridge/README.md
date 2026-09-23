@@ -29,6 +29,14 @@ the bridge carries it out and reports back.
   redirect or the device flow, reporting `bindCompleted` / `accountLinked`
   then the result. Results and events are retried until the VTC
   acknowledges them.
+- **Status for the VTC's console.** Every result and event carries, in its
+  payload's `ext` member under `org.openvtc.git-ns`, what the bridge knows
+  that the specification's payloads do not: `namespace` (the installation,
+  the App and its registration, missing permissions, a pending permission
+  upgrade, org rulesets, the check mode in force) and `repo` (the guard in
+  force — `requiredWorkflow`, `codeOwnerReview`, `bridgePostedCheck`,
+  `protectedFiles` or `none` — and the last check the bridge posted). It is
+  signed with the rest of the payload; anything unknown is left out.
 - **State that must survive a restart** — bindings, capabilities (and
   `CapabilityChanged`), GitHub's managed sets and required-workflow pins,
   pending flows, Forgejo's rotated bot token — is restored into the adapters

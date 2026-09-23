@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -65,7 +65,7 @@ use zeroize::Zeroizing;
 use crate::bridge::Bridge;
 use crate::config::{BridgeConfig, CheckConfig};
 use crate::jobs::Ctx;
-use crate::store::{NamespaceRecord, NamespaceState, Table};
+use crate::store::{LastCheck, NamespaceRecord, NamespaceState, RepoRecord, Table, repo_key};
 
 /// One commit's verdict, for the summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,7 +710,22 @@ pub struct CheckRunner {
     max_commits: usize,
     permits: Semaphore,
     in_flight: Mutex<BTreeSet<(String, String, String)>>,
+    /// Per repository (store key): when its last check was last reported to
+    /// the VTC, and whether a report is waiting to go.
+    reports: Mutex<BTreeMap<String, ReportSlot>>,
 }
+
+/// The post-check report of one repository, throttled.
+#[derive(Debug, Default)]
+struct ReportSlot {
+    last: Option<Instant>,
+    pending: bool,
+}
+
+/// At most one post-check report per repository in this long: each is an
+/// inspection of the repository, and a busy repository posts many checks.
+/// A report that waits carries the latest check when it goes.
+const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 impl CheckRunner {
     /// A runner.
@@ -721,6 +736,7 @@ impl CheckRunner {
             max_commits: cfg.max_commits,
             permits: Semaphore::new(cfg.concurrency.max(1)),
             in_flight: Mutex::new(BTreeSet::new()),
+            reports: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -750,7 +766,12 @@ pub(crate) fn spawn(
         let mut all_ok = true;
         for t in &triggers {
             match run(&bridge, t).await {
-                Ok(o) => tracing::info!(repo = %t.repo, head = %t.head_sha, outcome = ?o, "check"),
+                Ok(o) => {
+                    tracing::info!(repo = %t.repo, head = %t.head_sha, outcome = ?o, "check");
+                    if matches!(o, CheckOutcome::Posted(_)) {
+                        report_check(&bridge, t);
+                    }
+                }
                 Err(e) => {
                     all_ok = false;
                     tracing::warn!(repo = %t.repo, head = %t.head_sha, error = %e, "check not posted");
@@ -879,7 +900,80 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
     }
     g.finish_check_run(&trigger.repo, id, conclusion, &title, &summary)
         .await?;
+    // For the VTC's status report: the last check on a managed repository.
+    let conclusion_word = match conclusion {
+        CheckConclusion::Success => "success",
+        _ => "failure",
+    };
+    let _ = bridge.store.update::<RepoRecord, _>(
+        Table::Repos,
+        &repo_key(trigger.repo.host(), trigger.repo_id),
+        |r| {
+            Ok((
+                r.map(|mut r| {
+                    r.last_check = Some(LastCheck::new(
+                        trigger.head_sha.clone(),
+                        conclusion_word,
+                        crate::bridge::now(),
+                    ));
+                    r
+                }),
+                (),
+            ))
+        },
+    );
     Ok(CheckOutcome::Posted(conclusion))
+}
+
+/// Tell the VTC about the check just posted on a managed repository: an
+/// inspection, whose `protectionChanged` carries the complete drift the
+/// event requires and, in `ext`, the last check. Throttled per repository
+/// ([`REPORT_INTERVAL`]); a report already waiting picks up this check.
+fn report_check(bridge: &Arc<Bridge>, t: &CheckTrigger) {
+    let key = repo_key(t.repo.host(), t.repo_id);
+    if !matches!(
+        bridge.store.get::<RepoRecord>(Table::Repos, &key),
+        Ok(Some(_))
+    ) {
+        return;
+    }
+    let delay = {
+        let mut slots = bridge.checks.reports.lock().expect("lock");
+        let slot = slots.entry(key.clone()).or_default();
+        if slot.pending {
+            return;
+        }
+        slot.pending = true;
+        slot.last
+            .map(|l| (l + REPORT_INTERVAL).saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    };
+    // Weak: a waiting report must not keep a stopped bridge (and its
+    // store's lock) alive.
+    let weak = Arc::downgrade(bridge);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let Some(bridge) = weak.upgrade() else {
+            return;
+        };
+        {
+            let mut slots = bridge.checks.reports.lock().expect("lock");
+            let slot = slots.entry(key.clone()).or_default();
+            slot.pending = false;
+            slot.last = Some(Instant::now());
+        }
+        let Ok(Some(rec)) = bridge.store.get::<RepoRecord>(Table::Repos, &key) else {
+            return;
+        };
+        let Ok(ctx) = Ctx::load(&bridge, &rec.namespace) else {
+            return;
+        };
+        let lock = bridge.ns_lock(&rec.namespace);
+        let _g = lock.lock().await;
+        if let Err(e) = crate::jobs::inspect_repo(&bridge, &ctx, &rec.resource, true, None).await {
+            tracing::warn!(repo = %rec.resource, error = %e, "could not report a posted check");
+        }
+    });
 }
 
 async fn verify(

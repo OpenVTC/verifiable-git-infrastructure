@@ -185,6 +185,41 @@ async fn trusted_commits_into_the_default_branch_get_a_success() {
     assert_eq!(seen[0].2, "github.com/acme");
 }
 
+/// A check posted on a managed repository is reported to the VTC: an
+/// inspection's `protectionChanged`, whose `ext` carries the last check and
+/// the guard in force.
+#[tokio::test]
+async fn a_posted_check_on_a_managed_repository_is_reported_in_ext() {
+    let repo = pr_repo();
+    let mut w = check_world(&repo, repo.pr.clone()).await;
+    seed_repo(w.bridge.store(), &common::repo("widgets"), 812);
+    mount_inspect(&w.server).await;
+    mount_pr(&w, repo.head(), "main", &repo.base, 10).await;
+    post_webhook(
+        &w,
+        "pull_request",
+        "d-1",
+        &pr_event("synchronize", repo.head(), "main", &repo.base),
+    )
+    .await;
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(ev["payload"]["event"]["type"], "protectionChanged");
+    let report = &ev["payload"]["ext"]["org.openvtc.git-ns"]["repo"];
+    assert_eq!(report["guard"], "bridgePostedCheck", "{ev}");
+    assert_eq!(report["lastCheck"]["sha"], repo.head());
+    assert_eq!(report["lastCheck"]["conclusion"], "success");
+    let at = report["lastCheck"]["at"].as_str().unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "{at}");
+    assert_eq!(
+        report.as_object().unwrap().len(),
+        2,
+        "guard and lastCheck only: {report}"
+    );
+
+    // One report for one check.
+    w.quiet().await;
+}
+
 #[tokio::test]
 async fn an_untrusted_commit_fails_the_check() {
     let repo = pr_repo();

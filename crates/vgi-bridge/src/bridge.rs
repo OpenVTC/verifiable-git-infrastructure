@@ -246,14 +246,19 @@ impl Bridge {
             let Some(g) = adapter.github() else {
                 return;
             };
-            match g.detect_bridge_checks(&ns.resource).await {
-                Ok(ready) => {
+            match g.detect_installation(&ns.resource).await {
+                Ok((ready, missing)) => {
+                    // What the installation lacks, read again: an owner who
+                    // approved an upgrade no longer shows it as missing.
                     let _ =
                         self.store
                             .update::<NamespaceRecord, _>(Table::Namespaces, ns_id, |n| {
                                 Ok((
                                     n.map(|mut n| {
                                         n.bridge_checks = Some(ready);
+                                        if let Some(b) = n.binding.as_mut() {
+                                            b.missing_permissions = missing.clone();
+                                        }
                                         n
                                     }),
                                     (),
@@ -660,7 +665,22 @@ impl Bridge {
                 r.to_result(job_id).expect("minimal result is valid")
             }
         };
-        let payload = serde_json::to_value(&result).expect("serialisable");
+        let mut payload = serde_json::to_value(&result).expect("serialisable");
+        // The bridge's status report (`ext`), for the namespace and the
+        // repository the job reached.
+        let namespace = self
+            .store
+            .get::<JobRecord>(Table::Jobs, job_id)
+            .ok()
+            .flatten()
+            .map(|j| j.namespace);
+        if let Some(ns) = namespace {
+            let repo = report.repo.as_ref().map(|(r, id)| (r.host(), *id));
+            payload = crate::status::attach::<result::Payload>(
+                payload,
+                crate::status::ext(self, &ns, repo),
+            );
+        }
         match self.store.finish_job(job_id, &payload, now()) {
             Ok(true) => self.send_outbox(&format!("result:{job_id}")).await,
             Ok(false) => {}
@@ -680,11 +700,25 @@ impl Bridge {
         event_json: Value,
         drift: Option<Vec<Value>>,
     ) -> Result<()> {
+        // The repository an event is about, by forge id, for the status
+        // report (`ext`).
+        let repo = event_json
+            .get("forgeId")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok());
         let payload = mapping::event_payload(namespace, event_json, drift)?;
+        let host = self
+            .store
+            .get::<NamespaceRecord>(Table::Namespaces, namespace)
+            .ok()
+            .flatten()
+            .map(|n| n.resource.host().to_string());
+        let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
+        let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
         let key = format!("event:{}", wire::new_id());
         let entry = OutboxEntry {
             kind: OutboxKind::Event,
-            payload: serde_json::to_value(&payload)?,
+            payload,
             doc_ids: Vec::new(),
             last_sent: 0,
             attempts: 0,

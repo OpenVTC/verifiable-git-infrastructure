@@ -34,7 +34,7 @@ use vgi_bridge::{Bridge, BridgeConfig, BridgeIdentity, BridgeParts, Store};
 use vgi_forge::{Namespace, NamespaceBinding, NamespaceKind, Resource};
 use vgi_forge_github::Secret;
 use vgi_forge_github::webhook::sign_body;
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const APP_ID: u64 = 1001;
@@ -267,6 +267,57 @@ pub fn seed_repo(store: &Store, r: &Resource, id: u64) {
             ))
         })
         .unwrap();
+}
+
+/// The GitHub reads `inspect` makes for `acme/widgets` (forge id 812) in a
+/// bridge-posted-check namespace, with a healthy ruleset pinned to the App.
+pub async fn mount_inspect(server: &MockServer) {
+    mount_any_token(server).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 812, "full_name": "acme/widgets", "private": false,
+            "visibility": "public", "archived": false, "default_branch": "main",
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    for p in ["collaborators", "invitations"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/widgets/{p}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/rulesets"))
+        .and(query_param("includes_parents", "false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{ "id": 9, "name": "VGI commit trust" }])),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/rulesets/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "name": "VGI commit trust", "target": "branch", "enforcement": "active",
+            "bypass_actors": [], "current_user_can_bypass": "never",
+            "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+            "rules": [
+                { "type": "deletion" }, { "type": "non_fast_forward" },
+                { "type": "pull_request", "parameters": {
+                    "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": false,
+                    "require_code_owner_review": false, "require_last_push_approval": false,
+                    "required_review_thread_resolution": false } },
+                { "type": "required_status_checks", "parameters": {
+                    "strict_required_status_checks_policy": false,
+                    "required_status_checks": [
+                        { "context": "Verify commit trust", "integration_id": APP_ID } ] } }
+            ],
+        })))
+        .mount(server)
+        .await;
 }
 
 /// Any installation token request succeeds.

@@ -393,3 +393,10 @@ committer_email = "vgi-bridge@noreply.invalid"
   events queued meanwhile go out when it is back.
 - A job that fails half-way reports `partial` with each step's outcome; every
   step is check-then-apply, so the VTC may simply send it again.
+- **What the VTC's console shows about the forge** comes from the bridge: each
+  result and event carries a status report in its `ext` member
+  (`org.openvtc.git-ns`) — the App installation and what it lacks, whether a
+  permission upgrade waits for the owner's approval, org rulesets, the check
+  mode, and per repository the guard in force and the last check the bridge
+  posted. After a posted check the bridge inspects the repository and sends
+  a `protectionChanged` carrying it, at most once a minute per repository.
