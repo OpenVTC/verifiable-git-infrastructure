@@ -29,6 +29,13 @@
 //!   In both, repository writers are trusted not to forge a "Verify commit
 //!   trust" check run from a workflow on another branch; only the required
 //!   workflow closes that.
+//! - [`CheckGuard::BridgePosted`] (the same namespaces, when the adapter is
+//!   configured with [`crate::GitHubConfig::bridge_checks`]): no workflow at
+//!   all. The bridge runs verify-trust itself on every pull request and
+//!   merge group and posts the check as the community's App; the ruleset
+//!   requires the check **from that App's integration id**, which no
+//!   workflow can post as. This is what closes the forged-check gap outside
+//!   a required workflow (§9, decided 2026-09-23).
 
 use vgi_forge::{
     BootstrapComponent, BootstrapStep, ForgeAccount, ForgeError, ProtectionSpec, RepoSpec, Result,
@@ -81,6 +88,10 @@ pub enum CheckGuard {
     /// control the repository anyway (the user's decision). Re-plan when a
     /// second owner arrives.
     SoloOwner,
+    /// The bridge posts the check under its own App, and the ruleset pins
+    /// the required check to that App. No workflow is committed; one left
+    /// from an earlier guard is removed.
+    BridgePosted,
 }
 
 impl CheckGuard {
@@ -121,18 +132,28 @@ pub fn github_plan(
     check_pinned("verify-trust action", &cfg.verify_trust_action)?;
     check_version(&cfg.verify_trust_version)?;
     check_check_name(&cfg.required_check)?;
-    let keyring = cfg.platform_keyring.as_deref().ok_or_else(|| {
-        ForgeError::Config(
-            "no platform keyring: GitHub web-UI merges are signed by `web-flow`, and without its \
-             key in the exempt keyring every merge commit fails the check. Supply it in the \
-             config (for github.com, the contents of https://github.com/web-flow.gpg)"
-                .into(),
-        )
-    })?;
-    check_keyring(keyring)?;
+    // The bridge-posted check reads no keyring from the repository (the
+    // bridge holds its own, optionally), so only the workflow guards need
+    // one to commit or embed.
+    let keyring: &[u8] = match (cfg.platform_keyring.as_deref(), guard) {
+        (Some(k), _) => {
+            check_keyring(k)?;
+            k
+        }
+        (None, CheckGuard::BridgePosted) => &[],
+        (None, _) => {
+            return Err(ForgeError::Config(
+                "no platform keyring: GitHub web-UI merges are signed by `web-flow`, and without                  its key in the exempt keyring every merge commit fails the check. Supply it in                  the config (for github.com, the contents of https://github.com/web-flow.gpg)"
+                    .into(),
+            ));
+        }
+    };
 
     let mut steps = Vec::new();
-    if !matches!(guard, CheckGuard::RequiredWorkflow) {
+    if matches!(
+        guard,
+        CheckGuard::OwnerReview { .. } | CheckGuard::SoloOwner
+    ) {
         steps.push(BootstrapStep::new(
             "workflow",
             BootstrapComponent::Workflow,
@@ -269,6 +290,31 @@ pub fn github_plan(
                 )),
             ));
             steps.extend(cleanup_variables());
+        }
+        CheckGuard::BridgePosted => {
+            // The adapter pins this rule's check to its own App when it runs
+            // the step: the plan is the same ruleset, what differs is who
+            // may satisfy it.
+            steps.push(BootstrapStep::new(
+                "ruleset",
+                BootstrapComponent::RequiredCheck,
+                StepAction::ProtectDefaultBranch(ProtectionSpec::standard(
+                    cfg.required_check.clone(),
+                )),
+            ));
+            steps.extend(cleanup_variables());
+            // A workflow from an earlier guard would still run and post an
+            // Actions check that no longer counts; remove it so nothing
+            // suggests it matters. After the ruleset, like the
+            // required-workflow clean-up: the protection comes first.
+            steps.push(BootstrapStep::new(
+                "cleanup:workflow",
+                BootstrapComponent::Extra,
+                StepAction::RemoveFile {
+                    path: WORKFLOW_PATH.into(),
+                    message: "ci: the VGI check is now posted by the community's bridge".into(),
+                },
+            ));
         }
     }
     Ok(steps)

@@ -21,6 +21,7 @@ activation flow.
 | [`vgi-forge`](crates/vgi-forge) | Forge-neutral adapter layer for VTC-governed git namespaces: the `Forge` trait and `ForgeHooks`, capabilities, forge-qualified resources, rights → role projection, bootstrap plans, events and drift. No forge I/O. |
 | [`vgi-forge-github`](crates/vgi-forge-github) | The GitHub adapter: one community's own GitHub App (manifest registration, scoped per-job installation tokens), namespace binding, device-flow account linking, repo creation and the commit-trust bootstrap, role projection, verified webhooks. |
 | [`vgi-forge-forgejo`](crates/vgi-forge-forgejo) | The Forgejo (and Gitea) adapter: a scoped bot user with token rotation, version-probed capabilities, OAuth2 + PKCE binding and account linking, repo creation and the commit-trust bootstrap (fast-forward-only merges, protected workflow paths), merge allow-list role projection, verified webhooks. |
+| [`vgi-bridge`](crates/vgi-bridge) | The per-community bridge service (not published; a container): its own DID, `git-ns/bridge/*` jobs from its one VTC over DIDComm, the adapters, a sealed redb store, and — where GitHub has no required workflow — the "Verify commit trust" check posted by the bridge itself. Operator guide: [`docs/BRIDGE.md`](docs/BRIDGE.md). |
 
 ## The CI check
 

@@ -1,0 +1,75 @@
+# VGI bridge configuration — one community, one bridge (design §5.7).
+#
+# Nothing secret belongs in this file: keys, tokens and passwords live in the
+# sealed store (`vgi-bridge secret set …`, the GitHub manifest flow). Unknown
+# keys are refused at start-up.
+
+# The one VTC this bridge serves. Jobs signed by any other DID are refused.
+vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
+# The community's Trust Registry (for the bootstrap and the bridge's check).
+trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"
+# The DIDComm mediator the bridge's DID is reachable through (the VTC's).
+mediator_did = "did:web:mediator.acme-vtc.example"
+
+# Where the forges reach the bridge, through the TLS proxy in front of it.
+public_url = "https://bridge.acme-vtc.example/"
+# Plain HTTP behind the proxy.
+listen = "0.0.0.0:8080"
+data_dir = "/var/lib/vgi-bridge"
+
+# The master key that seals every secret: a mounted, owner-only file
+# (a Kubernetes/Docker secret). Back it up apart from the data directory.
+master_key_file = "/run/secrets/vgi-bridge-master-key"
+# …or an environment variable instead:
+# master_key_env = "VGI_BRIDGE_MASTER_KEY"
+
+# Oldest job accepted, in seconds (plus a minute of clock skew).
+# max_job_age_secs = 300
+# Largest request body read, in bytes.
+# max_body_bytes = 2097152
+# Drift sweep for forges without webhooks, and the result/event retry.
+# drift_sweep_secs = 3600
+# resend_secs = 60
+# How long a bind or account link waits for the person.
+# flow_ttl_secs = 900
+
+[verify_trust]
+# What the bootstrap writes into repositories (and the required workflow).
+action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>"
+version = "v0.5.0"
+# Required by the Forgejo plan: SHA-256 of the release tarball.
+# sha256 = "<64 hex>"
+# required_check = "Verify commit trust"
+
+[checks]
+# The check the bridge posts itself (GitHub, outside a required workflow).
+# max_commits = 250
+# max_signers = 16
+# git = "git"
+# fetch_timeout_secs = 120
+# max_fetch_bytes = 67108864
+# concurrency = 4
+
+[[github]]
+host = "github.com"
+# The App the manifest flow registers.
+app_name = "acme-vgi-bridge"
+# Required: the org the App is registered under (and owned by). For a
+# personal account, name it and set app_owner_is_user = true.
+app_owner = "acme"
+# app_owner_is_user = false
+# Optional: GitHub's web-flow key, the exempt keyring for commits GitHub
+# signs (web-UI merges, merge queues). The bridge-posted check works without
+# it (such commits then fail); the in-repo and required-workflow plans need it.
+# curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc
+platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
+# Post the check from the bridge where no org required workflow is
+# available (personal accounts, orgs without org rulesets). Leave on.
+# bridge_checks = true
+
+# [[forgejo]]
+# base_url = "https://codeberg.org/"
+# bot_login = "acme-vgi-bot"
+# oauth_client_id = "<the bridge's OAuth2 application on the instance>"
+# rotate_token_days = 30
+# instance_signing_key_fallback = false

@@ -31,11 +31,17 @@
 //! - **Webhooks.** `X-Hub-Signature-256` verified in constant time before
 //!   parsing; repository, member, membership, ruleset and installation
 //!   events become [`vgi_forge::ForgeEvent`]s.
+//! - **Bridge-posted checks.** With [`GitHubConfig::bridge_checks`], a
+//!   namespace without an org required workflow gets no workflow at all:
+//!   the bridge runs verify-trust on each pull request and posts the check
+//!   as the App ([`checks`]), and the ruleset requires it from the App's own
+//!   integration id, which no workflow can post as (§9).
 //!
 //! The HTTP layer is a thin reqwest client ([`api`]) rather than octocrab:
 //! see the crate README for why.
 
 mod api;
+pub mod checks;
 mod config;
 mod forge;
 pub mod jwt;
@@ -45,6 +51,7 @@ mod secret;
 pub mod webhook;
 
 pub use api::API_VERSION;
+pub use checks::{CheckConclusion, CheckTrigger, CheckTriggerKind, Comparison, PullRequestInfo};
 pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig, JwtIssuer};
 pub use forge::{GitHubForge, RequiredWorkflowPin};
 pub use jwt::{AppKeySigner, InProcessKey};

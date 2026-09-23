@@ -119,6 +119,10 @@ pub struct GitHubForge {
     /// are available. Absent means not known, which plans the owner-review
     /// fallback — safe everywhere.
     required_workflow: RwLock<BTreeMap<Resource, bool>>,
+    /// Per namespace: whether its installation grants what the
+    /// bridge-posted check needs (permissions and event subscriptions).
+    /// Absent means not known, which keeps the in-repo workflow.
+    check_ready: RwLock<BTreeMap<Resource, bool>>,
     pins: RwLock<BTreeMap<Resource, RequiredWorkflowPin>>,
     /// Per organisation: the forge ids of the repositories the bridge
     /// manages — what the org ruleset lists. From the bridge's store.
@@ -178,6 +182,7 @@ impl GitHubForge {
             actions_app_id,
             client_secret: None,
             required_workflow: RwLock::new(BTreeMap::new()),
+            check_ready: RwLock::new(BTreeMap::new()),
             pins: RwLock::new(BTreeMap::new()),
             managed: RwLock::new(BTreeMap::new()),
             org_locks: Mutex::new(BTreeMap::new()),
@@ -198,6 +203,24 @@ impl GitHubForge {
     /// The configuration.
     pub fn config(&self) -> &GitHubConfig {
         &self.config
+    }
+
+    pub(crate) fn api(&self) -> &Api {
+        &self.api
+    }
+
+    pub(crate) fn webhook_secret(&self) -> &Secret {
+        &self.webhook_secret
+    }
+
+    /// An installation token for `repo` alone, with `perms`, plus its owner
+    /// and name — for the crate's other modules.
+    pub(crate) async fn repo_token_for(
+        &self,
+        repo: &Resource,
+        perms: &[(&str, &str)],
+    ) -> Result<(Secret, String, String)> {
+        self.repo_token(repo, perms).await
     }
 
     /// Tell the adapter about a bound namespace (from the VTC's store, after
@@ -231,6 +254,7 @@ impl GitHubForge {
             .remove(ns);
         self.pins.write().expect("lock poisoned").remove(ns);
         self.managed.write().expect("lock poisoned").remove(ns);
+        self.check_ready.write().expect("lock poisoned").remove(ns);
     }
 
     /// Tell the adapter which repositories (by forge id) it manages in
@@ -260,6 +284,57 @@ impl GitHubForge {
             .entry(ns.clone())
             .or_default()
             .clone()
+    }
+
+    /// Record whether `ns`'s installation carries the bridge-posted check
+    /// (from [`GitHubForge::detect_bridge_checks`], or the bridge's store
+    /// after a restart). Until it is known, a namespace without a required
+    /// workflow keeps the in-repo Actions workflow.
+    pub fn set_bridge_checks_ready(&self, ns: &Resource, ready: bool) {
+        self.check_ready
+            .write()
+            .expect("lock poisoned")
+            .insert(ns.clone(), ready);
+    }
+
+    /// Whether `ns`'s installation is known to carry the bridge-posted
+    /// check (`None`: not known yet).
+    pub fn bridge_checks_ready(&self, ns: &Resource) -> Option<bool> {
+        self.check_ready
+            .read()
+            .expect("lock poisoned")
+            .get(ns)
+            .copied()
+    }
+
+    /// Read `ns`'s installation and record whether it grants what the
+    /// bridge-posted check needs: `checks: write`, `pull_requests: read`,
+    /// `merge_queues: read` and the `pull_request` and `merge_group`
+    /// subscriptions ([`crate::manifest::check_ready`]). An App registered
+    /// before these were in the manifest lacks them until its owner updates
+    /// the App's settings and each installation approves the change; the
+    /// bridge probes again when an installation accepts new permissions.
+    pub async fn detect_bridge_checks(&self, ns: &Resource) -> Result<bool> {
+        let namespace = self.namespace(ns)?;
+        let Some(installation) = namespace.installation_id else {
+            self.set_bridge_checks_ready(ns, false);
+            return Ok(false);
+        };
+        let jwt = self.jwt().await?;
+        let inst: InstallationJson = self
+            .api
+            .json(
+                Method::GET,
+                self.api
+                    .url(&["app", "installations", &installation.to_string()]),
+                Auth::Bearer(&jwt),
+                None,
+                "installation",
+            )
+            .await?;
+        let ready = crate::manifest::check_ready(&inst.permissions, &inst.events);
+        self.set_bridge_checks_ready(ns, ready);
+        Ok(ready)
     }
 
     /// Record whether org rulesets — and so a required workflow — are
@@ -801,23 +876,38 @@ impl GitHubForge {
     }
 
     async fn protect(&self, repo: &Resource, spec: &ProtectionSpec) -> Result<StepOutcome> {
+        let (ns, _, _) = self.locate(repo)?;
         let (token, owner, name) = self.repo_token(repo, PERMS_ADMIN).await?;
-        self.protect_with(&token, &owner, &name, spec).await
+        let bridge_posted = self.capabilities(&ns).bridge_posted_check;
+        self.protect_with(&token, &owner, &name, spec, bridge_posted)
+            .await
+    }
+
+    /// The App a required check is pinned to: this App where the bridge
+    /// posts the check itself, the GitHub Actions App otherwise.
+    async fn check_integration_id(&self, token: &Secret, bridge_posted: bool) -> Result<u64> {
+        if bridge_posted {
+            Ok(self.config.app_id)
+        } else {
+            self.actions_app_id(token).await
+        }
     }
 
     /// Converge the managed ruleset on `owner/name` to `spec`, with a token
-    /// holding administration on it.
+    /// holding administration on it. `bridge_posted` pins the required check
+    /// to this App instead of GitHub Actions.
     async fn protect_with(
         &self,
         token: &Secret,
         owner: &str,
         name: &str,
         spec: &ProtectionSpec,
+        bridge_posted: bool,
     ) -> Result<StepOutcome> {
         // Looked up only when this rule carries the check: under a required
         // workflow the org ruleset does.
         let actions_id = if spec.require_status_check {
-            Some(self.actions_app_id(token).await?)
+            Some(self.check_integration_id(token, bridge_posted).await?)
         } else {
             None
         };
@@ -1064,10 +1154,17 @@ impl Forge for GitHubForge {
         c.required_workflow = automated
             && ns.kind == NamespaceKind::Organization
             && self.required_workflow_known(&ns.resource);
-        // Without a namespace workflow, a single-owner repository gets no
-        // review requirement (the user's decision: there is nobody else to
-        // review, and its owner controls the repository anyway).
-        c.single_owner_repos_unreviewed = !c.required_workflow;
+        // Without a namespace workflow the bridge posts the check itself
+        // when configured to (§9, forged check runs): then nothing in the
+        // repository is on the check's path at all.
+        c.bridge_posted_check = automated
+            && !c.required_workflow
+            && self.config.bridge_checks
+            && self.bridge_checks_ready(&ns.resource) == Some(true);
+        // Otherwise a single-owner repository gets no review requirement on
+        // its workflow (the user's decision: there is nobody else to review,
+        // and its owner controls the repository anyway).
+        c.single_owner_repos_unreviewed = !c.required_workflow && !c.bridge_posted_check;
         match ns.kind {
             NamespaceKind::User => {
                 // §8: only the account holder can create repositories, and
@@ -1199,7 +1296,21 @@ impl Forge for GitHubForge {
                 false
             }
         };
-        let binding = NamespaceBinding::new(namespace, missing_permissions(&inst.permissions));
+        // Whether the installation carries the bridge-posted check: its
+        // permissions *and* its event subscriptions (an App registered before
+        // they were in the manifest lacks both until its owner approves).
+        self.set_bridge_checks_ready(
+            &namespace.resource,
+            crate::manifest::check_ready(&inst.permissions, &inst.events),
+        );
+        let mut missing = missing_permissions(&inst.permissions);
+        missing.extend(
+            crate::manifest::CHECK_EVENTS
+                .iter()
+                .filter(|e| !inst.events.iter().any(|x| x == *e))
+                .map(|e| format!("event:{e}")),
+        );
+        let binding = NamespaceBinding::new(namespace, missing);
         // Handed back as data for the bridge to persist; the adapter's copy
         // is in memory only.
         Ok(if probed {
@@ -1323,16 +1434,26 @@ impl Forge for GitHubForge {
                 ));
             }
         }
+        let caps = self.capabilities(&ns);
         let rs = self.managed_ruleset(&token, &owner, &name).await?;
         if let Some(rs) = &rs {
-            let actions_id = self.actions_app_id(&token).await?;
-            state.protection = self.protection(rs, r.default_branch.as_deref(), Some(actions_id));
+            // Only a check pinned to the App that should post it counts.
+            let check_app = self
+                .check_integration_id(&token, caps.bridge_posted_check)
+                .await?;
+            state.protection = self.protection(rs, r.default_branch.as_deref(), Some(check_app));
         }
-        self.inspect_actions_policy(&token, &owner, &name, &mut state.protection)
-            .await?;
+        if !caps.bridge_posted_check {
+            // Actions runs the check only where the bridge does not.
+            self.inspect_actions_policy(&token, &owner, &name, &mut state.protection)
+                .await?;
+        }
         drop(token);
-        let caps = self.capabilities(&ns);
-        if caps.required_workflow {
+        if caps.bridge_posted_check {
+            // Nothing in the repository is on the check's path: the bridge
+            // runs verify-trust from its own build and posts as its App.
+            state.protection.check_source_guard = vgi_forge::CheckSourceGuard::BridgePosted;
+        } else if caps.required_workflow {
             self.inspect_required_workflow(&ns, r.id, &mut state.protection)
                 .await?;
         } else if caps.automation {
@@ -1952,6 +2073,8 @@ struct InstallationJson {
     account: AccountJson,
     #[serde(default)]
     permissions: BTreeMap<String, String>,
+    #[serde(default)]
+    events: Vec<String>,
     #[serde(default)]
     suspended_at: Option<String>,
 }

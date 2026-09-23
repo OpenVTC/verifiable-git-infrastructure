@@ -1,0 +1,82 @@
+[package]
+name = "vgi-bridge"
+description = "The per-community VGI bridge: holds the community's forge credentials, takes git-ns/bridge jobs from its VTC over DIDComm, runs the forge adapters, reports results, events and drift, and posts the commit-trust check where no forge feature can be trusted to."
+readme = "README.md"
+keywords = ["git", "forge", "did", "didcomm", "trust-registry"]
+categories = ["development-tools", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# A deployable service, not a library anyone should build on: it ships as a
+# container next to the community's VTC (design §5.7), the same call
+# vtc-service makes. Keeping it off crates.io also keeps its dependency
+# choices (a second trust-tasks-rs line, axum, redb) out of every consumer's
+# graph, and `publish.yml` never has to order it among the published crates.
+publish = false
+
+[lib]
+name = "vgi_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vgi-bridge"
+path = "src/main.rs"
+
+[features]
+# Built-in adapters (design §5.8, "Packaging"). Both are on by default: the
+# container serves whichever forges its config names. A build without one
+# drops that adapter's code and HTTP routes.
+default = ["forge-github", "forge-forgejo"]
+forge-github = ["dep:vgi-forge-github", "dep:verify-trust"]
+forge-forgejo = ["dep:vgi-forge-forgejo"]
+
+[dependencies]
+vgi-forge = { workspace = true }
+vgi-forge-github = { workspace = true, optional = true }
+vgi-forge-forgejo = { workspace = true, optional = true }
+# The bridge-posted check (GitHub fallback mode) runs verify-trust as a
+# library against the pull request's commits.
+verify-trust = { workspace = true, optional = true }
+
+# Wire types (generated from the git-ns specifications) and their proofs.
+trust-tasks-rs = { workspace = true }
+trust-tasks-proof = { workspace = true }
+
+# DIDComm to the VTC: the TDK's messaging SDK (ATM), its delivery layer, and
+# vta-sdk's did:key / DID-secrets-bundle → DIDComm secret helpers.
+affinidi-tdk = { workspace = true }
+affinidi-messaging-delivery = { workspace = true }
+affinidi-messaging-core = { workspace = true }
+vta-sdk = { workspace = true, features = ["didcomm"] }
+ed25519-dalek = { workspace = true }
+
+axum = { workspace = true }
+redb = { workspace = true }
+toml = { workspace = true }
+aws-lc-rs = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+zeroize = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+# Signs real commits for the verify-trust path test.
+vgi-core = { workspace = true }
+tower = { workspace = true }

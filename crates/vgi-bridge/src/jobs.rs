@@ -1,0 +1,797 @@
+//! Running jobs: each kind mapped onto the forge-neutral adapter calls, with
+//! the adapter's [`vgi_forge::ForgeHooks`] around each operation.
+//!
+//! Every job is convergent: the adapter checks the forge and changes only
+//! what differs, so a job interrupted by a restart simply runs again.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use vgi_forge::{
+    BootstrapStep, Drift, EffectiveRights, ForgeAccount, ForgeError, ForgeRole, HookDecision,
+    Namespace, Projection, RepoSpec, RepoState, Resource, RoleAssignment, RoleMap, RoleOutcome,
+    StepOutcome, Unlisted,
+};
+
+use crate::bridge::Bridge;
+use crate::mapping::{self, Report, StepStatus};
+use crate::registry::Adapter;
+use crate::store::{NamespaceRecord, PinRecord, RepoRecord, Table, repo_key};
+use crate::wire::job;
+
+/// Run one job to its report.
+pub(crate) async fn run(bridge: &Arc<Bridge>, p: &job::Payload) -> Report {
+    let mut report = Report::default();
+    let ns_id = p.namespace.to_string();
+    let ctx = match Ctx::load(bridge, &ns_id) {
+        Ok(c) => c,
+        Err(msg) => {
+            report.fail_with("notCapable", msg);
+            return report;
+        }
+    };
+    let repo = p.repo.as_ref().map(|r| Resource::parse(r));
+    let repo = match repo.transpose() {
+        Ok(r) => r,
+        Err(e) => {
+            report.fail(&e);
+            return report;
+        }
+    };
+    use job::PayloadKind as K;
+    match (p.kind, repo) {
+        (K::ProjectRoles, Some(repo)) => {
+            let roles = p.desired_roles.clone().unwrap_or_default();
+            project_roles(bridge, &ctx, &repo, &roles, &mut report).await;
+        }
+        (K::CreateRepo, Some(repo)) => create_repo(bridge, &ctx, &repo, p, &mut report).await,
+        (K::Bootstrap, Some(repo)) => {
+            let only: Option<BTreeSet<String>> = p
+                .steps
+                .as_ref()
+                .map(|s| s.iter().map(|n| n.to_string()).collect());
+            bootstrap(bridge, &ctx, &repo, only.as_ref(), &mut report).await;
+        }
+        (K::Archive, Some(repo)) => archive(bridge, &ctx, &repo, &mut report).await,
+        (K::Inspect, Some(repo)) => {
+            if let Err(e) = inspect_repo(bridge, &ctx, &repo, true, Some(&mut report)).await {
+                report.fail(&e);
+            }
+        }
+        (K::Inspect, None) => sweep(bridge, &ctx, true, &mut report).await,
+        (kind, _) => report.fail_with("notCapable", format!("`{kind}` is not run here")),
+    }
+    report
+}
+
+/// A job's namespace, adapter and the adapter's view of the namespace.
+pub(crate) struct Ctx {
+    pub(crate) ns: NamespaceRecord,
+    pub(crate) adapter: Adapter,
+    pub(crate) namespace: Namespace,
+}
+
+impl Ctx {
+    pub(crate) fn load(bridge: &Bridge, ns_id: &str) -> Result<Ctx, String> {
+        let ns = bridge
+            .bound_namespace(ns_id)
+            .map_err(|r| r.0.message.unwrap_or_default())?;
+        let adapter = bridge
+            .adapters
+            .for_resource(&ns.resource)
+            .ok_or_else(|| format!("no adapter for `{}`", ns.resource.host()))?;
+        let namespace = ns.binding.as_ref().expect("bound").namespace.clone();
+        Ok(Ctx {
+            ns,
+            adapter,
+            namespace,
+        })
+    }
+
+    fn host(&self) -> &str {
+        self.ns.resource.host()
+    }
+}
+
+/// The repository record for `host`/`forge_id`, if the bridge knows it.
+fn repo_record(bridge: &Bridge, host: &str, forge_id: u64) -> Option<RepoRecord> {
+    bridge
+        .store
+        .get::<RepoRecord>(Table::Repos, &repo_key(host, forge_id))
+        .ok()
+        .flatten()
+}
+
+/// The record for a repository known by resource only.
+pub(crate) fn repo_record_by_resource(bridge: &Bridge, r: &Resource) -> Option<RepoRecord> {
+    bridge
+        .store
+        .list::<RepoRecord>(Table::Repos)
+        .ok()?
+        .into_iter()
+        .map(|(_, rec)| rec)
+        .find(|rec| rec.resource == *r)
+}
+
+/// The job's desired roles as forge roles, and the owners among them.
+fn desired_roles(
+    ctx: &Ctx,
+    roles: &[job::DesiredRole],
+) -> Result<(Vec<RoleAssignment>, Vec<ForgeAccount>), String> {
+    let forge = ctx.adapter.forge();
+    let map = RoleMap::default();
+    let mut out = Vec::new();
+    let mut owners = Vec::new();
+    for r in roles {
+        if *r.account.forge != *ctx.host() {
+            return Err(format!(
+                "`{}`'s account is on `{}`, not `{}`",
+                *r.subject,
+                *r.account.forge,
+                ctx.host()
+            ));
+        }
+        let account = mapping::account(&r.account).map_err(|e| e.to_string())?;
+        let right =
+            mapping::right(&r.right).ok_or_else(|| format!("unknown right `{}`", r.right))?;
+        if right == vgi_forge::Right::RepoOwn {
+            owners.push(account.clone());
+        }
+        let role = forge.map_role(&ctx.namespace, EffectiveRights::from_granted([right]), &map);
+        out.push(RoleAssignment::new(account, role));
+    }
+    Ok((out, owners))
+}
+
+/// Converge roles on `repo` to `desired`: people not listed lose a role the
+/// bridge projected before; roles it never projected are left and reported
+/// as drift (spec: *desiredRoles*).
+async fn apply_roles(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    repo: &Resource,
+    forge_id: Option<u64>,
+    desired: Vec<RoleAssignment>,
+    owners: Vec<ForgeAccount>,
+    report: &mut Report,
+) {
+    let previous = forge_id
+        .and_then(|id| repo_record(bridge, ctx.host(), id))
+        .map(|r| r.roles)
+        .unwrap_or_default();
+    let mut want = desired.clone();
+    for p in previous {
+        if p.role != ForgeRole::None && !want.iter().any(|w| w.account.id == p.account.id) {
+            want.push(RoleAssignment::new(p.account, ForgeRole::None));
+        }
+    }
+    let want = match ctx.adapter.hooks().before_apply_roles(repo, &want) {
+        HookDecision::Modify(w) => w,
+        HookDecision::Abort(why) => {
+            report.step("roles", StepStatus::Failed, Some(why.clone()));
+            report.fail_with("forgeError", why);
+            return;
+        }
+        _ => want,
+    };
+    match ctx
+        .adapter
+        .forge()
+        .apply_roles(repo, &want, Unlisted::Keep)
+        .await
+    {
+        Ok(r) => {
+            let failures: Vec<String> = r
+                .changes
+                .iter()
+                .filter_map(|c| match &c.outcome {
+                    RoleOutcome::Failed(m) => Some(format!("{}: {m}", c.account.login)),
+                    _ => None,
+                })
+                .collect();
+            let status = if !failures.is_empty() {
+                StepStatus::Failed
+            } else if r.changes.is_empty() {
+                StepStatus::Unchanged
+            } else {
+                StepStatus::Applied
+            };
+            report.step(
+                "roles",
+                status,
+                (!failures.is_empty()).then(|| failures.join("; ")),
+            );
+            if let Some(id) = forge_id {
+                let _ = bridge.store.update::<RepoRecord, _>(
+                    Table::Repos,
+                    &repo_key(ctx.host(), id),
+                    |rec| {
+                        let mut rec = rec.unwrap_or_else(|| {
+                            RepoRecord::new(ctx.ns.id.clone(), repo.clone(), id)
+                        });
+                        rec.roles = desired
+                            .iter()
+                            .filter(|d| d.role != ForgeRole::None)
+                            .cloned()
+                            .collect();
+                        rec.roles_known = true;
+                        rec.owners = owners.clone();
+                        Ok((Some(rec), ()))
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            report.step("roles", StepStatus::Failed, Some(e.to_string()));
+            report.fail(&e);
+        }
+    }
+}
+
+async fn project_roles(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    repo: &Resource,
+    roles: &[job::DesiredRole],
+    report: &mut Report,
+) {
+    let (desired, owners) = match desired_roles(ctx, roles) {
+        Ok(x) => x,
+        Err(m) => {
+            report.fail_with("forgeError", m);
+            return;
+        }
+    };
+    let forge_id = match forge_id_of(bridge, ctx, repo).await {
+        Ok(id) => id,
+        Err(e) => {
+            report.fail(&e);
+            return;
+        }
+    };
+    report.repo = Some((repo.clone(), forge_id));
+    apply_roles(bridge, ctx, repo, Some(forge_id), desired, owners, report).await;
+}
+
+/// The repository's forge id: from the record, or by inspecting it.
+async fn forge_id_of(bridge: &Bridge, ctx: &Ctx, repo: &Resource) -> Result<u64, ForgeError> {
+    if let Some(r) = repo_record_by_resource(bridge, repo) {
+        return Ok(r.forge_id);
+    }
+    Ok(ctx.adapter.forge().inspect(repo).await?.forge_id)
+}
+
+async fn create_repo(
+    bridge: &Arc<Bridge>,
+    ctx: &Ctx,
+    repo: &Resource,
+    p: &job::Payload,
+    report: &mut Report,
+) {
+    let job_spec = p.spec.as_ref().expect("checked by kind");
+    let (desired, owners) = match desired_roles(ctx, p.desired_roles.as_deref().unwrap_or(&[])) {
+        Ok(x) => x,
+        Err(m) => {
+            report.fail_with("forgeError", m);
+            return;
+        }
+    };
+    let mut spec =
+        RepoSpec::new(repo.clone()).with_visibility(mapping::visibility(&job_spec.visibility));
+    if let Some(d) = &job_spec.description {
+        spec = spec.with_description(d.to_string());
+    }
+    for o in &owners {
+        spec = spec.with_owner(o.clone());
+    }
+    let spec = match ctx.adapter.hooks().before_create(&spec) {
+        HookDecision::Modify(s) => s,
+        HookDecision::Abort(why) => {
+            report.step("create", StepStatus::Failed, Some(why.clone()));
+            report.fail_with("forgeError", why);
+            return;
+        }
+        _ => spec,
+    };
+
+    let forge = ctx.adapter.forge();
+    let state = match forge.create_repo(&spec).await {
+        Ok(state) => {
+            report.step("create", StepStatus::Applied, None);
+            state
+        }
+        // Our own earlier attempt (a retry after a crash): carry on.
+        Err(ForgeError::AlreadyExists {
+            forge_id: Some(id), ..
+        }) if repo_record(bridge, ctx.host(), id).is_some_and(|r| r.namespace == ctx.ns.id) => {
+            match forge.inspect(repo).await {
+                Ok(s) => {
+                    report.step("create", StepStatus::Unchanged, None);
+                    s
+                }
+                Err(e) => {
+                    report.step("create", StepStatus::Failed, Some(e.to_string()));
+                    report.fail(&e);
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            report.step("create", StepStatus::Failed, Some(e.to_string()));
+            report.fail(&e);
+            return;
+        }
+    };
+    report.repo = Some((state.resource.clone(), state.forge_id));
+    manage(bridge, ctx, &state, &owners);
+
+    let mut extra = Vec::new();
+    match ctx.adapter.hooks().after_create(&state) {
+        HookDecision::Modify(steps) => extra = steps,
+        HookDecision::Abort(why) => {
+            report.fail_with("forgeError", why);
+            return;
+        }
+        _ => {}
+    }
+    if !run_bootstrap(bridge, ctx, &spec, extra, None, report).await {
+        report.step("roles", StepStatus::Skipped, None);
+        return;
+    }
+    apply_roles(
+        bridge,
+        ctx,
+        &state.resource,
+        Some(state.forge_id),
+        desired,
+        owners,
+        report,
+    )
+    .await;
+}
+
+/// Record a repository as managed, in the store and (GitHub) the adapter's
+/// managed set — which the org ruleset lists.
+fn manage(bridge: &Bridge, ctx: &Ctx, state: &RepoState, owners: &[ForgeAccount]) {
+    let key = repo_key(ctx.host(), state.forge_id);
+    let _ = bridge
+        .store
+        .update::<RepoRecord, _>(Table::Repos, &key, |rec| {
+            let mut rec = rec.unwrap_or_else(|| {
+                RepoRecord::new(ctx.ns.id.clone(), state.resource.clone(), state.forge_id)
+            });
+            rec.resource = state.resource.clone();
+            if !owners.is_empty() {
+                rec.owners = owners.to_vec();
+            }
+            rec.archived = false;
+            Ok((Some(rec), ()))
+        });
+    let managed = bridge
+        .store
+        .update::<NamespaceRecord, _>(Table::Namespaces, &ctx.ns.id, |ns| {
+            let mut ns = ns.expect("bound namespace");
+            ns.managed.insert(state.forge_id);
+            let m = ns.managed.clone();
+            Ok((Some(ns), m))
+        });
+    #[cfg(feature = "forge-github")]
+    if let (Ok(m), Some(g)) = (managed, ctx.adapter.github()) {
+        g.set_managed_repositories(&ctx.ns.resource, m);
+    }
+    #[cfg(not(feature = "forge-github"))]
+    let _ = managed;
+}
+
+/// After a plan ran on GitHub: persist the pin and managed set the adapter
+/// now holds, so a restart hands back exactly these.
+fn persist_adapter_state(bridge: &Bridge, ctx: &Ctx) {
+    #[cfg(feature = "forge-github")]
+    if let Some(g) = ctx.adapter.github() {
+        let pin = g.required_workflow_pin(&ctx.ns.resource);
+        let managed = g.managed_repositories(&ctx.ns.resource);
+        let _ = bridge
+            .store
+            .update::<NamespaceRecord, _>(Table::Namespaces, &ctx.ns.id, |ns| {
+                let mut ns = ns.expect("bound namespace");
+                if let Some(p) = pin {
+                    ns.pin = Some(PinRecord {
+                        repository_id: p.repository_id,
+                        sha: p.sha,
+                        check: p.check,
+                    });
+                }
+                if let Some(m) = managed {
+                    ns.managed = m;
+                }
+                Ok((Some(ns), ()))
+            });
+    }
+    #[cfg(not(feature = "forge-github"))]
+    let _ = (bridge, ctx);
+}
+
+/// A capability the adapter found changed mid-plan: persist it, tell the
+/// adapter, and have the caller plan again.
+fn capability_changed(bridge: &Bridge, ctx: &Ctx, capability: &str, available: bool) {
+    let _ = bridge
+        .store
+        .update::<NamespaceRecord, _>(Table::Namespaces, &ctx.ns.id, |ns| {
+            let mut ns = ns.expect("bound namespace");
+            if capability == "required_workflow" {
+                ns.required_workflow = Some(available);
+                if let Some(c) = ns.capabilities.as_mut() {
+                    c.required_workflow = available;
+                }
+            }
+            Ok((Some(ns), ()))
+        });
+    #[cfg(feature = "forge-github")]
+    if capability == "required_workflow"
+        && let Some(g) = ctx.adapter.github()
+    {
+        g.set_required_workflow(&ctx.ns.resource, available);
+    }
+}
+
+/// Plan and run the bootstrap (after `extra` steps from a hook), keeping
+/// only the neutral step names in `only` when given. Re-plans once if the
+/// adapter reports a capability change. `true` if every step went through.
+async fn run_bootstrap(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    spec: &RepoSpec,
+    extra: Vec<BootstrapStep>,
+    only: Option<&BTreeSet<String>>,
+    report: &mut Report,
+) -> bool {
+    let forge = ctx.adapter.forge();
+    let Some(vgi) = bridge.adapters.vgi(ctx.host()) else {
+        report.fail_with("forgeError", "no bootstrap configuration for this forge");
+        return false;
+    };
+    let repo = &spec.resource;
+    let reported_before = report.steps.len();
+    for attempt in 0..2 {
+        let plan = match forge.bootstrap_plan(spec, &vgi) {
+            Ok(p) => p,
+            Err(e) => {
+                report.fail(&e);
+                return false;
+            }
+        };
+        let steps: Vec<BootstrapStep> = extra
+            .iter()
+            .cloned()
+            .chain(plan)
+            .filter(|s| only.is_none_or(|o| o.contains(&mapping::step_name(&s.id, s.component))))
+            .collect();
+        let mut done: Vec<(String, StepOutcome)> = Vec::new();
+        let mut failed = false;
+        let mut replan = false;
+        for step in &steps {
+            let name = mapping::step_name(&step.id, step.component);
+            if failed {
+                report.step(name, StepStatus::Skipped, None);
+                continue;
+            }
+            match forge.run_step(repo, step).await {
+                Ok(o) => {
+                    report.step(name, StepStatus::of(o), None);
+                    done.push((step.id.clone(), o));
+                }
+                Err(ForgeError::CapabilityChanged {
+                    capability,
+                    available,
+                    reason,
+                    ..
+                }) if attempt == 0 => {
+                    tracing::info!(%capability, available, %reason, "capability changed; planning again");
+                    capability_changed(bridge, ctx, &capability, available);
+                    replan = true;
+                    break;
+                }
+                Err(e) => {
+                    report.step(name, StepStatus::Failed, Some(e.to_string()));
+                    report.fail(&e);
+                    failed = true;
+                }
+            }
+        }
+        if replan {
+            // The steps already reported are re-run by the new plan.
+            report.steps.truncate(reported_before);
+            continue;
+        }
+        persist_adapter_state(bridge, ctx);
+        if failed {
+            return false;
+        }
+        if let HookDecision::Modify(more) = ctx.adapter.hooks().after_bootstrap(repo, &done) {
+            for step in &more {
+                let name = mapping::step_name(&step.id, step.component);
+                match forge.run_step(repo, step).await {
+                    Ok(o) => report.step(name, StepStatus::of(o), None),
+                    Err(e) => {
+                        report.step(name, StepStatus::Failed, Some(e.to_string()));
+                        report.fail(&e);
+                        return false;
+                    }
+                }
+            }
+        }
+        let _ = bridge.store.update::<RepoRecord, _>(
+            Table::Repos,
+            &repo_key(ctx.host(), report.repo.as_ref().map(|r| r.1).unwrap_or(0)),
+            |rec| {
+                Ok((
+                    rec.map(|mut r| {
+                        r.required_check = Some(vgi.required_check.clone());
+                        r
+                    }),
+                    (),
+                ))
+            },
+        );
+        return true;
+    }
+    report.fail_with("forgeError", "the adapter kept changing its capabilities");
+    false
+}
+
+async fn bootstrap(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    repo: &Resource,
+    only: Option<&BTreeSet<String>>,
+    report: &mut Report,
+) {
+    let state = match ctx.adapter.forge().inspect(repo).await {
+        Ok(s) => s,
+        Err(e) => {
+            report.fail(&e);
+            return;
+        }
+    };
+    report.repo = Some((state.resource.clone(), state.forge_id));
+    let owners = repo_record(bridge, ctx.host(), state.forge_id)
+        .map(|r| r.owners)
+        .unwrap_or_default();
+    manage(bridge, ctx, &state, &owners);
+    let mut spec = RepoSpec::new(state.resource.clone()).with_visibility(state.visibility);
+    for o in owners {
+        spec = spec.with_owner(o);
+    }
+    run_bootstrap(bridge, ctx, &spec, Vec::new(), only, report).await;
+}
+
+async fn archive(bridge: &Bridge, ctx: &Ctx, repo: &Resource, report: &mut Report) {
+    let forge = ctx.adapter.forge();
+    let state = match forge.inspect(repo).await {
+        Ok(s) => s,
+        Err(e) => {
+            report.step("archive", StepStatus::Failed, Some(e.to_string()));
+            report.fail(&e);
+            return;
+        }
+    };
+    report.repo = Some((state.resource.clone(), state.forge_id));
+    match forge.archive_repo(repo).await {
+        Ok(()) => {
+            report.step(
+                "archive",
+                if state.archived {
+                    StepStatus::Unchanged
+                } else {
+                    StepStatus::Applied
+                },
+                None,
+            );
+            let _ = bridge.store.update::<RepoRecord, _>(
+                Table::Repos,
+                &repo_key(ctx.host(), state.forge_id),
+                |rec| {
+                    Ok((
+                        rec.map(|mut r| {
+                            r.archived = true;
+                            r
+                        }),
+                        (),
+                    ))
+                },
+            );
+            // An archived repository takes no pull requests: it leaves the
+            // managed set (and the org ruleset with it).
+            let _ =
+                bridge
+                    .store
+                    .update::<NamespaceRecord, _>(Table::Namespaces, &ctx.ns.id, |ns| {
+                        let mut ns = ns.expect("bound namespace");
+                        ns.managed.remove(&state.forge_id);
+                        Ok((Some(ns), ()))
+                    });
+            persist_adapter_state(bridge, ctx);
+        }
+        Err(e) => {
+            report.step("archive", StepStatus::Failed, Some(e.to_string()));
+            report.fail(&e);
+        }
+    }
+}
+
+/// The projection the bridge holds for a repository.
+fn projection(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    state: &RepoState,
+    rec: Option<&RepoRecord>,
+) -> Projection {
+    let mut p = Projection::new(
+        rec.map(|r| r.resource.clone())
+            .unwrap_or_else(|| state.resource.clone()),
+    );
+    if let Some(r) = rec {
+        p.forge_id = Some(r.forge_id);
+        p.roles = r.roles.clone();
+        p.owners = r.owners.clone();
+        p.archived = r.archived;
+        p.required_check = r
+            .required_check
+            .clone()
+            .or_else(|| bridge.adapters.vgi(ctx.host()).map(|v| v.required_check));
+    }
+    p
+}
+
+/// Inspect one repository, compare it with the projection, and report the
+/// drift as a `protectionChanged` event (always when `always`, else only
+/// when it differs from what was last reported). A rename found here is
+/// reported as `repoRenamed` first.
+pub(crate) async fn inspect_repo(
+    bridge: &Bridge,
+    ctx: &Ctx,
+    repo: &Resource,
+    always: bool,
+    mut report: Option<&mut Report>,
+) -> Result<(), ForgeError> {
+    let state = ctx.adapter.forge().inspect(repo).await?;
+    let rec = repo_record(bridge, ctx.host(), state.forge_id);
+    if let Some(r) = &rec
+        && r.resource != state.resource
+    {
+        let ev = json!({
+            "type": "repoRenamed",
+            "forgeId": state.forge_id.to_string(),
+            "from": r.resource.as_str(),
+            "to": state.resource.as_str(),
+        });
+        if let Err(e) = bridge.send_event(&ctx.ns.id, ev, None).await {
+            tracing::error!(error = %e, "could not report a rename");
+        }
+        let _ = bridge
+            .store
+            .update::<RepoRecord, _>(Table::Repos, &r.key(), |x| {
+                Ok((
+                    x.map(|mut x| {
+                        x.resource = state.resource.clone();
+                        x
+                    }),
+                    (),
+                ))
+            });
+    }
+    let rec = repo_record(bridge, ctx.host(), state.forge_id);
+    let proj = projection(bridge, ctx, &state, rec.as_ref());
+    let mut proj_now = proj.clone();
+    proj_now.resource = state.resource.clone();
+    let mut drift = ctx.adapter.forge().diff(&state, &proj_now);
+    if !rec.as_ref().is_some_and(|r| r.roles_known) {
+        // No projection of roles yet: every collaborator would look
+        // unexpected.
+        drift.retain(|d| {
+            !matches!(
+                d,
+                Drift::UnexpectedRole { .. }
+                    | Drift::MissingRole { .. }
+                    | Drift::RoleMismatch { .. }
+            )
+        });
+    }
+    if let HookDecision::Modify(d) = ctx.adapter.hooks().on_drift(&state.resource, &drift) {
+        drift = d;
+    }
+    let enforced = drift.iter().all(|d| match d {
+        Drift::ProtectionWeakened { gaps } => mapping::check_enforced(gaps),
+        _ => true,
+    }) && proj.required_check.is_some();
+    let items = mapping::drift_items(ctx.host(), &state.resource, &drift);
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&items).unwrap_or_default(),
+    ));
+    let changed = rec.as_ref().and_then(|r| r.last_drift.as_deref()) != Some(digest.as_str());
+    if let Some(report) = report.as_deref_mut() {
+        report.repo = Some((state.resource.clone(), state.forge_id));
+    }
+    // Only a repository the bridge manages has a check to be in place; an
+    // unmanaged one is reported as it is, with nothing expected of it.
+    if let (Some(report), true) = (report, rec.is_some()) {
+        report.step(
+            "requiredCheck",
+            if enforced {
+                StepStatus::Unchanged
+            } else {
+                StepStatus::Failed
+            },
+            (!enforced).then(|| "the forge does not require the verify-trust check".to_string()),
+        );
+    }
+    if rec.is_some() && (always || changed) {
+        let ev = json!({
+            "type": "protectionChanged",
+            "forgeId": state.forge_id.to_string(),
+            "resource": state.resource.as_str(),
+            "requiredCheck": enforced,
+        });
+        if let Err(e) = bridge.send_event(&ctx.ns.id, ev, Some(items)).await {
+            tracing::error!(error = %e, "could not report drift");
+        } else if let Some(r) = &rec {
+            let _ = bridge
+                .store
+                .update::<RepoRecord, _>(Table::Repos, &r.key(), |x| {
+                    Ok((
+                        x.map(|mut x| {
+                            x.last_drift = Some(digest.clone());
+                            x
+                        }),
+                        (),
+                    ))
+                });
+        }
+    }
+    Ok(())
+}
+
+/// Inspect every repository the bridge manages in the namespace.
+pub(crate) async fn sweep(bridge: &Bridge, ctx: &Ctx, always: bool, report: &mut Report) {
+    let repos: Vec<RepoRecord> = bridge
+        .store
+        .list::<RepoRecord>(Table::Repos)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, r)| r)
+        .filter(|r| r.namespace == ctx.ns.id && !r.archived)
+        .collect();
+    let mut failures = Vec::new();
+    for r in repos {
+        if let Err(e) = inspect_repo(bridge, ctx, &r.resource, always, None).await {
+            failures.push(format!("{}: {e}", r.resource));
+        }
+    }
+    if !failures.is_empty() {
+        report.fail_with("forgeError", failures.join("; "));
+    }
+}
+
+/// The scheduled sweep for forges that push no events (`webhooks: false`).
+pub(crate) async fn sweep_without_webhooks(bridge: &Arc<Bridge>) {
+    let Ok(namespaces) = bridge.store.list::<NamespaceRecord>(Table::Namespaces) else {
+        return;
+    };
+    for (id, _) in namespaces {
+        let Ok(ctx) = Ctx::load(bridge, &id) else {
+            continue;
+        };
+        if ctx.adapter.forge().capabilities(&ctx.namespace).webhooks {
+            continue;
+        }
+        let lock = bridge.ns_lock(&id);
+        let _g = lock.lock().await;
+        let mut report = Report::default();
+        sweep(bridge, &ctx, false, &mut report).await;
+        if let Some((_, m)) = report.error {
+            tracing::warn!(namespace = %id, "drift sweep: {m}");
+        }
+    }
+}
