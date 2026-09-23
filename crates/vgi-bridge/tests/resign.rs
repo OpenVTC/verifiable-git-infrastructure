@@ -352,15 +352,22 @@ async fn dependabot_pushes(w: &World, remote: &Remote) {
     }
 }
 
+/// Runs the re-sign directly. A webhook posted just before can have started
+/// one in the background (a push to a branch whose pull request is known
+/// resumes it), and the per-branch guard then answers "already running":
+/// wait that one out, so the test sees the settled outcome rather than the
+/// race.
 async fn resign(w: &World) -> ResignOutcome {
-    run(
-        &w.bridge,
-        &vgi_forge::Resource::parse("github.com/acme/widgets").unwrap(),
-        REPO_ID,
-        PR,
-    )
-    .await
-    .unwrap()
+    let repo = vgi_forge::Resource::parse("github.com/acme/widgets").unwrap();
+    for _ in 0..200 {
+        let o = run(&w.bridge, &repo, REPO_ID, PR).await.unwrap();
+        if !matches!(&o, ResignOutcome::Skipped(why) if why == "a re-sign of this branch is already running")
+        {
+            return o;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("a background re-sign of the branch never finished");
 }
 
 fn skipped(o: &ResignOutcome) -> &str {
