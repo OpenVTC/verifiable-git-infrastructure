@@ -172,8 +172,23 @@ pub enum CommitStatus {
     /// PGP-signed (a platform commit), but the signature verifies against no
     /// key in the exempt keyring — or no keyring is configured.
     PgpRejected { detail: String },
-    /// PGP-signed by a key in the committed exempt keyring (e.g. a GitHub
-    /// web-UI merge commit). Passes, reported distinctly from `Trusted`.
+    /// Signed by an exempt platform key, but not a merge commit: a web-UI
+    /// file edit, a REST Contents API commit, a squash merge or a Dependabot
+    /// commit. The platform signs whatever it writes on anyone's behalf, so
+    /// its signature on a single-parent commit vouches for nobody. Fix:
+    /// re-sign the commit with `did-git-sign` (see the runbook, §5).
+    PlatformSignedEdit { fingerprint: String },
+    /// A merge signed by an exempt platform key, but `parent` neither passes
+    /// in this range nor lies below the range's base. The merge would carry
+    /// that parent's unverified content in with it.
+    PlatformMergeUnverifiedParent { fingerprint: String, parent: String },
+    /// A merge signed by an exempt platform key whose tree is not the clean
+    /// merge of its parents — typically conflicts resolved in the web UI,
+    /// which writes content no verified parent holds.
+    PlatformMergeAltered { fingerprint: String, detail: String },
+    /// A merge commit PGP-signed by a key in the committed exempt keyring
+    /// (e.g. a GitHub web-UI merge), whose parents all pass and whose tree is
+    /// their clean merge. Passes, reported distinctly from `Trusted`.
     Exempt { fingerprint: String },
     /// Valid signature by a registry-authorized signer. `resource` is the
     /// tuple resource the grant was found under (the primary one or the
@@ -344,13 +359,17 @@ pub async fn verify_prepared(
     // Pass 2: one registry query per distinct signer DID.
     let decisions = query_registry(args, &signer_dids).await?;
 
-    let commits: Vec<CommitVerdict> = checked
+    let mut verdicts: Vec<CommitVerdict> = checked
         .into_iter()
         .map(|(sha, signature)| CommitVerdict {
             sha,
             status: status_of(signature, &decisions),
         })
         .collect();
+
+    // Pass 3: a platform signature exempts only merges of passing parents.
+    apply_platform_merge_policy(&args.repo_dir, &args.range, commits, &mut verdicts)?;
+    let commits = verdicts;
 
     // Names are reported for the signers that actually signed something here
     // — a name for a DID absent from the range is noise.
@@ -372,6 +391,222 @@ pub async fn verify_prepared(
         unresolved_signers: signers.unresolved.clone(),
         signer_names,
     })
+}
+
+// --- platform-signed commits -----------------------------------------------------
+
+/// Narrow the platform-key exemption to merge commits, in place.
+///
+/// The signature layer reports every commit that verifies against the exempt
+/// keyring as `Exempt`. That alone proves only that *the platform* wrote the
+/// bytes — and GitHub's `web-flow` key signs everything GitHub writes on
+/// anyone's behalf: web-UI file edits (including a fork author editing their
+/// own branch on github.com), commits made through the REST Contents API by
+/// any writer, squash merges and Dependabot commits alike. Accepting the
+/// signature as-is let a single-parent web edit skip DID signing entirely.
+///
+/// What a platform signature *can* vouch for is a merge, because a merge
+/// introduces no content of its own: its tree is determined by its parents.
+/// So a platform-signed commit keeps `Exempt` only if
+///
+/// 1. it is a merge — a single-parent or root commit is `PlatformSignedEdit`;
+/// 2. each parent either passes in this range (`Trusted`, or itself an
+///    `Exempt` merge) or is a **boundary** commit of the range — excluded from
+///    it and therefore reachable from its base, i.e. already on the branch the
+///    range is measured against. A merge must not launder a parent that did
+///    not verify, so anything else is `PlatformMergeUnverifiedParent`;
+/// 3. its tree is exactly the clean merge of those parents, recomputed here
+///    with `git merge-tree --write-tree` (the merge-ort machinery GitHub's own
+///    merges use). "Content derives from the parents" is only true of a clean
+///    merge: GitHub's web conflict editor lets whoever can push the head
+///    branch — a fork author included — write arbitrary text into the
+///    conflicted files and have web-flow sign the result. A tree that differs,
+///    or parents that do not merge cleanly, is `PlatformMergeAltered`.
+///
+/// The parent and tree headers are read from the commit object the platform
+/// signature covers, so they cannot be rewritten without breaking it.
+///
+/// Dependabot commits are single-parent and are **not** exempted. Their only
+/// distinguishing mark is the `author` header (`dependabot[bot]`), with the
+/// same `GitHub <noreply@github.com>` committer as any web edit, and nothing
+/// binds that header to the Dependabot app: GitHub documents no guarantee
+/// that a web-flow-signed commit's author is the actor who caused it, does
+/// not document who the author of a squash commit is, and a flaw in exactly
+/// this check once let anyone obtain web-flow-signed commits with an
+/// arbitrary author (<https://iter.ca/post/gh-sig-pwn/>, fixed 2023). A
+/// maintainer re-signs a Dependabot PR's commits with `did-git-sign`, or the
+/// PR lands through a clean merge commit on top of a verified base.
+///
+/// Parents can appear after their children in `rev-list` order when commit
+/// dates are skewed, so verdicts are settled to a fixpoint rather than in one
+/// pass.
+fn apply_platform_merge_policy(
+    repo_dir: &Path,
+    range: &str,
+    commits: &[RangeCommit],
+    verdicts: &mut [CommitVerdict],
+) -> Result<()> {
+    let mut undecided: BTreeSet<usize> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v.status, CommitStatus::Exempt { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if undecided.is_empty() {
+        return Ok(());
+    }
+    let position: BTreeMap<&str, usize> = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.sha.as_str(), i))
+        .collect();
+    // Fetched only if some platform merge has a parent outside the range.
+    let mut boundary: Option<BTreeSet<String>> = None;
+
+    while !undecided.is_empty() {
+        let mut settled = Vec::new();
+        for &i in &undecided {
+            let CommitStatus::Exempt { fingerprint } = &verdicts[i].status else {
+                continue;
+            };
+            let fingerprint = fingerprint.clone();
+            let parents = commit_parents(&commits[i].raw);
+            if parents.len() < 2 {
+                settled.push((i, CommitStatus::PlatformSignedEdit { fingerprint }));
+                continue;
+            }
+
+            let mut failed = None;
+            let mut waiting = false;
+            for parent in &parents {
+                match position.get(parent.as_str()) {
+                    Some(&j) if undecided.contains(&j) => waiting = true,
+                    Some(&j) if verdicts[j].status.passes() => {}
+                    Some(_) => {
+                        failed = Some(parent.clone());
+                        break;
+                    }
+                    None => {
+                        let boundary = match &mut boundary {
+                            Some(set) => set,
+                            empty => empty.insert(range_boundary(repo_dir, range)?),
+                        };
+                        if !boundary.contains(parent) {
+                            failed = Some(parent.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let status = if let Some(parent) = failed {
+                CommitStatus::PlatformMergeUnverifiedParent {
+                    fingerprint,
+                    parent,
+                }
+            } else if waiting {
+                continue;
+            } else {
+                match clean_merge_mismatch(repo_dir, &commits[i].raw, &parents) {
+                    None => CommitStatus::Exempt { fingerprint },
+                    Some(detail) => CommitStatus::PlatformMergeAltered {
+                        fingerprint,
+                        detail,
+                    },
+                }
+            };
+            settled.push((i, status));
+        }
+
+        if settled.is_empty() {
+            // Unreachable for a real commit graph (it is acyclic), but a
+            // verdict that cannot be settled must not stay a pass.
+            for &i in &undecided {
+                if let CommitStatus::Exempt { fingerprint } = &verdicts[i].status {
+                    verdicts[i].status = CommitStatus::PlatformMergeUnverifiedParent {
+                        fingerprint: fingerprint.clone(),
+                        parent: "(cyclic parent chain)".to_string(),
+                    };
+                }
+            }
+            break;
+        }
+        for (i, status) in settled {
+            undecided.remove(&i);
+            verdicts[i].status = status;
+        }
+    }
+    Ok(())
+}
+
+/// The header block of a raw commit object: everything before the first
+/// blank line, without continuation lines (the `gpgsig` armor).
+fn commit_headers(raw: &[u8]) -> impl Iterator<Item = &str> {
+    let text = std::str::from_utf8(raw).unwrap_or("");
+    let headers = text.split_once("\n\n").map_or(text, |(h, _)| h);
+    headers.lines().filter(|line| !line.starts_with(' '))
+}
+
+/// The commit's parent SHAs, in order.
+fn commit_parents(raw: &[u8]) -> Vec<String> {
+    commit_headers(raw)
+        .filter_map(|line| line.strip_prefix("parent "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `None` if the commit's tree is the clean merge of `parents`; otherwise why
+/// not.
+fn clean_merge_mismatch(repo_dir: &Path, raw: &[u8], parents: &[String]) -> Option<String> {
+    let [ours, theirs] = parents else {
+        return Some(format!(
+            "{}-parent merge; the platform creates only two-parent merges",
+            parents.len()
+        ));
+    };
+    let Some(tree) = commit_headers(raw).find_map(|line| line.strip_prefix("tree ")) else {
+        return Some("commit has no tree header".to_string());
+    };
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            "--end-of-options",
+            ours,
+            theirs,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => return Some(format!("could not run git merge-tree: {e}")),
+    };
+    match output.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let merged = stdout.lines().next().unwrap_or("").trim();
+            if merged == tree {
+                None
+            } else {
+                Some(format!(
+                    "tree {tree} is not the clean merge of its parents ({merged}); \
+                     the merge added content of its own"
+                ))
+            }
+        }
+        Some(1) => Some(
+            "its parents do not merge cleanly, so the conflicts were resolved by hand \
+             (e.g. in the web UI) and that resolution is unsigned content"
+                .to_string(),
+        ),
+        _ => Some(format!(
+            "could not recompute the merge (git merge-tree needs git 2.38+ and the \
+             full history): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
 }
 
 // --- signature layer ---------------------------------------------------------
@@ -408,8 +643,10 @@ pub fn check_commit_signature(
         Ok(None) => return SignatureCheck::Unsigned,
         Err(e) => return SignatureCheck::Malformed(e.to_string()),
     };
-    // Platform commits (GitHub web-UI merges, Dependabot) are PGP-signed;
-    // they pass only via the explicitly committed exempt keyring.
+    // Platform commits (GitHub web-UI merges and edits, Dependabot) are
+    // PGP-signed; they can pass only via the explicitly committed exempt
+    // keyring. `Exempt` here is provisional: `verify_prepared` keeps it only
+    // for clean merges of passing parents (see `apply_platform_merge_policy`).
     if pem.starts_with("-----BEGIN PGP SIGNATURE-----") {
         let Some(keyring) = exempt else {
             return SignatureCheck::PgpRejected {
@@ -767,6 +1004,26 @@ pub fn list_commits(repo_dir: &Path, range: &str) -> Result<Vec<String>> {
     Ok(output.lines().map(str::to_string).collect())
 }
 
+/// The range's boundary: commits outside it that are parents of commits in
+/// it. Git computes these as the excluded parents reachable from the range's
+/// negative side (the `A` of `A..B`), so a boundary commit is one already on
+/// the base branch. A parent missing from the repository (a shallow clone) is
+/// never on this list.
+pub fn range_boundary(repo_dir: &Path, range: &str) -> Result<BTreeSet<String>> {
+    if range.starts_with('-') {
+        bail!("--range must be a revision range, not an option: {range:?}");
+    }
+    let output = git(
+        repo_dir,
+        &["rev-list", "--boundary", "--end-of-options", range],
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.strip_prefix('-'))
+        .map(str::to_string)
+        .collect())
+}
+
 /// Read one raw commit object.
 pub fn read_commit_raw(repo_dir: &Path, sha: &str) -> Result<Vec<u8>> {
     let output = Command::new("git")
@@ -831,6 +1088,32 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
             }
             CommitStatus::PgpRejected { detail } => {
                 println!("PGP-REJECTED {short}  {detail}");
+            }
+            CommitStatus::PlatformSignedEdit { fingerprint } => {
+                println!(
+                    "PLAT-EDIT    {short}  signed by platform key {fingerprint}, but not a merge: \
+                     the platform signs any web or API edit, so only merges are exempt. \
+                     Re-sign it with did-git-sign, e.g. \
+                     `git rebase --exec 'git commit --amend --no-edit -S' <base>`"
+                );
+            }
+            CommitStatus::PlatformMergeUnverifiedParent {
+                fingerprint,
+                parent,
+            } => {
+                println!(
+                    "PLAT-MERGE   {short}  merge signed by platform key {fingerprint} has parent \
+                     {parent}, which neither passes nor is on the base branch; fix that commit"
+                );
+            }
+            CommitStatus::PlatformMergeAltered {
+                fingerprint,
+                detail,
+            } => {
+                println!(
+                    "PLAT-MERGE   {short}  merge signed by platform key {fingerprint}: {detail}; \
+                     merge locally and sign it with did-git-sign"
+                );
             }
             CommitStatus::Unauthorized { signer_did } => {
                 println!(
@@ -1253,6 +1536,40 @@ mod tests {
                 signer_did: SIGNER.to_string()
             }
         );
+    }
+
+    #[test]
+    fn parents_are_read_from_the_header_block_only() {
+        // A body line, or a line of the signature armor, that happens to read
+        // `parent …` must not add a parent — that would turn an edit into a
+        // "merge".
+        let merge = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                     parent 1111111111111111111111111111111111111111\n\
+                     parent 2222222222222222222222222222222222222222\n\
+                     author A U Thor <a@example.com> 1700000000 +0000\n\
+                     committer GitHub <noreply@github.com> 1700000000 +0000\n\
+                     \n\
+                     Merge pull request #1\n";
+        assert_eq!(
+            commit_parents(merge.as_bytes()),
+            vec!["1".repeat(40), "2".repeat(40),]
+        );
+
+        let edit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                    parent 1111111111111111111111111111111111111111\n\
+                    author A U Thor <a@example.com> 1700000000 +0000\n\
+                    committer GitHub <noreply@github.com> 1700000000 +0000\n\
+                    \n\
+                    Update a.txt\n\
+                    \n\
+                    parent 2222222222222222222222222222222222222222\n";
+        let signed = signed_commit(
+            edit,
+            "-----BEGIN PGP SIGNATURE-----\n\
+             parent 3333333333333333333333333333333333333333\n\
+             -----END PGP SIGNATURE-----\n",
+        );
+        assert_eq!(commit_parents(signed.as_bytes()), vec!["1".repeat(40)]);
     }
 
     #[test]

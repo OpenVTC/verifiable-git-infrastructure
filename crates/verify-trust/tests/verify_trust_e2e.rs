@@ -484,7 +484,15 @@ mod pgp_platform {
     use rand::rngs::StdRng;
     use verify_trust::pgp_exempt::ExemptKeyring;
 
+    /// Generated once: the key's creation time is the wall clock, so two
+    /// generations a second apart are two different keys.
     fn platform_key() -> SignedSecretKey {
+        static KEY: std::sync::LazyLock<SignedSecretKey> =
+            std::sync::LazyLock::new(generate_platform_key);
+        KEY.clone()
+    }
+
+    fn generate_platform_key() -> SignedSecretKey {
         let mut rng = StdRng::seed_from_u64(7);
         SecretKeyParamsBuilder::default()
             .key_type(KeyType::Ed25519)
@@ -554,37 +562,254 @@ mod pgp_platform {
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
     }
 
+    fn platform_keyring() -> ExemptKeyring {
+        let armor = SignedPublicKey::from(platform_key())
+            .to_armored_string(ArmorOptions::default())
+            .unwrap();
+        ExemptKeyring::from_armored(&armor).unwrap()
+    }
+
+    fn status_of<'a>(report: &'a TrustReport, sha: &str) -> &'a CommitStatus {
+        &report
+            .commits
+            .iter()
+            .find(|c| c.sha == sha)
+            .unwrap_or_else(|| panic!("{sha} is not in the report"))
+            .status
+    }
+
+    /// A pull request as GitHub merges it: `main` and a `feature` branch fork
+    /// from a common root, each gains a commit, and the platform writes a
+    /// merge of the two, PGP-signed. The feature commit is DID-signed only if
+    /// `sign_feature`. Returns `(main_tip, feature_tip, platform_merge)`; the
+    /// range a PR check verifies is `main_tip..platform_merge`.
+    fn platform_merge_fixture(
+        repo: &Path,
+        did_key: &SigningKey,
+        sign_feature: bool,
+    ) -> (String, String, String) {
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "root"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("b.txt"), "feature\n").unwrap();
+        git(repo, &["add", "b.txt"]);
+        git(repo, &["commit", "-q", "-m", "feature work"]);
+        let mut feature = git(repo, &["rev-parse", "HEAD"]);
+        if sign_feature {
+            feature = sign_head_commit(repo, &feature, did_key);
+            git(repo, &["update-ref", "refs/heads/feature", &feature]);
+        }
+
+        // Base-branch history: already reviewed, outside the range.
+        git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("c.txt"), "main\n").unwrap();
+        git(repo, &["add", "c.txt"]);
+        git(repo, &["commit", "-q", "-m", "main moves on"]);
+        let main_tip = git(repo, &["rev-parse", "HEAD"]);
+
+        git(
+            repo,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge pull request #1",
+                "feature",
+            ],
+        );
+        let merge = git(repo, &["rev-parse", "HEAD"]);
+        let merge = pgp_sign_commit(repo, &merge, &platform_key());
+        git(repo, &["update-ref", "refs/heads/main", &merge]);
+        (main_tip, feature, merge)
+    }
+
     #[tokio::test]
-    async fn platform_signed_commit_is_exempt_with_keyring() {
+    async fn a_platform_signed_merge_of_verified_parents_is_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature, merge) = platform_merge_fixture(repo, &did_key, true);
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{merge}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(report.ok, "{:#?}", report.commits);
+        assert_eq!(report.commits.len(), 2);
+        assert!(status_of(&report, &feature).is_trusted());
+        assert!(matches!(
+            status_of(&report, &merge),
+            CommitStatus::Exempt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_platform_signed_merge_does_not_launder_an_unverified_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature, merge) = platform_merge_fixture(repo, &did_key, false);
+
+        let args = args_for(
+            repo,
+            format!("{main_tip}..{merge}"),
+            "http://127.0.0.1:1".into(),
+        );
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(!report.ok);
+        assert_eq!(status_of(&report, &feature), &CommitStatus::Unsigned);
+        assert!(
+            matches!(
+                status_of(&report, &merge),
+                CommitStatus::PlatformMergeUnverifiedParent { parent, .. } if *parent == feature
+            ),
+            "{:#?}",
+            report.commits
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_signed_merge_with_content_of_its_own_is_refused() {
+        // The web conflict editor: a merge whose tree is not what its parents
+        // merge to, carrying text no verified commit holds.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature, _) = platform_merge_fixture(repo, &did_key, true);
+        git(repo, &["reset", "-q", "--hard", &main_tip]);
+        git(
+            repo,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge pull request #1",
+                &feature,
+            ],
+        );
+        std::fs::write(repo.join("smuggled.txt"), "not in either parent\n").unwrap();
+        git(repo, &["add", "smuggled.txt"]);
+        git(repo, &["commit", "-q", "--amend", "--no-edit"]);
+        let altered = git(repo, &["rev-parse", "HEAD"]);
+        let altered = pgp_sign_commit(repo, &altered, &platform_key());
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{altered}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(!report.ok);
+        assert!(status_of(&report, &feature).is_trusted());
+        assert!(
+            matches!(
+                status_of(&report, &altered),
+                CommitStatus::PlatformMergeAltered { .. }
+            ),
+            "{:#?}",
+            report.commits
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_whose_parent_is_an_exempt_merge_is_exempt() {
+        // "Update branch" on a PR, then the PR check's own merge: the second
+        // platform merge's parent is the first, which must itself settle.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (_, feature, update) = platform_merge_fixture(repo, &did_key, true);
+        // The PR branch now points at the update merge; main moves again.
+        git(repo, &["update-ref", "refs/heads/feature", &update]);
+        git(repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        std::fs::write(repo.join("d.txt"), "main again\n").unwrap();
+        git(repo, &["add", "d.txt"]);
+        git(repo, &["commit", "-q", "-m", "main moves again"]);
+        let main_tip = git(repo, &["rev-parse", "HEAD"]);
+        git(
+            repo,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge pull request #1",
+                "feature",
+            ],
+        );
+        let outer = git(repo, &["rev-parse", "HEAD"]);
+        let outer = pgp_sign_commit(repo, &outer, &platform_key());
+
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(repo, format!("{main_tip}..{outer}"), registry);
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+
+        assert!(report.ok, "{:#?}", report.commits);
+        assert_eq!(report.commits.len(), 3);
+        assert!(status_of(&report, &feature).is_trusted());
+        assert!(matches!(
+            status_of(&report, &update),
+            CommitStatus::Exempt { .. }
+        ));
+        assert!(matches!(
+            status_of(&report, &outer),
+            CommitStatus::Exempt { .. }
+        ));
+    }
+
+    /// A single-parent commit on top of a DID-signed one, PGP-signed by the
+    /// platform, authored as `author`: a web-UI or Contents API edit.
+    async fn single_parent_platform_commit(author: Option<&str>) -> (TrustReport, String) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let did_key = SigningKey::from_bytes(&[9u8; 32]);
         let (base, did_signed) = repo_with_signed_commit(repo, &did_key);
 
-        // A "web-UI merge" style commit on top, PGP-signed by the platform key.
         std::fs::write(repo.join("a.txt"), "three\n").unwrap();
         git(repo, &["add", "a.txt"]);
-        git(repo, &["commit", "-q", "-m", "merge-style change"]);
+        let author_arg = author.map(|author| format!("--author={author}"));
+        let mut commit = vec!["commit", "-q", "-m", "Update a.txt"];
+        commit.extend(author_arg.as_deref());
+        git_as(repo, "noreply@github.com", &commit);
         let unsigned = git(repo, &["rev-parse", "HEAD"]);
-        let platform = platform_key();
-        let pgp_signed = pgp_sign_commit(repo, &unsigned, &platform);
-        git(repo, &["update-ref", "refs/heads/main", &pgp_signed]);
-
-        let keyring_armor = SignedPublicKey::from(platform.clone())
-            .to_armored_string(ArmorOptions::default())
-            .unwrap();
-        let keyring = ExemptKeyring::from_armored(&keyring_armor).unwrap();
+        let pgp_signed = pgp_sign_commit(repo, &unsigned, &platform_key());
 
         let registry = stub_registry(SIGNER.to_string()).await;
         let args = args_for(repo, format!("{base}..{pgp_signed}"), registry);
-        let report = verify(&args, &signers_for(&did_key), Some(&keyring)).await;
+        let report = verify(&args, &signers_for(&did_key), Some(&platform_keyring())).await;
+        assert!(status_of(&report, &did_signed).is_trusted());
+        (report, pgp_signed)
+    }
 
-        assert!(report.ok, "DID-signed + platform-exempt should both pass");
-        assert_eq!(report.commits.len(), 2);
-        assert!(report.commits[0].status.is_trusted(), "{did_signed}");
+    #[tokio::test]
+    async fn a_platform_signed_single_parent_edit_is_refused() {
+        let (report, edit) = single_parent_platform_commit(None).await;
+        assert!(
+            !report.ok,
+            "a web edit must not pass on the platform's word"
+        );
         assert!(matches!(
-            report.commits[1].status,
-            CommitStatus::Exempt { .. }
+            status_of(&report, &edit),
+            CommitStatus::PlatformSignedEdit { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_platform_signed_dependabot_commit_is_refused() {
+        // The author header is the only thing marking a Dependabot commit,
+        // and nothing binds it to Dependabot: it is not an exemption.
+        let (report, edit) = single_parent_platform_commit(Some(
+            "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+        ))
+        .await;
+        assert!(!report.ok);
+        assert!(matches!(
+            status_of(&report, &edit),
+            CommitStatus::PlatformSignedEdit { .. }
         ));
     }
 

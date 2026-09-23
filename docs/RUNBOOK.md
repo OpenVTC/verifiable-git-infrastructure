@@ -239,9 +239,27 @@ override reintroduces.
 curl -sS https://github.com/web-flow.gpg > .github/trusted-platform-keys.asc
 ```
 
-GitHub's web-UI merge and squash commits are PGP-signed by `web-flow`, not by a
-DID. Without this file every merge commit fails `pgpRejected`. Committing the
-key is what makes the exemption explicit and auditable.
+GitHub's web-UI merge commits — including the merge a pull-request check runs
+on — are PGP-signed by `web-flow`, not by a DID. Without this file every merge
+commit fails `pgpRejected`. Committing the key is what makes the exemption
+explicit and auditable.
+
+The key exempts **merge commits only**, and only a clean merge of parents that
+themselves pass. `web-flow` signs *everything* GitHub writes on someone's
+behalf — web-UI file edits (a fork author's included), REST Contents API
+commits by any writer, squash merges, Dependabot commits — so its signature on
+a single-parent commit says nothing about who chose the content. Those fail
+`platformSignedEdit` (§5). In practice:
+
+- **Merge with a merge commit.** Squash merges, and a merge queue set to
+  squash, produce single-parent `web-flow` commits that fail wherever they are
+  checked; use the *merge* method. (Rebase-and-merge is no better: GitHub
+  rewrites the commits and drops their signatures.)
+- **Don't edit files in the web UI** on a branch that is checked; commit
+  locally with `did-git-sign`.
+- **Resolve conflicts locally**, not in the web conflict editor: a merge whose
+  tree is not the clean merge of its parents fails `platformMergeAltered`.
+- **Dependabot pull requests** fail until a maintainer re-signs them (§5).
 
 **Repository variables** — plain variables, not secrets; they are public values
 and fork PRs must be able to read them:
@@ -377,9 +395,10 @@ there are under [Forgejo Actions runners](#forgejo-actions-runners) below.
 **Merge commits.** The `web-flow` keyring above is GitHub-specific. On Forgejo,
 prefer **fast-forward-only** merges (the repository's allowed merge styles):
 the DID-signed commits then land unchanged, and no platform key is needed at
-all. If you need merge or squash commits, the instance must sign them
+all. If you need merge commits, the instance must sign them
 (`[repository.signing]` in its configuration), and you commit the instance's
-public key as the exempt keyring:
+public key as the exempt keyring. It exempts clean merge commits only; an
+instance-signed squash commit fails `platformSignedEdit`:
 
 ```sh
 curl -sS https://git.example.org/api/v1/signing-key.gpg > .forgejo/trusted-platform-keys.asc
@@ -505,6 +524,30 @@ the remediation is unambiguous:
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
 | `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
 | `registryUnavailable` | the registry could not be consulted | registry outage; the check fails closed by design |
+| `pgpRejected` | PGP-signed by no key in the exempt keyring | no keyring configured, or a platform key other than the committed one |
+| `platformSignedEdit` | signed by the platform key, but not a merge: a web-UI or API edit, a squash merge, a Dependabot commit | re-sign it with `did-git-sign` (below); for squash merges, merge with a merge commit instead |
+| `platformMergeUnverifiedParent` | platform-signed merge with a parent (named) that neither passes nor is on the base branch | fix the named parent; the merge cannot vouch for it |
+| `platformMergeAltered` | platform-signed merge whose tree is not the clean merge of its parents | conflicts resolved in the web UI; merge locally and sign with `did-git-sign` |
+
+`exempt` is a clean, platform-signed merge commit whose parents all pass (see
+*Platform keyring* in §4).
+
+**Re-signing platform-written commits** (a Dependabot pull request, a web-UI
+edit). A maintainer who is an enrolled signer, with `did-git-sign` configured:
+
+```sh
+gh pr checkout <number>
+git rebase --exec 'git commit --amend --no-edit -S' origin/main
+git push --force-with-lease
+```
+
+`--amend` keeps the original author and makes the maintainer the committer, so
+each commit is signed by, and attributed to, the DID that vouched for it.
+Dependabot stops updating a pull request once someone else has pushed to it;
+comment `@dependabot recreate` to start over. Dependabot commits are refused
+rather than exempted because nothing binds a commit to Dependabot but its
+`author` header, and GitHub does not tie that header to the Dependabot app —
+any exemption keyed on it could be claimed by others.
 
 `registryUnavailable` makes registry availability a merge-blocking dependency.
 That is the intended trade — "denied" and "unreachable" are indistinguishable
