@@ -5,6 +5,7 @@ members = [
     "crates/did-git-sign",
     "crates/vgi-forge",
     "crates/vgi-forge-github",
+    "crates/vgi-forge-forgejo",
 ]
 resolver = "3"
 

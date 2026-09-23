@@ -34,7 +34,7 @@ Forgejo, …) where that is enforced.
   classified by whether it removes the commit-trust guarantee.
 
 Nothing here talks to a forge; adapters are separate crates
-([`vgi-forge-github`][github] first).
+([`vgi-forge-github`][github], [`vgi-forge-forgejo`][forgejo]).
 
 ## License
 
@@ -43,3 +43,4 @@ Apache-2.0.
 [vgi]: https://github.com/OpenVTC/verifiable-git-infrastructure
 [vgi-core]: https://crates.io/crates/vgi-core
 [github]: https://crates.io/crates/vgi-forge-github
+[forgejo]: https://crates.io/crates/vgi-forge-forgejo

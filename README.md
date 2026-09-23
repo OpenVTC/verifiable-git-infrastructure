@@ -20,6 +20,7 @@ activation flow.
 | [`did-git-sign`](crates/did-git-sign) | The signer (`did-git-sign`, a git `gpg.ssh.program`). Signs commits with a DID key held by your VTA; carries the dev-machine stack (VTA client, keyring, prompts). |
 | [`vgi-forge`](crates/vgi-forge) | Forge-neutral adapter layer for VTC-governed git namespaces: the `Forge` trait and `ForgeHooks`, capabilities, forge-qualified resources, rights → role projection, bootstrap plans, events and drift. No forge I/O. |
 | [`vgi-forge-github`](crates/vgi-forge-github) | The GitHub adapter: one community's own GitHub App (manifest registration, scoped per-job installation tokens), namespace binding, device-flow account linking, repo creation and the commit-trust bootstrap, role projection, verified webhooks. |
+| [`vgi-forge-forgejo`](crates/vgi-forge-forgejo) | The Forgejo (and Gitea) adapter: a scoped bot user with token rotation, version-probed capabilities, OAuth2 + PKCE binding and account linking, repo creation and the commit-trust bootstrap (fast-forward-only merges, protected workflow paths), merge allow-list role projection, verified webhooks. |
 
 ## The CI check
 

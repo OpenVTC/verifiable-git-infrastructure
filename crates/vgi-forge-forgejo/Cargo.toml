@@ -1,0 +1,30 @@
+[package]
+name = "vgi-forge-forgejo"
+description = "Forgejo (and Gitea) adapter for VGI git namespaces: a scoped bot user with token rotation, OAuth2+PKCE binding and account linking, capability probing, repo creation and bootstrap, merge allow-list role projection and verified webhooks."
+readme = "README.md"
+keywords = ["git", "forgejo", "gitea", "did", "trust-registry"]
+categories = ["development-tools", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vgi-forge = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+wiremock = { workspace = true }
