@@ -21,9 +21,13 @@
 //!   keeps the numeric id and login and discards the user token.
 //! - **Repos.** Create (organisations only — a personal account reports
 //!   `bot_can_create_repos: false`, §8), inspect, archive, converge roles,
-//!   and the §5.3 bootstrap: workflow, `web-flow` keyring, variables, and a
-//!   ruleset with no bypass actors whose required check is pinned to the
-//!   GitHub Actions App.
+//!   and the §5.3 bootstrap with a ruleset that has no bypass actors. So that
+//!   a pull request cannot satisfy its own check (§9), an organisation with
+//!   org rulesets runs verify-trust as a **required workflow** from the
+//!   bridge-managed `<org>/.vgi` at a pinned commit; elsewhere the workflow
+//!   is committed to the repository and, with two or more owners, guarded
+//!   by `CODEOWNERS` plus code-owner review; a solo repository gets the
+//!   check alone ([`plan::CheckGuard`]).
 //! - **Webhooks.** `X-Hub-Signature-256` verified in constant time before
 //!   parsing; repository, member, membership, ruleset and installation
 //!   events become [`vgi_forge::ForgeEvent`]s.
@@ -42,6 +46,6 @@ pub mod webhook;
 
 pub use api::API_VERSION;
 pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig, JwtIssuer};
-pub use forge::GitHubForge;
+pub use forge::{GitHubForge, RequiredWorkflowPin};
 pub use jwt::{AppKeySigner, InProcessKey};
 pub use secret::Secret;

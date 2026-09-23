@@ -30,14 +30,29 @@ use crate::secret::Secret;
 
 /// The App's permissions: repository Administration (write), Contents
 /// (write, for the bootstrap commit), Variables (write), Metadata (read);
-/// organisation Members (read). No secrets, Actions logs, code scanning or
-/// packages.
-pub const APP_PERMISSIONS: [(&str, &str); 5] = [
+/// organisation Members (read) and Administration (write). No secrets,
+/// Actions logs, code scanning or packages.
+///
+/// Organisation Administration (`organization_administration`) is for one
+/// thing: the org ruleset that runs verify-trust as a **required workflow**
+/// from the bridge-managed `<org>/.vgi` repository at a pinned commit (§9).
+/// A `pull_request` workflow committed to the repository itself runs from
+/// the pull request's own files, so a writer could edit it to pass; the
+/// org ruleset takes what runs out of the pull request's reach. GitHub files
+/// every `/orgs/{org}/rulesets` endpoint under this permission, at write
+/// even for reads. It is always requested — the manifest is fixed per App,
+/// and organisations are the recommended topology — and it also lets the
+/// App edit other org settings, which is why the bind screen has to say
+/// why it is there. On a personal account it grants nothing. An owner who
+/// declines it gets the owner-review fallback (`missing_permissions` lists
+/// it).
+pub const APP_PERMISSIONS: [(&str, &str); 6] = [
     ("actions_variables", "write"),
     ("administration", "write"),
     ("contents", "write"),
     ("members", "read"),
     ("metadata", "read"),
+    ("organization_administration", "write"),
 ];
 
 /// Webhook events for drift (§5.6), plus `organization` for members joining

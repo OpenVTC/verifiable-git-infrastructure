@@ -24,6 +24,12 @@ fn admin_perms() -> serde_json::Value {
     json!({ "administration": "write", "metadata": "read" })
 }
 
+/// A repository whose owner has a linked account (id 7, `bob`): who the
+/// owner-review fallback names in `CODEOWNERS`.
+fn owned(name: &str) -> RepoSpec {
+    RepoSpec::new(repo(name)).with_owner(ForgeAccount::new(7, "bob"))
+}
+
 // ── capabilities ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -287,6 +293,17 @@ async fn mount_inspect(server: &MockServer, ruleset: serde_json::Value) {
         .respond_with(ResponseTemplate::new(200).set_body_json(ruleset))
         .mount(server)
         .await;
+    // A solo-shaped repository: no CODEOWNERS (unmatched reads are 404s),
+    // Actions on.
+    mount_token(
+        server,
+        INSTALLATION,
+        Some("widgets"),
+        json!({ "contents": "read", "metadata": "read" }),
+        1,
+    )
+    .await;
+    mount_actions_allowed(server, "acme/widgets").await;
 }
 
 fn projection() -> Projection {
@@ -584,8 +601,8 @@ async fn mount_bootstrap_tokens(server: &MockServer) {
     let contents = json!({ "contents": "write", "metadata": "read" });
     let variables = json!({ "actions_variables": "write", "metadata": "read" });
     mount_token(server, INSTALLATION, Some("gadgets"), contents, 2).await;
-    mount_token(server, INSTALLATION, Some("gadgets"), variables, 2).await;
     mount_token(server, INSTALLATION, Some("gadgets"), admin_perms(), 1).await;
+    mount_token(server, INSTALLATION, Some("gadgets"), variables, 2).await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/gadgets"))
         .respond_with(ResponseTemplate::new(200).set_body_json(repo_json(
@@ -597,19 +614,38 @@ async fn mount_bootstrap_tokens(server: &MockServer) {
         .await;
 }
 
+/// A solo repository (one linked owner): workflow, keyring, the ruleset
+/// with the check and no review requirement, and the legacy variables
+/// removed — the DIDs are literals in the workflow now.
 #[tokio::test]
 async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
     let (server, forge) = server_and_forge().await;
-    let spec = RepoSpec::new(repo("gadgets"));
+    let spec = owned("gadgets");
     let plan = forge.bootstrap_plan(&spec, &vgi_config()).unwrap();
+    let ids: Vec<_> = plan.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "workflow",
+            "keyring",
+            "ruleset",
+            "cleanup:variable:TRUST_REGISTRY_DID",
+            "cleanup:variable:VTC_DID"
+        ]
+    );
     let workflow = String::from_utf8(file_contents(&plan, "workflow")).unwrap();
     assert!(workflow.contains("resource-format: qualified"));
+    assert!(workflow.contains("vtc-did: 'did:webvh:vtc.acme.example'"));
+    assert!(!workflow.contains("${{ vars"));
 
-    // ── first run: nothing exists ──
+    // ── first run: nothing exists but the legacy variables ──
     mount_bootstrap_tokens(&server).await;
-    for (file, id) in [
-        ("workflows/verify-trust.yml", "workflow"),
-        ("trusted-platform-keys.asc", "keyring"),
+    for (file, contents) in [
+        (
+            "workflows/verify-trust.yml",
+            file_contents(&plan, "workflow"),
+        ),
+        ("trusted-platform-keys.asc", file_contents(&plan, "keyring")),
     ] {
         let p = format!("/repos/acme/gadgets/contents/.github/{file}");
         Mock::given(method("GET"))
@@ -624,7 +660,7 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
             .and(path(p))
             .and(InstallationToken)
             .and(body_partial_json(json!({
-                "content": STANDARD.encode(file_contents(&plan, id)),
+                "content": STANDARD.encode(&contents),
             })))
             .and(|req: &wiremock::Request| {
                 serde_json::from_slice::<serde_json::Value>(&req.body)
@@ -636,32 +672,22 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
             .await;
     }
     for var in ["TRUST_REGISTRY_DID", "VTC_DID"] {
+        let p = format!("/repos/acme/gadgets/actions/variables/{var}");
         Mock::given(method("GET"))
-            .and(path(format!("/repos/acme/gadgets/actions/variables/{var}")))
+            .and(path(p.clone()))
             .respond_with(
-                ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
+                ResponseTemplate::new(200).set_body_json(json!({ "name": var, "value": "x" })),
             )
             .mount(&server)
             .await;
+        Mock::given(method("DELETE"))
+            .and(path(p))
+            .and(InstallationToken)
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
     }
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/gadgets/actions/variables"))
-        .and(body_json(
-            json!({ "name": "TRUST_REGISTRY_DID", "value": "did:webvh:registry.example" }),
-        ))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/gadgets/actions/variables"))
-        .and(body_json(
-            json!({ "name": "VTC_DID", "value": "did:webvh:vtc.acme.example" }),
-        ))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(1)
-        .mount(&server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/gadgets/rulesets"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
@@ -678,6 +704,7 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
             "rules": [
                 { "type": "deletion" },
                 { "type": "non_fast_forward" },
+                // One owner: no review requirement (the user's decision).
                 { "type": "pull_request", "parameters": {
                     "required_approving_review_count": 0,
                     "dismiss_stale_reviews_on_push": false,
@@ -700,25 +727,32 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
 
     let report = run_plan(&forge, &repo("gadgets"), &plan).await;
     assert!(report.is_complete(), "{:?}", report.failed);
-    assert!(
-        report
-            .completed
-            .iter()
-            .all(|(_, o)| *o == StepOutcome::Created),
-        "{report:?}"
+    let outcomes: Vec<_> = report.completed.iter().map(|(_, o)| *o).collect();
+    assert_eq!(
+        outcomes,
+        [
+            StepOutcome::Created,
+            StepOutcome::Created,
+            StepOutcome::Created,
+            StepOutcome::Updated,
+            StepOutcome::Updated
+        ]
     );
     server.verify().await;
     server.reset().await;
 
     // ── second run: everything already there, nothing is written ──
     mount_bootstrap_tokens(&server).await;
-    for (file, id) in [
-        ("workflows/verify-trust.yml", "workflow"),
-        ("trusted-platform-keys.asc", "keyring"),
+    for (file, contents) in [
+        (
+            "workflows/verify-trust.yml",
+            file_contents(&plan, "workflow"),
+        ),
+        ("trusted-platform-keys.asc", file_contents(&plan, "keyring")),
     ] {
         // GitHub wraps base64 content at 60 columns; the adapter must not
         // mistake that for a difference.
-        let b64 = STANDARD.encode(file_contents(&plan, id));
+        let b64 = STANDARD.encode(&contents);
         let wrapped: Vec<_> = b64
             .as_bytes()
             .chunks(60)
@@ -729,18 +763,6 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "type": "file", "sha": "abc", "encoding": "base64", "content": wrapped.join("\n"),
             })))
-            .mount(&server)
-            .await;
-    }
-    for (var, value) in [
-        ("TRUST_REGISTRY_DID", "did:webvh:registry.example"),
-        ("VTC_DID", "did:webvh:vtc.acme.example"),
-    ] {
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/acme/gadgets/actions/variables/{var}")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "name": var, "value": value })),
-            )
             .mount(&server)
             .await;
     }
@@ -782,7 +804,7 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
 async fn bootstrap_repairs_drifted_state_in_place() {
     let (server, forge) = server_and_forge().await;
     let plan = forge
-        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .bootstrap_plan(&owned("gadgets"), &vgi_config())
         .unwrap();
     let only = |id: &str| plan.iter().find(|s| s.id == id).unwrap().clone();
 
@@ -819,7 +841,7 @@ async fn bootstrap_repairs_drifted_state_in_place() {
         StepOutcome::Updated
     );
 
-    // A changed variable is patched.
+    // A legacy variable is removed.
     mount_token(
         &server,
         INSTALLATION,
@@ -836,18 +858,15 @@ async fn bootstrap_repairs_drifted_state_in_place() {
         )
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
+    Mock::given(method("DELETE"))
         .and(path("/repos/acme/gadgets/actions/variables/VTC_DID"))
-        .and(body_json(
-            json!({ "name": "VTC_DID", "value": "did:webvh:vtc.acme.example" }),
-        ))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
     assert_eq!(
         forge
-            .run_step(&repo("gadgets"), &only("variable:VTC_DID"))
+            .run_step(&repo("gadgets"), &only("cleanup:variable:VTC_DID"))
             .await
             .unwrap(),
         StepOutcome::Updated
@@ -910,12 +929,12 @@ async fn a_protected_branch_explains_why_a_file_write_was_refused() {
     )
     .await;
     Mock::given(method("GET"))
-        .and(path("/repos/acme/gadgets/contents/CODEOWNERS"))
+        .and(path("/repos/acme/gadgets/contents/LICENSE"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })))
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
-        .and(path("/repos/acme/gadgets/contents/CODEOWNERS"))
+        .and(path("/repos/acme/gadgets/contents/LICENSE"))
         .respond_with(ResponseTemplate::new(409).set_body_json(json!({
             "message": "Repository rule violations found",
             "errors": [{ "message": "Changes must be made through a pull request." }]
@@ -924,11 +943,11 @@ async fn a_protected_branch_explains_why_a_file_write_was_refused() {
         .await;
     let plan = forge
         .bootstrap_plan(
-            &RepoSpec::new(repo("gadgets")),
-            &vgi_config().with_extra_file("CODEOWNERS", "* @acme/owners\n"),
+            &owned("gadgets"),
+            &vgi_config().with_extra_file("LICENSE", "MIT\n"),
         )
         .unwrap();
-    let step = plan.iter().find(|s| s.id == "file:CODEOWNERS").unwrap();
+    let step = plan.iter().find(|s| s.id == "file:LICENSE").unwrap();
     let e = forge.run_step(&repo("gadgets"), step).await.unwrap_err();
     let msg = e.to_string();
     assert!(matches!(e, ForgeError::Rejected { status: 409, .. }));
@@ -1085,7 +1104,7 @@ async fn a_ruleset_with_any_exclusion_does_not_cover_the_default_branch() {
         .mount(&server)
         .await;
     let step = forge
-        .bootstrap_plan(&RepoSpec::new(repo("widgets")), &vgi_config())
+        .bootstrap_plan(&owned("widgets"), &vgi_config())
         .unwrap()
         .into_iter()
         .find(|s| s.id == "ruleset")
@@ -1137,7 +1156,7 @@ async fn the_actions_app_id_is_looked_up_when_not_configured() {
         .mount(&server)
         .await;
     let step = forge
-        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .bootstrap_plan(&owned("gadgets"), &vgi_config())
         .unwrap()
         .into_iter()
         .find(|s| s.id == "ruleset")
@@ -1159,7 +1178,7 @@ async fn write_file_against(content_reply: serde_json::Value) -> ForgeError {
     )
     .await;
     Mock::given(method("GET"))
-        .and(path("/repos/acme/gadgets/contents/CODEOWNERS"))
+        .and(path("/repos/acme/gadgets/contents/LICENSE"))
         .respond_with(ResponseTemplate::new(200).set_body_json(content_reply))
         .mount(&server)
         .await;
@@ -1170,12 +1189,12 @@ async fn write_file_against(content_reply: serde_json::Value) -> ForgeError {
         .await;
     let step = forge
         .bootstrap_plan(
-            &RepoSpec::new(repo("gadgets")),
-            &vgi_config().with_extra_file("CODEOWNERS", "* @acme/owners\n"),
+            &owned("gadgets"),
+            &vgi_config().with_extra_file("LICENSE", "MIT\n"),
         )
         .unwrap()
         .into_iter()
-        .find(|s| s.id == "file:CODEOWNERS")
+        .find(|s| s.id == "file:LICENSE")
         .unwrap();
     forge.run_step(&repo("gadgets"), &step).await.unwrap_err()
 }

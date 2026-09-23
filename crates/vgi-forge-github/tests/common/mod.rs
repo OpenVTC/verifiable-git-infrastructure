@@ -242,7 +242,8 @@ pub fn repo_json(id: u64, full_name: &str, archived: bool) -> Value {
     })
 }
 
-/// A ruleset exactly as the adapter creates it.
+/// A ruleset exactly as the adapter creates it for a solo repository: PR
+/// required with no review, the pinned check, no force-push or deletion.
 pub fn good_ruleset(id: u64) -> Value {
     json!({
         "id": id,
@@ -255,7 +256,13 @@ pub fn good_ruleset(id: u64) -> Value {
         "rules": [
             { "type": "deletion" },
             { "type": "non_fast_forward" },
-            { "type": "pull_request", "parameters": { "required_approving_review_count": 0 } },
+            { "type": "pull_request", "parameters": {
+                "required_approving_review_count": 0,
+                "dismiss_stale_reviews_on_push": false,
+                "require_code_owner_review": false,
+                "require_last_push_approval": false,
+                "required_review_thread_resolution": false
+            } },
             { "type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": false,
                 "required_status_checks": [
@@ -263,5 +270,45 @@ pub fn good_ruleset(id: u64) -> Value {
                 ]
             } }
         ]
+    })
+}
+
+/// [`good_ruleset`] with the owner-review pull-request rule (two or more
+/// owners).
+pub fn review_ruleset(id: u64) -> Value {
+    let mut rs = good_ruleset(id);
+    rs["rules"][2]["parameters"] = json!({
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": false
+    });
+    rs
+}
+
+/// Actions on and allowed to run anything: `GET .../actions/permissions`.
+pub async fn mount_actions_allowed(server: &MockServer, owner_repo: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{owner_repo}/actions/permissions")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "enabled": true, "allowed_actions": "all",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A managed `CODEOWNERS` naming `logins` for `/.github/`, as the adapter
+/// writes it.
+pub fn managed_codeowners(community: &str, logins: &[&str]) -> String {
+    let logins: Vec<String> = logins.iter().map(|l| l.to_string()).collect();
+    vgi_forge_github::plan::render_codeowners(community, &["/.github/".into()], &logins)
+}
+
+/// A contents-API file reply.
+pub fn file_reply(contents: &[u8], sha: &str) -> Value {
+    json!({
+        "type": "file", "sha": sha, "encoding": "base64",
+        "content": STANDARD.encode(contents),
     })
 }
