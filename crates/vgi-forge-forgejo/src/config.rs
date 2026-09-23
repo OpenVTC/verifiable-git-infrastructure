@@ -91,6 +91,14 @@ pub struct ForgejoConfig {
     pub status_check_context: Option<String>,
     /// What to do on an instance without fast-forward-only merges.
     pub merge_fallback: MergeFallback,
+    /// Deliver `TRUST_REGISTRY_DID` / `VTC_DID` as Actions variables rather
+    /// than writing them into the workflow. Off by default, for two reasons:
+    /// Forgejo lets only a repository *owner* (the org's Owners team) manage
+    /// variables, which the bot — an admin through its team — is not; and a
+    /// value in the workflow can only change through a pull request, which
+    /// the protected paths refuse, while an owner can re-point a variable at
+    /// another registry without one. Turn it on only if the bot is an owner.
+    pub use_actions_variables: bool,
     /// Per-request timeout.
     pub request_timeout: Duration,
     /// How long an account-link `state` stays valid.
@@ -147,6 +155,7 @@ impl ForgejoConfig {
             runs_on: DEFAULT_RUNS_ON.into(),
             status_check_context: None,
             merge_fallback: MergeFallback::Fail,
+            use_actions_variables: false,
             request_timeout: Duration::from_secs(30),
             link_state_ttl: Duration::from_secs(15 * 60),
         })
@@ -173,6 +182,13 @@ impl ForgejoConfig {
     /// Choose the fallback for instances without fast-forward-only merges.
     pub fn with_merge_fallback(mut self, fallback: MergeFallback) -> Self {
         self.merge_fallback = fallback;
+        self
+    }
+
+    /// Deliver the DIDs as Actions variables (see
+    /// [`ForgejoConfig::use_actions_variables`]: needs the bot to be an owner).
+    pub fn with_actions_variables(mut self) -> Self {
+        self.use_actions_variables = true;
         self
     }
 

@@ -163,6 +163,19 @@ pub async fn server_and_forge_at(
     (server, forge)
 }
 
+/// Like [`server_and_forge`], with the config adjusted by `f`.
+pub async fn server_and_forge_with(
+    f: impl FnOnce(ForgejoConfig) -> ForgejoConfig,
+) -> (MockServer, ForgejoForge) {
+    let server = MockServer::start().await;
+    mount_probe(&server, VERSION).await;
+    let forge = ForgejoForge::connect(f(config(&server)), credentials())
+        .await
+        .unwrap();
+    register(&forge);
+    (server, forge)
+}
+
 pub fn user(id: u64, login: &str) -> Value {
     json!({ "id": id, "login": login, "full_name": "", "email": "" })
 }

@@ -565,15 +565,24 @@ async fn the_adapter_against_a_real_forgejo() {
             "{path} in {p:?}"
         );
     }
-    let vars = fj
+    // The DIDs are in the (protected) workflow, not in variables: Forgejo
+    // lets only an owner manage those, and the bot is an admin.
+    let wf = fj
         .ok(
             ROOT,
             Method::GET,
-            "repos/acme/widgets/actions/variables/VTC_DID",
+            "repos/acme/widgets/contents/.forgejo/workflows/verify-trust.yml",
             None,
         )
         .await;
-    assert_eq!(vars["data"], "did:webvh:vtc.example");
+    let wf = String::from_utf8(
+        STANDARD
+            .decode(wf["content"].as_str().unwrap().replace('\n', ""))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(wf.contains("vtc-did: 'did:webvh:vtc.example'"), "{wf}");
+    assert!(wf.contains("uses: https://github.com/OpenVTC/"), "{wf}");
 
     // ── members link their accounts; roles are projected ────────────────
     let link = |who: (&'static str, &'static str)| {

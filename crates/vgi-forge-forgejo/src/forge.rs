@@ -1534,7 +1534,8 @@ impl Forge for ForgejoForge {
             actions_base: &self.config.actions_base,
             runs_on: &self.config.runs_on,
             status_context: self.config.status_context(&cfg.required_check),
-            inline_variables: !probed.info.features.actions_variables,
+            inline_variables: !(self.config.use_actions_variables
+                && probed.info.features.actions_variables),
             merges: match &key {
                 Some(k) => MergePlan::SigningKey(k),
                 None => MergePlan::FastForwardOnly,

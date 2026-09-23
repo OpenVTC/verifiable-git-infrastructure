@@ -708,7 +708,7 @@ fn protection_body(mergers: &[&str]) -> Value {
 
 #[tokio::test]
 async fn bootstrap_runs_every_step_on_a_fresh_repo() {
-    let (server, forge) = server_and_forge().await;
+    let (server, forge) = server_and_forge_with(|c| c.with_actions_variables()).await;
     let plan = forge
         .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
         .unwrap();
@@ -833,7 +833,7 @@ async fn bootstrap_runs_every_step_on_a_fresh_repo() {
 
 #[tokio::test]
 async fn a_bootstrapped_repo_reruns_without_writing() {
-    let (server, forge) = server_and_forge().await;
+    let (server, forge) = server_and_forge_with(|c| c.with_actions_variables()).await;
     mount_repo(&server, "gadgets", repo_json(9001, "acme/gadgets", false)).await;
     let workflow = step_contents(&forge, "workflow");
     Mock::given(method("GET"))
@@ -1061,8 +1061,34 @@ async fn the_signing_key_fallback_allows_signed_merge_commits_only() {
 }
 
 #[tokio::test]
+async fn by_default_the_dids_live_in_the_protected_workflow() {
+    // Forgejo lets only a repository owner manage variables; the bot is an
+    // admin. The workflow is also the safer home: it changes only through a
+    // pull request, which the protected paths refuse.
+    let (_server, forge) = server_and_forge().await;
+    let plan = forge
+        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .unwrap();
+    let ids: Vec<_> = plan.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["merge-styles", "workflow", "protection"]);
+    let wf = String::from_utf8(step_contents(&forge, "workflow")).unwrap();
+    assert!(wf.contains("registry-did: 'did:webvh:registry'"));
+    assert!(wf.contains("vtc-did: 'did:webvh:acme-vtc'"));
+}
+
+#[tokio::test]
 async fn forgejo_7_writes_the_dids_into_the_workflow() {
-    let (_server, forge) = server_and_forge_at("7.0.4+gitea-1.21.0", MergeFallback::Fail).await;
+    // Even opted in to variables, an instance without the API gets the DIDs
+    // inline.
+    let server = MockServer::start().await;
+    mount_probe(&server, "7.0.4+gitea-1.21.0").await;
+    let forge = vgi_forge_forgejo::ForgejoForge::connect(
+        config(&server).with_actions_variables(),
+        credentials(),
+    )
+    .await
+    .unwrap();
+    register(&forge);
     let plan = forge
         .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
         .unwrap();

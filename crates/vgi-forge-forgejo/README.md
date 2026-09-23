@@ -36,9 +36,12 @@ Gitea, best effort), acting as **one community's bot user** on it.
   (fast-forward only, Actions on — first, because it is the step an old
   instance refuses); `.forgejo/workflows/verify-trust.yml` (checkout and the
   action by **full URL** pinned to a commit, `resource-format: qualified`,
-  `version` and `sha256` pinned, no dormant `if:` guard); `TRUST_REGISTRY_DID`
-  and `VTC_DID` variables (written into the workflow where there is no
-  variables API); and branch protection on the default branch — no pushes,
+  `version` and `sha256` pinned, no dormant `if:` guard, and the registry and
+  VTC DIDs written into it — Forgejo lets only a repository *owner* manage
+  Actions variables, and a value in the protected workflow can only change
+  through a pull request, which a variable an owner edits cannot say;
+  `with_actions_variables()` opts into variables for a bot that is an owner);
+  and branch protection on the default branch — no pushes,
   applies to admins, the check's status context required, merging restricted
   to the allow-list, and the workflow directories and keyring as **protected
   files**, so no pull request can rewrite the check it is judged by.
