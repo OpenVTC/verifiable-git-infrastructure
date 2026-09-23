@@ -7,9 +7,14 @@ name: action-selftest
 # not happen is the marker appearing.
 #
 # Needs no secrets. The action's install step downloads a pinned VGI release
-# with the job's read-only GITHUB_TOKEN; verify-trust then exits on the dummy
-# inputs (the unknown resource-format, or the range at `git rev-list`) before
-# any DID resolution or registry query.
+# anonymously and, on this GitHub-hosted runner (which has `gh`), verifies its
+# build-provenance attestation with the job's read-only GITHUB_TOKEN; the dummy
+# range makes verify-trust exit at `git rev-list`, before any DID resolution or
+# registry query (or exits earlier on the dummy resource-format).
+#
+# The second job installs inside a container that has curl but no `gh` — the
+# situation on a Forgejo runner. The install must still succeed, checked
+# against the release's published checksum and a checksum pinned here.
 on:
   pull_request:
 
@@ -37,8 +42,9 @@ jobs:
           fallback-resource: '"; touch "$RUNNER_TEMP/sec4045_pwned"; echo "'
           resource-format: 'qualified$(touch "$RUNNER_TEMP/sec4045_pwned")'
           # Pinned, not `latest`: the check is about the action's shell, so it
-          # should not move when a release is cut.
-          version: v0.4.8
+          # should not move when a release is cut. At least v0.4.9, the first
+          # release with a build-provenance attestation for this runner to verify.
+          version: v0.4.12
 
       - name: Assert no input was executed
         env:
@@ -61,3 +67,46 @@ jobs:
             exit 1
           fi
           echo "No action input was executed."
+
+  installs-without-gh:
+    name: Action installs without gh or a GitHub token
+    runs-on: ubuntu-latest
+    # curl, tar and coreutils but no `gh`, as on a Forgejo runner. The image is
+    # pinned by digest, as every action is pinned by commit SHA. Trixie, not
+    # bookworm: the Linux binary is built on ubuntu-latest and needs glibc 2.39.
+    container:
+      image: buildpack-deps:trixie-curl@sha256:9071eeb01ff824dc623b03e4c392d631459e70000302c8f4b443804842281e39
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Confirm gh is absent
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            echo "::error::gh is installed in the container, so this job would not exercise the gh-less install"
+            exit 1
+          fi
+
+      # Only the install is under test here. The run step fails on the dummy
+      # inputs, which is expected.
+      - name: Run the action
+        id: action
+        continue-on-error: true
+        uses: ./.github/actions/verify-trust
+        with:
+          range: HEAD~1..HEAD
+          registry-did: did:example:registry
+          vtc-did: did:example:vtc
+          version: v0.4.12
+          # SHA-256 of verify-trust-x86_64-unknown-linux-gnu.tar.gz in v0.4.12.
+          sha256: cc4adbe2a20646791dc9007cba511ad581582c2dd2e94b6bad3c5d424ccaf61b
+
+      - name: Assert verify-trust was installed
+        run: |
+          set -euo pipefail
+          if ! command -v verify-trust >/dev/null 2>&1; then
+            echo "::error::the action did not install verify-trust without gh"
+            exit 1
+          fi
+          verify-trust --version
