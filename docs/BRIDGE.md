@@ -288,7 +288,15 @@ from **signed `push` webhooks, never from who a commit says wrote it**:
 
 - **The record.** Every verified `push` to a `dependabot/*` branch is kept:
   before, after, who GitHub says pushed (login and numeric id), and whether
-  the push created the branch. Deleting the branch clears its record.
+  the push created the branch. Deleting the branch clears its record, and
+  creating it again starts a new one — but only a delivery at least as new
+  as every one recorded (by GitHub's `repository.pushed_at`, which the
+  webhook signature covers) may clear or restart a record, and a delivery
+  more than six days old is not recorded at all: the bridge forgets
+  delivery ids after seven, so an older one could be a replay. Up to 64
+  `dependabot/*` branches are tracked per repository; past that the one
+  untouched longest is forgotten, and a forgotten branch is never
+  re-signed.
 - **When it re-signs.** On `pull_request` opened / synchronize / reopened —
   and when a push arrives for a branch whose pull request it has already
   seen — the bridge re-reads the pull request from GitHub and re-signs only
@@ -298,18 +306,29 @@ from **signed `push` webhooks, never from who a commit says wrote it**:
     repository**, and it targets the repository's default branch;
   - every push recorded on the branch came from Dependabot or was one of the
     bridge's own re-sign pushes, and walking back from the head through
-    those pushes reaches the branch's creation, by Dependabot, with no gap;
+    those pushes reaches the branch's creation, by Dependabot, with no gap
+    (a re-sign push whose webhook the bridge missed still links the walk,
+    by the exact old and new head it recorded before pushing);
   - the namespace has the re-sign on (the default; see the config below) and
     `platform_keyring_file` names GitHub's `web-flow` key;
   - each commit has one parent, carries only the standard headers, is
-    `web-flow`-signed with a signature that verifies against that key, and
-    is authored by Dependabot's noreply address.
+    `web-flow`-signed with a signature that verifies against that key, is
+    authored by Dependabot's noreply address, carries no `Signed-by-DID:`
+    trailer of its own, and **changes nothing under `.github/workflows/`**
+    (read from the commits' trees; if they cannot be read, nothing is
+    re-signed).
 
   Anything else — a push by anyone else, a push the bridge never saw (it was
   down), a pull request from a fork — and nothing is re-signed. The check
   fails as it would anyway, and its summary says why and what to do: a
   maintainer re-signs the commits (runbook §5), or Dependabot starts the
   branch over (close the pull request and delete the branch).
+- **Workflow changes are never re-signed.** A Dependabot pull request that
+  touches `.github/workflows/` — a `github-actions` update, typically —
+  waits for a maintainer to review it and re-sign it by hand (runbook §5);
+  the check says so. The bridge will not vouch for what CI runs, and the App
+  has no `workflows` permission, which GitHub requires to push such a change
+  (and which the manifest deliberately does not ask for).
 - **How.** Each commit is rebuilt with the **same tree** and the same author
   line; the committer is the bridge (`[resign]`), the message gains a
   `Signed-by-DID: <bridge DID>#<key>` trailer, and it is signed (sshsig,
@@ -319,7 +338,8 @@ from **signed `push` webhooks, never from who a commit says wrote it**:
   repository, over the same hardened git as the check. The bridge records
   that push as its own before sending it, so its webhook does not make the
   branch unclean. A head already carrying the bridge's signature is left
-  alone.
+  alone. Re-signs run `checks.concurrency` at a time, one at a time per
+  branch.
 - **Dependabot after a re-sign.** Dependabot stops rebasing a pull request
   someone else has pushed to — and the re-sign is such a push. Comment
   `@dependabot rebase` when it falls behind: Dependabot's push is recorded,

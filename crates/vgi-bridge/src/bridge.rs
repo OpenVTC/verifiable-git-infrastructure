@@ -156,6 +156,8 @@ impl Bridge {
         #[cfg(feature = "forge-github")]
         let checks =
             crate::checks::CheckRunner::new(&parts.config.checks, parts.commits, parts.fetcher);
+        #[cfg(feature = "forge-github")]
+        let resign = crate::resign::ResignRunner::new(parts.config.checks.concurrency);
         Arc::new(Bridge {
             cfg: parts.config,
             identity: parts.identity,
@@ -167,7 +169,7 @@ impl Bridge {
             #[cfg(feature = "forge-github")]
             checks,
             #[cfg(feature = "forge-github")]
-            resign: crate::resign::ResignRunner::default(),
+            resign,
         })
     }
 

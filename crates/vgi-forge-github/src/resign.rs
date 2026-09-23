@@ -64,6 +64,10 @@ pub struct PushEvent {
     pub sender_id: u64,
     /// GitHub's delivery id.
     pub delivery_id: Option<String>,
+    /// `repository.pushed_at`: when GitHub says the repository was last
+    /// pushed to, as it built this delivery (Unix seconds). The signature
+    /// covers it, so an old delivery replayed keeps its old time.
+    pub pushed_at: Option<i64>,
 }
 
 impl PushEvent {
@@ -82,6 +86,11 @@ fn object_id(v: &Value, key: &str) -> Result<String> {
     crate::checks::check_sha(s)
         .map_err(|_| ForgeError::Webhook(format!("push `{key}` is not an object id")))?;
     Ok(s.to_string())
+}
+
+/// `repository.pushed_at`: Unix seconds in `push` payloads.
+fn pushed_at(p: &Value) -> Option<i64> {
+    p.pointer("/repository/pushed_at").and_then(Value::as_i64)
 }
 
 impl GitHubForge {
@@ -141,6 +150,7 @@ impl GitHubForge {
             sender_login,
             sender_id,
             delivery_id,
+            pushed_at: pushed_at(&p),
         }))
     }
 

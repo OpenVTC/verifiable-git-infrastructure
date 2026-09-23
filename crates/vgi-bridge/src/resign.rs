@@ -12,15 +12,20 @@
 //!
 //! 1. **The ledger.** Every verified `push` to a `dependabot/*` branch is
 //!    recorded ([`BranchLedger`]): before, after, the sender GitHub reports
-//!    (login *and* numeric id), the `created` / `forced` flags, the
-//!    delivery. A deletion clears the branch's record; a creation starts it
-//!    afresh.
+//!    (login *and* numeric id), the `created` flag, the delivery. A deletion
+//!    clears the branch's record; a creation starts it afresh — but only a
+//!    delivery at least as new (GitHub's signed `repository.pushed_at`) as
+//!    every one recorded may reset or clear it, and one older than six days
+//!    is not recorded at all (a replay the delivery ids no longer catch). At
+//!    most 64 branches per repository are tracked; the one untouched longest
+//!    is forgotten, and a forgotten branch is never clean.
 //! 2. **Clean.** A branch is Dependabot-clean up to a head `H` when, walking
 //!    back from `H` through `after → before`, every link is a recorded push
 //!    and the walk ends at a creation pushed by Dependabot; and every push
 //!    recorded on the branch came from Dependabot or was the bridge's own
 //!    re-sign (recorded, before it was sent, as exactly that
-//!    `before → after`). A push the bridge never saw (it was down), a push by
+//!    `before → after` — which also bridges the walk when the webhook for
+//!    the bridge's own push never arrived). A push the bridge never saw (it was down), a push by
 //!    anyone else, or a record that does not lead back to the creation, and
 //!    the branch is not clean: nothing is re-signed, the check fails as it
 //!    would anyway, and its summary says why and what a maintainer can do.
@@ -35,8 +40,12 @@
 //! 4. **Each commit** in `base...head`, oldest first, must have exactly one
 //!    parent (the previous commit of the range, or for the first, any), be
 //!    `web-flow`-signed with a signature that verifies against the configured
-//!    keyring, carry only the standard headers, and be authored by
-//!    Dependabot's noreply identity.
+//!    keyring, carry only the standard headers, be authored by Dependabot's
+//!    noreply identity, and change nothing under `.github/workflows/` (the
+//!    changed paths are read from the trees; if they cannot be, nothing is
+//!    re-signed). Workflow changes are left to a maintainer: the bridge
+//!    does not vouch for what CI runs, and does not hold the `workflows`
+//!    permission a push of them would need anyway.
 //! 5. **Re-signed.** Each commit becomes a new commit with the **same tree**
 //!    (so nothing but commit objects is written), the original author line
 //!    unchanged, the bridge as committer (`[resign]`, dated now), the
@@ -53,7 +62,8 @@
 //!    the environment). The push is recorded in the ledger as the bridge's
 //!    own **before** it is sent.
 //!
-//! It never loops: a head whose commits already carry the bridge's
+//! Re-signs run a bounded number at a time (`checks.concurrency`) and one at
+//! a time per branch. It never loops: a head whose commits already carry the bridge's
 //! signature is left alone (Ed25519 is deterministic, so "our signature over
 //! this payload" is checked exactly), and any commit that is not
 //! `web-flow`-signed stops the re-sign.
@@ -83,6 +93,16 @@ use crate::store::{BranchLedger, NamespaceRecord, NamespaceState, OwnPush, PushR
 const MAX_PUSHES: usize = 256;
 /// The bridge's own pushes one branch's ledger keeps.
 const MAX_OWN: usize = 64;
+/// Dependabot branches tracked per repository; past this the one untouched
+/// longest is forgotten.
+const MAX_BRANCHES_PER_REPO: usize = 64;
+/// Push deliveries older than this (by GitHub's `repository.pushed_at`) are
+/// not recorded: the bridge forgets delivery ids after 7 days, so an older
+/// delivery could be a replay it can no longer recognise.
+const REPLAY_WINDOW_SECS: i64 = 6 * 86_400;
+/// The workflow directory. A change under it is never re-signed: the
+/// bridge does not vouch for what CI runs.
+const WORKFLOWS: &str = ".github/workflows";
 /// Ledgers untouched this long are dropped by the hourly maintenance.
 const LEDGER_TTL_SECS: i64 = 90 * 86_400;
 /// The branch prefix Dependabot pushes to.
@@ -105,10 +125,20 @@ pub enum ResignOutcome {
     Skipped(String),
 }
 
-/// Re-signs run one at a time per branch.
-#[derive(Default)]
+/// Re-signs run a bounded number at a time, and one at a time per branch.
 pub struct ResignRunner {
+    permits: tokio::sync::Semaphore,
     in_flight: Mutex<BTreeSet<(u64, String)>>,
+}
+
+impl ResignRunner {
+    /// At most `concurrency` re-signs at once.
+    pub fn new(concurrency: usize) -> Self {
+        ResignRunner {
+            permits: tokio::sync::Semaphore::new(concurrency.max(1)),
+            in_flight: Mutex::new(BTreeSet::new()),
+        }
+    }
 }
 
 struct InFlight<'a> {
@@ -151,41 +181,112 @@ pub fn check_branch_name(branch: &str) -> Result<()> {
 
 // ── the ledger ───────────────────────────────────────────────────────────
 
+/// Make room for a new ledger under `key`: past [`MAX_BRANCHES_PER_REPO`]
+/// ledgers in the repository, the one untouched longest is dropped (its
+/// branch is then unknown, so never clean — fail-safe).
+fn make_room(bridge: &Bridge, key: &str) -> Result<()> {
+    if bridge
+        .store
+        .get::<BranchLedger>(Table::Branches, key)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    // `<host>#<repo id>#`: every ledger of the same repository.
+    let prefix: String = {
+        let mut parts = key.splitn(3, '#');
+        format!(
+            "{}#{}#",
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default()
+        )
+    };
+    let mut same: Vec<(i64, String)> = bridge
+        .store
+        .list::<BranchLedger>(Table::Branches)?
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(k, l)| (l.touched, k))
+        .collect();
+    same.sort();
+    let excess = (same.len() + 1).saturating_sub(MAX_BRANCHES_PER_REPO);
+    for (_, k) in same.into_iter().take(excess) {
+        tracing::info!(ledger = %k, "dropping the oldest Dependabot branch record");
+        bridge.store.delete(Table::Branches, &k)?;
+    }
+    Ok(())
+}
+
 /// Record a verified push in its branch's ledger. Returns the pull request
 /// already seen for the branch, if any, so the re-sign can resume.
+///
+/// Replays are held off by GitHub's own clock, which the delivery's
+/// signature covers (`repository.pushed_at`): a delivery older than
+/// [`REPLAY_WINDOW_SECS`] — older than the delivery ids the bridge keeps —
+/// is not recorded at all, and only a delivery at least as new as every one
+/// recorded may reset the ledger (a creation) or clear it (a deletion). One
+/// that is older, or carries no time, only adds its record, which can make
+/// a branch unclean but never clean.
 pub fn record_push(bridge: &Bridge, host: &str, push: &PushEvent) -> Result<Option<u64>> {
     let branch = push.branch().context("not a branch")?.to_string();
     let key = ledger_key(host, push.repo_id, &branch);
+    let now = now();
+    if let Some(t) = push.pushed_at
+        && t < now - REPLAY_WINDOW_SECS
+    {
+        tracing::warn!(
+            repo = %push.repo, %branch, pushed_at = t,
+            "ignoring a push delivery older than the replay window"
+        );
+        return Ok(None);
+    }
+    if !push.deleted {
+        make_room(bridge, &key)?;
+    }
     bridge
         .store
         .update::<BranchLedger, _>(Table::Branches, &key, |current| {
+            let existed = current.is_some();
             let mut l = current.unwrap_or_default();
             let pr = l.pull_request;
+            let newest = match (push.pushed_at, l.last_pushed_at) {
+                (Some(t), Some(last)) => t >= last,
+                (Some(_), None) => true,
+                (None, _) => !existed,
+            };
             if push.deleted {
-                // The branch is gone (and with it any pull request): its
-                // record ends here.
-                return Ok((None, None));
+                if newest {
+                    // The branch is gone (and with it any pull request):
+                    // its record ends here.
+                    return Ok((None, None));
+                }
+                tracing::info!(%branch, "ignoring a deletion older than the branch's record");
+                return Ok((existed.then_some(l), None));
             }
-            if push.created {
+            if push.created && newest {
                 // A new branch under an old name: what happened to the
                 // old one says nothing about this one. The pull request
                 // number is kept — its delivery may have come first.
                 l = BranchLedger {
                     pull_request: pr,
+                    last_pushed_at: l.last_pushed_at,
                     ..BranchLedger::default()
                 };
             }
             l.repo = Some(push.repo.clone());
             l.branch = branch.clone();
+            l.touched = now;
+            if let Some(t) = push.pushed_at {
+                l.last_pushed_at = Some(l.last_pushed_at.map_or(t, |last| last.max(t)));
+            }
             let rec = PushRecord {
                 before: push.before.clone(),
                 after: push.after.clone(),
                 sender_login: push.sender_login.clone(),
                 sender_id: push.sender_id,
                 created: push.created,
-                forced: push.forced,
                 delivery_id: push.delivery_id.clone(),
-                at: now(),
+                at: now,
             };
             let repeat = l.pushes.iter().any(|p| {
                 p.before == rec.before && p.after == rec.after && p.sender_id == rec.sender_id
@@ -203,11 +304,13 @@ pub fn record_push(bridge: &Bridge, host: &str, push: &PushEvent) -> Result<Opti
 
 /// Remember the pull request open from a branch.
 fn remember_pull_request(bridge: &Bridge, key: &str, number: u64) -> Result<()> {
+    make_room(bridge, key)?;
     bridge
         .store
         .update::<BranchLedger, _>(Table::Branches, key, |l| {
             let mut l = l.unwrap_or_default();
             l.pull_request = Some(number);
+            l.touched = now();
             Ok((Some(l), ()))
         })
 }
@@ -227,8 +330,25 @@ fn record_own(bridge: &Bridge, key: &str, before: &str, after: &str) -> Result<(
                 after: after.to_string(),
                 at: now(),
             });
+            l.touched = now();
             Ok((Some(l), ()))
         })
+}
+
+/// Note why the re-sign of `head` stopped at its commits, for the check.
+fn note_skip(bridge: &Bridge, key: &str, head: &str, why: &str) {
+    let _ = bridge
+        .store
+        .update::<BranchLedger, _>(Table::Branches, key, |l| {
+            Ok((
+                l.map(|mut l| {
+                    l.last_skip = Some((head.to_string(), why.to_string()));
+                    l.touched = now();
+                    l
+                }),
+                (),
+            ))
+        });
 }
 
 fn short(sha: &str) -> &str {
@@ -260,8 +380,16 @@ pub fn is_clean(ledger: &BranchLedger, head: &str, login: &str, id: u64) -> Resu
         ));
     }
     let mut cur = head;
-    for _ in 0..=ledger.pushes.len() {
+    for _ in 0..=(ledger.pushes.len() + ledger.own.len()) {
         let Some(p) = ledger.pushes.iter().find(|p| p.after == cur) else {
+            // A push the bridge made itself, whose webhook it missed: its
+            // own record says exactly what it replaced. (The head it names
+            // only ever existed in the bridge until it pushed it, so no one
+            // else can have put it there.)
+            if let Some(o) = ledger.own.iter().find(|o| o.after == cur) {
+                cur = &o.before;
+                continue;
+            }
             return Err(format!(
                 "the bridge has no record of the push that made {} the head (it may have been \
                  down when it happened)",
@@ -362,35 +490,100 @@ fn eligibility(
 
 /// For a failing check on a Dependabot pull request: what the bridge does
 /// about it, as a paragraph for the check's summary. `None` for any other
-/// pull request.
+/// pull request. `protected` is the branch the check was posted against.
 pub(crate) fn check_hint(
     bridge: &Bridge,
     ctx: &Ctx,
     trigger: &CheckTrigger,
     pr: &PullRequestInfo,
+    protected: &str,
 ) -> Option<String> {
     let gh = github_config(bridge, trigger.repo.host())?;
     if !opened_by_dependabot(gh, pr) {
         return None;
     }
-    Some(
-        match eligibility(bridge, ctx, &trigger.repo, trigger.repo_id, pr, None) {
-            Ok(_) => format!(
-                "\n\n**Dependabot.** Only Dependabot has pushed to this branch, so the \
-                 community's bridge re-signs these commits with its own DID (`{}`); the check \
-                 runs again on the re-signed head. If the re-signed commits fail too, the VTC \
-                 has not granted the bridge `git.commit.sign` on this namespace.",
-                bridge.identity.did()
-            ),
-            Err(why) => format!(
-                "\n\n**Dependabot.** The bridge will not re-sign this pull request: {why}. A \
-                 maintainer who is an enrolled signer must re-sign the commits (runbook §5), \
-                 or Dependabot must start the branch over: close the pull request and delete \
-                 the branch, or comment `@dependabot recreate` (which is re-signed only if \
-                 Dependabot re-creates the branch rather than force-pushing it)."
-            ),
-        },
+    let by_hand = "A maintainer who is an enrolled signer must re-sign the commits by hand \
+                   (runbook §5: `gh pr checkout <number>`, then `git rebase --exec 'git commit \
+                   --amend --no-edit -S' origin/main` and `git push --force-with-lease`)";
+    // What the last re-sign of this very head found in its commits.
+    let noted = bridge
+        .store
+        .get::<BranchLedger>(
+            Table::Branches,
+            &ledger_key(trigger.repo.host(), trigger.repo_id, &pr.head_ref),
+        )
+        .ok()
+        .flatten()
+        .and_then(|l| l.last_skip)
+        .filter(|(head, _)| *head == pr.head_sha)
+        .map(|(_, why)| why);
+    let verdict = eligibility(
+        bridge,
+        ctx,
+        &trigger.repo,
+        trigger.repo_id,
+        pr,
+        Some(protected),
     )
+    .and_then(|_| noted.map_or(Ok(()), Err));
+    Some(match verdict {
+        Ok(()) => format!(
+            "\n\n**Dependabot.** Only Dependabot has pushed to this branch, so the \
+             community's bridge re-signs these commits with its own DID (`{}`) and the check \
+             runs again on the re-signed head — unless they change `{WORKFLOWS}/`, which the \
+             bridge never re-signs. If the re-signed commits fail too, the VTC has not granted \
+             the bridge `git.commit.sign` on this namespace.",
+            bridge.identity.did()
+        ),
+        Err(why) if why.contains(WORKFLOWS) => format!(
+            "\n\n**Dependabot.** This pull request changes `{WORKFLOWS}/`, and the bridge never \
+             re-signs workflow changes. {by_hand}."
+        ),
+        Err(why) => format!(
+            "\n\n**Dependabot.** The bridge will not re-sign this pull request: {why}. \
+             {by_hand}, or Dependabot must start the branch over: close the pull request and \
+             delete the branch, or comment `@dependabot recreate` (which is re-signed only if \
+             Dependabot re-creates the branch rather than force-pushing it)."
+        ),
+    })
+}
+
+/// Whether a changed path is (or could stand for) a workflow file.
+fn touches_workflows(path: &[u8]) -> bool {
+    let p = String::from_utf8_lossy(path).to_ascii_lowercase();
+    p == ".github" || p == WORKFLOWS || p.starts_with(&format!("{WORKFLOWS}/"))
+}
+
+/// Whether the change from `parent` to `commit` touches the workflow
+/// directory, read from the two trees (`diff-tree`, names only — no blob is
+/// needed). `Err` when the trees cannot be read: the caller then re-signs
+/// nothing.
+async fn changes_workflows(
+    fetcher: &crate::checks::GitFetcher,
+    dir: &std::path::Path,
+    parent: &str,
+    commit: &str,
+) -> Result<bool> {
+    let out = fetcher
+        .git_with_input(
+            dir,
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--name-only",
+                "--no-commit-id",
+                parent,
+                commit,
+            ],
+            b"",
+        )
+        .await?;
+    Ok(out
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .any(touches_workflows))
 }
 
 // ── acting ───────────────────────────────────────────────────────────────
@@ -512,6 +705,7 @@ pub async fn run(
         Err(why) => return skip(why),
     };
 
+    let _permit = bridge.resign.permits.acquire().await?;
     let flight = (repo_id, pr.head_ref.clone());
     if !bridge
         .resign
@@ -569,12 +763,17 @@ pub async fn run(
         Utc::now().timestamp()
     );
 
+    // A reason found in the commits themselves is noted for the check.
+    let stop = |why: String| {
+        note_skip(bridge, &key, &pr.head_sha, &why);
+        Ok(ResignOutcome::Skipped(why))
+    };
     let mut previous_original: Option<&str> = None;
     let mut previous_new: Option<String> = None;
     for c in &fetched.commits {
         let commit = match Commit::parse(&c.raw) {
             Ok(x) => x,
-            Err(e) => return skip(format!("commit {}: {e}", short(&c.sha))),
+            Err(e) => return stop(format!("commit {}: {e}", short(&c.sha))),
         };
         if let Err(why) = commit.check_dependabot(
             &c.raw,
@@ -583,11 +782,29 @@ pub async fn run(
             &gh.dependabot_login,
             &author_email,
         ) {
-            return skip(format!("commit {}: {why}", short(&c.sha)));
+            return stop(format!("commit {}: {why}", short(&c.sha)));
+        }
+        match changes_workflows(fetcher, fetched.dir.path(), &commit.parent, &c.sha).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return stop(format!(
+                    "commit {} changes `{WORKFLOWS}/`, which the bridge never re-signs",
+                    short(&c.sha)
+                ));
+            }
+            Err(e) => {
+                return stop(format!(
+                    "the files commit {} changes could not be read ({e})",
+                    short(&c.sha)
+                ));
+            }
         }
         let parent = previous_new.as_deref().unwrap_or(&commit.parent);
         let message = add_trailer(fetcher, fetched.dir.path(), &commit.message, &signing).await?;
-        let raw = resign_commit(&commit, parent, &committer, &message, &signing)?;
+        let raw = match resign_commit(&commit, parent, &committer, &message, &signing) {
+            Ok(r) => r,
+            Err(e) => return stop(format!("commit {}: {e}", short(&c.sha))),
+        };
         let sha = String::from_utf8(
             fetcher
                 .git_with_input(
@@ -890,6 +1107,7 @@ pub(crate) fn prune(bridge: &Bridge) {
             .iter()
             .map(|p| p.at)
             .chain(l.own.iter().map(|o| o.at))
+            .chain(std::iter::once(l.touched))
             .max()
             .unwrap_or(0);
         if now - last > LEDGER_TTL_SECS {
@@ -915,7 +1133,6 @@ mod tests {
             sender_login: who.0.into(),
             sender_id: who.1,
             created,
-            forced: false,
             delivery_id: None,
             at: 0,
         }
@@ -1008,6 +1225,53 @@ mod tests {
         // account.
         l.pushes.push(push(&sha('c'), &sha('d'), bot, false));
         assert!(is_clean(&l, &sha('d'), DEP.0, DEP.1).is_err());
+    }
+
+    #[test]
+    fn workflow_paths_are_recognised_in_any_case() {
+        for p in [
+            ".github/workflows/ci.yml",
+            ".GitHub/Workflows/x.yaml",
+            ".github/workflows",
+            ".github",
+        ] {
+            assert!(touches_workflows(p.as_bytes()), "{p}");
+        }
+        for p in [
+            ".github/dependabot.yml",
+            "Cargo.lock",
+            "src/.github/workflows/x",
+        ] {
+            assert!(!touches_workflows(p.as_bytes()), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_missed_own_push_still_links_the_chain_exactly() {
+        // Dependabot created a; the bridge re-signed a → b (its webhook
+        // never arrived); Dependabot then force-pushed b → c.
+        let mut l = ledger(vec![
+            push(ZERO_SHA, &sha('a'), DEP, true),
+            push(&sha('b'), &sha('c'), DEP, false),
+        ]);
+        assert!(is_clean(&l, &sha('c'), DEP.0, DEP.1).is_err(), "a gap");
+        l.own.push(OwnPush {
+            before: sha('a'),
+            after: sha('b'),
+            at: 0,
+        });
+        assert_eq!(is_clean(&l, &sha('c'), DEP.0, DEP.1), Ok(()));
+        // Exact only: an own record for another head bridges nothing.
+        let mut l2 = ledger(vec![
+            push(ZERO_SHA, &sha('a'), DEP, true),
+            push(&sha('b'), &sha('c'), DEP, false),
+        ]);
+        l2.own.push(OwnPush {
+            before: sha('a'),
+            after: sha('d'),
+            at: 0,
+        });
+        assert!(is_clean(&l2, &sha('c'), DEP.0, DEP.1).is_err());
     }
 
     #[test]

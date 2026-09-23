@@ -873,7 +873,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
         };
     if conclusion == CheckConclusion::Failure
         && let Some(pr) = &pr_info
-        && let Some(hint) = crate::resign::check_hint(bridge, &ctx, trigger, pr)
+        && let Some(hint) = crate::resign::check_hint(bridge, &ctx, trigger, pr, &protected)
     {
         summary.push_str(&hint);
     }

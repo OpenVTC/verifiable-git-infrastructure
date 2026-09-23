@@ -40,7 +40,7 @@ fn created_by_dependabot() -> serde_json::Value {
         "after": AFTER,
         "created": true, "deleted": false, "forced": false,
         "base_ref": null,
-        "repository": { "id": 812, "full_name": "Acme/Widgets" },
+        "repository": { "id": 812, "full_name": "Acme/Widgets", "pushed_at": 1790000000 },
         "pusher": { "name": "dependabot[bot]" },
         "sender": { "login": "dependabot[bot]", "id": 49699333, "type": "Bot" },
         "commits": [],
@@ -72,6 +72,11 @@ async fn a_verified_push_is_read_with_its_sender() {
         ("dependabot[bot]", 49699333)
     );
     assert_eq!(p.delivery_id.as_deref(), Some("d-9"));
+    assert_eq!(
+        p.pushed_at,
+        Some(1_790_000_000),
+        "GitHub's clock, under the signature"
+    );
 
     // Another event is not a push, but is still verified first.
     let (h, b) = signed(

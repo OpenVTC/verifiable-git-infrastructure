@@ -319,8 +319,6 @@ pub struct PushRecord {
     pub sender_id: u64,
     /// The push created the branch.
     pub created: bool,
-    /// The push was not a fast-forward.
-    pub forced: bool,
     /// GitHub's delivery id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_id: Option<String>,
@@ -369,6 +367,19 @@ pub struct BranchLedger {
     /// that arrives after the pull request's delivery can resume the re-sign.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<u64>,
+    /// Unix seconds, when anything last changed here (the oldest untouched
+    /// ledger of a repository is evicted first).
+    #[serde(default)]
+    pub touched: i64,
+    /// The newest `repository.pushed_at` of a delivery recorded here: an
+    /// older delivery may add a record but never resets or clears the
+    /// ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pushed_at: Option<i64>,
+    /// Why the last re-sign of a head stopped at its commits (the head, and
+    /// the reason), for the check's summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skip: Option<(String, String)>,
 }
 
 /// A flow waiting for a person, by its `state`.
