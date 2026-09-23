@@ -1430,6 +1430,54 @@ mod tests {
         );
     }
 
+    /// A `---` line is text in a commit message, not a patch divider. The
+    /// claim is read from the final paragraph, so a trailer written above the
+    /// `---` (did-git-sign's v1 commit-msg hook did this) is no claim at all,
+    /// and one written at the end — the v2 hook — verifies.
+    #[test]
+    fn the_claim_is_read_past_a_dash_dash_dash_line() {
+        let commit_with = |message: &str| {
+            format!(
+                "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                 author A U Thor <a@example.com> 1700000000 +0000\n\
+                 committer A U Thor <a@example.com> 1700000000 +0000\n\
+                 \n\
+                 {message}"
+            )
+        };
+        let (key, public) = test_key();
+
+        let v1 = commit_with(&format!(
+            "chore(deps): bump x\n\nBumps x.\n\nSigned-by-DID: {SIGNER}#key-0\n---\n\
+             updated-dependencies:\n- dependency-name: x\n"
+        ));
+        assert_eq!(
+            check_commit_signature(
+                sign_commit(&v1, &key).as_bytes(),
+                &signers_publishing(public),
+                None
+            ),
+            SignatureCheck::NoSignerDid {
+                committer: "a@example.com".to_string()
+            }
+        );
+
+        let v2 = commit_with(&format!(
+            "chore(deps): bump x\n\nBumps x.\n---\n\
+             updated-dependencies:\n- dependency-name: x\n\nSigned-by-DID: {SIGNER}#key-0\n"
+        ));
+        assert_eq!(
+            check_commit_signature(
+                sign_commit(&v2, &key).as_bytes(),
+                &signers_publishing(public),
+                None
+            ),
+            SignatureCheck::Valid {
+                signer_did: SIGNER.to_string()
+            }
+        );
+    }
+
     #[test]
     fn conflicting_trailer_and_committer_dids_fail_closed() {
         let payload = format!(

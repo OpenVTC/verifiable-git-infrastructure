@@ -731,6 +731,66 @@ async fn cmd_verify() -> Result<()> {
     Ok(())
 }
 
+/// Report the commit-msg hook that writes the `Signed-by-DID:` trailer.
+///
+/// `init` writes the hook once; upgrading the binary does not touch it. A
+/// hook from an older release keeps its old behaviour — version 1 put the
+/// trailer above a `---` line, where verify-trust does not read it — until
+/// `init` is re-run, so health says so.
+fn print_commit_msg_hook_status() {
+    use init::CommitMsgHookStatus as Hook;
+    print!("Commit-msg hook: ");
+    match init::commit_msg_hook_status() {
+        Ok(Hook::Current { path }) => println!(
+            "OK (v{}, {})",
+            init::COMMIT_MSG_HOOK_VERSION,
+            path.display()
+        ),
+        Ok(Hook::Outdated {
+            path,
+            installed,
+            current,
+        }) => {
+            println!(
+                "OUTDATED (v{installed}, current v{current}, {})",
+                path.display()
+            );
+            println!(
+                "  Re-run `did-git-sign init` to replace it. Hooks before v2 put the \
+                 Signed-by-DID trailer above any `---` line in a commit message, where \
+                 verify-trust does not read it, and those commits fail as noSignerDid."
+            );
+        }
+        Ok(Hook::Newer {
+            path,
+            installed,
+            current,
+        }) => {
+            println!(
+                "NEWER (v{installed}, this binary writes v{current}, {})",
+                path.display()
+            );
+            println!("  Installed by a newer did-git-sign; upgrade this binary.");
+        }
+        Ok(Hook::Foreign { path }) => {
+            println!("NOT did-git-sign ({})", path.display());
+            println!(
+                "  Nothing is known to write the Signed-by-DID trailer; commits will be \
+                 refused at signing time. Re-run `did-git-sign init`."
+            );
+        }
+        Ok(Hook::Missing { path }) => {
+            println!("MISSING ({})", path.display());
+            println!("  Re-run `did-git-sign init` to install it.");
+        }
+        Ok(Hook::Unknown) => {
+            println!("not checked (not in a repository and no global core.hooksPath)");
+        }
+        Err(e) => println!("could not check: {e}"),
+    }
+    println!();
+}
+
 async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Path>) -> Result<()> {
     let (config_path, cfg) = load_config()?;
 
@@ -785,6 +845,8 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
         None => println!("Token cache:     empty or expired"),
     }
     println!();
+
+    print_commit_msg_hook_status();
 
     // VTA connectivity
     print!("VTA health:      ");

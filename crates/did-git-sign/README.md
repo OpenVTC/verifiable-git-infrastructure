@@ -140,6 +140,27 @@ The `init` command performs the following:
    and hooks you add later, keep running. `uninstall` removes the directory and
    unsets `core.hooksPath`.
 
+   The trailer always goes in the message's final paragraph — the trailer
+   block `git log --format='%(trailers)'` and `verify-trust` read — even when
+   the message contains a `---` line (every Dependabot commit does). The hook
+   uses `git interpret-trailers --no-divider`, which needs **git ≥ 2.20** (2.19.2 on the maint line).
+
+### Upgrading: re-run `init` to refresh the hook
+
+`init` writes the hook once; installing a newer `did-git-sign` binary does not
+replace it. Each hook carries a version line (`# did-git-sign-hook-version:
+N`), and `did-git-sign health` reports `Commit-msg hook: OUTDATED` when the
+installed one is older than the binary's. Re-run `did-git-sign init` (with
+`--global` if that is how you installed) to replace it; `init` overwrites only
+hooks it wrote.
+
+Hooks from before the version line (v1) placed the trailer **above** any `---`
+line in a commit message. Commits made that way are signed but carry no claim
+`verify-trust` reads, and fail as `noSignerDid`. After upgrading the hook,
+`git commit --amend --no-edit` runs it again and adds the claim at the end
+(for older commits in a branch, `reword` them in `git rebase -i`, which also
+runs the hook).
+
 ## Usage
 
 After setup, commits are signed automatically:
@@ -154,7 +175,8 @@ Verify signatures:
 git log --show-signature
 ```
 
-Check your configuration and VTA connectivity:
+Check your configuration, the installed `commit-msg` hook, and VTA
+connectivity:
 
 ```bash
 did-git-sign health

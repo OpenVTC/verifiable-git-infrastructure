@@ -527,12 +527,25 @@ fn base64_encode_pubkey(public_key_bytes: &[u8; 32]) -> String {
 /// one-line message (`git commit -m fix`) the trailer landed glued to the
 /// subject line, where git's own parser reads no trailers at all.
 ///
+/// Every `interpret-trailers` call passes `--no-divider` (git ≥ 2.20, 2.19.2). In its
+/// default mode `interpret-trailers` takes a `---` line for the start of a
+/// patch and works on the paragraph above it, but a commit message has no
+/// patch: `git log`'s `%(trailers)` and verify-trust read the message's final
+/// paragraph, `---` lines included. Version 1 of this hook omitted the flag,
+/// so on any message holding a `---` line — every Dependabot commit — the
+/// claim landed where nothing reads it and the commit failed `noSignerDid`.
+///
 /// `Signed-off-by:` is added only when `did-git-sign.signoff` is true. A DCO
 /// sign-off is an assertion the committer makes about their right to submit
 /// the code, not one a signing tool may make on their behalf, so it is
 /// opt-in.
-const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
+///
+/// Bump [`COMMIT_MSG_HOOK_VERSION`] whenever this script changes behaviour:
+/// installed copies are only replaced when the user re-runs `init`, and
+/// `did-git-sign health` compares the version it finds against this one.
+pub const COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
 # Installed by did-git-sign — chains the repo commit-msg hook, then adds the Signed-by-DID trailer.
+# did-git-sign-hook-version: 2
 git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
 repo_hook="$git_dir/hooks/commit-msg"
 if [ -x "$repo_hook" ] && [ "$repo_hook" != "$0" ]; then
@@ -564,13 +577,115 @@ esac
 if [ "$(git config --bool did-git-sign.signoff 2>/dev/null)" = "true" ]; then
     NAME=$(git config user.name 2>/dev/null | tr -d '\r\n')
     EMAIL=$(git config user.email 2>/dev/null | tr -d '\r\n')
-    git interpret-trailers --in-place --if-exists doNothing \
+    git interpret-trailers --in-place --no-divider --if-exists doNothing \
         --trailer "Signed-off-by: $NAME <$EMAIL>" "$msg_file" || exit 1
 fi
 
-git interpret-trailers --in-place --if-exists doNothing \
-    --trailer "Signed-by-DID: $DID" "$msg_file" || exit 1
+# --no-divider: a commit message has no patch after it, so a `---` line is
+# text, and the final paragraph is the trailer block git log and verify-trust
+# read. Without it the trailer lands above the first `---`, where nobody looks.
+#
+# An existing claim is kept (amend, rebase). Existence is tested on the exact
+# key rather than with `--if-exists doNothing`, which matches keys by prefix:
+# a `Signed-by:` or `S:` trailer would count as a claim and none would be
+# written.
+existing=$(git interpret-trailers --parse --no-divider "$msg_file") || exit 1
+if ! printf '%s\n' "$existing" | grep -qi '^Signed-by-DID:'; then
+    git interpret-trailers --in-place --no-divider --where end --if-exists add \
+        --trailer "Signed-by-DID: $DID" "$msg_file" || exit 1
+fi
 "#;
+
+/// The version [`COMMIT_MSG_HOOK`] declares in its
+/// `# did-git-sign-hook-version:` line. A did-git-sign hook without that line
+/// predates it, and is version 1.
+pub const COMMIT_MSG_HOOK_VERSION: u32 = 2;
+
+const HOOK_VERSION_MARKER: &str = "# did-git-sign-hook-version:";
+const HOOK_OWNER_MARKER: &str = "Installed by did-git-sign";
+
+/// What `did-git-sign health` found at the commit-msg hook git will run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitMsgHookStatus {
+    /// The installed hook is this release's.
+    Current { path: PathBuf },
+    /// A did-git-sign hook from an older release; re-running `init` replaces
+    /// it.
+    Outdated {
+        path: PathBuf,
+        installed: u32,
+        current: u32,
+    },
+    /// A hook from a newer did-git-sign than this binary.
+    Newer {
+        path: PathBuf,
+        installed: u32,
+        current: u32,
+    },
+    /// A commit-msg hook exists but did-git-sign did not write it, so nothing
+    /// is known to add the `Signed-by-DID:` trailer.
+    Foreign { path: PathBuf },
+    /// No commit-msg hook where git will look.
+    Missing { path: PathBuf },
+    /// Not in a repository and no global `core.hooksPath`: nowhere to look.
+    Unknown,
+}
+
+/// Classify the text of a commit-msg hook (`None` when there is no file).
+fn classify_commit_msg_hook(path: PathBuf, content: Option<&str>) -> CommitMsgHookStatus {
+    let Some(content) = content else {
+        return CommitMsgHookStatus::Missing { path };
+    };
+    if !content.contains(HOOK_OWNER_MARKER) {
+        return CommitMsgHookStatus::Foreign { path };
+    }
+    let installed = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(HOOK_VERSION_MARKER))
+        .map(|version| version.trim().parse::<u32>().unwrap_or(0))
+        .unwrap_or(1);
+    let current = COMMIT_MSG_HOOK_VERSION;
+    match installed.cmp(&current) {
+        std::cmp::Ordering::Equal => CommitMsgHookStatus::Current { path },
+        std::cmp::Ordering::Less => CommitMsgHookStatus::Outdated {
+            path,
+            installed,
+            current,
+        },
+        std::cmp::Ordering::Greater => CommitMsgHookStatus::Newer {
+            path,
+            installed,
+            current,
+        },
+    }
+}
+
+/// Inspect the commit-msg hook git would run from the current directory.
+///
+/// Inside a repository that is `git rev-parse --git-path hooks/commit-msg`,
+/// which honours `core.hooksPath` at every scope; outside one, the global
+/// `core.hooksPath` is the only place a `--global` install can be found.
+pub fn commit_msg_hook_status() -> Result<CommitMsgHookStatus> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks/commit-msg"])
+        .output()
+        .context("failed to run git")?;
+    let path = if output.status.success() {
+        // Relative to the current directory unless `core.hooksPath` is
+        // absolute; made absolute so health can print where it looked.
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    } else {
+        match git_config_get("--global", "core.hooksPath")? {
+            Some(dir) => PathBuf::from(dir.trim()).join("commit-msg"),
+            None => return Ok(CommitMsgHookStatus::Unknown),
+        }
+    };
+    let content = std::fs::read_to_string(&path).ok();
+    Ok(classify_commit_msg_hook(path, content.as_deref()))
+}
 
 const STANDARD_GIT_HOOKS: &[&str] = &[
     "applypatch-msg",
@@ -973,6 +1088,230 @@ mod tests {
             std::fs::read_to_string(&msg).unwrap().contains(did),
             "hook must still write the trailer"
         );
+    }
+
+    /// Commit `message` through the installed hook and report the claim as
+    /// both readers of a commit object see it: git's `%(trailers)` view and
+    /// `vgi_core::signer_did`, which is what `verify-trust` checks.
+    #[cfg(unix)]
+    fn commit_through_hook(dir: &Path, message: &str) -> (String, Option<String>) {
+        let msg = dir.join("MSG");
+        std::fs::write(&msg, message).unwrap();
+        let out = Command::new("git")
+            .args(["-C", dir.to_str().unwrap()])
+            .args(["commit", "-q", "--allow-empty", "-F", msg.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let raw = Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "cat-file", "commit", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout;
+        (
+            git_trailer(dir, "Signed-by-DID"),
+            vgi_core::signer_did(&raw),
+        )
+    }
+
+    /// A `---` line is a patch divider to `git interpret-trailers` in its
+    /// default mode, so the trailer used to land *above* it — in a paragraph
+    /// that is not the final one. A commit object has no divider: `git log`'s
+    /// `%(trailers)` and verify-trust both read the final paragraph, found no
+    /// claim, and the commit failed as `noSignerDid`. Dependabot writes a
+    /// `---` line into every message it generates.
+    // Serial: `git commit` execs the hook — see the note above.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn commit_msg_hook_trailer_lands_in_the_final_block_past_a_divider() {
+        let dir = tempfile::tempdir().unwrap();
+        let did = "did:webvh:QmAbc:example.com#key-0";
+        repo_with_commit_msg_hook(dir.path(), did);
+
+        let messages = [
+            // Dependabot's shape.
+            "chore(deps): bump yaml-rust2 from 0.11.1 to 0.13.0\n\n\
+             Bumps yaml-rust2 from 0.11.1 to 0.13.0.\n\
+             ---\n\
+             updated-dependencies:\n\
+             - dependency-name: yaml-rust2\n  dependency-version: 0.13.0\n",
+            // A divider followed by a diff-like body.
+            "fix the thing\n\nexplanation\n\n---\n\
+             diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n",
+            // A divider as the last line.
+            "subject\n\nbody\n---\n",
+        ];
+        for message in messages {
+            let (logged, verified) = commit_through_hook(dir.path(), message);
+            assert_eq!(
+                logged, did,
+                "git log must see the claim; message: {message:?}"
+            );
+            assert_eq!(
+                verified.as_deref(),
+                Some("did:webvh:QmAbc:example.com"),
+                "verify-trust must see the claim; message: {message:?}"
+            );
+        }
+    }
+
+    /// When the final paragraph already names a DID, `--if-exists doNothing`
+    /// keeps it — and it is the claim the verifier reads, so the signer's
+    /// mismatch check (not a silent divergence) is what catches it. The old
+    /// hook put its own trailer above the divider instead, where nothing reads
+    /// it, and verify-trust checked the stale one below.
+    // Serial: `git commit` execs the hook — see the note above.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn commit_msg_hook_and_verifier_agree_on_an_existing_claim_past_a_divider() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit_msg_hook(dir.path(), "did:webvh:QmAbc:example.com#key-0");
+
+        let (logged, verified) = commit_through_hook(
+            dir.path(),
+            "subject\n\nbody\n---\nquoted\n\nSigned-by-DID: did:webvh:QmOld:example.com\n",
+        );
+        assert_eq!(logged, "did:webvh:QmOld:example.com");
+        assert_eq!(verified.as_deref(), Some("did:webvh:QmOld:example.com"));
+        let out = Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "log",
+                "-1",
+                "--format=%B",
+            ])
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !body.contains("QmAbc"),
+            "doNothing must not add a second, unread claim: {body}"
+        );
+    }
+
+    /// `--if-exists doNothing` matches trailer keys by prefix, so a final
+    /// block holding `Signed-by:` (or `S:`) used to count as an existing claim
+    /// and the hook wrote none.
+    // Serial: `git commit` execs the hook — see the note above.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn commit_msg_hook_is_not_fooled_by_a_key_that_prefixes_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let did = "did:webvh:QmAbc:example.com#key-0";
+        repo_with_commit_msg_hook(dir.path(), did);
+
+        for message in [
+            "subject\n\nSigned-by: someone\n",
+            "subject\n\nS: x\n",
+            "subject\n\nSigned-by-DIDX: x\n",
+        ] {
+            let (logged, verified) = commit_through_hook(dir.path(), message);
+            assert_eq!(logged, did, "message: {message:?}");
+            assert_eq!(
+                verified.as_deref(),
+                Some("did:webvh:QmAbc:example.com"),
+                "message: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hook_declares_the_current_version() {
+        assert!(COMMIT_MSG_HOOK.contains(&format!(
+            "{HOOK_VERSION_MARKER} {COMMIT_MSG_HOOK_VERSION}\n"
+        )));
+        assert_eq!(
+            classify_commit_msg_hook(PathBuf::from("h"), Some(COMMIT_MSG_HOOK)),
+            CommitMsgHookStatus::Current {
+                path: PathBuf::from("h")
+            }
+        );
+    }
+
+    /// The hook every release before the version marker installed.
+    #[test]
+    fn a_hook_without_a_version_marker_is_outdated() {
+        let v1 = "#!/bin/sh\n# Installed by did-git-sign — chains the repo commit-msg hook, \
+                  then adds the Signed-by-DID trailer.\n\
+                  git interpret-trailers --in-place --if-exists doNothing \\\n";
+        assert_eq!(
+            classify_commit_msg_hook(PathBuf::from("h"), Some(v1)),
+            CommitMsgHookStatus::Outdated {
+                path: PathBuf::from("h"),
+                installed: 1,
+                current: COMMIT_MSG_HOOK_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn hook_classification_covers_missing_foreign_and_newer() {
+        let path = PathBuf::from("h");
+        assert_eq!(
+            classify_commit_msg_hook(path.clone(), None),
+            CommitMsgHookStatus::Missing { path: path.clone() }
+        );
+        assert_eq!(
+            classify_commit_msg_hook(path.clone(), Some("#!/bin/sh\nnpx commitlint\n")),
+            CommitMsgHookStatus::Foreign { path: path.clone() }
+        );
+        let newer = COMMIT_MSG_HOOK.replace(
+            &format!("{HOOK_VERSION_MARKER} {COMMIT_MSG_HOOK_VERSION}"),
+            &format!("{HOOK_VERSION_MARKER} {}", COMMIT_MSG_HOOK_VERSION + 1),
+        );
+        assert_eq!(
+            classify_commit_msg_hook(path.clone(), Some(&newer)),
+            CommitMsgHookStatus::Newer {
+                path,
+                installed: COMMIT_MSG_HOOK_VERSION + 1,
+                current: COMMIT_MSG_HOOK_VERSION,
+            }
+        );
+    }
+
+    /// Health finds the hook through `core.hooksPath`, as git does.
+    #[test]
+    #[serial_test::serial]
+    fn commit_msg_hook_status_follows_core_hooks_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("my-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "core.hooksPath", hooks.to_str().unwrap()],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["-C", dir.path().to_str().unwrap()])
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let _cwd = CwdGuard::change_to(dir.path());
+        let status = commit_msg_hook_status().unwrap();
+        let CommitMsgHookStatus::Missing { path } = status else {
+            panic!("expected Missing, got {status:?}");
+        };
+        assert_eq!(
+            path.parent().unwrap().canonicalize().unwrap(),
+            hooks.canonicalize().unwrap()
+        );
+
+        std::fs::write(hooks.join("commit-msg"), COMMIT_MSG_HOOK).unwrap();
+        assert!(matches!(
+            commit_msg_hook_status().unwrap(),
+            CommitMsgHookStatus::Current { .. }
+        ));
     }
 
     /// Running twice must not stack duplicate trailers — amends and rebases

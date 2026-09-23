@@ -71,3 +71,4 @@ windows-native-keyring-store = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 rand = { workspace = true }
+proptest = { workspace = true }

@@ -11,8 +11,15 @@
 //! This generates commit messages full of awkward trailer shapes and holds
 //! vgi-core to *both* commands review tooling uses:
 //!
-//! - `git interpret-trailers --parse`
+//! - `git interpret-trailers --parse --no-divider`
 //! - `git log -1 --format='%(trailers:key=Signed-by-DID,valueonly,…)'`
+//!
+//! `---` lines are among the generated shapes. In its default mode
+//! `interpret-trailers` treats one as a patch divider and reads (or writes)
+//! the trailer block above it; a commit's trailer view has no divider. The
+//! *writer* side — that the claim did-git-sign's commit-msg hook adds is the
+//! claim read here — is held to the same view by
+//! `crates/did-git-sign/tests/hook_trailer_differential.rs`.
 //!
 //! git is the oracle here: no expected DID is hard-coded. The specific rules
 //! these cases pin down are asserted without git, and much faster, in the unit
@@ -143,10 +150,19 @@ fn did_from_git_log(repo: &GitRepo, message: &str) -> Option<String> {
     output.split('\0').next_back().and_then(did_from_value)
 }
 
-/// The DID `git interpret-trailers --parse` reports: the last `Signed-by-DID`
-/// among the trailer lines it prints, which it has already unfolded.
+/// The DID `git interpret-trailers --parse --no-divider` reports: the last
+/// `Signed-by-DID` among the trailer lines it prints, which it has already
+/// unfolded.
+///
+/// `--no-divider` because a commit message has no patch after it: `git log`'s
+/// `%(trailers)` sets `no_divider` itself, so a `---` line is ordinary text in
+/// the commit view. Without the flag `interpret-trailers` stops reading at the
+/// first `---` line and reports the paragraph above it.
 fn did_from_interpret_trailers(repo: &GitRepo, message: &str) -> Option<String> {
-    let parsed = repo.git(&["interpret-trailers", "--parse"], message.as_bytes());
+    let parsed = repo.git(
+        &["interpret-trailers", "--parse", "--no-divider"],
+        message.as_bytes(),
+    );
     parsed
         .lines()
         .filter_map(|line| {
@@ -256,6 +272,21 @@ const FIXED_CASES: &[&str] = &[
     // No trailer at all.
     "subject\n\njust a body\n",
     "",
+    // A `---` line is a patch divider only to `git interpret-trailers` in its
+    // default mode; in a commit it is text. Dependabot writes one into every
+    // message it generates.
+    "subject\n\nBumps x.\n---\nupdated-dependencies:\n- dependency-name: x\n",
+    "subject\n\nbody\n---\n",
+    "subject\n\nbody\n\n---\n",
+    "subject\n\nexplanation\n\n---\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n",
+    // A claim above the divider is not in the final paragraph.
+    "subject\n\nSigned-by-DID: did:webvh:QmA:example.com\n---\nbelow\n",
+    "subject\n\nSigned-by-DID: did:webvh:QmA:example.com\n\n---\nbelow\n",
+    // A divider inside the final paragraph, and a claim below one.
+    "subject\n\nbody\n\nSigned-by-DID: did:webvh:QmA:example.com\n---\n",
+    "subject\n\nbody\n---\n\nSigned-by-DID: did:webvh:QmA:example.com\n",
+    "subject\n\n--- \nSigned-by-DID: did:webvh:QmA:example.com\n",
+    "subject\n\n----\nSigned-by-DID: did:webvh:QmA:example.com\n",
 ];
 
 #[test]
@@ -320,6 +351,9 @@ const CONTINUATIONS: &[&str] = &[
 
 const BLANKS: &[&str] = &["", "   "];
 
+/// Lines `git interpret-trailers` takes for a patch divider by default.
+const DIVIDERS: &[&str] = &["---", "--- ", "--- a/file", "---\t", "----"];
+
 const COMMENTS: &[&str] = &[
     "# a comment",
     "# Signed-by-DID: did:webvh:QmComment:example.com",
@@ -342,6 +376,7 @@ fn arb_line() -> impl Strategy<Value = String> {
         2 => select(CONTINUATIONS).prop_map(str::to_string),
         2 => select(BLANKS).prop_map(str::to_string),
         1 => select(COMMENTS).prop_map(str::to_string),
+        2 => select(DIVIDERS).prop_map(str::to_string),
     ]
 }
 

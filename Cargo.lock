@@ -1931,6 +1931,7 @@ dependencies = [
  "keyring-core",
  "linux-keyutils-keyring-store",
  "multibase",
+ "proptest",
  "rand 0.8.8",
  "serde",
  "serde_json",
