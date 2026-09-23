@@ -107,6 +107,15 @@ key. It configures git:
   execing the repo's own `.git/hooks/<name>`, so existing hooks keep running.
   `init` refuses to take `core.hooksPath` from a tool that already owns it
   (husky, lefthook, pre-commit) rather than silently disabling it.
+  The hook needs git ≥ 2.20 (`interpret-trailers --no-divider`, also in 2.19.2).
+
+The hook is written once, by `init`; upgrading the binary does not replace it.
+`did-git-sign health` compares the hook's `# did-git-sign-hook-version:` line
+with the binary's and prints `Commit-msg hook: OUTDATED` when it is older —
+re-run `did-git-sign init` (same scope as the original install). Hooks before
+v2 put the trailer above any `---` line in the message (Dependabot-style
+messages, some templates), where neither `git log --format='%(trailers)'` nor
+`verify-trust` reads it, so those commits fail `noSignerDid`.
 
 `user.email` is deliberately left alone: it stays an ordinary address so GitHub
 and GitLab can attribute commits to the author's account. A commit that reaches
@@ -525,7 +534,7 @@ the remediation is unambiguous:
 | Verdict | Cause | Fix |
 |---|---|---|
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
-| `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool; check `did-git-sign health`, then re-run `init` |
+| `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
 | `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or publishes no Ed25519 method |
 | `unknownKey` | the claimed DID publishes no such key | signed by a key that identity does not hold |
