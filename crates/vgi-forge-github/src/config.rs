@@ -57,6 +57,15 @@ pub struct GitHubConfig {
     /// One second of device-flow polling interval, as the adapter waits it.
     /// Always one second outside tests.
     pub device_poll_unit: Duration,
+    /// Where no org required workflow is available (personal accounts,
+    /// organisations without org rulesets), the bridge posts the check
+    /// itself and the ruleset requires it from **this App** rather than
+    /// from GitHub Actions (§9, "forged check runs"): a workflow on another
+    /// branch can post a "Verify commit trust" run as the Actions App, but
+    /// not as the community's App. The plan then commits no workflow. Off by
+    /// default, so a caller with no check poster keeps the Actions workflow;
+    /// the bridge turns it on.
+    pub bridge_checks: bool,
 }
 
 impl GitHubConfig {
@@ -78,6 +87,7 @@ impl GitHubConfig {
             actions_integration_id: None,
             request_timeout: Duration::from_secs(30),
             device_poll_unit: Duration::from_secs(1),
+            bridge_checks: false,
         }
     }
 
@@ -118,6 +128,13 @@ impl GitHubConfig {
     /// Pin the Actions App id instead of looking it up.
     pub fn with_actions_integration_id(mut self, id: u64) -> Self {
         self.actions_integration_id = Some(id);
+        self
+    }
+
+    /// Have the bridge post the check itself where there is no org required
+    /// workflow (see [`GitHubConfig::bridge_checks`]).
+    pub fn with_bridge_checks(mut self) -> Self {
+        self.bridge_checks = true;
         self
     }
 }

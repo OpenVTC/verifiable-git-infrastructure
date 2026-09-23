@@ -165,6 +165,14 @@ pub struct Capabilities {
     /// [`ProtectionState::check_source_guard`] says which applies to each.
     #[serde(default)]
     pub single_owner_repos_unreviewed: bool,
+    /// The bridge itself runs verify-trust against each pull request and
+    /// posts the check under its own forge identity, and the protection
+    /// requires the check *from that identity* (§9, "forged check runs").
+    /// Nothing in the repository decides what runs, and no CI workflow can
+    /// post a check that counts. The bridge becomes a merge dependency, as
+    /// the registry already is.
+    #[serde(default)]
+    pub bridge_posted_check: bool,
 }
 
 /// What keeps a repository's check out of reach of the pull request it
@@ -191,6 +199,11 @@ pub enum CheckSourceGuard {
     /// pull request its owner merges. Accepted for a single-owner
     /// repository.
     Unreviewed,
+    /// The bridge runs the check itself and the protection accepts it only
+    /// from the bridge's own forge identity
+    /// ([`Capabilities::bridge_posted_check`]): nothing in the repository
+    /// is on the check's path.
+    BridgePosted,
 }
 
 /// A person's account on a forge. The numeric id is authoritative; the login

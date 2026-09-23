@@ -78,8 +78,12 @@ impl GitHubForge {
     /// the org has one; otherwise owner review for two or more owners, and
     /// none for a solo repository (the user's decision).
     pub(super) fn check_guard(&self, ns: &Namespace, spec: &RepoSpec) -> CheckGuard {
-        if self.capabilities(ns).required_workflow {
+        let caps = self.capabilities(ns);
+        if caps.required_workflow {
             return CheckGuard::RequiredWorkflow;
+        }
+        if caps.bridge_posted_check {
+            return CheckGuard::BridgePosted;
         }
         let mut owners: Vec<ForgeAccount> = Vec::new();
         if ns.kind == NamespaceKind::User
@@ -434,7 +438,7 @@ impl GitHubForge {
             .installation_token(&ns, Some(CENTRAL_REPO), PERMS_ADMIN)
             .await?;
         let central_outcome = self
-            .protect_with(&atoken, owner, CENTRAL_REPO, &central_spec())
+            .protect_with(&atoken, owner, CENTRAL_REPO, &central_spec(), false)
             .await?;
         drop(atoken);
 

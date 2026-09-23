@@ -5,11 +5,13 @@ implements [`vgi-forge`][vgi-forge]'s `Forge` for github.com and GitHub
 Enterprise Server, acting as **one community's own GitHub App**.
 
 - **App registration** through the manifest flow, with a fixed permission set
-  — repository Administration, Contents and Variables (write), Metadata
-  (read); organisation Members (read) and Administration (write), nothing
-  else. Organisation Administration is there for one thing, the org ruleset
-  that makes verify-trust a required workflow (below); an owner who declines
-  it gets the owner-review fallback. The code exchange refuses an App that GitHub
+  — repository Administration, Contents, Variables and Checks (write),
+  Metadata (read); organisation Members (read) and Administration (write),
+  nothing else. Organisation Administration is there for one thing, the org
+  ruleset that makes verify-trust a required workflow (below); an owner who
+  declines it gets the owner-review fallback. Checks is there for one thing
+  too, the check the bridge posts itself outside a required workflow
+  (below). The code exchange refuses an App that GitHub
   registered with more than that, and returns the key and secrets in a type
   that zeroizes on drop and never prints them.
 - **Auth.** An RS256 App JWT (`iat` backdated 60 s, nine-minute lifetime)
@@ -63,6 +65,18 @@ Enterprise Server, acting as **one community's own GitHub App**.
     from numeric ids at run time), and the ruleset requires one approving
     review from a code owner, dismissed by later pushes and never the last
     pusher's own.
+  - **Bridge-posted check** (the same namespaces, with
+    `GitHubConfig::with_bridge_checks`, which the bridge sets): no workflow
+    at all. The bridge receives `pull_request` / `merge_group` webhooks,
+    runs verify-trust against the commits itself (never the pull request's
+    code) and posts the "Verify commit trust" check run as the App
+    (`checks` module: `parse_check_trigger`, `compare_commits`,
+    `contents_read_token`, `start_check_run`, `finish_check_run`). The
+    ruleset pins the required check to **the App's own integration id**,
+    which no workflow can post as, so this closes the forged-check-run gap
+    below. `inspect` counts only a check pinned to the App and reports
+    `CheckSourceGuard::BridgePosted`; an old in-repo workflow is removed.
+    The bridge becomes a merge dependency, as the registry already is.
   - **Solo** (the same namespaces, a repository with **one** owner): the
     check alone, no review requirement — the owner could weaken their own
     workflow, which is accepted since they control the repository anyway.
@@ -104,7 +118,8 @@ Enterprise Server, acting as **one community's own GitHub App**.
     there whose job is named "Verify commit trust"; its run is a GitHub
     Actions check run like the real one, and GitHub cannot tell them apart
     for the required status check. Owner review stops edits to *this*
-    workflow, not that. Only the required workflow closes it.
+    workflow, not that. The required workflow closes it, and so does the
+    bridge-posted check.
   - What GitHub does with a required workflow in a repository whose Actions
     are disabled has not been verified against a live organisation yet;
     `inspect` reports disabled Actions as drift either way.

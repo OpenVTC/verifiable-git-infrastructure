@@ -46,9 +46,20 @@ use crate::secret::Secret;
 /// why it is there. On a personal account it grants nothing. An owner who
 /// declines it gets the owner-review fallback (`missing_permissions` lists
 /// it).
-pub const APP_PERMISSIONS: [(&str, &str); 6] = [
+///
+/// Checks (`checks`, write) is for one thing too: where there is no org
+/// required workflow, the **bridge posts the "Verify commit trust" check
+/// itself** (§9, "forged check runs"), and the repository ruleset requires
+/// that check from this App's own integration id. A workflow on another
+/// branch can post a check run under the GitHub Actions App — the reason a
+/// check pinned to Actions is forgeable by any writer — but nothing but
+/// this App's key can post one under this App. Check runs are all the
+/// permission reaches: it cannot read or change code, and a token for it is
+/// minted per pull request, for that one repository.
+pub const APP_PERMISSIONS: [(&str, &str); 7] = [
     ("actions_variables", "write"),
     ("administration", "write"),
+    ("checks", "write"),
     ("contents", "write"),
     ("members", "read"),
     ("metadata", "read"),
@@ -56,13 +67,16 @@ pub const APP_PERMISSIONS: [(&str, &str); 6] = [
 ];
 
 /// Webhook events for drift (§5.6), plus `organization` for members joining
-/// and leaving the org. `installation` events are always delivered to an App
-/// and need no subscription. Sorted.
-pub const APP_EVENTS: [&str; 6] = [
+/// and leaving the org, and `pull_request` / `merge_group` so the bridge can
+/// post the check where it runs it itself. `installation` events are always
+/// delivered to an App and need no subscription. Sorted.
+pub const APP_EVENTS: [&str; 8] = [
     "branch_protection_rule",
     "member",
     "membership",
+    "merge_group",
     "organization",
+    "pull_request",
     "repository",
     "repository_ruleset",
 ];

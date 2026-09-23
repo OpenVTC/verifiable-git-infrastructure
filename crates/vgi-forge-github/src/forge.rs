@@ -200,6 +200,24 @@ impl GitHubForge {
         &self.config
     }
 
+    pub(crate) fn api(&self) -> &Api {
+        &self.api
+    }
+
+    pub(crate) fn webhook_secret(&self) -> &Secret {
+        &self.webhook_secret
+    }
+
+    /// An installation token for `repo` alone, with `perms`, plus its owner
+    /// and name — for the crate's other modules.
+    pub(crate) async fn repo_token_for(
+        &self,
+        repo: &Resource,
+        perms: &[(&str, &str)],
+    ) -> Result<(Secret, String, String)> {
+        self.repo_token(repo, perms).await
+    }
+
     /// Tell the adapter about a bound namespace (from the VTC's store, after
     /// the admin confirmed the bind). Operations on repositories in a
     /// namespace that was never registered are refused with
@@ -801,23 +819,38 @@ impl GitHubForge {
     }
 
     async fn protect(&self, repo: &Resource, spec: &ProtectionSpec) -> Result<StepOutcome> {
+        let (ns, _, _) = self.locate(repo)?;
         let (token, owner, name) = self.repo_token(repo, PERMS_ADMIN).await?;
-        self.protect_with(&token, &owner, &name, spec).await
+        let bridge_posted = self.capabilities(&ns).bridge_posted_check;
+        self.protect_with(&token, &owner, &name, spec, bridge_posted)
+            .await
+    }
+
+    /// The App a required check is pinned to: this App where the bridge
+    /// posts the check itself, the GitHub Actions App otherwise.
+    async fn check_integration_id(&self, token: &Secret, bridge_posted: bool) -> Result<u64> {
+        if bridge_posted {
+            Ok(self.config.app_id)
+        } else {
+            self.actions_app_id(token).await
+        }
     }
 
     /// Converge the managed ruleset on `owner/name` to `spec`, with a token
-    /// holding administration on it.
+    /// holding administration on it. `bridge_posted` pins the required check
+    /// to this App instead of GitHub Actions.
     async fn protect_with(
         &self,
         token: &Secret,
         owner: &str,
         name: &str,
         spec: &ProtectionSpec,
+        bridge_posted: bool,
     ) -> Result<StepOutcome> {
         // Looked up only when this rule carries the check: under a required
         // workflow the org ruleset does.
         let actions_id = if spec.require_status_check {
-            Some(self.actions_app_id(token).await?)
+            Some(self.check_integration_id(token, bridge_posted).await?)
         } else {
             None
         };
@@ -1064,10 +1097,14 @@ impl Forge for GitHubForge {
         c.required_workflow = automated
             && ns.kind == NamespaceKind::Organization
             && self.required_workflow_known(&ns.resource);
-        // Without a namespace workflow, a single-owner repository gets no
-        // review requirement (the user's decision: there is nobody else to
-        // review, and its owner controls the repository anyway).
-        c.single_owner_repos_unreviewed = !c.required_workflow;
+        // Without a namespace workflow the bridge posts the check itself
+        // when configured to (§9, forged check runs): then nothing in the
+        // repository is on the check's path at all.
+        c.bridge_posted_check = automated && !c.required_workflow && self.config.bridge_checks;
+        // Otherwise a single-owner repository gets no review requirement on
+        // its workflow (the user's decision: there is nobody else to review,
+        // and its owner controls the repository anyway).
+        c.single_owner_repos_unreviewed = !c.required_workflow && !c.bridge_posted_check;
         match ns.kind {
             NamespaceKind::User => {
                 // §8: only the account holder can create repositories, and
@@ -1323,16 +1360,26 @@ impl Forge for GitHubForge {
                 ));
             }
         }
+        let caps = self.capabilities(&ns);
         let rs = self.managed_ruleset(&token, &owner, &name).await?;
         if let Some(rs) = &rs {
-            let actions_id = self.actions_app_id(&token).await?;
-            state.protection = self.protection(rs, r.default_branch.as_deref(), Some(actions_id));
+            // Only a check pinned to the App that should post it counts.
+            let check_app = self
+                .check_integration_id(&token, caps.bridge_posted_check)
+                .await?;
+            state.protection = self.protection(rs, r.default_branch.as_deref(), Some(check_app));
         }
-        self.inspect_actions_policy(&token, &owner, &name, &mut state.protection)
-            .await?;
+        if !caps.bridge_posted_check {
+            // Actions runs the check only where the bridge does not.
+            self.inspect_actions_policy(&token, &owner, &name, &mut state.protection)
+                .await?;
+        }
         drop(token);
-        let caps = self.capabilities(&ns);
-        if caps.required_workflow {
+        if caps.bridge_posted_check {
+            // Nothing in the repository is on the check's path: the bridge
+            // runs verify-trust from its own build and posts as its App.
+            state.protection.check_source_guard = vgi_forge::CheckSourceGuard::BridgePosted;
+        } else if caps.required_workflow {
             self.inspect_required_workflow(&ns, r.id, &mut state.protection)
                 .await?;
         } else if caps.automation {

@@ -29,6 +29,13 @@
 //!   In both, repository writers are trusted not to forge a "Verify commit
 //!   trust" check run from a workflow on another branch; only the required
 //!   workflow closes that.
+//! - [`CheckGuard::BridgePosted`] (the same namespaces, when the adapter is
+//!   configured with [`crate::GitHubConfig::bridge_checks`]): no workflow at
+//!   all. The bridge runs verify-trust itself on every pull request and
+//!   merge group and posts the check as the community's App; the ruleset
+//!   requires the check **from that App's integration id**, which no
+//!   workflow can post as. This is what closes the forged-check gap outside
+//!   a required workflow (§9, decided 2026-09-23).
 
 use vgi_forge::{
     BootstrapComponent, BootstrapStep, ForgeAccount, ForgeError, ProtectionSpec, RepoSpec, Result,
@@ -81,6 +88,10 @@ pub enum CheckGuard {
     /// control the repository anyway (the user's decision). Re-plan when a
     /// second owner arrives.
     SoloOwner,
+    /// The bridge posts the check under its own App, and the ruleset pins
+    /// the required check to that App. No workflow is committed; one left
+    /// from an earlier guard is removed.
+    BridgePosted,
 }
 
 impl CheckGuard {
@@ -132,7 +143,10 @@ pub fn github_plan(
     check_keyring(keyring)?;
 
     let mut steps = Vec::new();
-    if !matches!(guard, CheckGuard::RequiredWorkflow) {
+    if matches!(
+        guard,
+        CheckGuard::OwnerReview { .. } | CheckGuard::SoloOwner
+    ) {
         steps.push(BootstrapStep::new(
             "workflow",
             BootstrapComponent::Workflow,
@@ -269,6 +283,31 @@ pub fn github_plan(
                 )),
             ));
             steps.extend(cleanup_variables());
+        }
+        CheckGuard::BridgePosted => {
+            // The adapter pins this rule's check to its own App when it runs
+            // the step: the plan is the same ruleset, what differs is who
+            // may satisfy it.
+            steps.push(BootstrapStep::new(
+                "ruleset",
+                BootstrapComponent::RequiredCheck,
+                StepAction::ProtectDefaultBranch(ProtectionSpec::standard(
+                    cfg.required_check.clone(),
+                )),
+            ));
+            steps.extend(cleanup_variables());
+            // A workflow from an earlier guard would still run and post an
+            // Actions check that no longer counts; remove it so nothing
+            // suggests it matters. After the ruleset, like the
+            // required-workflow clean-up: the protection comes first.
+            steps.push(BootstrapStep::new(
+                "cleanup:workflow",
+                BootstrapComponent::Extra,
+                StepAction::RemoveFile {
+                    path: WORKFLOW_PATH.into(),
+                    message: "ci: the VGI check is now posted by the community's bridge".into(),
+                },
+            ));
         }
     }
     Ok(steps)
