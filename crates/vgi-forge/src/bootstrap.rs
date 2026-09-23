@@ -242,6 +242,18 @@ pub enum StepAction {
     ProtectDefaultBranch(ProtectionSpec),
     /// Make the repository's settings (merge methods, CI) match.
     ConfigureRepo(RepoSettings),
+    /// Rewrite files the default branch's protection forbids changing — the
+    /// managed workflow, the exempt keyring — through a temporary exception
+    /// for the bridge alone, restoring the protection exactly afterwards
+    /// (and attempting to even when a write failed). A maintenance job, not
+    /// part of a bootstrap: it is the one sanctioned way the bridge changes
+    /// a protected path, so it runs as one audited step.
+    RefreshProtectedFiles {
+        /// The files, each with its desired contents.
+        files: Vec<ExtraFile>,
+        /// Commit message for each file that changes.
+        message: String,
+    },
 }
 
 /// One step of a bootstrap plan.
