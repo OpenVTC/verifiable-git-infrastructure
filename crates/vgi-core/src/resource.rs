@@ -109,80 +109,79 @@ impl ResourceError {
     pub fn input(&self) -> &str {
         &self.input
     }
+
+    /// The message, naming the value `what` (`--resource`, `resource
+    /// derived from GITHUB_REPOSITORY`, …). [`fmt::Display`] is
+    /// `describe("resource")`.
+    pub fn describe(&self, what: &str) -> String {
+        let v = &self.input;
+        let e = "`<forge-host>/<owner>[/<repo>]`";
+        match &self.kind {
+            ResourceErrorKind::Empty => {
+                format!("{what} is empty; expected {e}, e.g. `github.com/acme/widgets`")
+            }
+            ResourceErrorKind::TooLong => {
+                format!("{what} `{v}` is longer than {MAX_RESOURCE_LEN} bytes")
+            }
+            ResourceErrorKind::Whitespace => format!(
+                "{what} `{v}` contains whitespace or a control character; a resource is {e} \
+                 with no spaces"
+            ),
+            ResourceErrorKind::NonAscii => format!(
+                "{what} `{v}` contains a non-ASCII character; forge hosts are written in \
+                 punycode and owner/repo names are ASCII"
+            ),
+            ResourceErrorKind::HasScheme => format!(
+                "{what} `{v}` is a URL, not a resource; did you mean `{}`?",
+                suggest_without_scheme(v)
+            ),
+            ResourceErrorKind::MissingForgeHost => {
+                let bare = v.trim_matches('/').to_ascii_lowercase();
+                format!(
+                    "{what} `{v}` is not forge-qualified (expected {e}); prefix the forge host, \
+                     e.g. `github.com/{bare}` or `codeberg.org/{bare}`"
+                )
+            }
+            ResourceErrorKind::InvalidHost => format!(
+                "{what} `{v}` starts with an invalid forge host; a host is dot-separated labels \
+                 of [a-z0-9-] (e.g. `github.com`, `git.example.org`) or `localhost`"
+            ),
+            ResourceErrorKind::HasPort => format!(
+                "{what} `{v}` carries a port; a resource names the forge by host alone — did you \
+                 mean `{}`?",
+                suggest_without_port(v)
+            ),
+            ResourceErrorKind::MissingOwner => {
+                let host = v.trim_end_matches('/').to_ascii_lowercase();
+                format!(
+                    "{what} `{v}` names a forge but no owner; e.g. `{host}/acme` or \
+                     `{host}/acme/widgets`"
+                )
+            }
+            ResourceErrorKind::EmptySegment => format!(
+                "{what} `{v}` has an empty path segment (a doubled, leading or trailing `/`); \
+                 did you mean `{}`?",
+                suggest_collapsed(v)
+            ),
+            ResourceErrorKind::DotSegment => {
+                format!("{what} `{v}` has a `.` or `..` segment; name the owner and repo directly")
+            }
+            ResourceErrorKind::InvalidCharacter(c) => format!(
+                "{what} `{v}` contains `{}`; owner and repo segments may only contain letters, \
+                 digits, `.`, `_` and `-`",
+                c.escape_default()
+            ),
+            ResourceErrorKind::TooManySegments { max } => format!(
+                "{what} `{v}` has too many segments for this forge: at most {max} after the host \
+                 (`<forge-host>/<owner>/<repo>`)"
+            ),
+        }
+    }
 }
 
 impl fmt::Display for ResourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let input = &self.input;
-        match &self.kind {
-            ResourceErrorKind::Empty => write!(
-                f,
-                "empty resource: expected `<forge-host>/<owner>[/<repo>]`, e.g. `github.com/acme/widgets`"
-            ),
-            ResourceErrorKind::TooLong => write!(
-                f,
-                "resource `{input}` is longer than {MAX_RESOURCE_LEN} bytes"
-            ),
-            ResourceErrorKind::Whitespace => write!(
-                f,
-                "resource `{input}` contains whitespace or a control character; \
-                 remove it (a resource is `<forge-host>/<owner>[/<repo>]` with no spaces)"
-            ),
-            ResourceErrorKind::NonAscii => write!(
-                f,
-                "resource `{input}` contains a non-ASCII character; \
-                 forge hosts must be written in punycode and owner/repo names are ASCII"
-            ),
-            ResourceErrorKind::HasScheme => write!(
-                f,
-                "resource `{input}` includes a URL scheme; drop it: `{}`",
-                suggest_without_scheme(input)
-            ),
-            ResourceErrorKind::MissingForgeHost => write!(
-                f,
-                "resource `{input}` does not name its forge; resources start with the forge \
-                 host, e.g. `github.com/{}` or `codeberg.org/{}`",
-                input.trim_matches('/').to_ascii_lowercase(),
-                input.trim_matches('/').to_ascii_lowercase()
-            ),
-            ResourceErrorKind::InvalidHost => write!(
-                f,
-                "resource `{input}` starts with an invalid forge host; a host is dot-separated \
-                 labels of [a-z0-9-] (e.g. `github.com`, `git.example.org`) or `localhost`"
-            ),
-            ResourceErrorKind::HasPort => write!(
-                f,
-                "resource `{input}` gives the forge host a port; a resource names a forge by \
-                 host alone: `{}`",
-                suggest_without_port(input)
-            ),
-            ResourceErrorKind::MissingOwner => write!(
-                f,
-                "resource `{input}` names only a forge; add the owner: `{}/<owner>[/<repo>]`",
-                input.trim_end_matches('/').to_ascii_lowercase()
-            ),
-            ResourceErrorKind::EmptySegment => write!(
-                f,
-                "resource `{input}` has an empty segment (a doubled, leading or trailing `/`); \
-                 write it as `{}`",
-                suggest_collapsed(input)
-            ),
-            ResourceErrorKind::DotSegment => write!(
-                f,
-                "resource `{input}` has a `.` or `..` segment; name the owner and repo directly"
-            ),
-            ResourceErrorKind::InvalidCharacter(c) => write!(
-                f,
-                "resource `{input}` contains `{}`; owner and repo segments may only contain \
-                 letters, digits, `.`, `_` and `-`",
-                c.escape_default()
-            ),
-            ResourceErrorKind::TooManySegments { max } => write!(
-                f,
-                "resource `{input}` has too many segments for this forge: at most {max} after \
-                 the host (`<forge-host>/<owner>/<repo>`)"
-            ),
-        }
+        f.write_str(&self.describe("resource"))
     }
 }
 

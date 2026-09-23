@@ -132,10 +132,13 @@ A resource either names the forge or leaves it implied:
 The qualified grammar is `<forge-host>/<owner>[/<repo>]`: the first segment is
 the forge's host (a dotted name such as `github.com`, a GitHub Enterprise
 Server host, `codeberg.org`, or `localhost`), followed by one or more path
-segments — a forge with nested groups keeps its full path. Everything is
-lowercased. Empty segments, `.` and `..`, a leading or trailing `/`, a URL
-scheme and a port are rejected, and so is an unqualified value, with the fix
-suggested:
+segments — a forge with nested groups keeps its full path. Path segments are
+ASCII letters, digits, `.`, `_` and `-`, and everything is lowercased. Empty
+segments, `.` and `..`, a leading or trailing `/`, a URL scheme, a port and
+any other character are rejected, and so is an unqualified value, with the
+fix suggested. The grammar is `vgi_core::normalize_resource`, the same one
+the VTC's registry projection and the forge adapters use, so a grant and a
+query name a repository with the same bytes:
 
 ```
 $ GITHUB_SERVER_URL=https://github.com verify-trust --resource-format qualified --resource acme/widgets …
