@@ -77,8 +77,11 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
             "members": "read",
             // §9: the org ruleset that makes verify-trust a required workflow.
             "organization_administration": "write",
-            // §9: the check the bridge posts itself where there is none.
+            // §9: the check the bridge posts itself where there is none, and
+            // the reads its trigger events need.
             "checks": "write",
+            "pull_requests": "read",
+            "merge_queues": "read",
         })
     );
     assert_eq!(m["public"], false);
@@ -106,7 +109,7 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
     ] {
         assert!(APP_EVENTS.contains(&event), "{event} feeds drift detection");
     }
-    for event in ["pull_request", "merge_group"] {
+    for event in ["pull_request", "merge_group", "check_run", "check_suite"] {
         assert!(
             APP_EVENTS.contains(&event),
             "{event} triggers the bridge's check"
@@ -116,7 +119,7 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
         APP_EVENTS.is_sorted(),
         "exchange_code compares a sorted list"
     );
-    assert_eq!(APP_PERMISSIONS.len(), 7, "no permission beyond §5.7's set");
+    assert_eq!(APP_PERMISSIONS.len(), 9, "no permission beyond §5.7's set");
 }
 
 #[test]
@@ -319,13 +322,19 @@ async fn complete_bind_records_installation_owner_and_kind() {
     assert_eq!(binding.namespace.kind, NamespaceKind::Organization);
     // The mock installation lacks the members and org administration
     // permissions.
+    // and everything the bridge-posted check needs, events included.
     assert_eq!(
         binding.missing_permissions,
         vec![
             "members:read".to_string(),
-            "organization_administration:write".to_string()
+            "merge_queues:read".to_string(),
+            "organization_administration:write".to_string(),
+            "pull_requests:read".to_string(),
+            "event:merge_group".to_string(),
+            "event:pull_request".to_string(),
         ]
     );
+    assert_eq!(forge.bridge_checks_ready(&ns), Some(false));
     forge.register_namespace(binding.namespace.clone()).unwrap();
     assert!(forge.capabilities(&binding.namespace).required_workflow);
     // Handed back as data for the bridge to persist, too.
@@ -534,7 +543,7 @@ async fn device_flow_stops_on_expiry_denial_or_deadline() {
 fn good_permissions() -> serde_json::Value {
     json!({
         "administration": "write", "contents": "write", "actions_variables": "write",
-            "checks": "write",
+        "checks": "write", "pull_requests": "read", "merge_queues": "read",
         "metadata": "read", "members": "read", "organization_administration": "write",
     })
 }
@@ -605,6 +614,7 @@ async fn jwt_issuer_can_be_the_numeric_app_id() {
             "id": 77,
             "account": { "id": 500, "login": "newco", "type": "Organization" },
             "permissions": good_permissions(),
+            "events": APP_EVENTS,
         })))
         .expect(1)
         .mount(&server)

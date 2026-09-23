@@ -119,6 +119,10 @@ pub struct GitHubForge {
     /// are available. Absent means not known, which plans the owner-review
     /// fallback — safe everywhere.
     required_workflow: RwLock<BTreeMap<Resource, bool>>,
+    /// Per namespace: whether its installation grants what the
+    /// bridge-posted check needs (permissions and event subscriptions).
+    /// Absent means not known, which keeps the in-repo workflow.
+    check_ready: RwLock<BTreeMap<Resource, bool>>,
     pins: RwLock<BTreeMap<Resource, RequiredWorkflowPin>>,
     /// Per organisation: the forge ids of the repositories the bridge
     /// manages — what the org ruleset lists. From the bridge's store.
@@ -178,6 +182,7 @@ impl GitHubForge {
             actions_app_id,
             client_secret: None,
             required_workflow: RwLock::new(BTreeMap::new()),
+            check_ready: RwLock::new(BTreeMap::new()),
             pins: RwLock::new(BTreeMap::new()),
             managed: RwLock::new(BTreeMap::new()),
             org_locks: Mutex::new(BTreeMap::new()),
@@ -249,6 +254,7 @@ impl GitHubForge {
             .remove(ns);
         self.pins.write().expect("lock poisoned").remove(ns);
         self.managed.write().expect("lock poisoned").remove(ns);
+        self.check_ready.write().expect("lock poisoned").remove(ns);
     }
 
     /// Tell the adapter which repositories (by forge id) it manages in
@@ -278,6 +284,57 @@ impl GitHubForge {
             .entry(ns.clone())
             .or_default()
             .clone()
+    }
+
+    /// Record whether `ns`'s installation carries the bridge-posted check
+    /// (from [`GitHubForge::detect_bridge_checks`], or the bridge's store
+    /// after a restart). Until it is known, a namespace without a required
+    /// workflow keeps the in-repo Actions workflow.
+    pub fn set_bridge_checks_ready(&self, ns: &Resource, ready: bool) {
+        self.check_ready
+            .write()
+            .expect("lock poisoned")
+            .insert(ns.clone(), ready);
+    }
+
+    /// Whether `ns`'s installation is known to carry the bridge-posted
+    /// check (`None`: not known yet).
+    pub fn bridge_checks_ready(&self, ns: &Resource) -> Option<bool> {
+        self.check_ready
+            .read()
+            .expect("lock poisoned")
+            .get(ns)
+            .copied()
+    }
+
+    /// Read `ns`'s installation and record whether it grants what the
+    /// bridge-posted check needs: `checks: write`, `pull_requests: read`,
+    /// `merge_queues: read` and the `pull_request` and `merge_group`
+    /// subscriptions ([`crate::manifest::check_ready`]). An App registered
+    /// before these were in the manifest lacks them until its owner updates
+    /// the App's settings and each installation approves the change; the
+    /// bridge probes again when an installation accepts new permissions.
+    pub async fn detect_bridge_checks(&self, ns: &Resource) -> Result<bool> {
+        let namespace = self.namespace(ns)?;
+        let Some(installation) = namespace.installation_id else {
+            self.set_bridge_checks_ready(ns, false);
+            return Ok(false);
+        };
+        let jwt = self.jwt().await?;
+        let inst: InstallationJson = self
+            .api
+            .json(
+                Method::GET,
+                self.api
+                    .url(&["app", "installations", &installation.to_string()]),
+                Auth::Bearer(&jwt),
+                None,
+                "installation",
+            )
+            .await?;
+        let ready = crate::manifest::check_ready(&inst.permissions, &inst.events);
+        self.set_bridge_checks_ready(ns, ready);
+        Ok(ready)
     }
 
     /// Record whether org rulesets — and so a required workflow — are
@@ -1100,7 +1157,10 @@ impl Forge for GitHubForge {
         // Without a namespace workflow the bridge posts the check itself
         // when configured to (§9, forged check runs): then nothing in the
         // repository is on the check's path at all.
-        c.bridge_posted_check = automated && !c.required_workflow && self.config.bridge_checks;
+        c.bridge_posted_check = automated
+            && !c.required_workflow
+            && self.config.bridge_checks
+            && self.bridge_checks_ready(&ns.resource) == Some(true);
         // Otherwise a single-owner repository gets no review requirement on
         // its workflow (the user's decision: there is nobody else to review,
         // and its owner controls the repository anyway).
@@ -1236,7 +1296,21 @@ impl Forge for GitHubForge {
                 false
             }
         };
-        let binding = NamespaceBinding::new(namespace, missing_permissions(&inst.permissions));
+        // Whether the installation carries the bridge-posted check: its
+        // permissions *and* its event subscriptions (an App registered before
+        // they were in the manifest lacks both until its owner approves).
+        self.set_bridge_checks_ready(
+            &namespace.resource,
+            crate::manifest::check_ready(&inst.permissions, &inst.events),
+        );
+        let mut missing = missing_permissions(&inst.permissions);
+        missing.extend(
+            crate::manifest::CHECK_EVENTS
+                .iter()
+                .filter(|e| !inst.events.iter().any(|x| x == *e))
+                .map(|e| format!("event:{e}")),
+        );
+        let binding = NamespaceBinding::new(namespace, missing);
         // Handed back as data for the bridge to persist; the adapter's copy
         // is in memory only.
         Ok(if probed {
@@ -1999,6 +2073,8 @@ struct InstallationJson {
     account: AccountJson,
     #[serde(default)]
     permissions: BTreeMap<String, String>,
+    #[serde(default)]
+    events: Vec<String>,
     #[serde(default)]
     suspended_at: Option<String>,
 }

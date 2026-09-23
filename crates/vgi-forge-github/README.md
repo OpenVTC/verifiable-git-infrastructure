@@ -6,12 +6,15 @@ Enterprise Server, acting as **one community's own GitHub App**.
 
 - **App registration** through the manifest flow, with a fixed permission set
   — repository Administration, Contents, Variables and Checks (write),
-  Metadata (read); organisation Members (read) and Administration (write),
-  nothing else. Organisation Administration is there for one thing, the org
+  Metadata, Pull requests and Merge queues (read); organisation Members
+  (read) and Administration (write), nothing else. Organisation Administration is there for one thing, the org
   ruleset that makes verify-trust a required workflow (below); an owner who
-  declines it gets the owner-review fallback. Checks is there for one thing
-  too, the check the bridge posts itself outside a required workflow
-  (below). The code exchange refuses an App that GitHub
+  declines it gets the owner-review fallback. Checks, Pull requests and
+  Merge queues are there for one thing too, the check the bridge posts
+  itself outside a required workflow (below); an installation without them
+  (or without the `pull_request` / `merge_group` events — an App registered
+  before they were in the manifest) keeps the Actions workflow
+  (`detect_bridge_checks`, `set_bridge_checks_ready`). The code exchange refuses an App that GitHub
   registered with more than that, and returns the key and secrets in a type
   that zeroizes on drop and never prints them.
 - **Auth.** An RS256 App JWT (`iat` backdated 60 s, nine-minute lifetime)
@@ -70,8 +73,13 @@ Enterprise Server, acting as **one community's own GitHub App**.
     at all. The bridge receives `pull_request` / `merge_group` webhooks,
     runs verify-trust against the commits itself (never the pull request's
     code) and posts the "Verify commit trust" check run as the App
-    (`checks` module: `parse_check_trigger`, `compare_commits`,
-    `contents_read_token`, `start_check_run`, `finish_check_run`). The
+    (`checks` module: `parse_check_trigger` — pull request opened,
+    synchronize, reopened and base edits, merge groups, this App's
+    rerequests — `default_branch`, `pull_request`, `compare_commits` (every
+    page), `contents_read_token`, `start_check_run`, `finish_check_run`).
+    The caller posts only for the protected base: a check run attaches to a
+    commit, so a success against any other base would count for the
+    protected one too. The
     ruleset pins the required check to **the App's own integration id**,
     which no workflow can post as, so this closes the forged-check-run gap
     below. `inspect` counts only a check pinned to the App and reports

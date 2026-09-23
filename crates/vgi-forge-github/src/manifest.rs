@@ -47,31 +47,55 @@ use crate::secret::Secret;
 /// declines it gets the owner-review fallback (`missing_permissions` lists
 /// it).
 ///
-/// Checks (`checks`, write) is for one thing too: where there is no org
+/// Checks (`checks`, write), Pull requests (`pull_requests`, read) and Merge
+/// queues (`merge_queues`, read) are for one thing too: where there is no org
 /// required workflow, the **bridge posts the "Verify commit trust" check
 /// itself** (§9, "forged check runs"), and the repository ruleset requires
 /// that check from this App's own integration id. A workflow on another
 /// branch can post a check run under the GitHub Actions App — the reason a
 /// check pinned to Actions is forgeable by any writer — but nothing but
-/// this App's key can post one under this App. Check runs are all the
-/// permission reaches: it cannot read or change code, and a token for it is
+/// this App's key can post one under this App. The two read permissions are
+/// what GitHub requires for the `pull_request` and `merge_group` events
+/// that tell the bridge when to check, and for reading a pull request's
+/// current base. None of them reaches code: checks only posts check runs,
+/// and the reads see pull request and queue metadata. Tokens for them are
 /// minted per pull request, for that one repository.
-pub const APP_PERMISSIONS: [(&str, &str); 7] = [
+pub const APP_PERMISSIONS: [(&str, &str); 9] = [
     ("actions_variables", "write"),
     ("administration", "write"),
     ("checks", "write"),
     ("contents", "write"),
     ("members", "read"),
+    ("merge_queues", "read"),
     ("metadata", "read"),
     ("organization_administration", "write"),
+    ("pull_requests", "read"),
 ];
 
+/// What the bridge-posted check needs on an installation: the permissions
+/// and the event subscriptions. An App registered before these were in the
+/// manifest has neither until its settings are changed and each
+/// installation's owner approves the change — until then the namespace
+/// keeps the in-repo Actions workflow.
+pub const CHECK_PERMISSIONS: [(&str, &str); 3] = [
+    ("checks", "write"),
+    ("merge_queues", "read"),
+    ("pull_requests", "read"),
+];
+
+/// The events the bridge-posted check is triggered by (see
+/// [`CHECK_PERMISSIONS`]).
+pub const CHECK_EVENTS: [&str; 2] = ["merge_group", "pull_request"];
+
 /// Webhook events for drift (§5.6), plus `organization` for members joining
-/// and leaving the org, and `pull_request` / `merge_group` so the bridge can
-/// post the check where it runs it itself. `installation` events are always
-/// delivered to an App and need no subscription. Sorted.
-pub const APP_EVENTS: [&str; 8] = [
+/// and leaving the org, and `pull_request` / `merge_group` / `check_run` /
+/// `check_suite` so the bridge can post (and re-post, on a rerequest) the
+/// check where it runs it itself. `installation` events are always delivered
+/// to an App and need no subscription. Sorted.
+pub const APP_EVENTS: [&str; 10] = [
     "branch_protection_rule",
+    "check_run",
+    "check_suite",
     "member",
     "membership",
     "merge_group",
@@ -248,6 +272,16 @@ pub(crate) fn excess_permissions(granted: &BTreeMap<String, String>) -> Vec<Stri
         })
         .map(|(name, level)| format!("{name}:{level}"))
         .collect()
+}
+
+/// Whether an installation with `granted` permissions and `events`
+/// subscriptions can carry the bridge-posted check.
+pub fn check_ready(granted: &BTreeMap<String, String>, events: &[String]) -> bool {
+    CHECK_PERMISSIONS.iter().all(|(name, level)| {
+        granted
+            .get(*name)
+            .is_some_and(|have| level_rank(have) >= level_rank(level))
+    }) && CHECK_EVENTS.iter().all(|e| events.iter().any(|x| x == e))
 }
 
 /// Reviewed permissions that `granted` lacks or holds at a lower level, as

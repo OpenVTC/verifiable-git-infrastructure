@@ -51,7 +51,7 @@ mod secret;
 pub mod webhook;
 
 pub use api::API_VERSION;
-pub use checks::{CheckConclusion, CheckTrigger, CheckTriggerKind, Comparison};
+pub use checks::{CheckConclusion, CheckTrigger, CheckTriggerKind, Comparison, PullRequestInfo};
 pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig, JwtIssuer};
 pub use forge::{GitHubForge, RequiredWorkflowPin};
 pub use jwt::{AppKeySigner, InProcessKey};

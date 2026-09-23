@@ -132,15 +132,22 @@ pub fn github_plan(
     check_pinned("verify-trust action", &cfg.verify_trust_action)?;
     check_version(&cfg.verify_trust_version)?;
     check_check_name(&cfg.required_check)?;
-    let keyring = cfg.platform_keyring.as_deref().ok_or_else(|| {
-        ForgeError::Config(
-            "no platform keyring: GitHub web-UI merges are signed by `web-flow`, and without its \
-             key in the exempt keyring every merge commit fails the check. Supply it in the \
-             config (for github.com, the contents of https://github.com/web-flow.gpg)"
-                .into(),
-        )
-    })?;
-    check_keyring(keyring)?;
+    // The bridge-posted check reads no keyring from the repository (the
+    // bridge holds its own, optionally), so only the workflow guards need
+    // one to commit or embed.
+    let keyring: &[u8] = match (cfg.platform_keyring.as_deref(), guard) {
+        (Some(k), _) => {
+            check_keyring(k)?;
+            k
+        }
+        (None, CheckGuard::BridgePosted) => &[],
+        (None, _) => {
+            return Err(ForgeError::Config(
+                "no platform keyring: GitHub web-UI merges are signed by `web-flow`, and without                  its key in the exempt keyring every merge commit fails the check. Supply it in                  the config (for github.com, the contents of https://github.com/web-flow.gpg)"
+                    .into(),
+            ));
+        }
+    };
 
     let mut steps = Vec::new();
     if matches!(

@@ -35,6 +35,13 @@ const PERMS_CHECKS: &[(&str, &str)] = &[("checks", "write"), ("metadata", "read"
 /// Listing and fetching the commits under test. Read-only: the bridge never
 /// writes to a repository while checking it.
 const PERMS_READ: &[(&str, &str)] = &[("contents", "read"), ("metadata", "read")];
+/// Reading a pull request's current head and base.
+const PERMS_PULLS: &[(&str, &str)] = &[("metadata", "read"), ("pull_requests", "read")];
+/// The repository's metadata (its default branch).
+const PERMS_METADATA: &[(&str, &str)] = &[("metadata", "read")];
+/// GitHub lists a comparison's commits 100 to a page, 250 in all.
+const COMPARE_PER_PAGE: usize = 100;
+const COMPARE_PAGES: usize = 3;
 
 /// GitHub caps a check run's `output.summary` at 65 535 characters.
 const MAX_SUMMARY: usize = 65_000;
@@ -43,18 +50,30 @@ const MAX_SUMMARY: usize = 65_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CheckTriggerKind {
-    /// A pull request was opened, pushed to, or reopened.
+    /// A pull request was opened, pushed to, reopened, or had its base
+    /// branch changed.
     PullRequest {
         /// Its number.
         number: u64,
-        /// Commits GitHub counts on it, when the delivery says.
-        commits: Option<u64>,
     },
     /// A merge queue asked for checks on a merge group.
     MergeGroup,
+    /// Someone asked for the check again (`check_run` / `check_suite`
+    /// `rerequested`) on a pull request.
+    Rerequested {
+        /// The pull request.
+        number: u64,
+    },
 }
 
-/// A verified delivery that calls for the check on `head_sha`.
+/// A verified delivery that calls for the check on `head_sha`, against the
+/// base branch `base_ref`.
+///
+/// A check run attaches to a *commit*, not to a pull request: a success on
+/// `head_sha` satisfies every pull request whose head is that commit. So a
+/// check is only meaningful — and must only be posted — against a base the
+/// required check protects; the caller decides that from `base_ref`, never
+/// from anything else in the delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CheckTrigger {
@@ -64,12 +83,29 @@ pub struct CheckTrigger {
     pub repo_id: u64,
     /// The commit the check is for.
     pub head_sha: String,
-    /// The base it is compared against.
+    /// The base branch's tip the delivery named (a pull request's may be
+    /// stale; the caller re-reads it).
     pub base_sha: String,
-    /// Pull request or merge group.
+    /// The base branch, without `refs/heads/`.
+    pub base_ref: String,
+    /// Pull request, merge group or rerequest.
     pub kind: CheckTriggerKind,
     /// GitHub's delivery id, for de-duplication.
     pub delivery_id: Option<String>,
+}
+
+/// A pull request as GitHub reports it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullRequestInfo {
+    /// Its head commit.
+    pub head_sha: String,
+    /// Its base branch, without `refs/heads/`.
+    pub base_ref: String,
+    /// The base branch's tip.
+    pub base_sha: String,
+    /// Open (a closed or merged one gets no new check).
+    pub open: bool,
 }
 
 /// How a check run ended.
@@ -106,21 +142,67 @@ pub struct Comparison {
     pub merge_base: String,
 }
 
+/// A branch name from a ref (`refs/heads/main` → `main`); a name that is
+/// already bare is returned as it is.
+fn branch_of(r: &str) -> &str {
+    r.strip_prefix("refs/heads/").unwrap_or(r)
+}
+
+/// The `pull_requests` entries of a `check_run` / `check_suite` payload, as
+/// rerequest triggers.
+fn rerequests(
+    repo: &Resource,
+    repo_id: u64,
+    head_sha: &str,
+    prs: Option<&Value>,
+    delivery_id: &Option<String>,
+) -> Vec<CheckTrigger> {
+    let mut out = Vec::new();
+    for pr in prs.and_then(Value::as_array).into_iter().flatten() {
+        let Some(number) = pr.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        let base_ref = pr
+            .pointer("/base/ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let base_sha = pr
+            .pointer("/base/sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if base_ref.is_empty() || check_sha(base_sha).is_err() {
+            continue;
+        }
+        out.push(CheckTrigger {
+            repo: repo.clone(),
+            repo_id,
+            head_sha: head_sha.to_string(),
+            base_sha: base_sha.to_string(),
+            base_ref: branch_of(base_ref).to_string(),
+            kind: CheckTriggerKind::Rerequested { number },
+            delivery_id: delivery_id.clone(),
+        });
+    }
+    out
+}
+
 impl GitHubForge {
     /// Verify a webhook and, if it calls for the bridge-posted check, say on
-    /// what. `Ok(None)` for a verified delivery that does not (another event,
-    /// a closed pull request). `Err` for one that failed verification, which
-    /// must not be acted on.
+    /// what. Empty for a verified delivery that does not (another event, a
+    /// closed pull request, a title edit). `Err` for one that failed
+    /// verification, which must not be acted on.
     ///
     /// Triggers: `pull_request` `opened` / `synchronize` / `reopened`, and
-    /// `merge_group` `checks_requested`. The repository is the delivery's
-    /// `repository` — the base the check is posted on — never the fork a
-    /// pull request came from.
+    /// `edited` when the base branch changed; `merge_group`
+    /// `checks_requested`; this App's `check_run` / `check_suite`
+    /// `rerequested` (one trigger per pull request the delivery names). The
+    /// repository is the delivery's `repository` — the base the check is
+    /// posted on — never the fork a pull request came from.
     pub fn parse_check_trigger(
         &self,
         headers: &HeaderMap,
         body: &[u8],
-    ) -> Result<Option<CheckTrigger>> {
+    ) -> Result<Vec<CheckTrigger>> {
         webhook::verify_signature(self.webhook_secret(), headers, body)?;
         let event = headers
             .get("x-github-event")
@@ -130,8 +212,11 @@ impl GitHubForge {
             .get("x-github-delivery")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        if event != "pull_request" && event != "merge_group" {
-            return Ok(None);
+        if !matches!(
+            event,
+            "pull_request" | "merge_group" | "check_run" | "check_suite"
+        ) {
+            return Ok(Vec::new());
         }
         let payload: Value = serde_json::from_slice(body)
             .map_err(|e| ForgeError::Webhook(format!("body is not JSON: {e}")))?;
@@ -149,44 +234,114 @@ impl GitHubForge {
             .and_then(Value::as_u64)
             .ok_or_else(|| ForgeError::Webhook("payload is missing `repository.id`".into()))?;
 
-        let (head_sha, base_sha, kind) = match (event, action) {
-            ("pull_request", "opened" | "synchronize" | "reopened") => {
+        let one = |head_sha: String, base_sha: String, base_ref: &str, kind| {
+            vec![CheckTrigger {
+                repo: repo.clone(),
+                repo_id,
+                head_sha,
+                base_sha,
+                base_ref: branch_of(base_ref).to_string(),
+                kind,
+                delivery_id: delivery_id.clone(),
+            }]
+        };
+        let app_id = self.config().app_id;
+        Ok(match (event, action) {
+            ("pull_request", "opened" | "synchronize" | "reopened" | "edited") => {
+                // An edit matters only when it moved the base: a title edit
+                // changes nothing the check depends on.
+                if action == "edited" && payload.pointer("/changes/base").is_none() {
+                    return Ok(Vec::new());
+                }
                 let pr = &payload["pull_request"];
                 let number = pr
                     .get("number")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| ForgeError::Webhook("pull request has no number".into()))?;
-                (
+                one(
                     sha_at(pr, &["head", "sha"])?,
                     sha_at(pr, &["base", "sha"])?,
-                    CheckTriggerKind::PullRequest {
-                        number,
-                        commits: pr.get("commits").and_then(Value::as_u64),
-                    },
+                    str_at(pr, &["base", "ref"])?,
+                    CheckTriggerKind::PullRequest { number },
                 )
             }
             ("merge_group", "checks_requested") => {
                 let group = &payload["merge_group"];
-                (
+                one(
                     sha_at(group, &["head_sha"])?,
                     sha_at(group, &["base_sha"])?,
+                    str_at(group, &["base_ref"])?,
                     CheckTriggerKind::MergeGroup,
                 )
             }
-            _ => return Ok(None),
-        };
-        Ok(Some(CheckTrigger {
-            repo,
-            repo_id,
-            head_sha,
-            base_sha,
-            kind,
-            delivery_id,
-        }))
+            ("check_run", "rerequested") | ("check_suite", "rerequested") => {
+                let obj = &payload[event];
+                // Only this App's own runs: another App's rerequest is not
+                // ours to answer.
+                if obj.pointer("/app/id").and_then(Value::as_u64) != Some(app_id) {
+                    return Ok(Vec::new());
+                }
+                let head = sha_at(obj, &["head_sha"])?;
+                rerequests(
+                    &repo,
+                    repo_id,
+                    &head,
+                    obj.get("pull_requests"),
+                    &delivery_id,
+                )
+            }
+            _ => Vec::new(),
+        })
+    }
+
+    /// The repository's default branch — the one branch the managed
+    /// ruleset protects (`~DEFAULT_BRANCH`), read from GitHub now rather
+    /// than from a delivery.
+    pub async fn default_branch(&self, repo: &Resource) -> Result<String> {
+        let (token, owner, name) = self.repo_token_for(repo, PERMS_METADATA).await?;
+        #[derive(Deserialize)]
+        struct R {
+            default_branch: Option<String>,
+        }
+        let r: R = self
+            .api()
+            .json(
+                Method::GET,
+                self.api().url(&["repos", &owner, &name]),
+                Auth::Bearer(&token),
+                None,
+                repo.as_str(),
+            )
+            .await?;
+        r.default_branch
+            .ok_or_else(|| ForgeError::Protocol(format!("`{repo}` has no default branch")))
+    }
+
+    /// Pull request `number` on `repo`, as GitHub reports it now.
+    pub async fn pull_request(&self, repo: &Resource, number: u64) -> Result<PullRequestInfo> {
+        let (token, owner, name) = self.repo_token_for(repo, PERMS_PULLS).await?;
+        let pr: Value = self
+            .api()
+            .json(
+                Method::GET,
+                self.api()
+                    .url(&["repos", &owner, &name, "pulls", &number.to_string()]),
+                Auth::Bearer(&token),
+                None,
+                "pull request",
+            )
+            .await?;
+        Ok(PullRequestInfo {
+            head_sha: sha_at(&pr, &["head", "sha"])?,
+            base_ref: branch_of(str_at(&pr, &["base", "ref"])?).to_string(),
+            base_sha: sha_at(&pr, &["base", "sha"])?,
+            open: pr.get("state").and_then(Value::as_str) == Some("open"),
+        })
     }
 
     /// The commits in `base...head` on `repo`, oldest first
-    /// (`GET /repos/{o}/{r}/compare/{base}...{head}`).
+    /// (`GET /repos/{o}/{r}/compare/{base}...{head}`, every page: GitHub
+    /// lists 100 per page and 250 in all).
     pub async fn compare_commits(
         &self,
         repo: &Resource,
@@ -208,26 +363,39 @@ impl GitHubForge {
             commits: Vec<Sha>,
         }
         let range = format!("{base}...{head}");
-        let mut url = self.api().url(&["repos", &owner, &name, "compare", &range]);
-        url.query_pairs_mut().append_pair("per_page", "100");
-        let c: Compare = self
-            .api()
-            .json(
-                Method::GET,
-                url,
-                Auth::Bearer(&token),
-                None,
-                "commit comparison",
-            )
-            .await?;
-        let commits = c.commits.into_iter().map(|s| s.sha).collect::<Vec<_>>();
+        let mut commits = Vec::new();
+        let mut total = 0;
+        let mut merge_base = String::new();
+        for page in 1..=COMPARE_PAGES {
+            let mut url = self.api().url(&["repos", &owner, &name, "compare", &range]);
+            url.query_pairs_mut()
+                .append_pair("per_page", &COMPARE_PER_PAGE.to_string())
+                .append_pair("page", &page.to_string());
+            let c: Compare = self
+                .api()
+                .json(
+                    Method::GET,
+                    url,
+                    Auth::Bearer(&token),
+                    None,
+                    "commit comparison",
+                )
+                .await?;
+            total = c.total_commits;
+            merge_base = c.merge_base_commit.sha;
+            let n = c.commits.len();
+            commits.extend(c.commits.into_iter().map(|s| s.sha));
+            if n < COMPARE_PER_PAGE || commits.len() as u64 >= total {
+                break;
+            }
+        }
         for sha in &commits {
             check_sha(sha)?;
         }
         Ok(Comparison {
             commits,
-            total: c.total_commits,
-            merge_base: c.merge_base_commit.sha,
+            total,
+            merge_base,
         })
     }
 
@@ -338,6 +506,14 @@ fn sha_at(v: &Value, path: &[&str]) -> Result<String> {
     check_sha(s)
         .map_err(|_| ForgeError::Webhook(format!("`{}` is not a commit id", path.join("."))))?;
     Ok(s.to_string())
+}
+
+fn str_at<'a>(v: &'a Value, path: &[&str]) -> Result<&'a str> {
+    path.iter()
+        .try_fold(v, |v, k| v.get(k))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ForgeError::Webhook(format!("payload is missing `{}`", path.join("."))))
 }
 
 fn truncate(s: &str, max: usize) -> String {
