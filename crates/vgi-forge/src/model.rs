@@ -11,6 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bootstrap::MergeMethod;
 use crate::resource::Resource;
 use crate::rights::ForgeRole;
 
@@ -311,6 +312,18 @@ pub struct ProtectionState {
     pub blocks_deletion: bool,
     /// Actors allowed to bypass it. Must be empty (§5.3).
     pub bypass_actors: Vec<String>,
+    /// Paths a pull request may not change (forge glob syntax), for a forge
+    /// that protects the workflow this way. Empty when not read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_paths: Vec<String>,
+    /// The merge methods the repository allows, for an adapter that reads
+    /// them. `None`: not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_methods: Option<Vec<MergeMethod>>,
+    /// Whether the forge's CI is enabled on the repository, for an adapter
+    /// that reads it. `None`: not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_enabled: Option<bool>,
 }
 
 /// A repository as observed on the forge.
