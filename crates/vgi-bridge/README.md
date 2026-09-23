@@ -42,6 +42,13 @@ the bridge carries it out and reports back.
   objects, never executed — and posts "Verify commit trust" as the App; the
   ruleset requires the check from the App's own integration id, so a
   workflow on another branch cannot forge it.
+- **Dependabot re-sign.** On GitHub, a Dependabot pull request whose branch
+  only Dependabot has pushed to — as recorded from signed `push` webhooks,
+  never read from the commits — is re-signed with the bridge's own DID
+  (same trees and authors, a `Signed-by-DID:` trailer, an sshsig by the DID
+  key) and force-pushed with a lease on the old head, so it passes the check
+  without a human step. The VTC must grant the bridge's DID
+  `git.commit.sign` on the namespace.
 
 Not published to crates.io: it is a service, shipped as a container
 (`Dockerfile` here). The operator guide is [`docs/BRIDGE.md`][guide];

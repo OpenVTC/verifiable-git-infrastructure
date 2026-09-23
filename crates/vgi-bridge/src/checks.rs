@@ -101,6 +101,14 @@ pub trait CommitVerifier: Send + Sync {
         resource: &str,
         fallback: &str,
     ) -> Result<Vec<CommitLine>>;
+
+    /// Whether the registry grants `did` `git.commit.sign` on `resource`
+    /// right now. `Ok(None)`: this verifier cannot say (the default). Used
+    /// only to warn an operator whose bridge DID lacks the grant the
+    /// Dependabot re-sign needs; never to decide anything.
+    async fn commit_sign_granted(&self, _did: &str, _resource: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
 }
 
 /// The real verifier: verify-trust's library, with the registry endpoint
@@ -227,7 +235,29 @@ impl CommitVerifier for VerifyTrustVerifier {
             })
             .collect())
     }
+
+    async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
+        use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqpQuery};
+        let tdk = self
+            .tdk
+            .get_or_try_init(|| async { verify_trust::build_resolver(false).await.map(Arc::new) })
+            .await?;
+        let url = self.endpoint(tdk).await?;
+        let transport = HttpsTransport::new(HttpsTransportConfig::new(&url))?;
+        let client = TrqlClient::new(Arc::new(transport), &self.registry_did);
+        let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
+        match client.authorization(query).await {
+            Ok(r) => Ok(Some(r.authorized)),
+            // The registry answered and refused the tuple: a denial.
+            Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
+
+/// Most objects one re-sign push fetches by id (see
+/// [`GitFetcher::complete_for_push`]).
+const MAX_MISSING_OBJECTS: usize = 2_000;
 
 /// Fetches commit objects without ever running anything from them.
 ///
@@ -383,13 +413,152 @@ impl GitFetcher {
             // The token is in the environment, not in anything git echoes;
             // stderr is still trimmed before it reaches a check summary.
             let err = String::from_utf8_lossy(&err);
+            // A push says why a ref was refused on its own line (a lease
+            // that no longer holds is `[rejected] … (stale info)`).
+            let line = err
+                .lines()
+                .find(|l| l.contains("rejected]"))
+                .or_else(|| err.lines().last())
+                .unwrap_or("failed");
+            bail!("git {}: {}", args[0], line.trim());
+        }
+        Ok(out)
+    }
+
+    /// Before pushing commits that reuse trees of the commits they replace:
+    /// fetch the objects git will want to send that the partial clone left
+    /// out. git sends the trees of `new_head` that no commit on the
+    /// remote's side of the push marks as present, with their blobs that
+    /// differ from the base's — in practice the files the change touched —
+    /// so those blobs are fetched (by id, bounded like every fetch).
+    pub(crate) async fn complete_for_push(
+        &self,
+        dir: &Path,
+        token: Option<&str>,
+        new_head: &str,
+        old_head: &str,
+    ) -> Result<()> {
+        check_sha(new_head).map_err(|e| anyhow!("{e}"))?;
+        check_sha(old_head).map_err(|e| anyhow!("{e}"))?;
+        let not_old = format!("^{old_head}");
+        let listed = self
+            .git(
+                dir,
+                &[
+                    "rev-list",
+                    "--objects",
+                    "--missing=print",
+                    new_head,
+                    &not_old,
+                ],
+                None,
+                false,
+            )
+            .await?;
+        let missing: Vec<String> = String::from_utf8_lossy(&listed)
+            .lines()
+            .filter_map(|l| l.strip_prefix('?'))
+            .map(|l| l.trim().to_string())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if missing.len() > MAX_MISSING_OBJECTS {
+            bail!(
+                "the change touches {} files; more than the bridge re-signs ({MAX_MISSING_OBJECTS})",
+                missing.len()
+            );
+        }
+        for m in &missing {
+            check_sha(m).map_err(|e| anyhow!("{e}"))?;
+        }
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--filter=blob:none",
+            "origin",
+        ];
+        args.extend(missing.iter().map(String::as_str));
+        self.git(dir, &args, token, true).await?;
+        Ok(())
+    }
+
+    /// Run git in `dir` with `input` on its standard input (for
+    /// `hash-object --stdin` and `interpret-trailers`), under the same
+    /// hardening and timeout as every other call. Never given a token.
+    pub(crate) async fn git_with_input(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        use tokio::io::AsyncWriteExt;
+        let mut cmd = self.command(dir, args, None);
+        cmd.stdin(Stdio::piped());
+        let mut child = cmd.spawn().context("running git")?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let input = input.to_vec();
+        let writer = tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+            drop(stdin);
+        });
+        let out = tokio::time::timeout(self.timeout, child.wait_with_output())
+            .await
+            .map_err(|_| anyhow!("git {} timed out", args[0]))?
+            .context("waiting for git")?;
+        let _ = writer.await;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
             bail!(
                 "git {}: {}",
                 args[0],
                 err.lines().last().unwrap_or("failed")
             );
         }
-        Ok(out)
+        Ok(out.stdout)
+    }
+
+    /// Push `new_head` to `refs/heads/<branch>` of the repository a
+    /// [`Fetched`] came from, only if the branch still points at `lease`
+    /// (`--force-with-lease` with an explicit expected value: the remote
+    /// compares and swaps, so a push that lands in between is never
+    /// overwritten). `dir` is the fetch's repository, where the new commits
+    /// were written.
+    pub(crate) async fn push(
+        &self,
+        dir: &Path,
+        token: Option<&str>,
+        new_head: &str,
+        branch: &str,
+        lease: &str,
+    ) -> Result<()> {
+        check_sha(new_head).map_err(|e| anyhow!("{e}"))?;
+        check_sha(lease).map_err(|e| anyhow!("{e}"))?;
+        crate::resign::check_branch_name(branch)?;
+        let lease = format!("--force-with-lease=refs/heads/{branch}:{lease}");
+        let refspec = format!("{new_head}:refs/heads/{branch}");
+        self.git(
+            dir,
+            &[
+                "push",
+                "--quiet",
+                "--no-verify",
+                // A thin pack would name blobs the partial clone does not
+                // hold as delta bases.
+                "--no-thin",
+                "--no-recurse-submodules",
+                &lease,
+                "origin",
+                &refspec,
+            ],
+            token,
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Fetch `head` with enough history to hold every commit in `commits`
@@ -400,6 +569,36 @@ impl GitFetcher {
         token: Option<&str>,
         head: &str,
         commits: &[String],
+    ) -> Result<Fetched> {
+        self.fetch_with(remote, token, head, commits, &["tree:0", "blob:none"], 0)
+            .await
+    }
+
+    /// Fetch for a rewrite: the commits, their trees (no blobs) and one
+    /// generation more — the parent the first rewritten commit keeps — so
+    /// that commits reusing those trees can be pushed back from this
+    /// repository. (git cannot push from a `tree:0` clone: it walks the
+    /// trees it must not send.) Trees are small and the byte bound still
+    /// applies.
+    pub(crate) async fn fetch_for_rewrite(
+        &self,
+        remote: &Url,
+        token: Option<&str>,
+        head: &str,
+        commits: &[String],
+    ) -> Result<Fetched> {
+        self.fetch_with(remote, token, head, commits, &["blob:none"], 1)
+            .await
+    }
+
+    async fn fetch_with(
+        &self,
+        remote: &Url,
+        token: Option<&str>,
+        head: &str,
+        commits: &[String],
+        filters: &[&str],
+        extra_depth: usize,
     ) -> Result<Fetched> {
         check_sha(head).map_err(|e| anyhow!("{e}"))?;
         for c in commits {
@@ -427,9 +626,9 @@ impl GitFetcher {
         }
         // Depth = the number of commits under test: every one of them is
         // within that many generations of the head.
-        let depth = format!("--depth={}", commits.len().max(1));
+        let depth = format!("--depth={}", commits.len().max(1) + extra_depth);
         let mut last_err = None;
-        for filter in ["tree:0", "blob:none"] {
+        for &filter in filters {
             self.git(
                 d,
                 &["config", "remote.origin.partialclonefilter", filter],
@@ -506,8 +705,8 @@ fn dir_size(dir: &Path) -> u64 {
 /// Runs checks, a bounded number at a time, each (repository, head, base
 /// branch) once at a time.
 pub struct CheckRunner {
-    verifier: Arc<dyn CommitVerifier>,
-    fetcher: GitFetcher,
+    pub(crate) verifier: Arc<dyn CommitVerifier>,
+    pub(crate) fetcher: GitFetcher,
     max_commits: usize,
     permits: Semaphore,
     in_flight: Mutex<BTreeSet<(String, String, String)>>,
@@ -609,7 +808,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
         .clone();
 
     // The base, from GitHub rather than the delivery wherever GitHub can say.
-    let (base_ref, base_sha) = match trigger.kind {
+    let (base_ref, base_sha, pr_info) = match trigger.kind {
         CheckTriggerKind::PullRequest { number } | CheckTriggerKind::Rerequested { number } => {
             let pr = g.pull_request(&trigger.repo, number).await?;
             if !pr.open {
@@ -619,9 +818,9 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
                 // Pushed to since: the delivery for the new head checks it.
                 return Ok(CheckOutcome::Skipped("the pull request has moved on"));
             }
-            (pr.base_ref, pr.base_sha)
+            (pr.base_ref.clone(), pr.base_sha.clone(), Some(pr))
         }
-        _ => (trigger.base_ref.clone(), trigger.base_sha.clone()),
+        _ => (trigger.base_ref.clone(), trigger.base_sha.clone(), None),
     };
     check_sha(&base_sha).map_err(|e| anyhow!("{e}"))?;
     let protected = g.default_branch(&trigger.repo).await?;
@@ -660,7 +859,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
     let id = g
         .start_check_run(&trigger.repo, &trigger.head_sha, &check_name, &external)
         .await?;
-    let (conclusion, title, summary) =
+    let (conclusion, title, mut summary) =
         match verify(bridge, &g, &ctx, trigger, &base_ref, &base_sha).await {
             Ok(v) => v,
             Err(e) => (
@@ -672,6 +871,12 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
                 ),
             ),
         };
+    if conclusion == CheckConclusion::Failure
+        && let Some(pr) = &pr_info
+        && let Some(hint) = crate::resign::check_hint(bridge, &ctx, trigger, pr, &protected)
+    {
+        summary.push_str(&hint);
+    }
     g.finish_check_run(&trigger.repo, id, conclusion, &title, &summary)
         .await?;
     Ok(CheckOutcome::Posted(conclusion))

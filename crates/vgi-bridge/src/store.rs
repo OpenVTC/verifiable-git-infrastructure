@@ -18,6 +18,11 @@
 //! - **The outbox** ([`OutboxEntry`]): results and events not yet
 //!   acknowledged by the VTC.
 //! - **Sealed secrets**: see [`crate::seal`]. Only ciphertext is written.
+//! - **The provenance ledger** ([`BranchLedger`]): who pushed to each
+//!   `dependabot/*` branch since it was created. The Dependabot re-sign acts
+//!   only on an unbroken record, so losing it means Dependabot pull requests
+//!   open before the loss are not re-signed (`@dependabot recreate` starts
+//!   them over).
 //!
 //! Every value is JSON in a string-keyed table: small, inspectable in a
 //! support session, and free of a schema migration story for records this
@@ -59,10 +64,13 @@ pub enum Table {
     Secrets,
     /// Small bookkeeping values (last token rotation, …) by name.
     Meta,
+    /// [`BranchLedger`] by `<host>#<repository id>#<branch>`: the Dependabot
+    /// re-sign's provenance ledger.
+    Branches,
 }
 
 impl Table {
-    const ALL: [Table; 8] = [
+    const ALL: [Table; 9] = [
         Table::Jobs,
         Table::Namespaces,
         Table::Repos,
@@ -71,6 +79,7 @@ impl Table {
         Table::Deliveries,
         Table::Secrets,
         Table::Meta,
+        Table::Branches,
     ];
 
     fn def(self) -> TableDefinition<'static, &'static str, &'static [u8]> {
@@ -83,6 +92,7 @@ impl Table {
             Table::Deliveries => "deliveries",
             Table::Secrets => "secrets",
             Table::Meta => "meta",
+            Table::Branches => "branches",
         })
     }
 }
@@ -292,6 +302,84 @@ impl RepoRecord {
 /// The key a repository is stored under.
 pub fn repo_key(host: &str, forge_id: u64) -> String {
     format!("{host}#{forge_id}")
+}
+
+/// One verified `push` to a `dependabot/*` branch, as GitHub reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PushRecord {
+    /// The branch's value before the push (all zeros when it was created).
+    pub before: String,
+    /// Its value after.
+    pub after: String,
+    /// Who GitHub says pushed: login…
+    pub sender_login: String,
+    /// …and numeric id.
+    pub sender_id: u64,
+    /// The push created the branch.
+    pub created: bool,
+    /// GitHub's delivery id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    /// Unix seconds, when the bridge recorded it.
+    pub at: i64,
+}
+
+/// A push the bridge made itself (a re-sign), recorded before it was sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct OwnPush {
+    /// The head it replaced (the force-push's lease).
+    pub before: String,
+    /// The re-signed head.
+    pub after: String,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+/// The provenance ledger of one `dependabot/*` branch (§9): every push the
+/// bridge has seen to it since it was created, and the bridge's own pushes.
+/// A branch's deletion clears it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct BranchLedger {
+    /// `host/owner/repo`, as last seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<Resource>,
+    /// The branch.
+    #[serde(default)]
+    pub branch: String,
+    /// Pushes, in the order they arrived (GitHub does not promise delivery
+    /// order; the chain is rebuilt from `before`/`after`).
+    #[serde(default)]
+    pub pushes: Vec<PushRecord>,
+    /// The bridge's own re-sign pushes.
+    #[serde(default)]
+    pub own: Vec<OwnPush>,
+    /// More pushes arrived than the ledger keeps: the branch is never clean
+    /// again (until deleted).
+    #[serde(default)]
+    pub overflow: bool,
+    /// The open pull request from this branch, once one was seen — so a push
+    /// that arrives after the pull request's delivery can resume the re-sign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<u64>,
+    /// Unix seconds, when anything last changed here (the oldest untouched
+    /// ledger of a repository is evicted first).
+    #[serde(default)]
+    pub touched: i64,
+    /// The newest `repository.pushed_at` of a delivery recorded here: an
+    /// older delivery may add a record but never resets or clears the
+    /// ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pushed_at: Option<i64>,
+    /// Why the last re-sign of a head stopped at its commits (the head, and
+    /// the reason), for the check's summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skip: Option<(String, String)>,
 }
 
 /// A flow waiting for a person, by its `state`.

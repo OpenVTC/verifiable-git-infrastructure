@@ -36,6 +36,9 @@
 //!   the bridge runs verify-trust on each pull request and posts the check
 //!   as the App ([`checks`]), and the ruleset requires it from the App's own
 //!   integration id, which no workflow can post as (§9).
+//! - **Dependabot re-sign.** `push` deliveries (who moved which branch) and
+//!   a per-repository push token, for the bridge to re-sign Dependabot pull
+//!   requests with its own DID on signed provenance ([`resign`]).
 //!
 //! The HTTP layer is a thin reqwest client ([`api`]) rather than octocrab:
 //! see the crate README for why.
@@ -47,6 +50,7 @@ mod forge;
 pub mod jwt;
 pub mod manifest;
 pub mod plan;
+pub mod resign;
 mod secret;
 pub mod webhook;
 
@@ -55,4 +59,5 @@ pub use checks::{CheckConclusion, CheckTrigger, CheckTriggerKind, Comparison, Pu
 pub use config::{DEFAULT_CHECKOUT_ACTION, GitHubConfig, JwtIssuer};
 pub use forge::{GitHubForge, RequiredWorkflowPin};
 pub use jwt::{AppKeySigner, InProcessKey};
+pub use resign::PushEvent;
 pub use secret::Secret;

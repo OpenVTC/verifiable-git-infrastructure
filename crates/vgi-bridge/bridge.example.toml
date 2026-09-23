@@ -50,6 +50,12 @@ version = "v0.5.0"
 # max_fetch_bytes = 67108864
 # concurrency = 4
 
+[resign]
+# The Dependabot re-sign (docs/BRIDGE.md §6a): the committer on re-signed
+# commits. The signer is the bridge's DID, named in the Signed-by-DID trailer.
+# committer_name = "VGI bridge"
+# committer_email = "vgi-bridge@noreply.invalid"
+
 [[github]]
 host = "github.com"
 # The App the manifest flow registers.
@@ -60,12 +66,22 @@ app_owner = "acme"
 # app_owner_is_user = false
 # Optional: GitHub's web-flow key, the exempt keyring for commits GitHub
 # signs (web-UI merges, merge queues). The bridge-posted check works without
-# it (such commits then fail); the in-repo and required-workflow plans need it.
+# it (such commits then fail); the in-repo and required-workflow plans need it,
+# and the Dependabot re-sign checks Dependabot's commits against it (without
+# it, nothing is re-signed).
 # curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc
 platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # Post the check from the bridge where no org required workflow is
 # available (personal accounts, orgs without org rulesets). Leave on.
 # bridge_checks = true
+# Dependabot's account, as GitHub reports it (GET /users/dependabot[bot]).
+# These are github.com's; a GHES instance has its own id.
+# dependabot_login = "dependabot[bot]"
+# dependabot_id = 49699333
+# Re-signing Dependabot pull requests is on for every namespace; turn it off
+# for one by its owner's login (lowercase):
+# [github.namespaces.acme]
+# resign_dependabot = false
 
 # [[forgejo]]
 # base_url = "https://codeberg.org/"

@@ -268,7 +268,10 @@ a single-parent commit says nothing about who chose the content. Those fail
   locally with `did-git-sign`.
 - **Resolve conflicts locally**, not in the web conflict editor: a merge whose
   tree is not the clean merge of its parents fails `platformMergeAltered`.
-- **Dependabot pull requests** fail until a maintainer re-signs them (§5).
+- **Dependabot pull requests** fail until a maintainer re-signs them (§5) —
+  except where a GitHub bridge serves the namespace: it re-signs a
+  Dependabot pull request itself when only Dependabot has pushed to its
+  branch (BRIDGE.md §6a).
 
 Verifying a platform-signed merge recomputes it with `merge-tree`, pinned to
 ignore `.gitattributes` (so a `merge=union` attribute cannot make a conflict

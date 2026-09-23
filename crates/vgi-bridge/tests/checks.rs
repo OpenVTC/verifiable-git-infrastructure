@@ -8,17 +8,12 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use common::*;
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tower::ServiceExt;
 use vgi_bridge::checks::{CommitVerifier, GitFetcher, VerifyTrustVerifier};
 use vgi_bridge::config::CheckConfig;
-use vgi_forge_github::Secret;
-use vgi_forge_github::webhook::sign_body;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -88,22 +83,6 @@ impl PrRepo {
     fn remote(&self) -> url::Url {
         url::Url::from_directory_path(self.dir.path()).unwrap()
     }
-}
-
-async fn post_webhook(w: &World, event: &str, delivery: &str, body: &Value) -> StatusCode {
-    let bytes = serde_json::to_vec(body).unwrap();
-    let sig = sign_body(&Secret::new(WEBHOOK_SECRET), &bytes);
-    let req = Request::post("/github/github.com/webhook")
-        .header("x-github-event", event)
-        .header("x-github-delivery", delivery)
-        .header("x-hub-signature-256", sig)
-        .body(Body::from(bytes))
-        .unwrap();
-    vgi_bridge::http::router(w.bridge.clone())
-        .oneshot(req)
-        .await
-        .unwrap()
-        .status()
 }
 
 fn pr_event(action: &str, head: &str, base_ref: &str, base_sha: &str) -> Value {
@@ -553,68 +532,6 @@ async fn a_fetch_past_the_byte_bound_is_stopped() {
 }
 
 // ── the real verify-trust path ───────────────────────────────────────────
-
-/// Serve the registry's `POST /trust-tasks`: `authorized` exactly for the
-/// `(entity, resource)` grants.
-async fn stub_registry(grants: Vec<(String, String)>) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let grants = grants.clone();
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let header_end = loop {
-                    let n = socket.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        return;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break p + 4;
-                    }
-                };
-                let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-                let len: usize = headers
-                    .lines()
-                    .find_map(|l| {
-                        l.strip_prefix("content-length:")
-                            .map(|v| v.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                while buf.len() < header_end + len {
-                    let n = socket.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        return;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                let req: Value = serde_json::from_slice(&buf[header_end..]).unwrap();
-                let entity = req["payload"]["entity_id"].as_str().unwrap_or_default();
-                let resource = req["payload"]["resource"].as_str().unwrap_or_default();
-                let granted = grants.iter().any(|(e, r)| e == entity && r == resource);
-                let body = json!({
-                    "id": "urn:uuid:stub", "threadId": req["id"],
-                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
-                    "payload": {
-                        "entity_id": entity, "authority_id": req["payload"]["authority_id"],
-                        "action": req["payload"]["action"], "resource": resource,
-                        "authorized": granted, "time_evaluated": "2026-09-23T00:00:00Z",
-                    }
-                })
-                .to_string();
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(reply.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            });
-        }
-    });
-    format!("http://{addr}")
-}
 
 /// A did:key and a commit it signed (sshsig, committer = the DID's key).
 fn signed_commit(repo: &Path, key: &SigningKey, msg: &str) -> (String, String) {

@@ -125,12 +125,14 @@ The App asks for: repository Administration, Contents, Variables and Checks
 (write), Metadata, Pull requests and Merge queues (read); organisation
 Members (read) and Administration (write); and the events
 `branch_protection_rule`, `check_run`, `check_suite`, `member`,
-`membership`, `merge_group`, `organization`, `pull_request`, `repository`,
-`repository_ruleset`. Organisation Administration is for the org ruleset
-that makes verify-trust a required workflow; Checks, Pull requests, Merge
-queues and the `pull_request` / `merge_group` / `check_*` events are for the
-check the bridge posts itself where there is none (§6). No secrets, Actions
-logs, code scanning or packages.
+`membership`, `merge_group`, `organization`, `pull_request`, `push`,
+`repository`, `repository_ruleset`. Organisation Administration is for the
+org ruleset that makes verify-trust a required workflow; Checks, Pull
+requests, Merge queues and the `pull_request` / `merge_group` / `check_*`
+events are for the check the bridge posts itself where there is none (§6);
+`push` (delivered under Contents) is the provenance record the Dependabot
+re-sign acts on, and Contents (write) is also what it pushes the re-signed
+commits with (§6a). No secrets, Actions logs, code scanning or packages.
 
 ### Upgrading an App registered before the bridge-posted check
 
@@ -152,6 +154,17 @@ without a required workflow, and says so in its log and in the bind's
    ruleset as drift (the check is still pinned to Actions), and the VTC's
    bootstrap job moves it over: the ruleset is pinned to the App and the
    in-repo workflow removed.
+
+### Upgrading an App registered before the Dependabot re-sign
+
+An App registered before `push` was in the manifest receives no pushes, so
+the bridge never sees a Dependabot branch as clean and **re-signs nothing**
+(Dependabot pull requests fail the check, as they would without a bridge).
+Nothing else changes. To turn it on, subscribe the App to the `push` event
+on its settings page (*Permissions & events*; it needs no new permission —
+Contents is already granted) and save. Only branches created after that are
+re-signed: an older branch has no record of its creation, so close its pull
+request and delete the branch and Dependabot opens it afresh.
 
 **Binding a namespace** starts at the VTC (`git-ns/namespace/bind`): the VTC
 sends the bridge a `beginBind` job, the admin follows the `next` URL to the
@@ -206,6 +219,7 @@ Everything is in `data_dir/state.redb`:
 | Repositories | forge ids, owners and projected roles — the projection drift is measured against |
 | Pending flows | binds and links waiting for a person |
 | Sealed secrets | the identity, the App key and secrets, Forgejo tokens — ciphertext only |
+| The provenance ledger | every push to each `dependabot/*` branch since its creation; the Dependabot re-sign acts only on an unbroken record (§6a), so after losing it, open Dependabot pull requests are not re-signed until Dependabot re-creates their branches |
 
 **Back up `state.redb` and the master key separately.** The store is
 useless without the key, and the key must never sit in the same backup as
@@ -261,6 +275,114 @@ This makes the bridge a **merge dependency** for those namespaces, as the
 registry already is: while it is down, pull requests wait for their check.
 Organisations with org rulesets use the required workflow instead and do not
 depend on the bridge to merge.
+
+## 6a. Dependabot pull requests: the re-sign
+
+verify-trust passes a commit GitHub signed (`web-flow`) only when it is a
+clean merge, so Dependabot's commits fail the check — nothing in a commit
+proves Dependabot wrote it: any writer can have GitHub write and sign a
+commit with any author through the Contents API. So that Dependabot pull
+requests still merge without a human step, a GitHub bridge **re-signs them
+with its own DID** (design §9, "Dependabot re-sign bot"). Provenance comes
+from **signed `push` webhooks, never from who a commit says wrote it**:
+
+- **The record.** Every verified `push` to a `dependabot/*` branch is kept:
+  before, after, who GitHub says pushed (login and numeric id), and whether
+  the push created the branch. Deleting the branch clears its record, and
+  creating it again starts a new one — but only a delivery at least as new
+  as every one recorded (by GitHub's `repository.pushed_at`, which the
+  webhook signature covers) may clear or restart a record, and a delivery
+  more than six days old is not recorded at all: the bridge forgets
+  delivery ids after seven, so an older one could be a replay. Up to 64
+  `dependabot/*` branches are tracked per repository; past that the one
+  untouched longest is forgotten, and a forgotten branch is never
+  re-signed.
+- **When it re-signs.** On `pull_request` opened / synchronize / reopened —
+  and when a push arrives for a branch whose pull request it has already
+  seen — the bridge re-reads the pull request from GitHub and re-signs only
+  if **all** of these hold:
+  - it was opened by `dependabot[bot]` (login *and* id — `dependabot_login`,
+    `dependabot_id`), its head is a `dependabot/*` branch **in the same
+    repository**, and it targets the repository's default branch;
+  - every push recorded on the branch came from Dependabot or was one of the
+    bridge's own re-sign pushes, and walking back from the head through
+    those pushes reaches the branch's creation, by Dependabot, with no gap
+    (a re-sign push whose webhook the bridge missed still links the walk,
+    by the exact old and new head it recorded before pushing);
+  - the namespace has the re-sign on (the default; see the config below) and
+    `platform_keyring_file` names GitHub's `web-flow` key;
+  - each commit has one parent, carries only the standard headers, is
+    `web-flow`-signed with a signature that verifies against that key, is
+    authored by Dependabot's noreply address, carries no `Signed-by-DID:`
+    trailer of its own, and **changes nothing under `.github/workflows/`**
+    (read from the commits' trees; if they cannot be read, nothing is
+    re-signed).
+
+  Anything else — a push by anyone else, a push the bridge never saw (it was
+  down), a pull request from a fork — and nothing is re-signed. The check
+  fails as it would anyway, and its summary says why and what to do: a
+  maintainer re-signs the commits (runbook §5), or Dependabot starts the
+  branch over (close the pull request and delete the branch).
+- **Workflow changes are never re-signed.** A Dependabot pull request that
+  touches `.github/workflows/` — a `github-actions` update, typically —
+  waits for a maintainer to review it and re-sign it by hand (runbook §5);
+  the check says so. The bridge will not vouch for what CI runs, and the App
+  has no `workflows` permission, which GitHub requires to push such a change
+  (and which the manifest deliberately does not ask for).
+- **How.** Each commit is rebuilt with the **same tree** and the same author
+  line; the committer is the bridge (`[resign]`), the message gains a
+  `Signed-by-DID: <bridge DID>#<key>` trailer, and it is signed (sshsig,
+  namespace `git`) with the bridge's Ed25519 DID key. The new commits are
+  force-pushed with a lease on the exact old head (a push that landed in
+  between is never overwritten), with a contents-write token for that one
+  repository, over the same hardened git as the check. The bridge records
+  that push as its own before sending it, so its webhook does not make the
+  branch unclean. A head already carrying the bridge's signature is left
+  alone. Re-signs run `checks.concurrency` at a time, one at a time per
+  branch.
+- **Dependabot after a re-sign.** Dependabot stops rebasing a pull request
+  someone else has pushed to — and the re-sign is such a push. Comment
+  `@dependabot rebase` when it falls behind: Dependabot's push is recorded,
+  and the bridge re-signs the result.
+
+**What the VTC must grant.** The re-signed commits pass only if the
+registry authorizes the bridge's DID for `git.commit.sign` on the namespace
+(`github.com/<owner>`). The VTC grants this at bind, as a service grant
+(`grantedBy` = the VTC) that its default policy allows for the namespace's
+own bridge; a VTC release without that grant needs it made by hand (a
+`git.commit.sign` grant to the bridge's DID on the namespace). The bridge checks at start (and a couple of minutes after a
+bind) and logs a warning naming the namespace if the registry says the grant
+is missing; it re-signs regardless, and the re-signed commits then fail as
+`unauthorized` until the grant exists.
+
+**What the bridge's DID must publish.** verify-trust resolves the DID in the
+trailer and accepts the signature only from an Ed25519 key its DID document
+lists as a verification method (`publicKeyMultibase`). The bridge signs with
+the same key that signs its Trust Task documents: a locally minted `did:key`
+always publishes it; for a VTA-provisioned `did:webvh`, the Ed25519 key in
+the imported bundle must be a verification method of the DID's document
+(VTA templates publish it). The commit signature's `git` namespace keeps it
+from ever passing as a document proof, and the other way round.
+
+Config (all optional):
+
+```toml
+# The committer on re-signed commits (the signer is the DID in the trailer).
+[resign]
+committer_name = "VGI bridge"
+committer_email = "vgi-bridge@noreply.invalid"
+
+[[github]]
+# …
+# Dependabot's account as GitHub reports it (github.com: GET /users/dependabot[bot]).
+# A GHES instance has its own id: look it up there.
+# dependabot_login = "dependabot[bot]"
+# dependabot_id = 49699333
+
+# Turn the re-sign off for one namespace (the owner's login, lowercase).
+# [github.namespaces.acme]
+# resign_dependabot = false
+```
 
 ## 7. Operating it
 

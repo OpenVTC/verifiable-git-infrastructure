@@ -92,6 +92,12 @@ pub struct CheckTrigger {
     pub kind: CheckTriggerKind,
     /// GitHub's delivery id, for de-duplication.
     pub delivery_id: Option<String>,
+    /// For a pull request delivery: its head branch, as the delivery says —
+    /// a hint for the Dependabot re-sign, which re-reads it from GitHub.
+    pub head_ref: Option<String>,
+    /// For a pull request delivery: who opened it, as the delivery says (a
+    /// hint only, like `head_ref`).
+    pub author_login: Option<String>,
 }
 
 /// A pull request as GitHub reports it now.
@@ -106,6 +112,17 @@ pub struct PullRequestInfo {
     pub base_sha: String,
     /// Open (a closed or merged one gets no new check).
     pub open: bool,
+    /// Its head branch, without `refs/heads/`.
+    pub head_ref: String,
+    /// The repository its head branch is in; `None` when GitHub reports
+    /// none (a deleted fork).
+    pub head_repo_id: Option<u64>,
+    /// The repository it merges into.
+    pub base_repo_id: Option<u64>,
+    /// The login of the account that opened it.
+    pub author_login: Option<String>,
+    /// That account's numeric id.
+    pub author_id: Option<u64>,
 }
 
 /// How a check run ended.
@@ -181,6 +198,8 @@ fn rerequests(
             base_ref: branch_of(base_ref).to_string(),
             kind: CheckTriggerKind::Rerequested { number },
             delivery_id: delivery_id.clone(),
+            head_ref: None,
+            author_login: None,
         });
     }
     out
@@ -243,6 +262,8 @@ impl GitHubForge {
                 base_ref: branch_of(base_ref).to_string(),
                 kind,
                 delivery_id: delivery_id.clone(),
+                head_ref: None,
+                author_login: None,
             }]
         };
         let app_id = self.config().app_id;
@@ -258,12 +279,17 @@ impl GitHubForge {
                     .get("number")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| ForgeError::Webhook("pull request has no number".into()))?;
-                one(
+                let mut t = one(
                     sha_at(pr, &["head", "sha"])?,
                     sha_at(pr, &["base", "sha"])?,
                     str_at(pr, &["base", "ref"])?,
                     CheckTriggerKind::PullRequest { number },
-                )
+                );
+                t[0].head_ref = str_at(pr, &["head", "ref"])
+                    .ok()
+                    .map(|r| branch_of(r).to_string());
+                t[0].author_login = str_at(pr, &["user", "login"]).ok().map(str::to_string);
+                t
             }
             ("merge_group", "checks_requested") => {
                 let group = &payload["merge_group"];
@@ -336,6 +362,18 @@ impl GitHubForge {
             base_ref: branch_of(str_at(&pr, &["base", "ref"])?).to_string(),
             base_sha: sha_at(&pr, &["base", "sha"])?,
             open: pr.get("state").and_then(Value::as_str) == Some("open"),
+            head_ref: pr
+                .pointer("/head/ref")
+                .and_then(Value::as_str)
+                .map(|r| branch_of(r).to_string())
+                .unwrap_or_default(),
+            head_repo_id: pr.pointer("/head/repo/id").and_then(Value::as_u64),
+            base_repo_id: pr.pointer("/base/repo/id").and_then(Value::as_u64),
+            author_login: pr
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            author_id: pr.pointer("/user/id").and_then(Value::as_u64),
         })
     }
 

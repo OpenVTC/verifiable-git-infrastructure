@@ -23,6 +23,9 @@
 //! - **Checks.** Where no required workflow is available on GitHub, the
 //!   bridge runs verify-trust itself on each pull request and posts the
 //!   check as the App, which the ruleset pins ([`checks`]).
+//! - **Dependabot re-sign.** On signed push provenance only, the bridge
+//!   re-signs Dependabot pull requests with its own DID so they pass that
+//!   check without a human step ([`resign`]).
 //!
 //! State is one redb file; the operator guide (`docs/BRIDGE.md`) covers
 //! deployment, the App registration, backups and networking.
@@ -38,6 +41,8 @@ pub mod identity;
 mod jobs;
 pub mod mapping;
 pub mod registry;
+#[cfg(feature = "forge-github")]
+pub mod resign;
 pub mod seal;
 pub mod store;
 pub mod transport;

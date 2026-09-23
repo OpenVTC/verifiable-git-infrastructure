@@ -30,7 +30,7 @@ path = "src/main.rs"
 # container serves whichever forges its config names. A build without one
 # drops that adapter's code and HTTP routes.
 default = ["forge-github", "forge-forgejo"]
-forge-github = ["dep:vgi-forge-github", "dep:verify-trust"]
+forge-github = ["dep:vgi-forge-github", "dep:verify-trust", "dep:vgi-core", "dep:trql-client"]
 forge-forgejo = ["dep:vgi-forge-forgejo"]
 
 [dependencies]
@@ -40,6 +40,12 @@ vgi-forge-forgejo = { workspace = true, optional = true }
 # The bridge-posted check (GitHub fallback mode) runs verify-trust as a
 # library against the pull request's commits.
 verify-trust = { workspace = true, optional = true }
+# The Dependabot re-sign signs commits with the bridge's DID key (the shared
+# PROTOCOL.sshsig encoder and trailer reader), and warns at start when the
+# registry does not grant that DID `git.commit.sign` (a TRQP query, through
+# the same client verify-trust uses).
+vgi-core = { workspace = true, optional = true }
+trql-client = { workspace = true, optional = true }
 
 # Wire types (generated from the git-ns specifications) and their proofs.
 trust-tasks-rs = { workspace = true }
@@ -77,6 +83,9 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+# Signs the web-flow (PGP) fixture commits for the Dependabot re-sign tests.
+pgp = { workspace = true }
+rand = { workspace = true }
 # Signs real commits for the verify-trust path test.
 vgi-core = { workspace = true }
 tower = { workspace = true }

@@ -72,6 +72,10 @@ pub struct BridgeConfig {
     /// The bridge-posted check.
     #[serde(default)]
     pub checks: CheckConfig,
+    /// The Dependabot re-sign (§9): the committer the re-signed commits
+    /// carry.
+    #[serde(default)]
+    pub resign: ResignConfig,
     /// GitHub (github.com or GHES), one App each.
     #[serde(default)]
     pub github: Vec<GitHubForgeConfig>,
@@ -138,6 +142,49 @@ impl Default for CheckConfig {
     }
 }
 
+/// The Dependabot re-sign's committer identity. The signature is the
+/// bridge's DID (the `Signed-by-DID:` trailer names it); this is only the
+/// name and address git and GitHub display as the committer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ResignConfig {
+    /// The committer name.
+    #[serde(default = "default_committer_name")]
+    pub committer_name: String,
+    /// The committer email. Not a DID: the DID claim is the trailer.
+    #[serde(default = "default_committer_email")]
+    pub committer_email: String,
+}
+
+impl Default for ResignConfig {
+    fn default() -> Self {
+        ResignConfig {
+            committer_name: default_committer_name(),
+            committer_email: default_committer_email(),
+        }
+    }
+}
+
+/// Per-namespace GitHub settings, under `[github.namespaces.<owner>]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct GitHubNamespaceConfig {
+    /// Re-sign Dependabot pull requests in this namespace (§9). On unless
+    /// turned off.
+    #[serde(default = "yes")]
+    pub resign_dependabot: bool,
+}
+
+impl Default for GitHubNamespaceConfig {
+    fn default() -> Self {
+        GitHubNamespaceConfig {
+            resign_dependabot: true,
+        }
+    }
+}
+
 /// One GitHub the bridge serves as one App.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +214,18 @@ pub struct GitHubForgeConfig {
     /// workflow (§9). On by default: without it a writer can forge the check.
     #[serde(default = "yes")]
     pub bridge_checks: bool,
+    /// The login GitHub reports for Dependabot, as the `sender` of its pushes
+    /// and the `user` of its pull requests.
+    #[serde(default = "default_dependabot_login")]
+    pub dependabot_login: String,
+    /// Dependabot's numeric account id, checked together with the login.
+    /// `49699333` on github.com (`GET /users/dependabot[bot]`); a GHES
+    /// instance has its own — look it up there.
+    #[serde(default = "default_dependabot_id")]
+    pub dependabot_id: u64,
+    /// Per-namespace settings, keyed by the owner's login (lowercase).
+    #[serde(default)]
+    pub namespaces: std::collections::BTreeMap<String, GitHubNamespaceConfig>,
     /// Override the API base (tests, proxies).
     #[serde(default)]
     pub api_base: Option<Url>,
@@ -255,6 +314,39 @@ fn default_concurrency() -> usize {
 fn default_github_host() -> String {
     "github.com".into()
 }
+fn default_dependabot_login() -> String {
+    "dependabot[bot]".into()
+}
+fn default_dependabot_id() -> u64 {
+    49_699_333
+}
+fn default_committer_name() -> String {
+    "VGI bridge".into()
+}
+fn default_committer_email() -> String {
+    "vgi-bridge@noreply.invalid".into()
+}
+
+impl GitHubForgeConfig {
+    /// Whether the Dependabot re-sign is on for the namespace owned by
+    /// `owner` (on unless `[github.namespaces.<owner>]` turns it off).
+    pub fn resign_dependabot(&self, owner: &str) -> bool {
+        self.namespaces
+            .get(&owner.to_ascii_lowercase())
+            .is_none_or(|n| n.resign_dependabot)
+    }
+}
+
+/// A name or address that can go into a git `committer` header as it is.
+fn check_ident(what: &str, v: &str) -> Result<()> {
+    if v.trim().is_empty()
+        || v.chars()
+            .any(|c| matches!(c, '<' | '>' | '\n' | '\r' | '\0'))
+    {
+        bail!("`{what}` must be non-empty and hold no `<`, `>` or line break; got `{v}`");
+    }
+    Ok(())
+}
 fn yes() -> bool {
     true
 }
@@ -323,12 +415,26 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
+        check_ident("resign.committer_name", &self.resign.committer_name)?;
+        check_ident("resign.committer_email", &self.resign.committer_email)?;
+        if self.resign.committer_email.starts_with("did:") {
+            bail!(
+                "`resign.committer_email` must not be a DID: the re-signed commits claim the \
+                 bridge's DID in their `Signed-by-DID:` trailer"
+            );
+        }
         let mut hosts = std::collections::BTreeSet::new();
         for g in &self.github {
             Resource::namespace_of(&g.host, "x")
                 .map_err(|e| anyhow::anyhow!("github host `{}`: {e}", g.host))?;
             if !hosts.insert(g.host.clone()) {
                 bail!("forge host `{}` is configured twice", g.host);
+            }
+            if g.dependabot_login.is_empty() || g.dependabot_id == 0 {
+                bail!("`dependabot_login` and `dependabot_id` must be set");
+            }
+            if let Some(k) = g.namespaces.keys().find(|k| **k != k.to_ascii_lowercase()) {
+                bail!("`github.namespaces` keys are lowercase owner logins; got `{k}`");
             }
         }
         for f in &self.forgejo {
@@ -419,6 +525,29 @@ oauth_client_id = "0b6e3a0c"
         let c = BridgeConfig::parse(include_str!("../bridge.example.toml")).unwrap();
         assert_eq!(c.github.len(), 1);
         assert!(c.forgejo.is_empty());
+    }
+
+    #[test]
+    fn the_dependabot_resign_is_on_by_default_and_off_per_namespace() {
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        let g = &c.github[0];
+        assert_eq!(g.dependabot_login, "dependabot[bot]");
+        assert_eq!(g.dependabot_id, 49_699_333);
+        assert!(g.resign_dependabot("acme"));
+        assert_eq!(c.resign.committer_name, "VGI bridge");
+        let off = EXAMPLE.replace(
+            "[[forgejo]]",
+            "[github.namespaces.acme]\nresign_dependabot = false\n\n[[forgejo]]",
+        );
+        let c = BridgeConfig::parse(&off).unwrap();
+        assert!(!c.github[0].resign_dependabot("Acme"));
+        assert!(c.github[0].resign_dependabot("other"));
+        let upper = off.replace("namespaces.acme]", "namespaces.Acme]");
+        assert!(BridgeConfig::parse(&upper).is_err());
+        for bad in ["\"a<b\"", "\"did:key:z6Mk\"", "\"\""] {
+            let t = format!("{EXAMPLE}\n[resign]\ncommitter_email = {bad}\n");
+            assert!(BridgeConfig::parse(&t).is_err(), "{bad}");
+        }
     }
 
     #[test]
