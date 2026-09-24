@@ -63,10 +63,15 @@
 //!    own **before** it is sent.
 //!
 //! Re-signs run a bounded number at a time (`checks.concurrency`) and one at
-//! a time per branch. It never loops: a head whose commits already carry the bridge's
-//! signature is left alone (Ed25519 is deterministic, so "our signature over
-//! this payload" is checked exactly), and any commit that is not
-//! `web-flow`-signed stops the re-sign.
+//! a time per branch. Holding the branch, a run reads where the branch
+//! points on the forge itself (not the API, which can lag a push) and
+//! re-signs only if it is still the pull request's head: a run that read
+//! the pull request while another was re-signing the branch then stops
+//! rather than pushing on a lease that can no longer hold. It never loops:
+//! a head whose commits already carry the bridge's signature is left alone
+//! (Ed25519 is deterministic, so "our signature over this payload" is
+//! checked exactly), and any commit that is not `web-flow`-signed stops the
+//! re-sign.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -738,7 +743,39 @@ pub async fn run(
     let fetched = fetcher
         .fetch_for_rewrite(&remote, Some(token.expose()), &pr.head_sha, &cmp.commits)
         .await?;
+    // The pull request was read before this run held the branch: another
+    // run may have re-signed (and pushed) it since, and the forge's API can
+    // still report the old head for a while after a push. The branch
+    // itself, read under the guard, is what the lease must match — no other
+    // re-sign of this branch can push until this one is done.
+    let current = fetcher
+        .branch_head(fetched.dir.path(), Some(token.expose()), &pr.head_ref)
+        .await?;
     drop(token);
+    if current.as_deref() != Some(pr.head_sha.as_str()) {
+        let ours = current.as_deref().is_some_and(|c| {
+            bridge
+                .store
+                .get::<BranchLedger>(Table::Branches, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|l| {
+                    l.own
+                        .iter()
+                        .any(|o| o.before == pr.head_sha && o.after == c)
+                })
+        });
+        return skip(if ours {
+            "already re-signed by the bridge".into()
+        } else {
+            format!(
+                "the branch is at {}, no longer the pull request's head {} (the push that moved \
+                 it resumes the re-sign)",
+                current.as_deref().map_or("nothing", short),
+                short(&pr.head_sha)
+            )
+        });
+    }
 
     let signing = bridge.identity.git_signing_key()?;
     if fetched

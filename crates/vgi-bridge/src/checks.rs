@@ -521,6 +521,32 @@ impl GitFetcher {
         Ok(out.stdout)
     }
 
+    /// Where `refs/heads/<branch>` of the repository a [`Fetched`] came
+    /// from points now (`None`: no such branch) — read from the remote
+    /// itself, never from the forge's API, which can lag a push.
+    pub(crate) async fn branch_head(
+        &self,
+        dir: &Path,
+        token: Option<&str>,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        crate::resign::check_branch_name(branch)?;
+        let refname = format!("refs/heads/{branch}");
+        let out = self
+            .git(dir, &["ls-remote", "origin", &refname], token, false)
+            .await?;
+        let out = String::from_utf8_lossy(&out);
+        for line in out.lines() {
+            if let Some((sha, name)) = line.split_once('\t')
+                && name.trim() == refname
+            {
+                check_sha(sha).map_err(|e| anyhow!("{e}"))?;
+                return Ok(Some(sha.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Push `new_head` to `refs/heads/<branch>` of the repository a
     /// [`Fetched`] came from, only if the branch still points at `lease`
     /// (`--force-with-lease` with an explicit expected value: the remote
