@@ -31,9 +31,9 @@ use reqwest::{Method, StatusCode, header};
 use serde_json::{Value, json};
 use url::Url;
 use vgi_forge::{
-    BindCallback, BindRequest, BindStep, Drift, Forge, ForgeRole, LinkCallback, LinkStep,
-    MergeMethod, Projection, RepoSpec, Resource, RoleAssignment, StepOutcome, Unlisted, VgiConfig,
-    run_plan,
+    AccessSource, BindCallback, BindRequest, BindStep, Drift, Forge, ForgeAccount, ForgeRole,
+    LinkCallback, LinkStep, MergeMethod, Projection, RepoSpec, Resource, RoleAssignment,
+    StepOutcome, Unlisted, VgiConfig, run_plan,
 };
 use vgi_forge_forgejo::{
     BOT_TOKEN_SCOPES, Credentials, ForgejoConfig, ForgejoForge, Secret, plan::PROTECTED_PATHS,
@@ -642,6 +642,22 @@ async fn the_adapter_against_a_real_forgejo() {
     let drift = forge.diff(&state, &projection);
     assert!(drift.is_empty(), "{drift:?}");
 
+    // Job 0.2 `removeAccounts`: access that is not a direct role is read
+    // back, not changed. The org's owner has no direct role on `widgets`,
+    // and still owns it.
+    let root = fj.ok(ROOT, Method::GET, "user", None).await;
+    let root = ForgeAccount::new(root["id"].as_u64().unwrap(), ROOT.0);
+    let access = forge
+        .indirect_access(&widgets, &root)
+        .await
+        .unwrap()
+        .expect("the owner's access");
+    assert_eq!(access.role, ForgeRole::Admin, "{access:?}");
+    assert!(
+        access.via.contains(&AccessSource::OrgOwner("acme".into())),
+        "{access:?}"
+    );
+
     // Weakening the rule in the UI (as the org owner) is drift.
     fj.ok(
         ROOT,
@@ -1066,6 +1082,7 @@ const USED: &[Used] = &[
     ("PATCH", "/teams/{id}", TEAM_FIELDS, &["id"]),
     ("GET", "/teams/{id}/members/{username}", &[], &[]),
     ("PUT", "/teams/{id}/members/{username}", &[], &[]),
+    ("GET", "/repos/{owner}/{repo}/teams", &[], &["id", "name"]),
     ("GET", "/orgs/{org}/hooks", &[], &["id", "url", "config"]),
     (
         "POST",

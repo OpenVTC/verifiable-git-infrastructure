@@ -10,12 +10,13 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vgi_forge::{
-    ApplyReport, BindCallback, BindRequest, BindStep, BootstrapStep, Capabilities, Collaborator,
-    Drift, Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind, ForgeRole,
-    HookDecision, LinkCallback, LinkMethod, LinkStep, Namespace, NamespaceBinding, NamespaceKind,
-    Projection, ProtectionSpec, ProtectionState, RepoSpec, RepoState, RequiredCheckKind, Resource,
-    Result, RoleAssignment, RoleChange, RoleOutcome, StepAction, StepOutcome, Unlisted, VgiConfig,
-    Visibility, async_trait, collapse_to_ladder, default_diff, validate_repo_path,
+    AccessSource, ApplyReport, BindCallback, BindRequest, BindStep, BootstrapStep, Capabilities,
+    Collaborator, Drift, Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind,
+    ForgeRole, HookDecision, IndirectAccess, LinkCallback, LinkMethod, LinkStep, Namespace,
+    NamespaceBinding, NamespaceKind, Projection, ProtectionSpec, ProtectionState, RepoSpec,
+    RepoState, RequiredCheckKind, Resource, Result, RoleAssignment, RoleChange, RoleOutcome,
+    StepAction, StepOutcome, Unlisted, VgiConfig, Visibility, async_trait, collapse_to_ladder,
+    default_diff, validate_repo_path,
 };
 
 use crate::api::{Api, Auth};
@@ -56,6 +57,14 @@ const PERMS_CONTENTS: &[(&str, &str)] = &[("contents", "write"), ("metadata", "r
 const PERMS_VARIABLES: &[(&str, &str)] = &[("actions_variables", "write"), ("metadata", "read")];
 const PERMS_READ_CONTENTS: &[(&str, &str)] = &[("contents", "read"), ("metadata", "read")];
 const PERMS_METADATA: &[(&str, &str)] = &[("metadata", "read")];
+/// Reading someone's access to a repository and — in an organisation —
+/// the teams and membership it comes from.
+const PERMS_ACCESS: &[(&str, &str)] = &[("administration", "read"), ("metadata", "read")];
+const PERMS_ACCESS_ORG: &[(&str, &str)] = &[
+    ("administration", "read"),
+    ("members", "read"),
+    ("metadata", "read"),
+];
 /// Org rulesets. *Write* even to read them: GitHub lists every
 /// `/orgs/{org}/rulesets` endpoint under organization Administration
 /// (write), and shows bypass actors only to a caller who could edit them.
@@ -1126,6 +1135,56 @@ impl GitHubForge {
             }
         }
     }
+
+    /// Where `login`'s access to an organisation's repository comes from,
+    /// other than a direct role: owning the organisation, the teams with
+    /// access to the repository that they are in, or — failing both — the
+    /// organisation's base permission for members. Best effort: a lookup
+    /// GitHub refuses leaves that source out, and the access is still
+    /// reported.
+    async fn access_sources(
+        &self,
+        token: &Secret,
+        owner: &str,
+        name: &str,
+        login: &str,
+    ) -> Vec<AccessSource> {
+        let auth = Auth::Bearer(token);
+        let membership = |url| async move {
+            self.api
+                .get_opt::<MembershipJson>(url, auth, "membership")
+                .await
+                .ok()
+                .flatten()
+                .filter(|m| m.state == "active")
+        };
+        let mut via = Vec::new();
+        let org = membership(self.api.url(&["orgs", owner, "memberships", login])).await;
+        if org.as_ref().is_some_and(|m| m.role == "admin") {
+            via.push(AccessSource::OrgOwner(owner.to_string()));
+        }
+        let teams: Vec<TeamJson> = self
+            .api
+            .get_all(
+                self.api.url(&["repos", owner, name, "teams"]),
+                auth,
+                "repository teams",
+            )
+            .await
+            .unwrap_or_default();
+        for t in teams {
+            let url = self
+                .api
+                .url(&["orgs", owner, "teams", &t.slug, "memberships", login]);
+            if membership(url).await.is_some() {
+                via.push(AccessSource::Team(t.name));
+            }
+        }
+        if via.is_empty() && org.is_some() {
+            via.push(AccessSource::OrgMember(owner.to_string()));
+        }
+        via
+    }
 }
 
 /// Where someone stands on a repository before a change.
@@ -1698,6 +1757,68 @@ impl Forge for GitHubForge {
         Ok(report)
     }
 
+    /// GitHub's effective permission for the account
+    /// (`/collaborators/{username}/permission` counts teams, organisation
+    /// ownership and the base permission), then where it comes from.
+    async fn indirect_access(
+        &self,
+        repo: &Resource,
+        account: &ForgeAccount,
+    ) -> Result<Option<IndirectAccess>> {
+        let (ns, owner, name) = self.locate(repo)?;
+        let org = ns.kind == NamespaceKind::Organization;
+        let perms = if org { PERMS_ACCESS_ORG } else { PERMS_ACCESS };
+        let token = self.installation_token(&ns, Some(name), perms).await?;
+        let login = match self.login_for(&token, account.id).await {
+            Ok(l) => l,
+            // No such account any more: it has no access.
+            Err(ForgeError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let url = self
+            .api
+            .url(&["repos", owner, name, "collaborators", &login, "permission"]);
+        let Some(p) = self
+            .api
+            .get_opt::<PermissionJson>(url, Auth::Bearer(&token), "collaborator permission")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let role = p
+            .role_name
+            .as_deref()
+            .and_then(role_from_name)
+            .or_else(|| role_from_name(&p.permission))
+            .unwrap_or(ForgeRole::None);
+        if role == ForgeRole::None {
+            return Ok(None);
+        }
+        if role == ForgeRole::Read {
+            // Everyone reads a public repository (and every enterprise
+            // member an internal one): that is no access to report.
+            let r: RepoJson = self
+                .api
+                .json(
+                    Method::GET,
+                    self.api.url(&["repos", owner, name]),
+                    Auth::Bearer(&token),
+                    None,
+                    repo.as_str(),
+                )
+                .await?;
+            if self.repo_state(&r)?.visibility != Visibility::Private {
+                return Ok(None);
+            }
+        }
+        let via = if org {
+            self.access_sources(&token, owner, name, &login).await
+        } else {
+            Vec::new()
+        };
+        Ok(Some(IndirectAccess::new(role, via)))
+    }
+
     fn bootstrap_plan(&self, repo: &RepoSpec, cfg: &VgiConfig) -> Result<Vec<BootstrapStep>> {
         if repo.resource.host() != self.config.host {
             return Err(ForgeError::WrongResource {
@@ -1992,6 +2113,31 @@ struct RepoJson {
 struct UserJson {
     id: u64,
     login: String,
+}
+
+/// `GET /repos/{owner}/{repo}/collaborators/{username}/permission`: the
+/// account's effective permission, whatever it comes from.
+#[derive(Deserialize)]
+struct PermissionJson {
+    #[serde(default)]
+    permission: String,
+    #[serde(default)]
+    role_name: Option<String>,
+}
+
+/// An organisation or team membership.
+#[derive(Deserialize)]
+struct MembershipJson {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct TeamJson {
+    name: String,
+    slug: String,
 }
 
 #[derive(Deserialize)]

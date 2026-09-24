@@ -44,10 +44,10 @@ pub use event::{
 pub use forge::Forge;
 pub use hooks::{ForgeHooks, HookDecision, NoHooks};
 pub use model::{
-    ApplyReport, BindCallback, BindRequest, BindStep, Capabilities, CheckSourceGuard, Collaborator,
-    ForgeAccount, ForgeKind, LinkCallback, LinkMethod, LinkStep, Namespace, NamespaceBinding,
-    NamespaceKind, Projection, ProtectionState, RepoSpec, RepoState, RequiredCheckKind,
-    RoleAssignment, RoleChange, RoleOutcome, Unlisted, Visibility,
+    AccessSource, ApplyReport, BindCallback, BindRequest, BindStep, Capabilities, CheckSourceGuard,
+    Collaborator, ForgeAccount, ForgeKind, IndirectAccess, LinkCallback, LinkMethod, LinkStep,
+    Namespace, NamespaceBinding, NamespaceKind, Projection, ProtectionState, RepoSpec, RepoState,
+    RequiredCheckKind, RoleAssignment, RoleChange, RoleOutcome, Unlisted, Visibility,
 };
 pub use resource::{OWNER_REPO_DEPTH, Resource};
 pub use rights::{EffectiveRights, ForgeRole, Right, RoleMap, collapse_to_ladder};

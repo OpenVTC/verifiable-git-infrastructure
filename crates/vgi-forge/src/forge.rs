@@ -8,8 +8,8 @@ use crate::error::{ForgeError, Result};
 use crate::event::{Drift, ForgeEvent, default_diff};
 use crate::model::{
     ApplyReport, BindCallback, BindRequest, BindStep, Capabilities, ForgeAccount, ForgeKind,
-    LinkCallback, LinkStep, Namespace, NamespaceBinding, Projection, RepoSpec, RepoState,
-    RoleAssignment, Unlisted,
+    IndirectAccess, LinkCallback, LinkStep, Namespace, NamespaceBinding, Projection, RepoSpec,
+    RepoState, RoleAssignment, Unlisted,
 };
 use crate::resource::Resource;
 use crate::rights::{EffectiveRights, ForgeRole, RoleMap, collapse_to_ladder};
@@ -110,6 +110,25 @@ pub trait Forge: Send + Sync {
     /// owner; an adapter that knows its automation account's id adds it.
     fn is_protected_account(&self, ns: &Namespace, account: u64) -> bool {
         ns.owner_id == Some(account)
+    }
+
+    /// Access `account` has to `repo` that is not a direct role on it —
+    /// through a team, as an owner or a member of the organisation — above
+    /// what anyone has anyway (`read` on a repository everyone can read).
+    /// `Ok(None)`: none.
+    ///
+    /// Asked after the account's direct role was taken away
+    /// (`git-ns/bridge/job` 0.2 `removeAccounts`), so that access the job
+    /// could not remove is reported. It only reads: teams and organisation
+    /// membership are never changed to satisfy a job about one repository.
+    /// The default knows of no access other than direct roles.
+    async fn indirect_access(
+        &self,
+        repo: &Resource,
+        account: &ForgeAccount,
+    ) -> Result<Option<IndirectAccess>> {
+        let _ = (repo, account);
+        Ok(None)
     }
 
     /// The steps that turn commit trust on for this forge's CI.
