@@ -21,7 +21,7 @@ use vgi_forge::{ForgeEventKind, HookDecision, InstallationChange, Resource};
 use crate::bridge::{Bridge, now};
 use crate::jobs::{self, Ctx};
 use crate::mapping::Report;
-use crate::store::{NamespaceRecord, NamespaceState, RepoRecord, Table, repo_key};
+use crate::store::{BranchLedger, NamespaceRecord, NamespaceState, RepoRecord, Table, repo_key};
 
 /// The namespace-level repository the GitHub adapter keeps for the
 /// required workflow. Part of the binding, never reported as unmanaged
@@ -142,6 +142,123 @@ fn repo_by_id(bridge: &Bridge, host: &str, id: u64) -> Option<RepoRecord> {
         .flatten()
 }
 
+/// Stop governing repository `forge_id` on `host`: its record, its place in
+/// every managed set (the store's and the adapter's, which would otherwise
+/// write it back), and the Dependabot provenance ledgers kept for it.
+/// Nothing of it is carried anywhere: a repository that comes back — into
+/// this namespace or another one this bridge serves — starts unmanaged
+/// (event 0.2: rights never follow a repository out of its namespace).
+pub(crate) fn detach(bridge: &Bridge, host: &str, forge_id: u64) {
+    let _ = bridge.store.delete(Table::Repos, &repo_key(host, forge_id));
+    let namespaces = bridge
+        .store
+        .list::<NamespaceRecord>(Table::Namespaces)
+        .unwrap_or_default();
+    for (id, ns) in namespaces {
+        if ns.resource.host() != host || !ns.managed.contains(&forge_id) {
+            continue;
+        }
+        let managed = bridge
+            .store
+            .update::<NamespaceRecord, _>(Table::Namespaces, &id, |n| {
+                let Some(mut n) = n else {
+                    return Ok((None, None));
+                };
+                n.managed.remove(&forge_id);
+                let m = n.managed.clone();
+                Ok((Some(n), Some(m)))
+            });
+        #[cfg(feature = "forge-github")]
+        if let (Ok(Some(m)), Some(g)) = (
+            managed,
+            bridge.adapters.get(host).and_then(|a| a.github().cloned()),
+        ) {
+            g.set_managed_repositories(&ns.resource, m);
+        }
+        #[cfg(not(feature = "forge-github"))]
+        let _ = managed;
+    }
+    let prefix = format!("{host}#{forge_id}#");
+    if let Ok(ledgers) = bridge.store.list::<BranchLedger>(Table::Branches) {
+        for (key, _) in ledgers.into_iter().filter(|(k, _)| k.starts_with(&prefix)) {
+            let _ = bridge.store.delete(Table::Branches, &key);
+        }
+    }
+}
+
+/// Detach every repository namespace `ns_id` records at `resource` under a
+/// forge id other than `forge_id`: the name was reused (event 0.2 — the
+/// governed repository was deleted or moved without an event, and the
+/// newcomer inherits nothing). Returns whether there was one.
+pub(crate) fn detach_reused_name(
+    bridge: &Bridge,
+    ns_id: &str,
+    resource: &Resource,
+    forge_id: u64,
+) -> bool {
+    let stale: Vec<RepoRecord> = bridge
+        .store
+        .list::<RepoRecord>(Table::Repos)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, r)| r)
+        .filter(|r| r.namespace == ns_id && r.resource == *resource && r.forge_id != forge_id)
+        .collect();
+    for r in &stale {
+        tracing::warn!(
+            %resource, old = r.forge_id, new = forge_id,
+            "a new repository took a governed name; the old one is no longer managed"
+        );
+        detach(bridge, resource.host(), r.forge_id);
+    }
+    !stale.is_empty()
+}
+
+/// Report `resource` (forge id `forge_id`) to namespace `ns` as a repository
+/// the VTC did not create or adopt — unless it is the bridge's own
+/// namespace-level repository, or one it manages. A repository this
+/// namespace records at the same name under another forge id is detached
+/// first (name reuse).
+pub(crate) async fn report_unmanaged(
+    bridge: &Bridge,
+    ns: &NamespaceRecord,
+    resource: &Resource,
+    forge_id: u64,
+) {
+    if NAMESPACE_REPOS.contains(&resource.repo_name().unwrap_or_default())
+        || repo_by_id(bridge, resource.host(), forge_id).is_some()
+    {
+        return;
+    }
+    detach_reused_name(bridge, &ns.id, resource, forge_id);
+    let ev = json!({ "type": "repoCreatedUnmanaged", "forgeId": forge_id.to_string(), "resource": resource.as_str() });
+    report(bridge, &ns.id, ev).await;
+}
+
+/// A repository left namespace `from_ns` (from `from` to `to`): detach it
+/// and report `repoTransferred` there. When `to` lies in another namespace
+/// this bridge serves, it arrives there unmanaged and is reported so —
+/// its state here is never carried across.
+pub(crate) async fn transferred_out(
+    bridge: &Bridge,
+    from_ns: &NamespaceRecord,
+    from: &Resource,
+    to: &Resource,
+    forge_id: u64,
+) {
+    detach(bridge, to.host(), forge_id);
+    if NAMESPACE_REPOS.contains(&from.repo_name().unwrap_or_default()) {
+        return;
+    }
+    let ev = json!({ "type": "repoTransferred", "forgeId": forge_id.to_string(), "from": from.as_str(), "to": to.as_str() });
+    report(bridge, &from_ns.id, ev).await;
+    if let Some(to_ns) = namespace_for(bridge, to)
+        && to_ns.id != from_ns.id
+    {
+        report_unmanaged(bridge, &to_ns, to, forge_id).await;
+    }
+}
+
 async fn inspect_in(bridge: &Bridge, ns: &NamespaceRecord, repo: &Resource) {
     let Ok(ctx) = Ctx::load(bridge, &ns.id) else {
         return;
@@ -177,11 +294,9 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             // until its create returns; give it a moment before calling it
             // unmanaged.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if repo_by_id(bridge, repo.host(), forge_id).is_some() {
-                return;
-            }
-            let ev = json!({ "type": "repoCreatedUnmanaged", "forgeId": forge_id.to_string(), "resource": repo.as_str() });
-            report(bridge, &ns.id, ev).await;
+            // At a governed name, with another forge id: the name was
+            // reused, and the repository governed there is detached first.
+            report_unmanaged(bridge, &ns, &repo, forge_id).await;
         }
         ForgeEventKind::RepoDeleted { repo, forge_id } => {
             let Some(ns) = namespace_for(bridge, &repo) else {
@@ -190,20 +305,7 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             if NAMESPACE_REPOS.contains(&repo.repo_name().unwrap_or_default()) {
                 return;
             }
-            let _ = bridge
-                .store
-                .delete(Table::Repos, &repo_key(repo.host(), forge_id));
-            let _ = bridge
-                .store
-                .update::<NamespaceRecord, _>(Table::Namespaces, &ns.id, |n| {
-                    Ok((
-                        n.map(|mut n| {
-                            n.managed.remove(&forge_id);
-                            n
-                        }),
-                        (),
-                    ))
-                });
+            detach(bridge, repo.host(), forge_id);
             let ev = json!({ "type": "repoDeleted", "forgeId": forge_id.to_string(), "resource": repo.as_str() });
             report(bridge, &ns.id, ev).await;
         }
@@ -218,6 +320,9 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
                 tracing::warn!(%from, %to, "ignoring a rename that crosses namespaces");
                 return;
             }
+            // Renamed onto a name the namespace still records for another
+            // repository: that one is gone, and nothing of it passes on.
+            detach_reused_name(bridge, &ns.id, &to, forge_id);
             let _ = bridge.store.update::<RepoRecord, _>(
                 Table::Repos,
                 &repo_key(to.host(), forge_id),
@@ -246,59 +351,26 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
                     .and_then(|n| n.join(to.repo_name().unwrap_or_default()).ok())
             });
             let from_ns = from.as_ref().and_then(|f| namespace_for(bridge, f));
-            let to_ns = namespace_for(bridge, &to);
-            let Some(from_ns) = from_ns else {
+            match (from_ns, from) {
+                // Out of a namespace this bridge serves — to another owner,
+                // and so out of the namespace, wherever `to` is (a namespace
+                // is one owner on one forge). The bridge stops governing it
+                // and carries nothing across: if `to` is in another
+                // namespace it serves, it arrives there unmanaged (event
+                // 0.2: a transfer detaches; rights never move).
+                (Some(from_ns), Some(from)) if from_ns.resource.contains(&from) => {
+                    transferred_out(bridge, &from_ns, &from, &to, forge_id).await;
+                }
                 // Transferred *in* from outside every bound namespace: to
                 // this namespace it is a repository the VTC did not create
                 // or adopt, reported as such — never as `repoTransferred`,
-                // whose `from` would lie outside it (event 0.2, and valid
-                // 0.1 too).
-                if let Some(t) = to_ns
-                    && !NAMESPACE_REPOS.contains(&to.repo_name().unwrap_or_default())
-                    && repo_by_id(bridge, to.host(), forge_id).is_none()
-                {
-                    let ev = json!({ "type": "repoCreatedUnmanaged", "forgeId": forge_id.to_string(), "resource": to.as_str() });
-                    report(bridge, &t.id, ev).await;
+                // whose `from` would lie outside it.
+                _ => {
+                    if let Some(t) = namespace_for(bridge, &to) {
+                        report_unmanaged(bridge, &t, &to, forge_id).await;
+                    }
                 }
-                return;
-            };
-            let Some(from) = from else { return };
-            let ns = from_ns;
-            match (&rec, &to_ns) {
-                (Some(r), Some(t)) => {
-                    let _ = bridge
-                        .store
-                        .update::<RepoRecord, _>(Table::Repos, &r.key(), |x| {
-                            Ok((
-                                x.map(|mut x| {
-                                    x.resource = to.clone();
-                                    x.namespace = t.id.clone();
-                                    x
-                                }),
-                                (),
-                            ))
-                        });
-                }
-                (Some(r), None) => {
-                    // Out of every bound namespace: no longer governed.
-                    let _ = bridge.store.delete(Table::Repos, &r.key());
-                    let _ =
-                        bridge
-                            .store
-                            .update::<NamespaceRecord, _>(Table::Namespaces, &ns.id, |n| {
-                                Ok((
-                                    n.map(|mut n| {
-                                        n.managed.remove(&forge_id);
-                                        n
-                                    }),
-                                    (),
-                                ))
-                            });
-                }
-                _ => {}
             }
-            let ev = json!({ "type": "repoTransferred", "forgeId": forge_id.to_string(), "from": from.as_str(), "to": to.as_str() });
-            report(bridge, &ns.id, ev).await;
         }
         ForgeEventKind::CollaboratorChanged {
             repo,

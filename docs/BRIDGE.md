@@ -400,3 +400,52 @@ committer_email = "vgi-bridge@noreply.invalid"
   mode, and per repository the guard in force and the last check the bridge
   posted. After a posted check the bridge inspects the repository and sends
   a `protectionChanged` carrying it, at most once a minute per repository.
+
+### Event versions
+
+The bridge sends `git-ns/bridge/event` **0.2** by default. A VTC that does
+not understand 0.2 yet refuses it as an unsupported type; until it is
+updated, set in the config
+
+```toml
+event_version = "0.1"   # "0.1" or "0.2" (the default)
+```
+
+and restart. Switch back to `"0.2"` (or remove the line) once the VTC takes
+0.2. The two versions are wire-identical: an event is the same payload under
+either type URI, and events still queued when you switch go out under the
+new one. The VTC's acknowledgement is accepted in either version.
+
+What 0.2 changes is what the VTC does with an event. The bridge's own
+handling is the same whichever version it sends:
+
+- **A transfer detaches.** A managed repository moved to another owner —
+  another organisation, another forge, or another namespace this same bridge
+  serves — is reported to its old namespace as `repoTransferred` (whose `to`
+  may lie anywhere: it only says where the repository went). The bridge
+  drops it from that namespace: its record, its place in the managed set
+  (and the org ruleset's repository list), and its Dependabot provenance
+  ledger. Nothing is carried into the receiving namespace; if this bridge
+  serves it, the repository is reported there as `repoCreatedUnmanaged`, for
+  that namespace's admins to adopt and grant afresh. A transfer the forge
+  sent no webhook for is found the same way by the next inspection (the
+  forge answers for the old name with the new home).
+- **A reused name detaches the old repository.** A new repository — created
+  or transferred in — at a name the namespace governs under a different
+  forge id means the governed one went without an event. The bridge detaches
+  the old one and reports the newcomer as `repoCreatedUnmanaged`; it
+  inherits nothing. (A managed repository renamed onto such a name is
+  reported as `repoRenamed`; the stale record at the name is dropped.)
+- **Every resource lies inside its event's namespace.** The bridge never
+  sends an event whose `resource`, `from`, `repoRenamed` `to`, or drift
+  `resource` lies outside the namespace it reports to — such an event is
+  logged (`not reporting an event that names a repository outside its
+  namespace`) and dropped. Only a `repoTransferred`'s `to` may lie outside.
+
+**With a 0.1 VTC**, a `repoTransferred` whose `to` lies in another namespace
+the VTC governs is handled by 0.1 as a rename: the VTC moves the
+repository's rights to the new namespace. The bridge does not follow — it
+has detached the repository and reports it there as unmanaged — so jobs the
+VTC sends for it in the new namespace act on a repository the bridge does
+not manage until it is adopted. Update the VTC to 0.2 before relying on
+transfers between namespaces.

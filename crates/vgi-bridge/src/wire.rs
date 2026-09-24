@@ -38,7 +38,14 @@ use trust_tasks_rs::{
 
 use crate::identity::BridgeIdentity;
 
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event;
+/// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
+/// `git-ns/bridge/event` 0.2, the type every event is built as. 0.1 is
+/// wire-identical (0.2 changes only what the VTC does with a transfer, a
+/// reused name, and a resource outside the namespace), so an event for a
+/// VTC configured for 0.1 is the same payload under the 0.1 type URI: see
+/// [`event_type_uri`].
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event;
 /// `git-ns/bridge/job` 0.1, still accepted from a VTC that has not moved.
 pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_1 as job_v0_1;
 /// `git-ns/bridge/job` 0.2, the version the bridge runs every job as. A 0.1
@@ -53,6 +60,24 @@ pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
 pub fn is_job_type(type_uri: &str) -> bool {
     use trust_tasks_rs::Payload as _;
     type_uri == job::Payload::TYPE_URI || type_uri == job_v0_1::Payload::TYPE_URI
+}
+
+/// The type URI an event is sent under, for the version the VTC takes.
+pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
+    use crate::config::EventVersion;
+    use trust_tasks_rs::Payload as _;
+    match version {
+        EventVersion::V0_1 => event_v0_1::Payload::TYPE_URI,
+        _ => event::Payload::TYPE_URI,
+    }
+}
+
+/// Whether `type_uri` (bare) is the VTC's acknowledgement of an event, of
+/// either version (a VTC acknowledges an event in the version it was sent,
+/// and the configured version may have changed since).
+pub fn is_event_response_type(type_uri: &str) -> bool {
+    use trust_tasks_rs::Payload as _;
+    type_uri == event::Response::TYPE_URI || type_uri == event_v0_1::Response::TYPE_URI
 }
 
 /// Parse a job payload by the version its document declares. A 0.1 payload

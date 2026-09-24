@@ -6,6 +6,9 @@
 
 # The one VTC this bridge serves. Jobs signed by any other DID are refused.
 vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
+# The git-ns/bridge/event version sent to that VTC: "0.2" (the default), or
+# "0.1" until the VTC understands 0.2 (BRIDGE.md §7, "Event versions").
+# event_version = "0.2"
 # The community's Trust Registry (for the bootstrap and the bridge's check).
 trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"
 # The DIDComm mediator the bridge's DID is reachable through (the VTC's).
