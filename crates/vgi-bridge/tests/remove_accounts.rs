@@ -351,6 +351,228 @@ async fn the_bridges_own_github_app_is_never_removed() {
     assert!(step["detail"].as_str().unwrap().contains("never removed"));
 }
 
+// ── access that is not a direct role (GitHub) ───────────────────────────
+
+/// Eve holds `write` directly; the job removes it. After that GitHub
+/// answers her effective permission with `permission` (`role_name`), and
+/// the organisation membership and the repository's teams as given (a
+/// team whose membership is not mounted is one she is not in).
+async fn mount_github_eve_after_removal(
+    server: &MockServer,
+    role_name: &str,
+    org_role: Option<&str>,
+    teams: &[(&str, &str, bool)],
+    private: bool,
+) {
+    mount_github_roles(
+        server,
+        "acme",
+        vec![json!({ "id": EVE, "login": "eve-renamed", "role_name": "write" })],
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/acme/widgets/collaborators/eve-renamed"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/user/{EVE}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": EVE, "login": "eve-renamed" })),
+        )
+        .mount(server)
+        .await;
+    let permission = match role_name {
+        "maintain" => "write",
+        "triage" => "read",
+        p => p,
+    };
+    Mock::given(method("GET"))
+        .and(path(
+            "/repos/acme/widgets/collaborators/eve-renamed/permission",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "permission": permission, "role_name": role_name,
+            "user": { "id": EVE, "login": "eve-renamed" },
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 812, "full_name": "acme/widgets", "private": private,
+            "visibility": if private { "private" } else { "public" },
+        })))
+        .mount(server)
+        .await;
+    if let Some(role) = org_role {
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/memberships/eve-renamed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "state": "active", "role": role })),
+            )
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/teams"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(Value::Array(
+                teams
+                    .iter()
+                    .map(|(name, slug, _)| json!({ "name": name, "slug": slug }))
+                    .collect(),
+            )),
+        )
+        .mount(server)
+        .await;
+    for (_, slug, member) in teams {
+        if *member {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/orgs/acme/teams/{slug}/memberships/eve-renamed"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "state": "active", "role": "member" })),
+                )
+                .mount(server)
+                .await;
+        }
+    }
+}
+
+/// Every request that could change something, other than minting tokens.
+async fn writes(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method != http::Method::GET && !r.url.path().ends_with("/access_tokens"))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+async fn run_revert(w: &mut World, job: &str, repo: &str, host: &str) -> Value {
+    w.send_job_0_2(revert_job(
+        job,
+        repo,
+        json!([account(host, EVE, "eve-dev")]),
+    ))
+    .await;
+    assert_eq!(w.next().await["payload"]["accepted"], true);
+    w.next_of(RESULT).await
+}
+
+/// Job 0.2: access through a team is not a role on the repository. The
+/// direct role goes, the team stays untouched, and the `roles` step fails
+/// naming the team — only the one she is in.
+#[tokio::test]
+async fn access_through_a_github_team_fails_the_roles_step_and_names_the_team() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    mount_github_eve_after_removal(
+        &w.server,
+        "maintain",
+        Some("member"),
+        &[("Core", "core", true), ("Docs", "docs", false)],
+        false,
+    )
+    .await;
+    let result = run_revert(&mut w, "job_team", "github.com/acme/widgets", "github.com").await;
+    assert_eq!(result["payload"]["outcome"], "failed", "{result}");
+    let step = roles_step(&result);
+    assert_eq!(step["outcome"], "failed", "{result}");
+    let detail = step["detail"].as_str().unwrap();
+    assert!(detail.contains("eve-dev"), "{detail}");
+    assert!(
+        detail.contains("`maintain` access through team `Core`"),
+        "{detail}"
+    );
+    assert!(!detail.contains("Docs"), "{detail}");
+    assert!(!detail.contains("member of"), "{detail}");
+    // The direct role is gone; nothing about the team or the organisation
+    // was changed.
+    assert_eq!(
+        writes(&w.server).await,
+        vec!["DELETE /repos/acme/widgets/collaborators/eve-renamed"]
+    );
+    // Membership was read with a token that may read it.
+    let asked_members = w
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/access_tokens"))
+        .any(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["permissions"]["members"] == "read"
+        });
+    assert!(asked_members);
+}
+
+/// An organisation owner is the repository's admin whatever its
+/// collaborators say: reported, and the organisation left as it is.
+#[tokio::test]
+async fn a_github_organisation_owner_fails_the_roles_step() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    mount_github_eve_after_removal(&w.server, "admin", Some("admin"), &[], false).await;
+    let result = run_revert(&mut w, "job_owner", "github.com/acme/widgets", "github.com").await;
+    let step = roles_step(&result);
+    assert_eq!(step["outcome"], "failed", "{result}");
+    let detail = step["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("`admin` access as an owner of `acme`"),
+        "{detail}"
+    );
+    assert!(detail.contains("does not change teams or the organisation"));
+    assert_eq!(
+        writes(&w.server).await,
+        vec!["DELETE /repos/acme/widgets/collaborators/eve-renamed"]
+    );
+}
+
+/// On a private repository, `read` left from the organisation's base
+/// permission is access too.
+#[tokio::test]
+async fn a_github_base_permission_on_a_private_repository_is_reported() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    mount_github_eve_after_removal(&w.server, "read", Some("member"), &[], true).await;
+    let result = run_revert(&mut w, "job_base", "github.com/acme/widgets", "github.com").await;
+    let step = roles_step(&result);
+    assert_eq!(step["outcome"], "failed", "{result}");
+    assert!(
+        step["detail"]
+            .as_str()
+            .unwrap()
+            .contains("`read` access as a member of `acme` (its base permission)"),
+        "{step}"
+    );
+}
+
+/// `read` on a public repository is what everyone has: the removal
+/// succeeded.
+#[tokio::test]
+async fn read_on_a_public_github_repository_is_no_access_left() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    mount_github_eve_after_removal(&w.server, "read", None, &[], false).await;
+    let result = run_revert(
+        &mut w,
+        "job_public",
+        "github.com/acme/widgets",
+        "github.com",
+    )
+    .await;
+    assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
+    assert_eq!(roles_step(&result)["outcome"], "applied");
+}
+
 // ── Forgejo ─────────────────────────────────────────────────────────────
 
 const FJ: &str = "127.0.0.1";
@@ -529,4 +751,129 @@ async fn the_bridges_own_forgejo_bot_is_never_removed() {
     assert_eq!(step["outcome"], "failed", "{result}");
     assert!(step["detail"].as_str().unwrap().contains("never removed"));
     assert!(deletes(&w.server).await.is_empty());
+}
+
+/// After Eve's direct role goes, Forgejo answers her effective permission
+/// with `permission`, whether she owns the organisation with `owner`, and
+/// the repository's teams as given (id, name, whether she is in it).
+async fn mount_forgejo_eve_after_removal(
+    server: &MockServer,
+    permission: &str,
+    owner: bool,
+    teams: &[(u64, &str, bool)],
+) {
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/acme/widgets/collaborators/eve-renamed"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true, "data": [{ "id": EVE, "login": "eve-renamed" }],
+        })))
+        .mount(server)
+        .await;
+    // Ahead of the world's answer (her direct `write`).
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v1/repos/acme/widgets/collaborators/eve-renamed/permission",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "permission": permission })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/eve-renamed/orgs/acme/permissions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "is_owner": owner, "is_admin": owner, "can_write": true, "can_read": true,
+            "can_create_repository": owner,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/acme/widgets/teams"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-total-count", teams.len().to_string())
+                .set_body_json(Value::Array(
+                    teams
+                        .iter()
+                        .map(|(id, name, _)| json!({ "id": id, "name": name, "permission": "write" }))
+                        .collect(),
+                )),
+        )
+        .mount(server)
+        .await;
+    for (id, _, member) in teams {
+        if *member {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/teams/{id}/members/eve-renamed")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "id": EVE, "login": "eve-renamed" })),
+                )
+                .mount(server)
+                .await;
+        }
+    }
+}
+
+/// Job 0.2 on Forgejo: write access through a team is reported, and only
+/// the direct role is removed.
+#[tokio::test]
+async fn access_through_a_forgejo_team_fails_the_roles_step_and_names_the_team() {
+    let mut w = forgejo_world().await;
+    mount_forgejo_eve_after_removal(
+        &w.server,
+        "write",
+        false,
+        &[(3, "Developers", true), (4, "Docs", false)],
+    )
+    .await;
+    let result = run_revert(&mut w, "job_fjteam", &format!("{FJ}/acme/widgets"), FJ).await;
+    let step = roles_step(&result);
+    assert_eq!(step["outcome"], "failed", "{result}");
+    let detail = step["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("`write` access through team `Developers`"),
+        "{detail}"
+    );
+    assert!(!detail.contains("Docs"), "{detail}");
+    assert!(!detail.contains("owner"), "{detail}");
+    assert_eq!(
+        writes(&w.server).await,
+        vec!["DELETE /api/v1/repos/acme/widgets/collaborators/eve-renamed"]
+    );
+}
+
+/// A Forgejo organisation owner (the Owners team) keeps `owner` access:
+/// reported, never changed.
+#[tokio::test]
+async fn a_forgejo_organisation_owner_fails_the_roles_step() {
+    let mut w = forgejo_world().await;
+    mount_forgejo_eve_after_removal(&w.server, "owner", true, &[(1, "Owners", true)]).await;
+    let result = run_revert(&mut w, "job_fjowner", &format!("{FJ}/acme/widgets"), FJ).await;
+    let step = roles_step(&result);
+    assert_eq!(step["outcome"], "failed", "{result}");
+    let detail = step["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("`admin` access as an owner of `acme` and through team `Owners`"),
+        "{detail}"
+    );
+    assert_eq!(
+        writes(&w.server).await,
+        vec!["DELETE /api/v1/repos/acme/widgets/collaborators/eve-renamed"]
+    );
+}
+
+/// `read` on a public Forgejo repository is what everyone has.
+#[tokio::test]
+async fn read_on_a_public_forgejo_repository_is_no_access_left() {
+    let mut w = forgejo_world().await;
+    mount_forgejo_eve_after_removal(&w.server, "read", false, &[]).await;
+    let result = run_revert(&mut w, "job_fjread", &format!("{FJ}/acme/widgets"), FJ).await;
+    assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
+    assert_eq!(roles_step(&result)["outcome"], "applied");
 }

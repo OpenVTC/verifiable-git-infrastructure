@@ -327,6 +327,71 @@ impl RepoSpec {
     }
 }
 
+/// Access an account has to a repository that is not a direct role on it —
+/// what is left after its direct role was taken away (`git-ns/bridge/job`
+/// 0.2 `removeAccounts`), and which the bridge reports rather than changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct IndirectAccess {
+    /// The account's effective role on the repository, as the forge reports
+    /// it.
+    pub role: ForgeRole,
+    /// Where it comes from, as far as the forge says. Empty when it does not
+    /// say.
+    pub via: Vec<AccessSource>,
+}
+
+impl IndirectAccess {
+    /// `role`, coming from `via`.
+    pub fn new(role: ForgeRole, via: Vec<AccessSource>) -> Self {
+        IndirectAccess { role, via }
+    }
+}
+
+impl fmt::Display for IndirectAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}` access", self.role)?;
+        if self.via.is_empty() {
+            return f.write_str(" from something other than a direct role");
+        }
+        for (i, v) in self.via.iter().enumerate() {
+            f.write_str(match i {
+                0 => " ",
+                _ if i + 1 == self.via.len() => " and ",
+                _ => ", ",
+            })?;
+            write!(f, "{v}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Where access that is not a direct role comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "name")]
+#[non_exhaustive]
+pub enum AccessSource {
+    /// Membership of a team with access to the repository (the team's
+    /// name).
+    Team(String),
+    /// Being an owner of the organisation (its login).
+    OrgOwner(String),
+    /// The permission every member of the organisation has on its
+    /// repositories (the organisation's login).
+    OrgMember(String),
+}
+
+impl fmt::Display for AccessSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessSource::Team(t) => write!(f, "through team `{t}`"),
+            AccessSource::OrgOwner(o) => write!(f, "as an owner of `{o}`"),
+            AccessSource::OrgMember(o) => write!(f, "as a member of `{o}` (its base permission)"),
+        }
+    }
+}
+
 /// A collaborator as observed on the forge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

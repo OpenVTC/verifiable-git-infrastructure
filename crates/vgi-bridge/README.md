@@ -31,8 +31,12 @@ the bridge carries it out and reports back.
   then the result. A 0.2 `projectRoles` may name `removeAccounts` — the
   revert of a forge-side `roleAdded` drift — whose direct roles on the
   repository go by forge id whoever gave them; the namespace's owner and the
-  bridge's own App or bot are never removed. Results and events are
-  retried until the VTC acknowledges them.
+  bridge's own App or bot are never removed. Access such an account keeps
+  through a team, as an organisation owner or through the organisation's
+  base permission is read back (GitHub's and Forgejo's effective
+  collaborator permission) and reported as a failed `roles` step naming
+  where it comes from; teams and organisations are never changed.
+  Results and events are retried until the VTC acknowledges them.
 - **Status for the VTC's console.** Every result and event carries, in its
   payload's `ext` member under `org.openvtc.git-ns`, what the bridge knows
   that the specification's payloads do not: `namespace` (the installation,

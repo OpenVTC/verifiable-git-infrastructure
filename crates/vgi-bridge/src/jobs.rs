@@ -208,7 +208,8 @@ async fn apply_roles(
     // By id: the adapter reads each one's current login from the forge, so
     // a login renamed since the VTC saw it is still the account removed. An
     // account with no role is already converged.
-    for account in removals.remove {
+    for account in &removals.remove {
+        let account = account.clone();
         match want.iter_mut().find(|w| w.account.id == account.id) {
             // Only a formerly projected role can be here: `desiredRoles`
             // and `removeAccounts` never overlap (checked at admission).
@@ -232,7 +233,7 @@ async fn apply_roles(
         .await
     {
         Ok(r) => {
-            let failures: Vec<String> = removals
+            let mut failures: Vec<String> = removals
                 .refused
                 .iter()
                 .cloned()
@@ -241,6 +242,7 @@ async fn apply_roles(
                     _ => None,
                 }))
                 .collect();
+            failures.extend(remaining_access(ctx, repo, &removals.remove, &r).await);
             let status = if !failures.is_empty() {
                 StepStatus::Failed
             } else if r.changes.is_empty() {
@@ -278,6 +280,43 @@ async fn apply_roles(
             report.fail(&e);
         }
     }
+}
+
+/// Access the accounts `removeAccounts` named still have to `repo` once
+/// their direct role is gone — through a team, as an organisation owner or
+/// member — one line each, for the failed `roles` step (job 0.2: the bridge
+/// reports it and never changes the team or the organisation). An account
+/// whose removal itself failed is already reported.
+async fn remaining_access(
+    ctx: &Ctx,
+    repo: &Resource,
+    removed: &[ForgeAccount],
+    applied: &vgi_forge::ApplyReport,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for account in removed {
+        let failed = applied
+            .changes
+            .iter()
+            .any(|c| c.account.id == account.id && matches!(c.outcome, RoleOutcome::Failed(_)));
+        if failed {
+            continue;
+        }
+        match ctx.adapter.forge().indirect_access(repo, account).await {
+            Ok(None) => {}
+            Ok(Some(access)) => out.push(format!(
+                "{} ({}): no direct role any more, but still {access}; the bridge does not \
+                 change teams or the organisation",
+                account.login, account.id
+            )),
+            Err(e) => out.push(format!(
+                "{} ({}): the direct role is gone, but whether access remains through a team or \
+                 the organisation could not be read: {e}",
+                account.login, account.id
+            )),
+        }
+    }
+    out
 }
 
 async fn project_roles(

@@ -10,13 +10,13 @@ use reqwest::Method;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use vgi_forge::{
-    ApplyReport, BindCallback, BindRequest, BindStep, BootstrapStep, Capabilities, Collaborator,
-    Drift, Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind, ForgeRole,
-    HookDecision, LinkCallback, LinkMethod, LinkStep, MergeMethod, Namespace, NamespaceBinding,
-    NamespaceKind, Projection, ProtectionGap, ProtectionSpec, ProtectionState, RepoSettings,
-    RepoSpec, RepoState, RequiredCheckKind, Resource, Result, RoleAssignment, RoleChange,
-    RoleOutcome, StepAction, StepOutcome, Unlisted, VgiConfig, Visibility, async_trait,
-    collapse_to_ladder, default_diff, validate_repo_path,
+    AccessSource, ApplyReport, BindCallback, BindRequest, BindStep, BootstrapStep, Capabilities,
+    Collaborator, Drift, Forge, ForgeAccount, ForgeError, ForgeEvent, ForgeHooks, ForgeKind,
+    ForgeRole, HookDecision, IndirectAccess, LinkCallback, LinkMethod, LinkStep, MergeMethod,
+    Namespace, NamespaceBinding, NamespaceKind, Projection, ProtectionGap, ProtectionSpec,
+    ProtectionState, RepoSettings, RepoSpec, RepoState, RequiredCheckKind, Resource, Result,
+    RoleAssignment, RoleChange, RoleOutcome, StepAction, StepOutcome, Unlisted, VgiConfig,
+    Visibility, async_trait, collapse_to_ladder, default_diff, validate_repo_path,
 };
 
 use crate::api::{Api, Auth};
@@ -1260,6 +1260,59 @@ impl ForgejoForge {
         Ok(user.login)
     }
 
+    /// Where `login`'s access to an organisation's repository comes from,
+    /// other than a direct role: owning the organisation, and the teams
+    /// with access to the repository that they are in. Best effort: a
+    /// lookup Forgejo refuses leaves that source out, and the access is
+    /// still reported.
+    async fn access_sources(
+        &self,
+        token: &Secret,
+        owner: &str,
+        name: &str,
+        login: &str,
+    ) -> Vec<AccessSource> {
+        let auth = Auth::Token(token);
+        let mut via = Vec::new();
+        let org: Option<OrgPermissionsJson> = self
+            .api
+            .get_opt(
+                self.api
+                    .url(&["users", login, "orgs", owner, "permissions"]),
+                auth,
+                "organisation permissions",
+            )
+            .await
+            .ok()
+            .flatten();
+        if org.is_some_and(|o| o.is_owner) {
+            via.push(AccessSource::OrgOwner(owner.to_string()));
+        }
+        let teams: Vec<TeamJson> = self
+            .api
+            .get_all(
+                self.api.url(&["repos", owner, name, "teams"]),
+                auth,
+                "repository teams",
+            )
+            .await
+            .unwrap_or_default();
+        for t in teams {
+            let url = self
+                .api
+                .url(&["teams", &t.id.to_string(), "members", login]);
+            if self
+                .api
+                .exists(url, auth, "team member")
+                .await
+                .unwrap_or(false)
+            {
+                via.push(AccessSource::Team(t.name));
+            }
+        }
+        via
+    }
+
     async fn set_collaborator(
         &self,
         token: &Secret,
@@ -1906,6 +1959,51 @@ impl Forge for ForgejoForge {
             }
         }
         Ok(report)
+    }
+
+    /// Forgejo's effective permission for the account
+    /// (`/collaborators/{collaborator}/permission` counts teams and
+    /// organisation ownership), then where it comes from. Forgejo has no
+    /// organisation-wide base permission: an organisation's members reach
+    /// its repositories through teams (the owners through the Owners team).
+    async fn indirect_access(
+        &self,
+        repo: &Resource,
+        account: &ForgeAccount,
+    ) -> Result<Option<IndirectAccess>> {
+        let (ns, owner, name) = self.locate(repo)?;
+        self.automated(&ns)?;
+        let token = self.token();
+        let login = match self.login_for(&token, account.id).await {
+            Ok(l) => l,
+            // No such account any more: it has no access.
+            Err(ForgeError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let url = self
+            .api
+            .url(&["repos", owner, name, "collaborators", &login, "permission"]);
+        let Some(p) = self
+            .api
+            .get_opt::<PermissionJson>(url, Auth::Token(&token), "collaborator permission")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(perm) = Perm::parse(&p.permission) else {
+            // `none`.
+            return Ok(None);
+        };
+        // Everyone reads a public repository: that is no access to report.
+        if perm == Perm::Read && !self.get_repo(&token, owner, name).await?.private {
+            return Ok(None);
+        }
+        let via = if ns.kind == NamespaceKind::Organization {
+            self.access_sources(&token, owner, name, &login).await
+        } else {
+            Vec::new()
+        };
+        Ok(Some(IndirectAccess::new(perm.observed(false), via)))
     }
 
     fn bootstrap_plan(&self, repo: &RepoSpec, cfg: &VgiConfig) -> Result<Vec<BootstrapStep>> {
@@ -2589,6 +2687,12 @@ struct SearchJson {
 #[derive(Deserialize)]
 struct PermissionJson {
     permission: String,
+}
+
+#[derive(Deserialize)]
+struct OrgPermissionsJson {
+    #[serde(default)]
+    is_owner: bool,
 }
 
 #[derive(Deserialize)]

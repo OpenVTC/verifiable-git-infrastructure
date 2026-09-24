@@ -554,10 +554,12 @@ async fn a_push_delivered_after_the_pull_request_resumes_the_re_sign() {
     assert!(raw.contains(&format!("Signed-by-DID: {}#", w.bridge.did())));
 }
 
-/// The lease: if the branch moved after GitHub named its head, the push is
-/// refused and the branch keeps what landed.
+/// If the branch moved after GitHub named its head, nothing is pushed and
+/// the branch keeps what landed: the run reads the branch itself before it
+/// re-signs (and pushes with a lease on that head, for a push that lands
+/// after the read).
 #[tokio::test]
-async fn the_force_push_is_refused_when_the_head_moved() {
+async fn nothing_is_pushed_when_the_head_moved() {
     let remote = Remote::new(2);
     let w = resign_world(&remote, true).await;
     mount_github(&w, &remote, remote.head(), DEPENDABOT).await;
@@ -571,16 +573,32 @@ async fn the_force_push_is_refused_when_the_head_moved() {
             &remote.commits[0],
         ],
     );
-    let e = run(
-        &w.bridge,
-        &vgi_forge::Resource::parse("github.com/acme/widgets").unwrap(),
-        REPO_ID,
-        PR,
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{e:#}").contains("stale info"), "{e:#}");
+    let o = resign(&w).await;
+    assert!(
+        skipped(&o).contains("no longer the pull request's head"),
+        "{o:?}"
+    );
     assert_eq!(remote.branch_head(), remote.commits[0], "not overwritten");
+}
+
+/// The race a webhook-started run and another run can run into: one
+/// re-signs and pushes while GitHub's API still names the old head. A run
+/// after it reads the old head from the API but the re-signed one on the
+/// branch, and stops — it does not push again on a lease that can no
+/// longer hold.
+#[tokio::test]
+async fn a_run_behind_the_api_after_a_re_sign_does_nothing() {
+    let remote = Remote::new(2);
+    let w = resign_world(&remote, true).await;
+    mount_github(&w, &remote, remote.head(), DEPENDABOT).await;
+    dependabot_pushes(&w, &remote).await;
+    let ResignOutcome::Resigned { new_head, .. } = resign(&w).await else {
+        panic!("not re-signed")
+    };
+    // The mock GitHub still names the old head.
+    let o = resign(&w).await;
+    assert_eq!(skipped(&o), "already re-signed by the bridge");
+    assert_eq!(remote.branch_head(), new_head);
 }
 
 // ── not re-signing ───────────────────────────────────────────────────────
