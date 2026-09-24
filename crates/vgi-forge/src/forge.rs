@@ -100,6 +100,18 @@ pub trait Forge: Send + Sync {
         unlisted: Unlisted,
     ) -> Result<ApplyReport>;
 
+    /// Whether the account with forge id `account` must never be taken off a
+    /// repository in `ns`, whatever a job asks: the namespace's owner (on a
+    /// personal account, the implicit admin of every repository in it) and
+    /// the adapter's own automation identity (a Forgejo bot, a GitHub App's
+    /// bot user), without which nothing the bridge does would keep working.
+    ///
+    /// Matched by numeric id, never by login. The default protects the
+    /// owner; an adapter that knows its automation account's id adds it.
+    fn is_protected_account(&self, ns: &Namespace, account: u64) -> bool {
+        ns.owner_id == Some(account)
+    }
+
     /// The steps that turn commit trust on for this forge's CI.
     fn bootstrap_plan(&self, repo: &RepoSpec, cfg: &VgiConfig) -> Result<Vec<BootstrapStep>>;
 

@@ -45,7 +45,8 @@ pub(crate) async fn run(bridge: &Arc<Bridge>, p: &job::Payload) -> Report {
     match (p.kind, repo) {
         (K::ProjectRoles, Some(repo)) => {
             let roles = p.desired_roles.clone().unwrap_or_default();
-            project_roles(bridge, &ctx, &repo, &roles, &mut report).await;
+            let remove = p.remove_accounts.clone().unwrap_or_default();
+            project_roles(bridge, &ctx, &repo, &roles, &remove, &mut report).await;
         }
         (K::CreateRepo, Some(repo)) => create_repo(bridge, &ctx, &repo, p, &mut report).await,
         (K::Bootstrap, Some(repo)) => {
@@ -146,9 +147,44 @@ fn desired_roles(
     Ok((out, owners))
 }
 
+/// Accounts a job asks to take off a repository (`removeAccounts`), sorted
+/// into those the adapter may remove and those it must never touch.
+#[derive(Debug, Default)]
+struct Removals {
+    /// To remove, by id; the login is the job's, display only.
+    remove: Vec<ForgeAccount>,
+    /// Refused, with why: the namespace's owner, the bridge's own bot.
+    refused: Vec<String>,
+}
+
+impl Removals {
+    fn sort(ctx: &Ctx, accounts: &[job::ForgeAccount]) -> Result<Removals, String> {
+        let mut out = Removals::default();
+        for a in accounts {
+            let account = mapping::account(a).map_err(|e| e.to_string())?;
+            if ctx
+                .adapter
+                .forge()
+                .is_protected_account(&ctx.namespace, account.id)
+            {
+                out.refused.push(format!(
+                    "{} ({}): the namespace's owner and the bridge's own account are never removed",
+                    account.login, account.id
+                ));
+            } else {
+                out.remove.push(account);
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Converge roles on `repo` to `desired`: people not listed lose a role the
 /// bridge projected before; roles it never projected are left and reported
-/// as drift (spec: *desiredRoles*).
+/// as drift (spec: *desiredRoles*) — except the accounts in `removals`,
+/// whose direct role goes whatever it is and whoever gave it (job 0.2
+/// `removeAccounts`).
+#[allow(clippy::too_many_arguments)]
 async fn apply_roles(
     bridge: &Bridge,
     ctx: &Ctx,
@@ -156,6 +192,7 @@ async fn apply_roles(
     forge_id: Option<u64>,
     desired: Vec<RoleAssignment>,
     owners: Vec<ForgeAccount>,
+    removals: Removals,
     report: &mut Report,
 ) {
     let previous = forge_id
@@ -166,6 +203,17 @@ async fn apply_roles(
     for p in previous {
         if p.role != ForgeRole::None && !want.iter().any(|w| w.account.id == p.account.id) {
             want.push(RoleAssignment::new(p.account, ForgeRole::None));
+        }
+    }
+    // By id: the adapter reads each one's current login from the forge, so
+    // a login renamed since the VTC saw it is still the account removed. An
+    // account with no role is already converged.
+    for account in removals.remove {
+        match want.iter_mut().find(|w| w.account.id == account.id) {
+            // Only a formerly projected role can be here: `desiredRoles`
+            // and `removeAccounts` never overlap (checked at admission).
+            Some(w) => w.role = ForgeRole::None,
+            None => want.push(RoleAssignment::new(account, ForgeRole::None)),
         }
     }
     let want = match ctx.adapter.hooks().before_apply_roles(repo, &want) {
@@ -184,13 +232,14 @@ async fn apply_roles(
         .await
     {
         Ok(r) => {
-            let failures: Vec<String> = r
-                .changes
+            let failures: Vec<String> = removals
+                .refused
                 .iter()
-                .filter_map(|c| match &c.outcome {
+                .cloned()
+                .chain(r.changes.iter().filter_map(|c| match &c.outcome {
                     RoleOutcome::Failed(m) => Some(format!("{}: {m}", c.account.login)),
                     _ => None,
-                })
+                }))
                 .collect();
             let status = if !failures.is_empty() {
                 StepStatus::Failed
@@ -236,10 +285,18 @@ async fn project_roles(
     ctx: &Ctx,
     repo: &Resource,
     roles: &[job::DesiredRole],
+    remove: &[job::ForgeAccount],
     report: &mut Report,
 ) {
     let (desired, owners) = match desired_roles(ctx, roles) {
         Ok(x) => x,
+        Err(m) => {
+            report.fail_with("forgeError", m);
+            return;
+        }
+    };
+    let removals = match Removals::sort(ctx, remove) {
+        Ok(r) => r,
         Err(m) => {
             report.fail_with("forgeError", m);
             return;
@@ -253,7 +310,17 @@ async fn project_roles(
         }
     };
     report.repo = Some((repo.clone(), forge_id));
-    apply_roles(bridge, ctx, repo, Some(forge_id), desired, owners, report).await;
+    apply_roles(
+        bridge,
+        ctx,
+        repo,
+        Some(forge_id),
+        desired,
+        owners,
+        removals,
+        report,
+    )
+    .await;
 }
 
 /// The repository's forge id: from the record, or by inspecting it.
@@ -349,6 +416,7 @@ async fn create_repo(
         Some(state.forge_id),
         desired,
         owners,
+        Removals::default(),
         report,
     )
     .await;

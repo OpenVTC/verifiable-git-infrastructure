@@ -48,6 +48,8 @@ pub const KEYRING: &str =
 pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
 pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";
 pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
+/// `git-ns/bridge/job` 0.2: `projectRoles` may carry `removeAccounts`.
+pub const JOB_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.2";
 
 /// One App key per test binary.
 pub fn app_pem() -> &'static str {
@@ -409,6 +411,13 @@ impl World {
     /// Send a job; returns the job document.
     pub async fn send_job(&self, payload: Value) -> Value {
         let doc = self.doc(JOB, payload, None).await;
+        self.deliver(doc.clone()).await;
+        doc
+    }
+
+    /// Send a `git-ns/bridge/job` 0.2 job; returns the job document.
+    pub async fn send_job_0_2(&self, payload: Value) -> Value {
+        let doc = self.doc(JOB_0_2, payload, None).await;
         self.deliver(doc.clone()).await;
         doc
     }

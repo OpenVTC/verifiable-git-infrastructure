@@ -211,6 +211,13 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             let Some(ns) = namespace_for(bridge, &to) else {
                 return;
             };
+            // A rename stays with its owner. One whose `from` lies outside
+            // the namespace is not a rename the VTC may act on (event 0.2:
+            // every resource in an event lies inside its namespace).
+            if !ns.resource.contains(&from) {
+                tracing::warn!(%from, %to, "ignoring a rename that crosses namespaces");
+                return;
+            }
             let _ = bridge.store.update::<RepoRecord, _>(
                 Table::Repos,
                 &repo_key(to.host(), forge_id),
@@ -238,12 +245,25 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
                     .as_ref()
                     .and_then(|n| n.join(to.repo_name().unwrap_or_default()).ok())
             });
-            let Some(from) = from else { return };
-            let from_ns = namespace_for(bridge, &from);
+            let from_ns = from.as_ref().and_then(|f| namespace_for(bridge, f));
             let to_ns = namespace_for(bridge, &to);
-            let Some(ns) = from_ns.clone().or(to_ns.clone()) else {
+            let Some(from_ns) = from_ns else {
+                // Transferred *in* from outside every bound namespace: to
+                // this namespace it is a repository the VTC did not create
+                // or adopt, reported as such — never as `repoTransferred`,
+                // whose `from` would lie outside it (event 0.2, and valid
+                // 0.1 too).
+                if let Some(t) = to_ns
+                    && !NAMESPACE_REPOS.contains(&to.repo_name().unwrap_or_default())
+                    && repo_by_id(bridge, to.host(), forge_id).is_none()
+                {
+                    let ev = json!({ "type": "repoCreatedUnmanaged", "forgeId": forge_id.to_string(), "resource": to.as_str() });
+                    report(bridge, &t.id, ev).await;
+                }
                 return;
             };
+            let Some(from) = from else { return };
+            let ns = from_ns;
             match (&rec, &to_ns) {
                 (Some(r), Some(t)) => {
                     let _ = bridge
@@ -262,6 +282,18 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
                 (Some(r), None) => {
                     // Out of every bound namespace: no longer governed.
                     let _ = bridge.store.delete(Table::Repos, &r.key());
+                    let _ =
+                        bridge
+                            .store
+                            .update::<NamespaceRecord, _>(Table::Namespaces, &ns.id, |n| {
+                                Ok((
+                                    n.map(|mut n| {
+                                        n.managed.remove(&forge_id);
+                                        n
+                                    }),
+                                    (),
+                                ))
+                            });
                 }
                 _ => {}
             }

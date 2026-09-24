@@ -14,7 +14,8 @@ the bridge carries it out and reports back.
   locally minted `did:key` — with every key sealed (AES-256-GCM under a
   mounted master key) in a redb store. It serves **one** VTC and refuses a
   document from any other DID, whatever its proof.
-- **Protocol.** `git-ns/bridge/job` in; exactly one `git-ns/bridge/result`
+- **Protocol.** `git-ns/bridge/job` (0.2, and 0.1 from a VTC that has not
+  moved) in; exactly one `git-ns/bridge/result`
   per job; `git-ns/bridge/event`s for what happens on the forge. The payload
   types are generated from the normative specifications
   (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed
@@ -27,8 +28,11 @@ the bridge carries it out and reports back.
   trait with the adapter's `ForgeHooks` around each operation; `beginBind`
   and `beginAccountLink` answer with `next` and complete through the forge's
   redirect or the device flow, reporting `bindCompleted` / `accountLinked`
-  then the result. Results and events are retried until the VTC
-  acknowledges them.
+  then the result. A 0.2 `projectRoles` may name `removeAccounts` — the
+  revert of a forge-side `roleAdded` drift — whose direct roles on the
+  repository go by forge id whoever gave them; the namespace's owner and the
+  bridge's own App or bot are never removed. Results and events are
+  retried until the VTC acknowledges them.
 - **Status for the VTC's console.** Every result and event carries, in its
   payload's `ext` member under `org.openvtc.git-ns`, what the bridge knows
   that the specification's payloads do not: `namespace` (the installation,

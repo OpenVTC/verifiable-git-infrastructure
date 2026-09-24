@@ -1661,9 +1661,24 @@ impl Forge for GitHubForge {
             }
         }
 
+        // The App's own bot user, by the login GitHub reports for it now: a
+        // `[bot]` login cannot be registered by a person.
+        let own_bot = format!("{}[bot]", self.config.app_slug);
         for (account, to) in todo {
             let cur = current.get(&account.id).map(|(_, c)| c);
             let from = cur.map_or(ForgeRole::None, Current::role);
+            if to == ForgeRole::None
+                && let Some(Current::Member { login, .. }) = cur
+                && login.eq_ignore_ascii_case(&own_bot)
+            {
+                report.changes.push(RoleChange::new(
+                    account,
+                    from,
+                    to,
+                    RoleOutcome::Failed("the bridge's own App is never removed".into()),
+                ));
+                continue;
+            }
             let outcome = match self
                 .change_role(&token, &ns, owner, name, &account, to, cur)
                 .await

@@ -39,8 +39,38 @@ use trust_tasks_rs::{
 use crate::identity::BridgeIdentity;
 
 pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event;
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_1 as job;
+/// `git-ns/bridge/job` 0.1, still accepted from a VTC that has not moved.
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_1 as job_v0_1;
+/// `git-ns/bridge/job` 0.2, the version the bridge runs every job as. A 0.1
+/// job is a valid 0.2 job with the same meaning (0.2 only adds
+/// `removeAccounts`), so it is read with [`job_v0_1`] and carried as this
+/// type from then on: see [`parse_job`].
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_2 as job;
 pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
+
+/// Whether `type_uri` (bare) is a job this bridge takes: `git-ns/bridge/job`
+/// 0.1 or 0.2.
+pub fn is_job_type(type_uri: &str) -> bool {
+    use trust_tasks_rs::Payload as _;
+    type_uri == job::Payload::TYPE_URI || type_uri == job_v0_1::Payload::TYPE_URI
+}
+
+/// Parse a job payload by the version its document declares. A 0.1 payload
+/// is parsed against the 0.1 type — so a 0.1 document carrying
+/// `removeAccounts`, a member 0.1 does not have, is refused rather than
+/// read as 0.2 — and then carried as 0.2, which is wire-identical for
+/// every member 0.1 has.
+pub fn parse_job(type_uri: &str, payload: &Value) -> std::result::Result<job::Payload, String> {
+    use trust_tasks_rs::Payload as _;
+    if type_uri == job_v0_1::Payload::TYPE_URI {
+        let p: job_v0_1::Payload =
+            serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))?;
+        let v = serde_json::to_value(&p).map_err(|e| format!("job payload: {e}"))?;
+        serde_json::from_value(v).map_err(|e| format!("job payload (as 0.2): {e}"))
+    } else {
+        serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))
+    }
+}
 
 /// The DIDComm message type that carries a Trust Task document as its body
 /// (the Trust Tasks DIDComm binding; the same constant vtc-service routes on).
@@ -379,6 +409,47 @@ pub fn check_kind_members(p: &job::Payload) -> std::result::Result<(), String> {
         if !roles.iter().all(|r| seen.insert(r.account.id.to_string())) {
             return Err("`desiredRoles` names one account twice".into());
         }
+    }
+    check_remove_accounts(p)
+}
+
+/// `removeAccounts` (job 0.2): `projectRoles` on a repository only, at
+/// least one account, none twice, and none also in `desiredRoles` — an
+/// account is matched by `forge` and `id`, never by its display `login`.
+/// Whether each account is on the namespace's forge is checked once the
+/// namespace is known (the bridge's admission).
+fn check_remove_accounts(p: &job::Payload) -> std::result::Result<(), String> {
+    let Some(remove) = &p.remove_accounts else {
+        return Ok(());
+    };
+    if p.kind != job::PayloadKind::ProjectRoles {
+        return Err(format!("`{}` does not use `removeAccounts`", p.kind));
+    }
+    if p.repo.is_none() {
+        return Err(
+            "`removeAccounts` takes roles off a repository and needs `repo`: a namespace's \
+             owners change only through `desiredRoles`"
+                .into(),
+        );
+    }
+    if remove.is_empty() {
+        return Err("`removeAccounts` must name at least one account".into());
+    }
+    let key = |a: &job::ForgeAccount| (a.forge.to_string(), a.id.to_string());
+    let mut seen = std::collections::BTreeSet::new();
+    if !remove.iter().all(|a| seen.insert(key(a))) {
+        return Err("`removeAccounts` names one account twice".into());
+    }
+    if let Some(overlap) = p
+        .desired_roles
+        .iter()
+        .flatten()
+        .find(|r| seen.contains(&key(&r.account)))
+    {
+        return Err(format!(
+            "account {} on `{}` is in both `desiredRoles` and `removeAccounts`",
+            *overlap.account.id, *overlap.account.forge
+        ));
     }
     Ok(())
 }

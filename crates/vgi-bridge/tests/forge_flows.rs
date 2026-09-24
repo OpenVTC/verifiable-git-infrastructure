@@ -674,3 +674,57 @@ async fn a_restart_restores_pins_managed_sets_and_unfinished_jobs() {
     let rec: JobRecord = w.bridge.store().get(Table::Jobs, "job_q").unwrap().unwrap();
     assert_eq!(rec.state, JobState::Finished);
 }
+
+#[tokio::test]
+async fn transfers_are_reported_from_inside_the_namespace_they_concern() {
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+
+    // Transferred *in* from an owner no bound namespace covers: to `acme`
+    // it is a repository the VTC did not create or adopt — never a
+    // `repoTransferred` whose `from` lies outside the namespace.
+    let incoming = json!({
+        "action": "transferred",
+        "repository": { "id": 950, "full_name": "acme/imported" },
+        "changes": { "owner": { "from": { "user": { "id": 31, "login": "outsider" } } } },
+    });
+    let s = post_webhook(&w, "repository", "t-1", &incoming, WEBHOOK_SECRET).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(ev["payload"]["namespace"], NS);
+    assert_eq!(
+        ev["payload"]["event"],
+        json!({ "type": "repoCreatedUnmanaged", "forgeId": "950",
+                "resource": "github.com/acme/imported" })
+    );
+
+    // A managed repository transferred out of every bound namespace: the
+    // bridge stops governing it, record and managed set both.
+    let outgoing = json!({
+        "action": "transferred",
+        "repository": { "id": 812, "full_name": "elsewhere/widgets" },
+        "changes": { "owner": { "from": { "organization": { "id": 500, "login": "acme" } } } },
+    });
+    let s = post_webhook(&w, "repository", "t-2", &outgoing, WEBHOOK_SECRET).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(
+        ev["payload"]["event"],
+        json!({ "type": "repoTransferred", "forgeId": "812",
+                "from": "github.com/acme/widgets", "to": "github.com/elsewhere/widgets" })
+    );
+    assert!(
+        w.bridge
+            .store()
+            .get::<RepoRecord>(Table::Repos, "github.com#812")
+            .unwrap()
+            .is_none()
+    );
+    let ns: NamespaceRecord = w
+        .bridge
+        .store()
+        .get(Table::Namespaces, NS)
+        .unwrap()
+        .unwrap();
+    assert!(!ns.managed.contains(&812));
+}

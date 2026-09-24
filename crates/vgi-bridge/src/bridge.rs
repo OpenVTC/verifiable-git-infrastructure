@@ -324,7 +324,7 @@ impl Bridge {
             }
         };
         let ty = verified.doc.type_uri.to_string();
-        if ty == job::Payload::TYPE_URI {
+        if wire::is_job_type(&ty) {
             self.on_job(verified).await;
         } else if ty == result::Response::TYPE_URI {
             self.on_result_ack(&verified);
@@ -370,13 +370,12 @@ impl Bridge {
     }
 
     async fn on_job(self: &Arc<Self>, v: VerifiedDoc) {
-        let payload: job::Payload = match serde_json::from_value(v.doc.payload.clone()) {
+        let payload = match wire::parse_job(&v.type_uri(), &v.doc.payload) {
             Ok(p) => p,
             Err(e) => {
                 self.send_error(
                     &v.doc,
-                    ErrorPayload::new(StandardCode::MalformedRequest)
-                        .with_message(format!("job payload: {e}")),
+                    ErrorPayload::new(StandardCode::MalformedRequest).with_message(e),
                 )
                 .await;
                 return;
@@ -553,6 +552,25 @@ impl Bridge {
                     ns.resource
                 )));
             }
+        }
+        // An account to remove on another forge than the namespace's could
+        // only be a mistake: nothing here could remove it (spec, request
+        // rule 3).
+        if let Some(a) = p
+            .remove_accounts
+            .iter()
+            .flatten()
+            .find(|a| *a.forge != *ns.resource.host())
+        {
+            return Err(JobRefusal::standard(
+                StandardCode::MalformedRequest,
+                format!(
+                    "`removeAccounts` names account {} on `{}`; namespace `{ns_id}` is on `{}`",
+                    *a.id,
+                    *a.forge,
+                    ns.resource.host()
+                ),
+            ));
         }
         let binding = ns.binding.as_ref().expect("bound");
         let caps = adapter.forge().capabilities(&binding.namespace);
