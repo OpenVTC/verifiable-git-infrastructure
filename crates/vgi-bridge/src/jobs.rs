@@ -769,9 +769,44 @@ pub(crate) async fn inspect_repo(
 ) -> Result<(), ForgeError> {
     let state = ctx.adapter.forge().inspect(repo).await?;
     let rec = repo_record(bridge, ctx.host(), state.forge_id);
+    if !ctx.ns.resource.contains(&state.resource) {
+        // The forge answered for the old name with a repository now under
+        // another owner: it was transferred without an event reaching the
+        // bridge. That is a transfer, never a rename, which would name a
+        // repository outside the namespace (event 0.2).
+        if let Some(r) = &rec
+            && ctx.ns.resource.contains(&r.resource)
+        {
+            crate::events::transferred_out(
+                bridge,
+                &ctx.ns,
+                &r.resource,
+                &state.resource,
+                state.forge_id,
+            )
+            .await;
+        } else {
+            tracing::warn!(
+                asked = %repo, found = %state.resource,
+                "the forge answered with a repository outside the namespace; nothing reported"
+            );
+        }
+        return Ok(());
+    }
+    if rec.is_none()
+        && crate::events::detach_reused_name(bridge, &ctx.ns.id, &state.resource, state.forge_id)
+    {
+        // A repository the bridge does not manage, at a name it governed
+        // under another forge id: the name was reused without an event.
+        // The old one is detached; the newcomer is reported unmanaged.
+        crate::events::report_unmanaged(bridge, &ctx.ns, &state.resource, state.forge_id).await;
+    }
     if let Some(r) = &rec
         && r.resource != state.resource
     {
+        // Renamed onto a name still recorded for another repository: that
+        // one is gone, and nothing of it passes on.
+        crate::events::detach_reused_name(bridge, &ctx.ns.id, &state.resource, state.forge_id);
         let ev = json!({
             "type": "repoRenamed",
             "forgeId": state.forge_id.to_string(),

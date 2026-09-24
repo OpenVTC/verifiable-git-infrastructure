@@ -328,7 +328,7 @@ impl Bridge {
             self.on_job(verified).await;
         } else if ty == result::Response::TYPE_URI {
             self.on_result_ack(&verified);
-        } else if ty == event::Response::TYPE_URI {
+        } else if wire::is_event_response_type(&ty) {
             self.on_event_ack(&verified);
         } else if verified.doc.type_uri.slug() == "trust-task-error" {
             self.on_error_response(&verified);
@@ -712,6 +712,11 @@ impl Bridge {
 
     /// Report an event in `namespace` (queued until the VTC acknowledges
     /// it).
+    ///
+    /// An event naming a repository outside `namespace` is never sent
+    /// (event 0.2: a bridge's authority is per namespace, and the VTC
+    /// refuses such an event whole): it is logged and dropped, whichever
+    /// version the VTC takes.
     pub(crate) async fn send_event(
         &self,
         namespace: &str,
@@ -724,13 +729,30 @@ impl Bridge {
             .get("forgeId")
             .and_then(Value::as_str)
             .and_then(|id| id.parse::<u64>().ok());
-        let payload = mapping::event_payload(namespace, event_json, drift)?;
-        let host = self
+        let ns_resource = self
             .store
             .get::<NamespaceRecord>(Table::Namespaces, namespace)
             .ok()
             .flatten()
-            .map(|n| n.resource.host().to_string());
+            .map(|n| n.resource);
+        // With no namespace record there is nothing to contain a repository:
+        // only an event that names none may go.
+        if let Some(resource) = mapping::outside_namespace(
+            ns_resource.as_ref(),
+            &event_json,
+            drift.as_deref().unwrap_or_default(),
+        ) {
+            let ty = event_json.get("type").and_then(Value::as_str).unwrap_or("");
+            tracing::error!(
+                namespace,
+                %resource,
+                r#type = ty,
+                "not reporting an event that names a repository outside its namespace"
+            );
+            return Ok(());
+        }
+        let payload = mapping::event_payload(namespace, event_json, drift)?;
+        let host = ns_resource.map(|r| r.host().to_string());
         let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
         let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
         let key = format!("event:{}", wire::new_id());
@@ -754,7 +776,7 @@ impl Bridge {
         };
         let type_uri = match entry.kind {
             OutboxKind::Result => result::Payload::TYPE_URI,
-            _ => event::Payload::TYPE_URI,
+            _ => wire::event_type_uri(self.cfg.event_version),
         };
         let (id, doc) = match wire::signed_request(
             &self.identity,

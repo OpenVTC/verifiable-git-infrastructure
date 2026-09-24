@@ -27,6 +27,13 @@ pub struct BridgeConfig {
     /// The one VTC this bridge serves. Jobs signed by any other DID are
     /// refused (spec: `permissionDenied`), whatever their proof.
     pub vtc_did: String,
+    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.2"`
+    /// (the default), or `"0.1"` for a VTC that does not understand 0.2 yet.
+    /// The two are wire-identical; what differs is what the VTC does with
+    /// a transfer (0.2 detaches the repository and never moves its rights).
+    /// The bridge's own handling is the same either way.
+    #[serde(default)]
+    pub event_version: EventVersion,
     /// The community's Trust Registry, for the bootstrap plan and the
     /// bridge-posted check.
     pub trust_registry_did: String,
@@ -82,6 +89,19 @@ pub struct BridgeConfig {
     /// Forgejo instances, one bot each.
     #[serde(default)]
     pub forgejo: Vec<ForgejoForgeConfig>,
+}
+
+/// A `git-ns/bridge/event` version the bridge can send.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub enum EventVersion {
+    /// `git-ns/bridge/event` 0.1, for a VTC that has not moved to 0.2.
+    #[serde(rename = "0.1")]
+    V0_1,
+    /// `git-ns/bridge/event` 0.2.
+    #[default]
+    #[serde(rename = "0.2")]
+    V0_2,
 }
 
 /// Inputs to every bootstrap plan.
@@ -506,6 +526,23 @@ oauth_client_id = "0b6e3a0c"
             "https://bridge.acme.example/github/github.com/webhook"
         );
         assert_eq!(c.checks.max_commits, 250);
+        assert_eq!(c.event_version, EventVersion::V0_2, "0.2 unless set");
+    }
+
+    #[test]
+    fn the_event_version_is_0_1_or_0_2() {
+        let with = |v: &str| {
+            BridgeConfig::parse(&EXAMPLE.replacen(
+                "public_url",
+                &format!("event_version = \"{v}\"\npublic_url"),
+                1,
+            ))
+        };
+        assert_eq!(with("0.1").unwrap().event_version, EventVersion::V0_1);
+        assert_eq!(with("0.2").unwrap().event_version, EventVersion::V0_2);
+        for bad in ["0.3", "1.0", "", "v0.2"] {
+            assert!(with(bad).is_err(), "`{bad}` is refused");
+        }
     }
 
     #[test]

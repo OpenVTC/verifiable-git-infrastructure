@@ -47,7 +47,11 @@ pub const KEYRING: &str =
 
 pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
 pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";
-pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
+/// `git-ns/bridge/event` 0.2, what the bridge sends unless configured
+/// otherwise.
+pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
+/// `git-ns/bridge/event` 0.1, for a VTC configured `event_version = "0.1"`.
+pub const EVENT_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
 /// `git-ns/bridge/job` 0.2: `projectRoles` may carry `removeAccounts`.
 pub const JOB_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.2";
 
@@ -142,6 +146,8 @@ pub struct Options {
     pub keyring: bool,
     /// Appended to the `[[github]]` table (e.g. per-namespace settings).
     pub github_extra: String,
+    /// `event_version`, when set.
+    pub event_version: Option<&'static str>,
 }
 
 impl Default for Options {
@@ -162,6 +168,7 @@ impl Default for Options {
             seed_app: true,
             keyring: true,
             github_extra: String::new(),
+            event_version: None,
         }
     }
 }
@@ -182,6 +189,7 @@ mediator_did = "did:web:mediator.acme.example"
 public_url = "https://bridge.acme.example/"
 max_body_bytes = {max_body}
 resend_secs = 3600
+{event_version}
 
 [verify_trust]
 action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@0123456789abcdef0123456789abcdef01234567"
@@ -203,6 +211,10 @@ web_base = "{web}"
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
         max_body = o.max_body,
         extra = o.github_extra,
+        event_version = o
+            .event_version
+            .map(|v| format!("event_version = \"{v}\""))
+            .unwrap_or_default(),
     ))
     .unwrap()
 }
@@ -274,11 +286,18 @@ pub fn seed_repo(store: &Store, r: &Resource, id: u64) {
 /// The GitHub reads `inspect` makes for `acme/widgets` (forge id 812) in a
 /// bridge-posted-check namespace, with a healthy ruleset pinned to the App.
 pub async fn mount_inspect(server: &MockServer) {
+    mount_inspect_as(server, 812, "acme/widgets").await;
+}
+
+/// As [`mount_inspect`], but GitHub answers for `acme/widgets` with
+/// repository `id` named `full_name` (a transfer or a rename GitHub
+/// redirects, or a new repository at the name).
+pub async fn mount_inspect_as(server: &MockServer, id: u64, full_name: &str) {
     mount_any_token(server).await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/widgets"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 812, "full_name": "acme/widgets", "private": false,
+            "id": id, "full_name": full_name, "private": false,
             "visibility": "public", "archived": false, "default_branch": "main",
         })))
         .with_priority(1)
@@ -488,7 +507,7 @@ impl World {
     pub async fn ack_event(&self, event_doc: &Value) {
         let ack = self
             .doc(
-                &format!("{EVENT}#response"),
+                &format!("{}#response", event_doc["type"].as_str().unwrap()),
                 json!({}),
                 event_doc["threadId"].as_str(),
             )

@@ -351,6 +351,33 @@ pub fn event_payload(
     serde_json::from_value(v).context("building the event")
 }
 
+/// The first resource in an event that lies outside `namespace`, by
+/// whole-segment containment (event 0.2: the VTC refuses such an event
+/// whole, so the bridge never sends one): the `resource` of any event, the
+/// `from` of any event, a `repoRenamed`'s `to`, and every drift item's
+/// `resource`. A `repoTransferred`'s `to` is exempt — a transfer leaves the
+/// namespace by definition. A resource that does not parse counts as
+/// outside, as does every resource when there is no `namespace` to hold it.
+pub fn outside_namespace(
+    namespace: Option<&Resource>,
+    event: &Value,
+    drift: &[Value],
+) -> Option<String> {
+    let renamed = event.get("type").and_then(Value::as_str) == Some("repoRenamed");
+    let mut members = vec![event.get("resource"), event.get("from")];
+    if renamed {
+        members.push(event.get("to"));
+    }
+    members.extend(drift.iter().map(|d| d.get("resource")));
+    members.into_iter().flatten().find_map(|v| {
+        let s = v.as_str().unwrap_or_default();
+        match Resource::parse(s) {
+            Ok(r) if namespace.is_some_and(|n| n.contains(&r)) => None,
+            _ => Some(s.to_string()),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +451,70 @@ mod tests {
         assert_eq!(p.drift.len(), 2);
         assert!(!check_enforced(&[ProtectionGap::Missing]));
         assert!(check_enforced(&[ProtectionGap::ForcePushAllowed]));
+    }
+
+    #[test]
+    fn every_resource_but_a_transfers_destination_lies_in_the_namespace() {
+        let ns = Resource::parse("github.com/acme").unwrap();
+        let out = |ev: Value, drift: &[Value]| outside_namespace(Some(&ns), &ev, drift);
+        // Inside: nothing to refuse.
+        assert_eq!(
+            out(
+                json!({"type":"repoRenamed","forgeId":"1","from":"github.com/acme/a","to":"github.com/acme/b"}),
+                &[]
+            ),
+            None
+        );
+        // A transfer's `to` is where the repository went: exempt.
+        assert_eq!(
+            out(
+                json!({"type":"repoTransferred","forgeId":"1","from":"github.com/acme/a","to":"github.com/acme-labs/a"}),
+                &[]
+            ),
+            None
+        );
+        // A transfer's `from`, a rename's either end, a resource, a drift
+        // item: each must be inside.
+        let cases = [
+            (
+                json!({"type":"repoTransferred","forgeId":"1","from":"github.com/other/a","to":"github.com/acme/a"}),
+                vec![],
+                "github.com/other/a",
+            ),
+            (
+                json!({"type":"repoRenamed","forgeId":"1","from":"github.com/acme/a","to":"github.com/acme-labs/a"}),
+                vec![],
+                "github.com/acme-labs/a",
+            ),
+            (
+                json!({"type":"repoRenamed","forgeId":"1","from":"github.com/acme-labs/a","to":"github.com/acme/a"}),
+                vec![],
+                "github.com/acme-labs/a",
+            ),
+            (
+                json!({"type":"repoCreatedUnmanaged","forgeId":"1","resource":"github.com/acmex/a"}),
+                vec![],
+                "github.com/acmex/a",
+            ),
+            (
+                json!({"type":"repoDeleted","forgeId":"1","resource":"codeberg.org/acme/a"}),
+                vec![],
+                "codeberg.org/acme/a",
+            ),
+            (
+                json!({"type":"protectionChanged","forgeId":"1","resource":"github.com/acme/a","requiredCheck":true}),
+                vec![json!({"type":"protectionWeakened","resource":"github.com/other/a"})],
+                "github.com/other/a",
+            ),
+        ];
+        for (ev, drift, bad) in cases {
+            assert_eq!(out(ev.clone(), &drift).as_deref(), Some(bad), "{ev}");
+        }
+        // Events without resources are never refused.
+        assert_eq!(out(json!({"type":"installationRemoved"}), &[]), None);
+        // No namespace: nothing is inside it.
+        let ev = json!({"type":"repoDeleted","forgeId":"1","resource":"github.com/acme/a"});
+        assert!(outside_namespace(None, &ev, &[]).is_some());
+        assert!(outside_namespace(None, &json!({"type":"installationRemoved"}), &[]).is_none());
     }
 }
