@@ -312,11 +312,17 @@ wiremock = "0.6"
 # type across the vta-sdk or trql-client boundary (it signs and verifies with
 # trust-tasks-proof on the 0.22 line), and did-git-sign — the crate OpenVTC
 # consumes — is unaffected. It closes when vta-sdk and trql-client move to 0.22.
-trust-tasks-rs = { version = "0.22.3", default-features = false, features = ["git-ns"] }
+#
+# 0.22.4 is the floor because it carries `git-ns/bridge/job` 0.2
+# (`removeAccounts`, what a `git-ns/drift/resolve` revert of `roleAdded`
+# sends). It moves within the 0.22 line, so the split stays exactly two nodes:
+# vta-sdk 0.51 already resolves 0.22 here, and the 0.21 node that remains
+# comes only through trql-client 0.18 (and the affinidi-tdk 0.16 it pulls).
+trust-tasks-rs = { version = "0.22.4", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
-trust-tasks-proof = "0.22.3"
+trust-tasks-proof = "0.22.4"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each

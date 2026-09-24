@@ -1398,6 +1398,11 @@ impl Forge for ForgejoForge {
         c
     }
 
+    /// The owner, and the bot every automated action goes through.
+    fn is_protected_account(&self, ns: &Namespace, account: u64) -> bool {
+        ns.owner_id == Some(account) || self.bot().id == account
+    }
+
     async fn begin_bind(&self, req: BindRequest) -> Result<BindStep> {
         if req.namespace.host() != self.config.host || !req.namespace.is_namespace() {
             return Err(ForgeError::WrongResource {
@@ -1712,8 +1717,23 @@ impl Forge for ForgejoForge {
         let mut list_dependent: Vec<usize> = Vec::new();
         let mut keep_listed: BTreeSet<u64> = BTreeSet::new();
 
+        let bot = self.bot().id;
         for (id, (account, role)) in &wanted {
             let have = current.get(id);
+            if *id == bot
+                && *role == ForgeRole::None
+                && let Some(h) = have
+            {
+                // Whatever the caller asked: the bot losing its role would
+                // end every automated action here.
+                report.changes.push(RoleChange::new(
+                    account.clone(),
+                    h.perm.observed(h.listed),
+                    ForgeRole::None,
+                    RoleOutcome::Failed("the bridge's own bot is never removed".into()),
+                ));
+                continue;
+            }
             let need_perm = Perm::for_role(*role);
             let need_listed = rule.is_some() && *role >= ForgeRole::Maintain;
             let have_perm = have.map(|h| h.perm);

@@ -389,7 +389,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "trust-tasks-proof",
- "trust-tasks-rs 0.22.3",
+ "trust-tasks-rs 0.22.4",
  "uuid",
 ]
 
@@ -5766,9 +5766,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-proof"
-version = "0.22.3"
+version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dec4559096cbaffc3f04dd074751d479e015fa1c0a6781636eb8bc6a11360908"
+checksum = "2fb3c252bf87f0830cdcd0bff9b2b00e40286fe7321c1c877ae0111fea954c25"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -5779,7 +5779,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs 0.22.3",
+ "trust-tasks-rs 0.22.4",
 ]
 
 [[package]]
@@ -5799,9 +5799,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.22.3"
+version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26f9f1dd77f52419569cd3051e5ac1268b7304aec5063dd99b4d5feebc7decfa"
+checksum = "403b16f0f1075b8af10ba54553ddf0555ec4b4abd1abe941c8c5efcc1af3749a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6048,7 +6048,7 @@ dependencies = [
  "tracing-subscriber",
  "trql-client",
  "trust-tasks-proof",
- "trust-tasks-rs 0.22.3",
+ "trust-tasks-rs 0.22.4",
  "url",
  "verify-trust",
  "vgi-core",
@@ -6168,7 +6168,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.22.3",
+ "trust-tasks-rs 0.22.4",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",

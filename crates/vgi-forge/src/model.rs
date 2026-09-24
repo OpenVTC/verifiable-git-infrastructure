@@ -245,6 +245,13 @@ impl RoleAssignment {
 }
 
 /// What to do with direct collaborators the desired set does not mention.
+///
+/// Removing one *named* account whatever its role (a `git-ns/bridge/job`
+/// 0.2 `removeAccounts` entry) needs no mode of its own: the caller lists it
+/// in `desired` with [`ForgeRole::None`](crate::ForgeRole::None), which an
+/// adapter converges by taking the account's direct role away — matched by
+/// id, with the login read fresh from the forge — and treats as already
+/// converged when the account holds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
