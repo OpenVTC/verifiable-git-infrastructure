@@ -311,6 +311,9 @@ pub async fn build_forgejo(
     if let Some(ctx) = &f.status_check_context {
         fc = fc.with_status_check_context(ctx.clone());
     }
+    if let Some(label) = &f.runs_on {
+        fc = fc.with_runs_on(label.clone())?;
+    }
     let mut creds = Credentials::new(token, oauth, webhook);
     if let Some(pw) = secret("bot-password")? {
         creds = creds.with_bot_password(pw);

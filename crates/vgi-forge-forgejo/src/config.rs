@@ -179,6 +179,16 @@ impl ForgejoConfig {
         self
     }
 
+    /// Ask for runner label `label` (`runs-on:`) in the workflow the
+    /// bootstrap writes, instead of [`DEFAULT_RUNS_ON`]. Checked here, so a
+    /// bad label fails at start-up rather than at the first bootstrap.
+    pub fn with_runs_on(mut self, label: impl Into<String>) -> Result<Self> {
+        let label = label.into();
+        crate::plan::check_runs_on(&label)?;
+        self.runs_on = label;
+        Ok(self)
+    }
+
     /// Choose the fallback for instances without fast-forward-only merges.
     pub fn with_merge_fallback(mut self, fallback: MergeFallback) -> Self {
         self.merge_fallback = fallback;
@@ -322,6 +332,26 @@ mod tests {
             c.status_context("Verify commit trust"),
             "Verify commit trust / Verify commit trust (pull_request)"
         );
+    }
+
+    #[test]
+    fn the_runner_label_defaults_and_is_checked() {
+        let c = ForgejoConfig::new(
+            url("https://codeberg.org/"),
+            "bot",
+            "cid",
+            url("https://b/1"),
+            url("https://b/2"),
+        )
+        .unwrap();
+        assert_eq!(c.runs_on, DEFAULT_RUNS_ON);
+        assert_eq!(
+            c.clone().with_runs_on("ubuntu-24.04").unwrap().runs_on,
+            "ubuntu-24.04"
+        );
+        for bad in ["", "docker\nevil: 1", "a b", "${{ x }}"] {
+            assert!(c.clone().with_runs_on(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -117,13 +117,21 @@ pub(crate) fn repo_record_by_resource(bridge: &Bridge, r: &Resource) -> Option<R
         .find(|rec| rec.resource == *r)
 }
 
-/// The job's desired roles as forge roles, and the owners among them.
+/// The job's desired roles on `repo` as forge roles, under `repo`'s role map
+/// (the bridge config's `role_map` layers), and the owners among them.
+///
+/// A namespace admin gets no forge role (decided 2026-09-25): an entry whose
+/// right is `git.ns.admin` (or `git.repo.create`) asks for
+/// [`ForgeRole::None`], whatever the map says, so a role the bridge
+/// projected for it before is taken away.
 fn desired_roles(
+    bridge: &Bridge,
     ctx: &Ctx,
+    repo: &Resource,
     roles: &[job::DesiredRole],
 ) -> Result<(Vec<RoleAssignment>, Vec<ForgeAccount>), String> {
     let forge = ctx.adapter.forge();
-    let map = RoleMap::default();
+    let map: RoleMap = bridge.cfg.role_map(repo);
     let mut out = Vec::new();
     let mut owners = Vec::new();
     for r in roles {
@@ -327,7 +335,7 @@ async fn project_roles(
     remove: &[job::ForgeAccount],
     report: &mut Report,
 ) {
-    let (desired, owners) = match desired_roles(ctx, roles) {
+    let (desired, owners) = match desired_roles(bridge, ctx, repo, roles) {
         Ok(x) => x,
         Err(m) => {
             report.fail_with("forgeError", m);
@@ -378,13 +386,14 @@ async fn create_repo(
     report: &mut Report,
 ) {
     let job_spec = p.spec.as_ref().expect("checked by kind");
-    let (desired, owners) = match desired_roles(ctx, p.desired_roles.as_deref().unwrap_or(&[])) {
-        Ok(x) => x,
-        Err(m) => {
-            report.fail_with("forgeError", m);
-            return;
-        }
-    };
+    let (desired, owners) =
+        match desired_roles(bridge, ctx, repo, p.desired_roles.as_deref().unwrap_or(&[])) {
+            Ok(x) => x,
+            Err(m) => {
+                report.fail_with("forgeError", m);
+                return;
+            }
+        };
     let mut spec =
         RepoSpec::new(repo.clone()).with_visibility(mapping::visibility(&job_spec.visibility));
     if let Some(d) = &job_spec.description {

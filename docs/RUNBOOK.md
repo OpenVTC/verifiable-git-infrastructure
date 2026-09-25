@@ -472,6 +472,7 @@ jobs:
     name: Verify commit trust
     if: vars.TRUST_REGISTRY_DID != ''
     runs-on: docker                   # whatever label your runner registers
+                                      # (the bridge: `runs_on` in [[forgejo]])
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -843,10 +844,14 @@ cnm git grant  --subject did:…:erin --right git.repo.own      --resource githu
 cnm git revoke --subject did:…:dave --right git.repo.maintain --resource github.com/acme/widgets
 ```
 
-- **Roles follow linked accounts.** `own` projects to `admin` and `maintain`
-  to `maintain` in an organisation; on a personal account both become
-  `write`, the only collaborator role there. A member with no linked GitHub
-  account gets no role until they link (openvtc `l`).
+- **Roles follow linked accounts.** By default `own` projects to `admin`
+  and `maintain` to `maintain` in an organisation (on Forgejo: `write` plus
+  the merge allow-list); on a personal account both become `write`, the only
+  collaborator role there. Committers get no role (fork pull requests). The
+  bridge's `role_map` changes this per bridge, forge, namespace or
+  repository — maintainers as `admin`, committers `write` on a repository
+  that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). A member
+  with no linked GitHub account gets no role until they link (openvtc `l`).
 - **A repository keeps an owner.** Revoking the last one is
   `git-ns:lastOwner`; grant the replacement first. Only an owner record
   **without an expiry** counts for this, so an expiring grant cannot be the
@@ -861,9 +866,13 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
 - **Archive** (`cnm git archive github.com/acme/widgets`, elevated) makes the
   repository read-only on GitHub and revokes every commit right on it. No
   task reverses it.
-- **Namespace admins get no organisation role.** The bridge does not project
-  `git.ns.admin` (it refuses a namespace-level role projection,
-  `notCapable`): who owns the GitHub organisation is yours to manage.
+- **Namespace admins get no forge role.** The bridge does not project
+  `git.ns.admin` — not as an organisation owner (it refuses a
+  namespace-level role projection, `notCapable`) and not as a repository
+  role (a desired role carrying `git.ns.admin` projects nothing), and no
+  `role_map` can change that. Who owns the organisation is yours to manage.
+  A namespace admin who should also hold a role on a repository needs that
+  repository's right (`own`, `maintain`) in their own name.
 
 ### 8c. A member leaves
 

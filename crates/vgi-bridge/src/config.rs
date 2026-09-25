@@ -10,6 +10,7 @@
 //! `VGI_BRIDGE_LISTEN`, `VGI_BRIDGE_DATA_DIR`, `VGI_BRIDGE_PUBLIC_URL`,
 //! `VGI_BRIDGE_MASTER_KEY_FILE`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use url::Url;
-use vgi_forge::{DEFAULT_REQUIRED_CHECK, Resource};
+use vgi_forge::{DEFAULT_REQUIRED_CHECK, ForgeRole, Resource, RoleMap};
 
 /// The whole file.
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +84,11 @@ pub struct BridgeConfig {
     /// carry.
     #[serde(default)]
     pub resign: ResignConfig,
+    /// Which forge role each repository right gets, for every forge this
+    /// bridge serves. Each `[[github]]` / `[[forgejo]]` entry, namespace and
+    /// repository can override it (see [`RoleMapConfig`]).
+    #[serde(default)]
+    pub role_map: RoleMapConfig,
     /// GitHub (github.com or GHES), one App each.
     #[serde(default)]
     pub github: Vec<GitHubForgeConfig>,
@@ -186,6 +192,78 @@ impl Default for ResignConfig {
     }
 }
 
+/// Which forge role a repository right asks for (§5.8 layer 3, the
+/// `role_map` community hook), as one layer of overrides.
+///
+/// Layers apply field by field, the most specific winning: a repository's
+/// (`[<forge>.namespaces.<owner>.repos.<name>.role_map]`), then its
+/// namespace's (`[<forge>.namespaces.<owner>.role_map]`), then its forge
+/// entry's (`[<forge>.role_map]`), then the bridge's (`[role_map]`), then
+/// the built-in default — `own = "admin"`, `maintain = "maintain"`,
+/// `commit = "none"`. Each value is `none`, `read`, `triage`, `write`,
+/// `maintain` or `admin`; a forge without a level rounds it down (Forgejo's
+/// `maintain` is `write` plus the default branch's merge allow-list; a
+/// GitHub personal account has only `write`).
+///
+/// Every map a layer can produce must be ordered (`own ≥ maintain ≥
+/// commit`) with `commit` at most `write`, or the start fails.
+///
+/// **There is deliberately no key for `git.ns.admin`**: a namespace admin
+/// gets no forge role (decided 2026-09-25), so none can be configured — an
+/// unknown key such as `ns_admin` fails the start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RoleMapConfig {
+    /// Role for `git.repo.own`.
+    #[serde(default)]
+    pub own: Option<ForgeRole>,
+    /// Role for `git.repo.maintain`.
+    #[serde(default)]
+    pub maintain: Option<ForgeRole>,
+    /// Role for `git.commit.sign` (`write` opts committers in to
+    /// branch-based contribution; `none`, the default, is fork PRs).
+    #[serde(default)]
+    pub commit: Option<ForgeRole>,
+}
+
+impl RoleMapConfig {
+    /// `self` over `base`: each field `self` sets wins.
+    fn over(self, base: RoleMapConfig) -> RoleMapConfig {
+        RoleMapConfig {
+            own: self.own.or(base.own),
+            maintain: self.maintain.or(base.maintain),
+            commit: self.commit.or(base.commit),
+        }
+    }
+
+    /// The map these layers make, over the built-in default.
+    fn resolve(layers: &[Option<RoleMapConfig>]) -> Result<RoleMap> {
+        let merged = layers
+            .iter()
+            .flatten()
+            .fold(RoleMapConfig::default(), |acc, l| l.over(acc));
+        let d = RoleMap::default();
+        RoleMap::new(
+            merged.own.unwrap_or(d.own),
+            merged.maintain.unwrap_or(d.maintain),
+            merged.commit.unwrap_or(d.commit),
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+/// Per-repository settings, under
+/// `[<forge>.namespaces.<owner>.repos.<name>]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RepoConfig {
+    /// This repository's role-map overrides.
+    #[serde(default)]
+    pub role_map: Option<RoleMapConfig>,
+}
+
 /// Per-namespace GitHub settings, under `[github.namespaces.<owner>]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,14 +273,35 @@ pub struct GitHubNamespaceConfig {
     /// turned off.
     #[serde(default = "yes")]
     pub resign_dependabot: bool,
+    /// This namespace's role-map overrides.
+    #[serde(default)]
+    pub role_map: Option<RoleMapConfig>,
+    /// Per-repository settings, keyed by the repository's name (lowercase).
+    #[serde(default)]
+    pub repos: BTreeMap<String, RepoConfig>,
 }
 
 impl Default for GitHubNamespaceConfig {
     fn default() -> Self {
         GitHubNamespaceConfig {
             resign_dependabot: true,
+            role_map: None,
+            repos: BTreeMap::new(),
         }
     }
+}
+
+/// Per-namespace Forgejo settings, under `[forgejo.namespaces.<owner>]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ForgejoNamespaceConfig {
+    /// This namespace's role-map overrides.
+    #[serde(default)]
+    pub role_map: Option<RoleMapConfig>,
+    /// Per-repository settings, keyed by the repository's name (lowercase).
+    #[serde(default)]
+    pub repos: BTreeMap<String, RepoConfig>,
 }
 
 /// One GitHub the bridge serves as one App.
@@ -243,9 +342,12 @@ pub struct GitHubForgeConfig {
     /// instance has its own — look it up there.
     #[serde(default = "default_dependabot_id")]
     pub dependabot_id: u64,
+    /// Role-map overrides for every namespace on this host.
+    #[serde(default)]
+    pub role_map: Option<RoleMapConfig>,
     /// Per-namespace settings, keyed by the owner's login (lowercase).
     #[serde(default)]
-    pub namespaces: std::collections::BTreeMap<String, GitHubNamespaceConfig>,
+    pub namespaces: BTreeMap<String, GitHubNamespaceConfig>,
     /// Override the API base (tests, proxies).
     #[serde(default)]
     pub api_base: Option<Url>,
@@ -276,6 +378,17 @@ pub struct ForgejoForgeConfig {
     /// Require this status context instead of the derived one.
     #[serde(default)]
     pub status_check_context: Option<String>,
+    /// The runner label (`runs-on:`) of the workflow the bootstrap writes.
+    /// `None`: the adapter's default, `docker`. Whatever label the
+    /// instance's runners register; the job image needs glibc 2.39+.
+    #[serde(default)]
+    pub runs_on: Option<String>,
+    /// Role-map overrides for every namespace on this instance.
+    #[serde(default)]
+    pub role_map: Option<RoleMapConfig>,
+    /// Per-namespace settings, keyed by the owner's login (lowercase).
+    #[serde(default)]
+    pub namespaces: BTreeMap<String, ForgejoNamespaceConfig>,
 }
 
 impl ForgejoForgeConfig {
@@ -355,6 +468,109 @@ impl GitHubForgeConfig {
             .get(&owner.to_ascii_lowercase())
             .is_none_or(|n| n.resign_dependabot)
     }
+}
+
+/// The role-map layers for a namespace and repository: `(namespace, repos)`.
+type NsLayers<'a> = (Option<RoleMapConfig>, &'a BTreeMap<String, RepoConfig>);
+
+impl BridgeConfig {
+    /// The role map for `repo` (`host/owner/name`): its repository's,
+    /// namespace's, forge entry's and the bridge's overrides over the
+    /// default. A resource on a host this bridge has no entry for gets the
+    /// bridge-wide map.
+    pub fn role_map(&self, repo: &Resource) -> RoleMap {
+        let host = repo.host();
+        let owner = repo.owner().to_ascii_lowercase();
+        let name = repo.repo_name().map(str::to_ascii_lowercase);
+        let (forge, ns): (Option<RoleMapConfig>, Option<NsLayers<'_>>) =
+            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+                (
+                    g.role_map,
+                    g.namespaces.get(&owner).map(|n| (n.role_map, &n.repos)),
+                )
+            } else if let Some(f) = self
+                .forgejo
+                .iter()
+                .find(|f| f.host().is_ok_and(|h| h == host))
+            {
+                (
+                    f.role_map,
+                    f.namespaces.get(&owner).map(|n| (n.role_map, &n.repos)),
+                )
+            } else {
+                (None, None)
+            };
+        let ns_layer = ns.and_then(|(l, _)| l);
+        let repo_layer = ns
+            .zip(name)
+            .and_then(|((_, repos), n)| repos.get(&n))
+            .and_then(|r| r.role_map);
+        // Every chain was checked by `validate`, so this cannot fail on a
+        // loaded config; the default is the safe answer if it ever did.
+        RoleMapConfig::resolve(&[Some(self.role_map), forge, ns_layer, repo_layer])
+            .unwrap_or_default()
+    }
+
+    /// Check every role map the layers can produce, and the keys.
+    fn validate_role_maps(&self) -> Result<()> {
+        let base = Some(self.role_map);
+        RoleMapConfig::resolve(&[base]).context("`role_map`")?;
+        let check = |what: String,
+                     forge: Option<RoleMapConfig>,
+                     namespaces: Vec<(&String, NsLayers<'_>)>|
+         -> Result<()> {
+            RoleMapConfig::resolve(&[base, forge]).with_context(|| format!("`{what}.role_map`"))?;
+            for (owner, (ns, repos)) in namespaces {
+                if *owner != owner.to_ascii_lowercase() {
+                    bail!("`{what}.namespaces` keys are lowercase owner logins; got `{owner}`");
+                }
+                RoleMapConfig::resolve(&[base, forge, ns])
+                    .with_context(|| format!("`{what}.namespaces.{owner}.role_map`"))?;
+                for (name, repo) in repos {
+                    if *name != name.to_ascii_lowercase() {
+                        bail!(
+                            "`{what}.namespaces.{owner}.repos` keys are lowercase repository \
+                             names; got `{name}`"
+                        );
+                    }
+                    RoleMapConfig::resolve(&[base, forge, ns, repo.role_map]).with_context(
+                        || format!("`{what}.namespaces.{owner}.repos.{name}.role_map`"),
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        for g in &self.github {
+            check(
+                format!("github ({})", g.host),
+                g.role_map,
+                g.namespaces
+                    .iter()
+                    .map(|(k, n)| (k, (n.role_map, &n.repos)))
+                    .collect(),
+            )?;
+        }
+        for f in &self.forgejo {
+            check(
+                format!("forgejo ({})", f.host()?),
+                f.role_map,
+                f.namespaces
+                    .iter()
+                    .map(|(k, n)| (k, (n.role_map, &n.repos)))
+                    .collect(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A Forgejo runner label, checked as the adapter will check it.
+fn check_runs_on(label: &str) -> Result<()> {
+    #[cfg(feature = "forge-forgejo")]
+    vgi_forge_forgejo::plan::check_runs_on(label)?;
+    #[cfg(not(feature = "forge-forgejo"))]
+    let _ = label;
+    Ok(())
 }
 
 /// A name or address that can go into a git `committer` header as it is.
@@ -453,17 +669,17 @@ impl BridgeConfig {
             if g.dependabot_login.is_empty() || g.dependabot_id == 0 {
                 bail!("`dependabot_login` and `dependabot_id` must be set");
             }
-            if let Some(k) = g.namespaces.keys().find(|k| **k != k.to_ascii_lowercase()) {
-                bail!("`github.namespaces` keys are lowercase owner logins; got `{k}`");
-            }
         }
         for f in &self.forgejo {
             let host = f.host()?;
             if !hosts.insert(host.clone()) {
                 bail!("forge host `{host}` is configured twice");
             }
+            if let Some(label) = &f.runs_on {
+                check_runs_on(label).with_context(|| format!("forgejo ({host}) `runs_on`"))?;
+            }
         }
-        Ok(())
+        self.validate_role_maps()
     }
 
     /// A URL under `public_url`.
@@ -585,6 +801,101 @@ oauth_client_id = "0b6e3a0c"
             let t = format!("{EXAMPLE}\n[resign]\ncommitter_email = {bad}\n");
             assert!(BridgeConfig::parse(&t).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_forgejo_runner_label_defaults_and_is_checked() {
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(c.forgejo[0].runs_on, None, "the adapter's default");
+        let with = |label: &str| {
+            BridgeConfig::parse(&EXAMPLE.replace(
+                "oauth_client_id = \"0b6e3a0c\"",
+                &format!("oauth_client_id = \"0b6e3a0c\"\nruns_on = {label}"),
+            ))
+        };
+        assert_eq!(
+            with("\"ubuntu-24.04\"").unwrap().forgejo[0]
+                .runs_on
+                .as_deref(),
+            Some("ubuntu-24.04")
+        );
+        for bad in ["\"\"", "\"a b\"", "\"x\\nevil: 1\""] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn res(s: &str) -> Resource {
+        Resource::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_role_map_defaults_to_the_design_projection() {
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        for r in [
+            "github.com/acme/widgets",
+            "codeberg.org/acme/w",
+            "elsewhere.org/x/y",
+        ] {
+            assert_eq!(c.role_map(&res(r)), RoleMap::default(), "{r}");
+        }
+    }
+
+    #[test]
+    fn role_map_layers_apply_most_specific_first() {
+        let text = format!(
+            "{}\n{}",
+            EXAMPLE.replace("[[github]]", "[role_map]\ncommit = \"read\"\n\n[[github]]"),
+            r#"
+[forgejo.role_map]
+maintain = "admin"
+
+[forgejo.namespaces.acme.role_map]
+maintain = "write"
+
+[forgejo.namespaces.acme.repos.widgets.role_map]
+commit = "write"
+"#
+        );
+        let c = BridgeConfig::parse(&text).unwrap();
+        use ForgeRole::*;
+        let got = |r| {
+            let m = c.role_map(&res(r));
+            (m.own, m.maintain, m.commit)
+        };
+        // Bridge-wide only.
+        assert_eq!(got("github.com/acme/widgets"), (Admin, Maintain, Read));
+        // Forge entry over the bridge.
+        assert_eq!(got("codeberg.org/other/widgets"), (Admin, Admin, Read));
+        // Namespace over the forge entry.
+        assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Write, Read));
+        // Repository over the namespace; names match case-insensitively.
+        assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Write, Write));
+    }
+
+    #[test]
+    fn a_role_map_cannot_name_a_namespace_admin_or_be_out_of_order() {
+        let with = |extra: &str| BridgeConfig::parse(&format!("{EXAMPLE}\n{extra}"));
+        for bad in [
+            // No key for `git.ns.admin`, under any spelling.
+            "[role_map]\nns_admin = \"admin\"",
+            "[role_map]\nadmin = \"admin\"",
+            "[forgejo.namespaces.acme.role_map]\nnsAdmin = \"admin\"",
+            // Out of order, or a committer above `write`.
+            "[role_map]\nown = \"write\"",
+            "[role_map]\ncommit = \"maintain\"",
+            "[forgejo.role_map]\nmaintain = \"admin\"\ncommit = \"admin\"",
+            // Checked through every layer, not only on its own.
+            "[forgejo.role_map]\nown = \"maintain\"\n\
+             [forgejo.namespaces.acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.namespaces.acme.repos.w.role_map]\ncommit = \"triage\"\nmaintain = \"read\"",
+            // Keys are lowercase.
+            "[forgejo.namespaces.Acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.namespaces.acme.repos.W.role_map]\ncommit = \"write\"",
+            "[role_map]\nmaintain = \"superuser\"",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+        assert!(with("[role_map]\nmaintain = \"admin\"\ncommit = \"write\"").is_ok());
     }
 
     #[test]

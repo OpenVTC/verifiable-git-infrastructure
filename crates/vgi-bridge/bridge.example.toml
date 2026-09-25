@@ -59,6 +59,17 @@ version = "v0.5.0"
 # committer_name = "VGI bridge"
 # committer_email = "vgi-bridge@noreply.invalid"
 
+# Which forge role each repository right gets (docs/BRIDGE.md §6c). The
+# defaults are shown; [github.role_map], [github.namespaces.<owner>.role_map]
+# and [github.namespaces.<owner>.repos.<name>.role_map] (and the same under
+# [forgejo…]) override them field by field, most specific first. Must stay
+# own >= maintain >= commit, with commit at most "write". There is no key for
+# git.ns.admin: a namespace admin never gets a forge role.
+[role_map]
+# own = "admin"
+# maintain = "maintain"     # on Forgejo: write + the merge allow-list
+# commit = "none"           # "write" lets committers push branches
+
 [[github]]
 host = "github.com"
 # The App the manifest flow registers.
@@ -85,6 +96,11 @@ platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # for one by its owner's login (lowercase):
 # [github.namespaces.acme]
 # resign_dependabot = false
+# Role-map overrides for one namespace, and for one repository in it:
+# [github.namespaces.acme.role_map]
+# maintain = "admin"
+# [github.namespaces.acme.repos.widgets.role_map]
+# commit = "write"
 
 # [[forgejo]]
 # base_url = "https://codeberg.org/"
@@ -92,3 +108,9 @@ platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # oauth_client_id = "<the bridge's OAuth2 application on the instance>"
 # rotate_token_days = 30
 # instance_signing_key_fallback = false
+# The runner label the bootstrap's workflow asks for (runs-on:). Default
+# "docker"; the job image needs glibc 2.39+.
+# runs_on = "docker"
+# Maintainers as admins on this instance, instead of write + merge allow-list:
+# [forgejo.role_map]
+# maintain = "admin"
