@@ -11,6 +11,13 @@ answers with exactly one `git-ns/bridge/result` per job, and reports what it
 sees happening on the forge as `git-ns/bridge/event`s. It serves exactly one
 VTC and refuses a job signed by anyone else.
 
+Setting up a namespace end to end — the VTC's `[git_ns]` config, binding,
+rights, members, the first repository — is
+[SETUP-GITHUB-VTC.md](SETUP-GITHUB-VTC.md); operating one day to day
+(people, drift, restores, troubleshooting) is
+[RUNBOOK.md §8](RUNBOOK.md#8-operating-a-vtc-managed-namespace). This guide is
+the bridge itself.
+
 ---
 
 ## 1. What it needs
@@ -74,7 +81,14 @@ vgi-bridge --config /etc/vgi-bridge/bridge.toml identity import bundle.json
 shred -u bundle.json
 ```
 
-Register the printed DID at the VTC as the bridge serving its namespaces.
+Register the printed DID at the VTC as the bridge serving its namespaces:
+the VTC's `[git_ns] bridges` maps each forge host to it.
+
+The VTC reaches the bridge through a transport the bridge's DID document
+advertises (a `DIDCommMessaging` service naming the mediator). A `did:key`
+advertises none, so a VTC cannot send it jobs: use the `did:key` only where
+nothing does, and a `did:webvh` whose document carries that service for a
+real deployment (SETUP-GITHUB-VTC.md §2.2).
 
 The admin commands (`init`, `identity`, `secret`) open the store directly,
 and redb allows one process at a time: stop the bridge first.
@@ -202,7 +216,7 @@ The bind (an org owner signing in through the OAuth app) adds the bot to a
 stored, runs in two phases: mint a new token (verified to be the bot's), seal
 it, and only then delete the old one. A crash in between leaves an extra live
 token (delete it by hand; its name starts `vgi-bridge-`), never a dead
-credential.
+credential. Rotating by hand: [RUNBOOK.md §8j](RUNBOOK.md#8j-rotating-the-forgejo-bot-token).
 
 **Limit (documented, not closed):** Forgejo commit statuses cannot be pinned
 to a poster, so repository writers are trusted not to forge a status. The
@@ -228,7 +242,8 @@ and copy the single file. After a restore the bridge re-sends every
 unacknowledged result and event; the VTC treats repeats as harmless, and
 repeats its own jobs, which the bridge answers from the ledger. Losing the
 store entirely means re-registering the GitHub App and re-binding the
-namespaces.
+namespaces — and re-binding means unbinding first, which revokes every right
+in them ([RUNBOOK.md §8i](RUNBOOK.md#8i-the-bridge-backup-restore-restart)).
 
 ## 6. The check the bridge posts itself
 

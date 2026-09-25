@@ -1,13 +1,25 @@
 # VGI operator runbook
 
-Activating commit trust on a repository, end to end. Read this if you run the
-Trust Registry, the VTA, or the repositories the check protects.
+Running commit trust on a forge's repositories. Read this if you run the
+Trust Registry, the VTA, the VTC, or the repositories the check protects.
 
 The shape to hold in your head: **VGI verifies, the VTC decides.** A commit
 names its signer DID on its own `committer` header; `verify-trust` proves that
 DID signed it, then asks the registry whether that DID is authorized. Who may
 sign, key rotation, and revocation are registry and VTA concerns — nothing
 about them lives in the repository.
+
+**Which path.** There are two ways to put the registry's answers into
+repositories, and this runbook serves both:
+
+| You have | Path | Read |
+|---|---|---|
+| A VTC with git namespaces, and a VGI bridge next to it | **VTC-managed** (recommended): rights are records in the VTC, which publishes the commit rights to the registry; the bridge creates repositories, sets up the check, projects roles and reports drift | set up: [SETUP-GITHUB-VTC.md](SETUP-GITHUB-VTC.md); the bridge: [BRIDGE.md](BRIDGE.md); day two: [§8](#8-operating-a-vtc-managed-namespace) |
+| A registry and a VTC, no bridge — a forge no bridge serves, or a few repositories | **Manual**: you issue each grant and set up each repository by hand | §1–§7 |
+
+§1–§7 are also the reference both paths share: the grant tuple (§2),
+contributors' machines (§3, §3a), what the check needs from a repository
+(§4, §4a), and every verdict with its fix (§5).
 
 ---
 
@@ -576,8 +588,9 @@ removed first — use `exec git commit --amend -S` and delete the line in the
 editor.
 
 Dependabot stops updating a pull request once someone else has pushed to it;
-comment `@dependabot recreate` to start over. A VGI bridge bot that re-signs
-Dependabot pull requests is planned. Dependabot commits are refused
+comment `@dependabot recreate` to start over. Where a GitHub bridge serves the
+namespace it re-signs clean Dependabot pull requests itself (BRIDGE.md §6a;
+§8e for when it does not). Dependabot commits are refused
 rather than exempted because nothing binds a commit to Dependabot but its
 `author` header, and GitHub does not tie that header to the Dependabot app —
 any exemption keyed on it could be claimed by others.
@@ -606,6 +619,9 @@ rather than by key.
 
 **Retire a repository.** Nothing to clean up in the repo; drop the grants whose
 resource named it.
+
+In a VTC-managed namespace each of these is a change to the VTC's records
+instead: §8.
 
 ## 7. Things that carry more weight than they look like
 
@@ -638,8 +654,448 @@ independent of it. If you additionally enable GitHub's built-in *Require signed
 commits* rule, it will reject DID-signed commits whose keys are not registered
 with GitHub — enable one or the other deliberately, not both by reflex.
 
-**Squash and rebase merges rewrite commits.** The result is signed by
-`web-flow` and passes via the exempt keyring, not as `trusted`. That is
-expected: the DID-signed commits in the pull request are what got verified.
+**Squash and rebase merges rewrite commits.** A squash merge is a
+single-parent commit signed by `web-flow`, which the exempt keyring does not
+exempt (`platformSignedEdit`); a rebase-merge drops the DID signatures. The
+pull request itself was verified, but any later range containing the result
+fails. Merge with merge commits (§4).
+
+## 8. Operating a VTC-managed namespace
+
+Day two for a namespace bound in bridge mode (set up with
+[SETUP-GITHUB-VTC.md](SETUP-GITHUB-VTC.md)). Everything here is a change to
+the VTC's records, not to the forge or the registry: the VTC publishes the
+commit rights to the registry and has the bridge converge the forge. Nothing
+in the repository changes when people come and go.
+
+Where to do it:
+
+- **`cnm git …`** — each change is a signed `git-ns/*` Trust Task, authorized
+  by the **profile DID's own git rights**. The listings (`cnm git namespace
+  list`, `cnm git repos`, `cnm git view --admin`) use an admin session.
+- **openvtc** — for members: *Communities* → the community → `r` opens
+  *Repos*. On a repository: `a` grant, `x` revoke, `t` transfer, `A` archive;
+  on the list: `n` new repository; anywhere: `l` link a forge account, `r`
+  refresh.
+- **The admin console's Repos page** (`/admin/repos`) — every namespace,
+  repository, right, drift item and job. Its changes are signed with the
+  browser's console key where one is enrolled, or handed over as the `cnm`
+  command.
+
+Under the default `[git_ns] elevated_requires_admin = true`, **elevated**
+actions — granting or revoking `git.repo.own` or `git.repo.create`,
+transfer, archive, adopt — and **destructive** ones — bind, unbind, granting
+or revoking `git.ns.admin` — are accepted only from a community
+administrator who also holds the git right that entitles them. Granting and
+revoking `maintain` and `git.commit.sign`, and creating a repository, are
+normal-class. (Why: SETUP-GITHUB-VTC.md §1.)
+
+A change reaches the registry within a projector pass (`tick_seconds`,
+default 5; at least once a minute regardless) and the forge when the bridge
+runs the job. `GET /v1/git-ns/projection` shows what is published and how many
+changes are pending; `GET /v1/git-ns/jobs` shows the bridge jobs. Both are on
+the console.
+
+### 8a. Add or remove a contributor
+
+**Add.** An owner of the repository (or a namespace admin over it; a
+maintainer too, if the policy sets `maintainer_grants_commit`):
+
+```sh
+cnm git grant --subject did:webvh:…:carol --right git.commit.sign \
+  --resource github.com/acme/widgets --expires-in 90d --reason "widgets v2"
+```
+
+Effective on the next check run — re-run the check on an open pull request.
+Committers get **no GitHub role**: they contribute through forks, and the
+required check decides what lands. To give someone a role, grant
+`git.repo.maintain` (§8b).
+
+- The subject must be a **current member** under the shipped policy; anyone
+  else is `git-ns:policyDenied` (`external-signers-not-enabled`). Admitting
+  outside contributors is a policy change the community makes deliberately —
+  for example, `git.commit.sign` only, expiring within 90 days.
+- A namespace-wide grant (`--resource github.com/acme`) is honoured only by
+  the **bridge-posted check**. The workflows the bootstrap writes query the
+  repository alone (SETUP-GITHUB-VTC.md, *Not implemented*), so in a
+  required-workflow, in-repo or Forgejo repository, grant per repository.
+
+**Remove.**
+
+```sh
+cnm git revoke --subject did:webvh:…:carol --right git.commit.sign \
+  --resource github.com/acme/widgets --reason "left the project"
+```
+
+Effective on the next run. Their merged commits keep verifying
+cryptographically and are not checked again; open pull requests with their
+commits now fail `unauthorized`. Only recorded rights can be revoked: an
+owner's commit right is implied, not recorded, so revoking `git.commit.sign`
+from an owner is `git-ns/right/revoke:notGranted` — revoke the ownership
+instead.
+
+### 8b. Owners and maintainers
+
+```sh
+# a maintainer: merge and triage on GitHub (normal-class; an owner may)
+cnm git grant  --subject did:…:dave --right git.repo.maintain --resource github.com/acme/widgets
+# a co-owner: admin on GitHub (elevated: a community administrator)
+cnm git grant  --subject did:…:erin --right git.repo.own      --resource github.com/acme/widgets
+cnm git revoke --subject did:…:dave --right git.repo.maintain --resource github.com/acme/widgets
+```
+
+- **Roles follow linked accounts.** `own` projects to `admin` and `maintain`
+  to `maintain` in an organisation; on a personal account both become
+  `write`, the only collaborator role there. A member with no linked GitHub
+  account gets no role until they link (openvtc `l`).
+- **A repository keeps an owner.** Revoking the last one is
+  `git-ns:lastOwner`; grant the replacement first. Only an owner record
+  **without an expiry** counts for this, so an expiring grant cannot be the
+  one that keeps it.
+- **Handing over your own ownership** is
+  `cnm git transfer github.com/acme/widgets --to did:…:erin` — the VTC's
+  record, not a GitHub transfer (elevated).
+- **Going from one owner to two**, or back, changes the owner-review guard
+  (solo ↔ `CODEOWNERS` review). The bridge reports it as a `bootstrapMissing`
+  drift item; revert it (§8d) to re-run the bootstrap. The required workflow
+  and the bridge-posted check do not depend on the owners.
+- **Archive** (`cnm git archive github.com/acme/widgets`, elevated) makes the
+  repository read-only on GitHub and revokes every commit right on it. No
+  task reverses it.
+- **Namespace admins get no organisation role.** The bridge does not project
+  `git.ns.admin` (it refuses a namespace-level role projection,
+  `notCapable`): who owns the GitHub organisation is yours to manage.
+
+### 8c. A member leaves
+
+Remove them from the community as usual (the console's *Members* page,
+`DELETE /v1/members/{did}`). The VTC then, on its own:
+
+1. revokes **every git right they held**, everywhere — withdrawn from the
+   registry, and their GitHub roles removed by the next role projection (a
+   projection job retries until it succeeds);
+2. marks each repository they owned alone **`orphaned`**, governed by the
+   namespace admins until one of them names an owner
+   (`cnm git grant … --right git.repo.own`);
+3. removes their linked forge accounts.
+
+**Grants they issued stay** — they were made under the community's
+authority. Review them: the console lists *issued by departed members*
+(`GET /v1/git-ns/rights/issued-by-departed`); revoke with `cnm git revoke`
+whatever should not outlive its granter. A community that wants them gone
+automatically sets `cascade_on_departure` in its `gitNamespace` policy's
+`settings`; the departure sweep then revokes them too.
+
+If the departed member was the namespace's **last admin**, it is now
+headless (§8g).
+
+Access their account has other than a direct role on the repository — an
+organisation team, organisation ownership — is not the bridge's to change. A
+projection that cannot take it away reports its `roles` step as failed,
+naming the team or the ownership: remove it on GitHub.
+
+### 8d. Drift: adopt or revert
+
+The bridge compares each repository with what the VTC projects and reports
+every difference as a drift item. Members see them in
+`cnm git view --resource github.com/acme/widgets` (and openvtc); administrators
+on the console (`GET /v1/git-ns/drift`). An owner of the repository, or a
+namespace admin over it, answers each one.
+
+| Item | Means | Adopt | Revert |
+|---|---|---|---|
+| `roleAdded` | an account holds a role the rights do not give | records it as a right (below) | removes the direct role (`git-ns/bridge/job` 0.2 `removeAccounts`) |
+| `roleChanged` | a role other than the projected one | if it raises a linked member: records the higher right | re-sends the complete desired roles |
+| `roleRemoved` | a projected role is gone | — | re-sends the complete desired roles |
+| `requiredCheckMissing` | the ruleset no longer requires the check | — | re-runs the `requiredCheck` bootstrap step |
+| `protectionWeakened` | bypass actors, force-push, an unprotected check source, Actions disabled, … | — | re-runs the `requiredCheck` bootstrap step |
+| `bootstrapMissing` | the plan must change (owner count, org rulesets gained) | — | re-runs the whole bootstrap |
+
+A required check that disappears is put back without anyone asking: the VTC
+re-runs the `requiredCheck` step as soon as the bridge reports it. Role drift
+is only reported, unless the policy sets `role_drift = "enforce"`.
+
+**Revert** changes no right and has the bridge undo the forge change:
+
+```sh
+cnm git drift resolve github.com/acme/widgets revert --type roleAdded \
+  --account-id 5550123 --account-login eve-dev
+cnm git drift resolve github.com/acme/widgets revert --type protectionWeakened
+```
+
+A role item is selected by the account's **numeric id** (`--account-id`, as
+`git view` shows it), never by login. Reverting an `admin` role has the
+impact of revoking `own`, and is elevated.
+
+**Adopt** records the forge-side role as a right, evaluated exactly as a
+grant from you — the same fixed rules, policy (seen as `right.grant` with
+`via: "drift.adopt"`) and consent class. It needs the value you read, so a
+forge that changed since adopts nothing:
+
+```sh
+cnm git drift resolve github.com/acme/widgets adopt --type roleAdded \
+  --account-id 5550124 --account-login dave --observed maintain
+```
+
+Adoptable: a `roleAdded`, or a `roleChanged` that raises the member, held by
+an account **linked to a current member**, at a role a right projects to —
+`admin` → `git.repo.own`, `maintain` → `git.repo.maintain`, and on a personal
+account `write` → `git.repo.maintain`. `write` in an organisation, `triage`
+and `read` project nothing and cannot be adopted: revert them.
+
+Every resolution is followed by an inspection, so it is confirmed rather than
+assumed. Refusals are in §8k.
+
+### 8e. Dependabot pull requests
+
+**The bridge re-signs them** with its own DID when Dependabot alone has
+pushed to the branch since creating it, the pull request comes from the same
+repository and targets the default branch, and no commit touches
+`.github/workflows/` (BRIDGE.md §6a has every condition). It needs
+`platform_keyring_file` set, the App subscribed to `push`, and the bridge's
+service grant in the registry. After a re-sign Dependabot stops rebasing:
+comment `@dependabot rebase`, and the bridge re-signs the result. Turn it off
+for a namespace with `[github.namespaces.<owner>] resign_dependabot = false`
+in the bridge config.
+
+When the check still fails, its summary (bridge-posted) or the job's
+`PLAT-EDIT` lines say which commits. The usual causes:
+
+- **The pull request changes a workflow** (`github-actions` updates). Never
+  re-signed: the bridge will not vouch for what CI runs, and its App has no
+  `workflows` permission to push such a change anyway.
+- **Someone else pushed to the branch**, or the bridge missed a push while it
+  was down: the record is broken. Close the pull request and delete the
+  branch; Dependabot opens it afresh and the bridge re-signs the new one.
+- **The repository is checked by a workflow**, not by the bridge (required
+  workflow, in-repo): the bridge's grant is on the namespace, which those
+  workflows do not query, so its re-signed commits fail `unauthorized`
+  (SETUP-GITHUB-VTC.md, *Not implemented*). Re-sign by hand.
+
+**Re-signing by hand.** A maintainer who is an enrolled signer reviews the
+change, then re-signs only the refused commits (the reasoning is in §5):
+
+```sh
+gh pr checkout <number>
+git rebase -i origin/main
+#   after the `pick` of each refused commit, add:
+#   exec git commit --amend --no-edit -S
+git push --force-with-lease
+```
+
+GitHub refuses a push that changes `.github/workflows/` from a credential
+without the `workflow` scope: with `gh` as the git credential helper, run
+`gh auth refresh -s workflow` first. In an owner-review repository the change
+to `.github/` then needs another owner's approval, which is the point.
+Dependabot will not update the pull request after your push;
+`@dependabot recreate` starts it over (and discards the re-sign).
+
+### 8f. GitHub App permission upgrades
+
+A manifest change reaches only new App registrations. When a release adds a
+permission or an event — the bridge-posted check (Checks, Pull requests,
+Merge queues; `pull_request`, `merge_group`, `check_run`, `check_suite`), the
+Dependabot re-sign (`push`) — an existing App keeps working with what it has,
+and the bridge says what it lacks: in its log, on the console's namespace card
+(*missing permissions*, *permission upgrade pending*), and in
+`cnm --json git namespace list` (`forgeStatus.missingPermissions`,
+`forgeStatus.permissionUpgradePending`).
+
+1. On the App's settings page (*Permissions & events*) add what is missing,
+   and save.
+2. An organisation owner accepts the new permissions on the installation
+   (GitHub shows a banner there).
+3. GitHub tells the bridge (`installation` `new_permissions_accepted`); it
+   reads the installation again, and each repository moves to the new mode
+   at its next inspection.
+
+A newly subscribed `push` re-signs only Dependabot branches created after it.
+The detail of each upgrade is in BRIDGE.md §3.
+
+### 8g. A headless namespace: reseat
+
+A namespace whose every `git.ns.admin` has left the community or lapsed is
+**headless**: nobody can adopt, name an owner for an orphaned repository, or
+grant namespace rights. The console and `GET /v1/git-ns/namespaces` flag it
+(`headless`). A community administrator restores it:
+
+```sh
+cnm git reseat ns_… --subject did:webvh:…:alice \
+  --statement "Both admins left in the September reorganisation; Alice leads infra."
+```
+
+It grants a current member a **permanent** `git.ns.admin`, with the statement
+as its reason, and the audit record keeps the statement and how each earlier
+admin record ended. While any live admin record of a current member remains
+it is refused `git-ns/namespace/reseat:notHeadless` — that admin grants
+instead — so it cannot be used to go around an admin.
+
+Prevent it: keep **two admins without an expiry**. The last-admin invariant
+counts only those, but a departure can still take the last one.
+
+### 8h. Transfers, renames and a reused name
+
+The VTC keys repositories by the forge's **numeric id**, not by name.
+
+- **Renamed within the namespace:** the rights move with it (`repoRenamed`).
+  The old name's registry records are withdrawn before any are published
+  under the new one.
+- **Transferred out** — to another organisation, another forge, or another
+  namespace this same VTC governs: the repository is **detached** and every
+  right on it withdrawn (`repoTransferred`). Rights never move with it; the
+  receiving namespace's admins granted none of them. If this bridge serves the
+  destination, the repository appears there as **unmanaged**, and its admins
+  adopt it and grant afresh:
+
+  ```sh
+  cnm git adopt github.com/acme-labs/widgets --owner did:…:alice
+  ```
+
+- **A new repository at a governed name** (created or transferred in, with a
+  different forge id): the governed one went without an event, so it is
+  detached, and the newcomer is reported unmanaged. It inherits nothing.
+- **Deleted on GitHub:** detached (`repoDeleted`), its rights withdrawn.
+- **Reusing a name:** creating or adopting at a name whose earlier records
+  are still being withdrawn from the registry is refused `unavailable`
+  (*… are still being withdrawn from the Trust Registry; retry once they are
+  gone*). Retry after a projector pass.
+
+`cnm git transfer` is none of these: it hands ownership over in the VTC's
+records and moves nothing on GitHub.
+
+### 8i. The bridge: backup, restore, restart
+
+Everything is in `data_dir/state.redb`, sealed with the master key
+(BRIDGE.md §5).
+
+- **Back up** the file and the key **separately**. For a consistent copy,
+  stop the bridge (or snapshot the volume) and copy the one file.
+- **Restore:** stop the bridge, put the file back, start it with the same
+  master key. It re-sends every result and event the VTC had not
+  acknowledged; the VTC repeats its own unfinished jobs, which the bridge
+  answers from its job ledger rather than running twice.
+- **Restart** needs nothing: the bridge hands its adapters the managed
+  repository set and the required-workflow pin back from the store. If a
+  restored store is older than the organisation's `VGI required workflow`
+  ruleset (the pin moved after the backup), inspections report the pin as
+  unverified — critical drift — until the required-workflow step runs again:
+  revert the item (§8d).
+- **What a restore loses:** Dependabot branches created after the backup
+  have no provenance record, so they are not re-signed until Dependabot
+  recreates them; a Forgejo bot token rotated after the backup is not in the
+  store (§8j).
+- **Losing the store, or the key,** means registering a new GitHub App and
+  binding again — and there is no re-attach. The VTC still holds the
+  namespace as bound to that bridge, and binding it again needs
+  `cnm git namespace unbind` first, which **revokes every right in the
+  namespace** and detaches every repository; everything is then granted and
+  adopted afresh. Back the store up.
+
+The VTC's own backup (VTI `docs/03-vtc/backup-restore.md`) carries the
+git-namespace records; its bridge-job queue and the registry-projection mirror
+are not backed up. The projector rebuilds the mirror from the registry at
+start. A change whose job was lost shows up as drift at the repository's next
+inspection.
+
+### 8j. Rotating the Forgejo bot token
+
+**Automatically:** set `rotate_token_days` in the `[[forgejo]]` entry and
+store the bot's password (`vgi-bridge secret set forgejo/<host>/bot-password`;
+the bot must not use two-factor auth). The bridge looks hourly; the first
+look only starts the clock. It mints a new token, checks it is the bot's,
+seals it, and only then deletes the old one — a crash in between leaves an
+extra live token (its name starts `vgi-bridge-`; delete it on the bot's
+*Settings → Applications*), never a dead credential.
+
+**By hand:**
+
+1. As the bot, create a token with the scopes `write:organization` and
+   `write:repository`.
+2. Stop the bridge; `vgi-bridge secret set forgejo/<host>/bot-token` (reads
+   standard input); start it. The bridge reads its secrets at start.
+3. Delete the old token on the bot's *Settings → Applications*.
+
+Delete the old token before the new one is in place and every job fails
+(`forbidden`) until it is. The same `secret set` replaces the OAuth client
+secret or the webhook secret; change the webhook secret on the
+organisation's webhook at the same time, or deliveries fail verification.
+
+### 8k. Troubleshooting
+
+**Check verdicts** in a managed repository. The general cause and fix of each
+are in §5; this is what they usually mean here.
+
+| Verdict | Usually | Fix |
+|---|---|---|
+| `trusted`, `exempt` | passes | — |
+| `unsigned` | signing not set up on that machine | `did-git-sign health`; commit again |
+| `malformed` | the signature is not an Ed25519 sshsig (an RSA or ECDSA SSH key, or corrupt) | sign with `did-git-sign`; amend |
+| `noSignerDid` | the commit-msg hook did not run, or is older than v2 | `did-git-sign health`, re-run `init`; amend |
+| `conflictingSignerDids` | a carried-over `Signed-by-DID:` trailer | amend so one claim remains |
+| `unresolvedSigner` | the signer's DID document is unreachable, or names a non-public host (refused, never fetched) | fix the DID's hosting |
+| `unknownKey` | signed with a key the DID does not publish | `did-git-sign init` for the right key |
+| `badSignature` | the commit changed after it was signed | re-sign |
+| `unauthorized` | no right on this repository: never granted, revoked, lapsed, the member left — or a namespace-level right in a workflow-checked repository (§8a), or the bridge's re-signed Dependabot commits there (§8e) | `cnm git view --resource <repository>`; grant on the repository |
+| `registryUnavailable` | the registry could not be asked | a registry outage; the check fails closed by design |
+| `pgpRejected` | a PGP signature from a key not in the exempt keyring | set `platform_keyring_file` in the bridge config (GitHub's current `web-flow.gpg`) |
+| `platformSignedEdit` | a web-UI edit, a squash merge, a Dependabot commit not re-signed | re-sign (§8e); merge with merge commits |
+| `platformMergeUnverifiedParent` | a GitHub-signed merge over a failing parent | fix that parent |
+| `platformMergeAltered` | conflicts resolved in the web editor | merge locally and sign with `did-git-sign` |
+
+Under the bridge-posted check, a check that never appears means the bridge is
+down or its App lacks the check permissions (§8f). *No commits were verified*
+and *The head is already part of `main`* are failures by design.
+
+**VTC refusals** — what `cnm`, openvtc and the console report; `cnm` adds the
+fix where one applies.
+
+| Code | Cause | Fix |
+|---|---|---|
+| `git-ns/namespace/bind:noBridge` | no `[git_ns] bridges` entry for the forge host, or the VTC not restarted since | add it and restart the VTC; or bind `--mode manual` |
+| `git-ns/namespace/bind:alreadyBound` | bound, or a bind is pending | `cnm git namespace list`; a pending bind is dropped after 24 h |
+| `git-ns:namespaceNotBound` | the bind has not completed | finish the step at the URL `namespace bind` printed |
+| `git-ns:unknownNamespace` | no bound namespace contains the resource, or no namespace has that id | a forge-qualified, lowercase resource; ids from `namespace list` |
+| `git-ns:unknownRepo` | the VTC records no repository there | `cnm git adopt` it |
+| `git-ns:repoNotActive` | the repository is pending, archived or detached | `cnm git repos` for its state |
+| `git-ns:scopeViolation` | the resource lies outside what the right can cover (another namespace or forge, a namespace right on a repository) | name the right resource |
+| `git-ns:escalation` | granting more than you hold, or re-delegating `repo.create` | someone who holds it grants; `cnm git view` shows yours |
+| `git-ns:membersOnly` | a namespace right (`ns.admin`, `repo.create`) for a non-member | members only — a fixed rule |
+| `git-ns:policyDenied` | the community's `gitNamespace` policy refused (`not-a-member`, `external-signers-not-enabled`, or its own code) | a policy change, if the community wants one |
+| `git-ns:lastOwner` / `git-ns:lastAdmin` | it would leave no owner / no admin without an expiry | grant the replacement first |
+| `git-ns/right/revoke:notGranted` | no live record matches — often an implied right | revoke the right that implies it |
+| `git-ns/right/grant:expiryInPast` | the expiry is in the past | a future one |
+| `git-ns/repo/create:nameTaken` | the VTC records a repository at that name | `cnm git view --resource …` |
+| `git-ns/repo/adopt:alreadyManaged` | it is governed already | nothing to do |
+| `git-ns/repo/transfer:notOwner` / `selfTransfer` | you hold no ownership record to hand over / you named yourself | a namespace admin grants `own` instead |
+| `git-ns/drift/resolve:driftNotFound` | resolved already, or the forge changed since you read it | read it again with `git view` |
+| `git-ns/drift/resolve:notAdoptable` / `accountNotLinked` / `noMatchingRight` | the item records no right: a protection item; `write`, `triage` or `read`; an unlinked account; a role no higher than one held | revert it — or, to accept a lowering, revoke the right |
+| `git-ns/drift/resolve:notRevertible` | manual mode; or the account is a member's and the projection gives it a role there; or the bridge implements only job 0.1 | undo it on the forge; revoke the member's right; upgrade the bridge |
+| `git-ns/namespace/reseat:notHeadless` | a live admin remains | that admin grants `git.ns.admin` |
+| `git-ns/account/link:unsupportedForge` | no bridge-mode namespace on that forge | bind one in bridge mode |
+| `git-ns/account/link-status:unknownLink` | the link attempt is unknown, or forgotten (after 7 days) | start again (`l`) |
+| `permissionDenied` | the signer lacks the right; or an elevated or destructive action from someone who is not a community administrator (`elevated_requires_admin`); or a bind or reseat without the community-administrator capability | a community administrator does it |
+| `malformedRequest` | a DID that is not DID-core (`did:<method>:<id>`, the id only letters, digits, `.` `-` `_` `:` and `%`-escapes — no fragment, spaces or shell characters); a resource that is not forge-qualified; an unknown right | fix the value; `cnm` refuses these before signing |
+| `unavailable` | the bridge did not answer an in-line job (bind, link), or refused it — the message carries its code, e.g. `noMatchingProtocol` (a `did:key` bridge, or no DIDComm service in its DID document); earlier records at the name still being withdrawn (§8h); **two governed repositories recorded at one name** | check the bridge and its DID document, retry; for two at one name, below |
+
+*Two governed repositories at one name* is refused rather than guessed at
+(*N governed repositories are recorded at …; an administrator must resolve
+which one it is*). No task resolves it today; the console's repository list
+shows both. Report it: events alone should not produce it.
+
+**Bridge job failures** — the console's job list and a repository's step
+outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
+
+| Code | Cause | Fix |
+|---|---|---|
+| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand and adopt; manage organisation roles yourself |
+| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
+| `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
+| step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |
+| step `notFound` | the repository is gone, or outside the installation's repository selection | an inspection that finds nothing detaches it; install the App on *All repositories* |
+| step `nameTaken` | the name exists on the forge already | adopt it, or pick another name |
+| step `rateLimited` | the forge's rate limit | the job is retried |
+| step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
+| a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
+| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.2 | update the VTC, or `event_version = "0.1"` meanwhile (BRIDGE.md §7) |
 
 [vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure
