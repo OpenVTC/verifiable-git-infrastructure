@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use url::Url;
-use vgi_forge::{DEFAULT_REQUIRED_CHECK, ForgeRole, Resource, RoleMap};
+use vgi_forge::{DEFAULT_REQUIRED_CHECK, ForgeRole, Resource, RoleMap, VerifyTransport};
 
 /// The whole file.
 #[derive(Debug, Clone, Deserialize)]
@@ -125,6 +125,12 @@ pub struct VerifyTrustConfig {
     /// The required check's name.
     #[serde(default = "default_check")]
     pub required_check: String,
+    /// The Trust Registry binding the written workflows use (the action's
+    /// `transport` input): `auto` (default — TSP, then DIDComm, then HTTPS,
+    /// no fallback), `tsp`, `didcomm` or `https`. Set `https` while the
+    /// registry's mediator does not admit a CI run's throwaway DID.
+    #[serde(default)]
+    pub transport: VerifyTransport,
 }
 
 /// Bounds on the check the bridge runs itself.
@@ -153,6 +159,12 @@ pub struct CheckConfig {
     /// Checks run at once; more wait.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// The Trust Registry binding the bridge-posted check uses: `auto`
+    /// (default — DIDComm over the bridge's own session, then HTTPS, no
+    /// fallback), `didcomm` or `https`. The bridge never uses TSP, so `tsp`
+    /// is refused.
+    #[serde(default)]
+    pub transport: VerifyTransport,
 }
 
 impl Default for CheckConfig {
@@ -164,6 +176,7 @@ impl Default for CheckConfig {
             fetch_timeout_secs: default_fetch_timeout(),
             max_fetch_bytes: default_max_fetch_bytes(),
             concurrency: default_concurrency(),
+            transport: VerifyTransport::Auto,
         }
     }
 }
@@ -651,6 +664,12 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
+        if self.checks.transport == VerifyTransport::Tsp {
+            bail!(
+                "`checks.transport = \"tsp\"`: the bridge-posted check queries the registry over \
+                 the bridge's DIDComm session or HTTPS, never TSP; use `auto`, `didcomm` or `https`"
+            );
+        }
         check_ident("resign.committer_name", &self.resign.committer_name)?;
         check_ident("resign.committer_email", &self.resign.committer_email)?;
         if self.resign.committer_email.starts_with("did:") {
@@ -743,6 +762,38 @@ oauth_client_id = "0b6e3a0c"
         );
         assert_eq!(c.checks.max_commits, 250);
         assert_eq!(c.event_version, EventVersion::V0_2, "0.2 unless set");
+    }
+
+    #[test]
+    fn the_transports_default_to_auto_and_the_check_refuses_tsp() {
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(c.verify_trust.transport, VerifyTransport::Auto);
+        assert_eq!(c.checks.transport, VerifyTransport::Auto);
+
+        let pinned = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\ntransport = \"https\"\n\n[checks]\ntransport = \"didcomm\"\n",
+        );
+        let c = BridgeConfig::parse(&pinned).unwrap();
+        assert_eq!(c.verify_trust.transport, VerifyTransport::Https);
+        assert_eq!(c.checks.transport, VerifyTransport::Didcomm);
+        assert_eq!(
+            crate::registry::vgi_config(&c, None).verify_trust_transport,
+            VerifyTransport::Https,
+            "the written workflows carry the pin"
+        );
+
+        let tsp = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\n\n[checks]\ntransport = \"tsp\"\n",
+        );
+        let e = BridgeConfig::parse(&tsp).unwrap_err().to_string();
+        assert!(e.contains("never TSP"), "{e}");
+        let bogus = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\ntransport = \"carrier-pigeon\"\n",
+        );
+        assert!(BridgeConfig::parse(&bogus).is_err());
     }
 
     #[test]

@@ -65,7 +65,7 @@ remediation applies:
 | `unsigned` | no `gpgsig` header |
 | `noSignerDid` | signed, but the committer names no DID |
 | `unresolvedSigner` | the claimed DID did not resolve |
-| `unknownKey` | the claimed DID publishes no such key |
+| `unknownKey` | the claimed DID publishes no such key — usually rotated out since the commit was signed; re-sign it with the current key |
 | `badSignature` | the DID publishes the key, but the signature fails |
 | `unauthorized` | valid signature, registry says no |
 | `registryUnavailable` | the registry could not be consulted — unreachable, or (TSP/DIDComm) its mediator refused this run's DID or no answer authenticated as the registry arrived |
@@ -102,9 +102,18 @@ three is enough: a registry that publishes only `#tsp`, or only `#didcomm`, is
 queried over it. A registry offering none of what this build speaks fails with
 both sides' bindings named, rather than downgrading silently.
 
+`--transport <auto|tsp|didcomm|https>` chooses the binding. `auto` (the
+default) is the strict preference above, with **no fallback**: if the chosen
+binding fails — a mediator that refuses this run's DID — the run fails; it is
+never retried over HTTPS. A named binding is used only if the registry
+advertises it and this build speaks it; otherwise the run fails, naming both
+sides. `--transport https` uses the document's `#rest` endpoint — the setting
+for a registry whose mediator does not yet admit CI's throwaway DIDs.
+
 `--registry-url <url>` is the explicit HTTPS override: it skips discovery and
-queries `POST <url>/trust-tasks`, exactly as before. Use it for a local
-registry that publishes no service entry, or to pin HTTPS.
+queries `POST <url>/trust-tasks`, exactly as before, and implies
+`--transport https` (combining it with `tsp` or `didcomm` is an error). Use it
+for a local registry that publishes no service entry.
 
 There is deliberately **no fallback to guessing a URL from the DID's domain**.
 `vta-sdk` does that for a VTA, where a wrong host merely fails authentication;

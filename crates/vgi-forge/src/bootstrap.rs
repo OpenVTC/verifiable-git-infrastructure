@@ -20,6 +20,63 @@ use crate::resource::Resource;
 /// The required status check's default name: the verify-trust job's `name`.
 pub const DEFAULT_REQUIRED_CHECK: &str = "Verify commit trust";
 
+/// Which Trust Registry binding the verify-trust workflow uses — the
+/// action's `transport` input.
+///
+/// `Auto` (the default) is verify-trust's strict preference: TSP, then
+/// DIDComm, then HTTPS, whichever the registry's DID document advertises,
+/// with no fallback when the chosen one fails. A community whose registry
+/// mediator does not yet admit a CI run's throwaway DID pins `Https`.
+/// A closed set, so a value can be written into a workflow as-is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum VerifyTransport {
+    /// Strict preference: TSP, then DIDComm, then HTTPS.
+    #[default]
+    Auto,
+    /// TSP only.
+    Tsp,
+    /// DIDComm only.
+    Didcomm,
+    /// HTTPS (the registry's `#rest` endpoint) only.
+    Https,
+}
+
+impl VerifyTransport {
+    /// The action input's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerifyTransport::Auto => "auto",
+            VerifyTransport::Tsp => "tsp",
+            VerifyTransport::Didcomm => "didcomm",
+            VerifyTransport::Https => "https",
+        }
+    }
+
+    /// Whether this is the default.
+    pub fn is_auto(&self) -> bool {
+        *self == VerifyTransport::Auto
+    }
+
+    /// The workflow's `transport:` input line (indented for the action's
+    /// `with:` block), or nothing for the default — so a workflow written
+    /// before this option existed is unchanged byte for byte.
+    pub fn workflow_input_line(self, indent: &str) -> String {
+        if self.is_auto() {
+            String::new()
+        } else {
+            format!("{indent}transport: {}\n", self.as_str())
+        }
+    }
+}
+
+impl std::fmt::Display for VerifyTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Forge-neutral inputs to a bootstrap plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +111,10 @@ pub struct VgiConfig {
     /// a `CODEOWNERS`, a licence). Committed before protection is enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<ExtraFile>,
+    /// The registry binding the workflow's verify-trust uses (`transport:`
+    /// input); the default writes no input.
+    #[serde(default, skip_serializing_if = "VerifyTransport::is_auto")]
+    pub verify_trust_transport: VerifyTransport,
 }
 
 impl VgiConfig {
@@ -73,7 +134,14 @@ impl VgiConfig {
             required_check: DEFAULT_REQUIRED_CHECK.into(),
             platform_keyring: None,
             extra_files: Vec::new(),
+            verify_trust_transport: VerifyTransport::Auto,
         }
+    }
+
+    /// Pin the registry binding the workflow uses.
+    pub fn with_verify_trust_transport(mut self, transport: VerifyTransport) -> Self {
+        self.verify_trust_transport = transport;
+        self
     }
 
     /// Pin the release tarball's SHA-256.

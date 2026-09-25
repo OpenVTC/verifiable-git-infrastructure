@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use verify_trust::resource::{CiEnv, ResourceFormat, select_resources};
-use verify_trust::{VerifyTrustArgs, handle_verify_trust};
+use verify_trust::{TransportSelector, VerifyTrustArgs, handle_verify_trust};
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +42,17 @@ struct Cli {
     /// we name.
     #[arg(long)]
     registry_url: Option<String>,
+
+    /// Which registry binding to query over. `auto` (default): TSP, then
+    /// DIDComm, then HTTPS — the first the registry's DID document
+    /// advertises — with no fallback if it then fails. `tsp`, `didcomm`,
+    /// `https`: that binding only; one the registry does not advertise, or
+    /// this build cannot speak, is an error. `https` uses the document's
+    /// `#rest` endpoint, or --registry-url when given (which implies https).
+    /// Use `https` while the registry's mediator does not admit this run's
+    /// throwaway DID.
+    #[arg(long, value_enum, default_value_t = TransportSelector::Auto)]
+    transport: TransportSelector,
 
     /// DID of the Trust Registry: the recipient of every query, and what the
     /// endpoint is discovered from.
@@ -132,6 +143,7 @@ async fn main() -> Result<()> {
         range: cli.range,
         max_signers: cli.max_signers,
         registry_url: cli.registry_url,
+        transport: cli.transport,
         registry_did: cli.registry_did,
         vtc_did: cli.vtc_did,
         action: cli.action,

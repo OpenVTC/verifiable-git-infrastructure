@@ -70,7 +70,7 @@ use vgi_core::{
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
 use crate::pgp_exempt::ExemptKeyring;
-pub use crate::registry::{Registry, RegistryChannel};
+pub use crate::registry::{Registry, RegistryChannel, TransportSelector};
 
 /// Everything `verify-trust` needs for one run.
 #[derive(Debug, Clone)]
@@ -105,6 +105,11 @@ pub struct VerifyTrustArgs {
     /// integrity; this one is a second, independently mutable value that
     /// nothing cross-checks.
     pub registry_url: Option<String>,
+    /// Which registry binding to use ([`TransportSelector`]): `Auto` for the
+    /// strict TSP > DIDComm > HTTPS preference with no fallback, or one
+    /// named binding. With `registry_url` set, only `Auto` and `Https` are
+    /// accepted — the URL is an HTTPS endpoint.
+    pub transport: TransportSelector,
     /// DID of the registry (the `recipient` on every query document, and what
     /// the endpoint is discovered from).
     pub registry_did: String,
@@ -293,11 +298,12 @@ pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
     // keys come from the same cache.
     let tdk = build_resolver(args.resolve_agent_names).await?;
     let registry = match &args.registry_url {
-        Some(url) => Registry::https(url, &args.registry_did)?,
+        Some(url) => https_override(url, args.transport, &args.registry_did)?,
         None => {
             let route = registry::discover_registry_route(
                 &tdk,
                 &args.registry_did,
+                args.transport,
                 &registry::supported_transports(),
             )
             .await?;
@@ -312,6 +318,18 @@ pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
     let report = report?;
     print_report(&args, &report)?;
     Ok(if report.ok { 0 } else { 1 })
+}
+
+/// `--registry-url`: the explicit HTTPS override, which only `auto` or
+/// `https` may accompany.
+fn https_override(url: &str, transport: TransportSelector, registry_did: &str) -> Result<Registry> {
+    match transport {
+        TransportSelector::Auto | TransportSelector::Https => Registry::https(url, registry_did),
+        other => bail!(
+            "--registry-url is an HTTPS endpoint and cannot be combined with --transport \
+             {other}; drop one of them"
+        ),
+    }
 }
 
 /// One commit of the range, read once so the object is not fetched again for
@@ -884,8 +902,13 @@ pub async fn resolve_registry_endpoint(
     tdk: &affinidi_tdk::TDK,
     registry_did: &str,
 ) -> Result<String> {
-    let choice =
-        registry::discover_registry_route(tdk, registry_did, &[TransportKind::Https]).await?;
+    let choice = registry::discover_registry_route(
+        tdk,
+        registry_did,
+        TransportSelector::Https,
+        &[TransportKind::Https],
+    )
+    .await?;
     tracing::debug!(endpoint = %choice.endpoint, "discovered registry REST endpoint");
     Ok(choice.endpoint)
 }
@@ -1200,7 +1223,11 @@ fn print_report(args: &VerifyTrustArgs, report: &TrustReport) -> Result<()> {
             }
             CommitStatus::UnknownKey { did, fingerprint } => {
                 println!(
-                    "UNKNOWN-KEY  {short}  {} publishes no key {fingerprint}",
+                    "UNKNOWN-KEY  {short}  {} publishes no key {fingerprint}: the signer's DID \
+                     no longer publishes the key this commit was signed with (usually a key \
+                     rotation since it was signed). Re-sign the commit with the current key: \
+                     `git rebase -i <base>` and add `exec git commit --amend --no-edit -S` \
+                     after its pick (runbook §5)",
                     signer(did)
                 );
             }
@@ -1992,6 +2019,7 @@ mod tests {
             range: String::new(),
             max_signers: 32,
             registry_url: None,
+            transport: TransportSelector::Auto,
             registry_did: "did:example:registry".to_string(),
             vtc_did: "did:example:vtc".to_string(),
             action: "git.commit.sign".to_string(),
@@ -2010,6 +2038,20 @@ mod tests {
             raw: sign_commit(&unsigned_commit(), &key).into_bytes(),
         };
         (vec![commit], signers_publishing(public))
+    }
+
+    #[test]
+    fn the_https_override_implies_https_and_refuses_another_transport() {
+        for ok in [TransportSelector::Auto, TransportSelector::Https] {
+            let r = https_override("https://registry.example", ok, "did:example:registry");
+            assert_eq!(r.unwrap().kind(), TransportKind::Https);
+        }
+        for bad in [TransportSelector::Tsp, TransportSelector::Didcomm] {
+            let e = https_override("https://registry.example", bad, "did:example:registry")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("cannot be combined"), "{e}");
+        }
     }
 
     #[tokio::test]

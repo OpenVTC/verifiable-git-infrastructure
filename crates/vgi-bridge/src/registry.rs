@@ -229,6 +229,7 @@ pub fn vgi_config(cfg: &BridgeConfig, keyring: Option<Vec<u8>>) -> VgiConfig {
         v.version.clone(),
     );
     out.required_check = v.required_check.clone();
+    out = out.with_verify_trust_transport(v.transport);
     if let Some(sha) = &v.sha256 {
         out = out.with_verify_trust_sha256(sha.clone());
     }

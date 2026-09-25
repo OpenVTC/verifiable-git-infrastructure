@@ -103,6 +103,7 @@ async fn repo_init(args: InitArgs, out: &mut dyn Write) -> Result<()> {
         args.verify_trust_version.clone(),
     );
     cfg.required_check = args.required_check.clone();
+    cfg = cfg.with_verify_trust_transport(args.verify_trust_transport.into());
 
     let owner = resource.owner().to_string();
     let name = resource

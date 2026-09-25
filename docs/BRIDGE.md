@@ -347,8 +347,14 @@ repository writers are trusted not to forge the check —
   before. Because the bridge's DID is stable, a registry in private mode
   (`ACL_MODE=ExplicitAllow`) can admit it by name — add the bridge DID to the
   registry's allow list. A registry that refuses it, or does not answer in
-  30 seconds, fails the check (`registryUnavailable`). TSP is not used by the
-  bridge: its link to the mediator is DIDComm. The bridge's DID document must
+  30 seconds, fails the check (`registryUnavailable`) — with no fallback to
+  HTTPS. `transport` under `[checks]` chooses: `auto` (default: DIDComm, then
+  HTTPS), `didcomm` or `https`; set `https` while the registry does not admit
+  the bridge's DID. TSP is not used by the bridge — its link to the mediator
+  is DIDComm — and `tsp` is refused. The workflows the bridge *writes* take
+  their own `transport` under `[verify_trust]` (`auto`, `tsp`, `didcomm`,
+  `https`; default `auto` writes no input), passed to the action as its
+  `transport` input. The bridge's DID document must
   route DIDComm to the bridge's mediator, which it already must for the VTC.
 - It completes "Verify commit trust" as **success** or **failure** with a
   per-commit table. Anything that goes wrong fails the check (closed).

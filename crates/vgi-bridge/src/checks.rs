@@ -133,6 +133,8 @@ pub struct VerifyTrustVerifier {
     registry_route: tokio::sync::Mutex<Option<trql_client::TransportChoice>>,
     /// A fixed HTTPS endpoint (tests; a registry that publishes none).
     registry_override: Option<String>,
+    /// `checks.transport`: auto (DIDComm > HTTPS), didcomm or https.
+    transport: verify_trust::TransportSelector,
     /// The bridge's own channel to the registry, for the DIDComm binding.
     channel: Option<Arc<dyn verify_trust::RegistryChannel>>,
 }
@@ -153,6 +155,13 @@ impl VerifyTrustVerifier {
                 .collect(),
             tdk: OnceCell::new(),
             registry_route: tokio::sync::Mutex::new(None),
+            transport: match cfg.checks.transport {
+                vgi_forge::VerifyTransport::Didcomm => verify_trust::TransportSelector::Didcomm,
+                vgi_forge::VerifyTransport::Https => verify_trust::TransportSelector::Https,
+                // `tsp` is refused when the config is loaded.
+                vgi_forge::VerifyTransport::Tsp => verify_trust::TransportSelector::Tsp,
+                _ => verify_trust::TransportSelector::Auto,
+            },
             registry_override: None,
             channel: None,
         }
@@ -199,6 +208,7 @@ impl VerifyTrustVerifier {
                 let r = verify_trust::registry::discover_registry_route(
                     tdk,
                     &self.registry_did,
+                    self.transport,
                     &self.supported(),
                 )
                 .await?;
@@ -248,6 +258,7 @@ impl CommitVerifier for VerifyTrustVerifier {
             range: String::new(),
             max_signers: self.max_signers,
             registry_url: None,
+            transport: verify_trust::TransportSelector::Auto,
             registry_did: self.registry_did.clone(),
             vtc_did: self.vtc_did.clone(),
             action: "git.commit.sign".into(),

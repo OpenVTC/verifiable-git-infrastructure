@@ -70,8 +70,10 @@ DIDComm, then HTTPS**. Over TSP and DIDComm each run queries as a throwaway
 `did:peer` and believes only an answer authenticated as the registry's DID;
 the registry's mediator must admit unknown DIDs for that (see the
 [runbook](docs/RUNBOOK.md)), and a refusal fails the check closed.
-`registry-url` is the explicit HTTPS override, for a registry that publishes
-no service entry.
+There is no fallback: while the registry's mediator is not configured for that,
+set `transport: https` (inputs: `auto` — the default — `tsp`, `didcomm`,
+`https`). `registry-url` is the explicit HTTPS override, for a registry that
+publishes no service entry.
 
 `resource` defaults to the current repo and is security-relevant — it is the
 only thing scoping a signer to this repository. It comes in two forms, chosen

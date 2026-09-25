@@ -45,6 +45,11 @@ version = "v0.5.0"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
 # sha256 = "<64 hex>"
 # required_check = "Verify commit trust"
+# The Trust Registry binding the written workflows use: auto (TSP, then
+# DIDComm, then HTTPS; no fallback), tsp, didcomm or https. Use "https" while
+# the registry's mediator does not admit a CI run's throwaway DID
+# (docs/RUNBOOK.md, "Registry discovery").
+# transport = "auto"
 
 [checks]
 # The check the bridge posts itself (GitHub, outside a required workflow).
@@ -54,6 +59,9 @@ version = "v0.5.0"
 # fetch_timeout_secs = 120
 # max_fetch_bytes = 67108864
 # concurrency = 4
+# The binding the bridge-posted check uses: auto (DIDComm over the bridge's
+# own session, then HTTPS; no fallback), didcomm or https. Never tsp.
+# transport = "auto"
 
 [resign]
 # The Dependabot re-sign (docs/BRIDGE.md §6a): the committer on re-signed

@@ -245,7 +245,7 @@ jobs:
           range: origin/${{{{ github.base_ref }}}}..HEAD
           registry-did: {registry}
           vtc-did: {vtc}
-          resource-format: qualified
+{transport}          resource-format: qualified
           # The namespace: where the VTC publishes namespace-wide commit rights.
           fallback-resource: {fallback}
 {keyring}          # A Forgejo runner cannot check the release's attestation; the
@@ -254,6 +254,7 @@ jobs:
           sha256: {sha256}
 "#,
         runs_on = opts.runs_on,
+        transport = cfg.verify_trust_transport.workflow_input_line("          "),
         checkout = opts.checkout_action,
         fallback = fallback_resource(repo),
         version = cfg.verify_trust_version,
@@ -605,6 +606,21 @@ mod tests {
         assert!(wf.contains("registry-did: 'did:webvh:reg'"));
         assert!(wf.contains("vtc-did: 'did:webvh:vtc'"));
         assert!(!wf.contains("vars."));
+    }
+
+    #[test]
+    fn the_transport_input_is_written_only_when_pinned() {
+        let b = base();
+        let o = opts(&b, MergePlan::FastForwardOnly, false);
+        let action = resolve_action(&cfg().verify_trust_action, &b).unwrap();
+        let wf = render_workflow(&cfg(), &o, &spec().resource, &action, SUM);
+        assert!(!wf.contains("transport:"), "{wf}");
+        let pinned = cfg().with_verify_trust_transport(vgi_forge::VerifyTransport::Didcomm);
+        let wf = render_workflow(&pinned, &o, &spec().resource, &action, SUM);
+        assert!(
+            wf.contains("          transport: didcomm\n          resource-format"),
+            "{wf}"
+        );
     }
 
     #[test]

@@ -346,12 +346,37 @@ admits the DID but closes its inbox, so every run is `UNAVAILABLE`. The
 registry's own `ACL_MODE` (default `ExplicitDeny`) must also accept unknown
 senders.
 
-There is **no automatic fallback** from a refused mediator binding to HTTPS:
-discovery picks the most-preferred binding advertised, and a failure there is
-a failure. A registry that advertises `#tsp` or `#didcomm` on a mediator that
-will not admit unknown DIDs therefore fails every CI run until either the
-mediator is opened as above, the mediator entries are withdrawn from its DID
-document, or workflows pin `registry-url` to its REST interface.
+There is **no automatic fallback** from a refused mediator binding to HTTPS —
+a blocked mediator must never quietly downgrade the check. `transport: auto`
+(the default) picks the most-preferred binding advertised, and a failure
+there is a failure. **If your registry's mediator is not configured as above
+yet, set `transport: https`** on the action (the registry must still publish
+`#rest`), or `transport = "https"` under `[verify_trust]` in the bridge config
+for the workflows it writes:
+
+```yaml
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
+        with:
+          # …
+          transport: https   # until the registry's mediator admits CI's throwaway DIDs
+```
+
+`transport` takes `auto`, `tsp`, `didcomm` or `https`. A named binding the
+registry does not advertise, or the verifier cannot speak, fails the run with
+both sides named. `registry-url` implies `https`.
+
+> **Release note — behaviour change.** verify-trust now queries the Trust
+> Registry over the binding its DID document advertises, preferring TSP, then
+> DIDComm, then HTTPS; the REST interface is optional. A registry that
+> advertises `#tsp` or `#didcomm` is now queried over it instead of `#rest`,
+> as a throwaway `did:peer` per run, and the registry's mediator must admit
+> such DIDs (`explicit_deny`, and an open-inbox `global_acl_default` —
+> see *Registry discovery* in the runbook). There is no fallback: until the
+> mediator is configured, runs fail `registryUnavailable`. To keep today's
+> HTTPS behaviour, set `transport: https` (Action), `--transport https` (CLI),
+> or `transport = "https"` in the bridge's `[verify_trust]` / `[checks]`.
+> `UNKNOWN-KEY` now says what usually causes it: the signer rotated their
+> key, and the commit must be re-signed with the current one.
 
 The runner needs outbound HTTPS and WebSocket (`wss://`) to the mediator.
 
@@ -666,10 +691,10 @@ the remediation is unambiguous:
 | `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
 | `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or publishes no Ed25519 method |
-| `unknownKey` | the claimed DID publishes no such key | signed by a key that identity does not hold |
+| `unknownKey` | the claimed DID publishes no such key | usually the signer **rotated their key** after signing — the DID no longer publishes the old one, so re-sign the commit with the current key (below). Otherwise it was signed by a key that identity never held: `did-git-sign init` for the right key |
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
 | `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
-| `registryUnavailable` | the registry could not be consulted | registry outage; the check fails closed by design |
+| `registryUnavailable` | the registry could not be consulted | registry outage — or, over TSP/DIDComm, a registry mediator that does not admit the run's throwaway DID (§4, *Registry discovery*; set `transport: https` meanwhile). The check fails closed by design |
 | `pgpRejected` | PGP-signed by no key in the exempt keyring | no keyring configured, or a platform key other than the committed one |
 | `platformSignedEdit` | signed by the platform key, but not a merge: a web-UI or API edit, a squash merge, a Dependabot commit | re-sign it with `did-git-sign` (below); for squash merges, merge with a merge commit instead |
 | `platformMergeUnverifiedParent` | platform-signed merge with a parent (named) that neither passes nor is on the base branch | fix the named parent; the merge cannot vouch for it |
@@ -677,6 +702,15 @@ the remediation is unambiguous:
 
 `exempt` is a clean, platform-signed merge commit whose parents all pass (see
 *Platform keyring* in §4).
+
+**Re-signing after a key rotation** (`unknownKey`). Once your DID document
+stops publishing the old key, every commit you signed with it that is not yet
+merged fails. **After rotating your signing key, re-sign the commits in your
+open pull requests**: the same `git rebase -i` recipe below, adding the
+`exec git commit --amend --no-edit -S` line after each of *your* commits,
+then force-push. Every check verifies against the DID documents as they are
+*now*, so a commit already merged is only affected if a later range includes
+it again.
 
 **Re-signing platform-written commits** (a Dependabot pull request, a web-UI
 edit). A maintainer who is an enrolled signer, with `did-git-sign` configured,
@@ -729,7 +763,9 @@ simply stop being authorized, which is the honest description of what changed.
 
 **Rotate a key.** Update the DID document. The DID is unchanged, so the grant
 stays valid and no repository is touched. This is why enrolment is by identity
-rather than by key.
+rather than by key. **After rotating, re-sign the commits in your open pull
+requests** — they were signed with the key the DID no longer publishes, so
+they now fail as `unknownKey` (§5, *Re-signing after a key rotation*).
 
 **Retire a repository.** Nothing to clean up in the repo; drop the grants whose
 resource named it.
@@ -1177,10 +1213,10 @@ are in §5; this is what they usually mean here.
 | `noSignerDid` | the commit-msg hook did not run, or is older than v2 | `did-git-sign health`, re-run `init`; amend |
 | `conflictingSignerDids` | a carried-over `Signed-by-DID:` trailer | amend so one claim remains |
 | `unresolvedSigner` | the signer's DID document is unreachable, or names a non-public host (refused, never fetched) | fix the DID's hosting |
-| `unknownKey` | signed with a key the DID does not publish | `did-git-sign init` for the right key |
+| `unknownKey` | signed with a key the DID does not publish — most often one rotated out since | re-sign with the current key (§5); if it never was the DID's key, `did-git-sign init` for the right key |
 | `badSignature` | the commit changed after it was signed | re-sign |
 | `unauthorized` | no right on this repository or its namespace: never granted, revoked, lapsed, the member left — or a namespace-level right (a namespace admin's, the bridge's re-signed Dependabot commits) under a workflow that predates the namespace fallback (§8a, §8e) | `cnm git view --resource <repository>`; grant on the repository; upgrade the workflow (BRIDGE.md §6b) |
-| `registryUnavailable` | the registry could not be asked | a registry outage; the check fails closed by design |
+| `registryUnavailable` | the registry could not be asked | a registry outage, or a registry mediator that refuses the throwaway DID (TSP/DIDComm) — `transport: https` until it is configured; the check fails closed by design |
 | `pgpRejected` | a PGP signature from a key not in the exempt keyring | set `platform_keyring_file` in the bridge config (GitHub's current `web-flow.gpg`) |
 | `platformSignedEdit` | a web-UI edit, a squash merge, a Dependabot commit not re-signed | re-sign (§8e); merge with merge commits |
 | `platformMergeUnverifiedParent` | a GitHub-signed merge over a failing parent | fix that parent |

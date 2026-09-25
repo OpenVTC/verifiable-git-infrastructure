@@ -469,7 +469,7 @@ jobs:
           # repository admin's to change.
           registry-did: {registry}
           vtc-did: {vtc}
-          resource-format: qualified
+{transport}          resource-format: qualified
 {fallback}          # GitHub web-UI merge/squash commits are PGP-signed by web-flow;
           # they pass only via this committed keyring.
           exempt-keyring: {keyring}
@@ -480,6 +480,7 @@ jobs:
         action = cfg.verify_trust_action,
         registry = yaml_single_quoted(&cfg.trust_registry_did),
         vtc = yaml_single_quoted(&cfg.vtc_did),
+        transport = cfg.verify_trust_transport.workflow_input_line("          "),
         fallback = fallback_block(repo),
         keyring = KEYRING_PATH,
         version = cfg.verify_trust_version,
@@ -563,7 +564,7 @@ jobs:
           # would override an organisation one.
           registry-did: {registry}
           vtc-did: {vtc}
-          resource-format: qualified
+{transport}          resource-format: qualified
 {fallback}          exempt-keyring: ${{{{ runner.temp }}}}/vgi-platform-keys.asc
           version: {version}
 "#,
@@ -574,6 +575,7 @@ jobs:
         action = cfg.verify_trust_action,
         registry = yaml_single_quoted(&cfg.trust_registry_did),
         vtc = yaml_single_quoted(&cfg.vtc_did),
+        transport = cfg.verify_trust_transport.workflow_input_line("          "),
         fallback = fallback_block(repo),
         version = cfg.verify_trust_version,
     ))
@@ -1009,6 +1011,25 @@ mod tests {
             assert!(wf.contains(FALLBACK_LINES), "{wf}");
             assert!(!wf.contains("resource-format: legacy"));
         }
+    }
+
+    #[test]
+    fn the_transport_input_is_written_only_when_pinned() {
+        // The default writes nothing, so existing workflows do not drift.
+        let wf = render_workflow(&cfg(), CHECKOUT, &spec().resource);
+        assert!(!wf.contains("transport:"), "{wf}");
+        let keyring = b"k".to_vec();
+        let rw = render_required_workflow(&cfg(), CHECKOUT, &spec().resource, &keyring).unwrap();
+        assert!(!rw.contains("transport:"));
+
+        let pinned = cfg().with_verify_trust_transport(vgi_forge::VerifyTransport::Https);
+        let wf = render_workflow(&pinned, CHECKOUT, &spec().resource);
+        assert!(
+            wf.contains("vtc-did: 'did:webvh:vtc'\n          transport: https\n"),
+            "{wf}"
+        );
+        let rw = render_required_workflow(&pinned, CHECKOUT, &spec().resource, &keyring).unwrap();
+        assert!(rw.contains("          transport: https\n"), "{rw}");
     }
 
     #[test]

@@ -70,9 +70,102 @@ pub fn supported_transports() -> Vec<TransportKind> {
     kinds
 }
 
+/// Which binding to use: the strict preference order, or one named binding.
+///
+/// `Auto` takes the highest-preference binding the registry advertises and
+/// this build speaks (TSP, then DIDComm, then HTTPS). There is **no
+/// fallback**: if that binding then fails — a mediator that refuses the run's
+/// DID, say — the query fails; it is never retried over a lower one. A named
+/// binding is used only if the registry advertises it and this build speaks
+/// it; otherwise the run fails, naming both sides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub enum TransportSelector {
+    /// TSP, then DIDComm, then HTTPS — whichever is advertised first.
+    #[default]
+    Auto,
+    /// TSP only.
+    Tsp,
+    /// DIDComm only.
+    Didcomm,
+    /// HTTPS only: the `#rest` endpoint the DID document names.
+    Https,
+}
+
+impl TransportSelector {
+    /// The one binding this names; `None` for `Auto`.
+    #[must_use]
+    pub fn kind(self) -> Option<TransportKind> {
+        match self {
+            Self::Auto => None,
+            Self::Tsp => Some(TransportKind::Tsp),
+            Self::Didcomm => Some(TransportKind::Didcomm),
+            Self::Https => Some(TransportKind::Https),
+        }
+    }
+}
+
+impl std::fmt::Display for TransportSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind() {
+            Some(kind) => write!(f, "{kind}"),
+            None => f.write_str("auto"),
+        }
+    }
+}
+
+/// The binding `selector` picks from `caps`, given what `ours` can build.
+///
+/// `Auto` is [`select_route`]. A named binding must be in `ours` and
+/// advertised in `caps` (with a mediator DID for TSP/DIDComm); anything else
+/// is an error that names what each side offers — never a quiet substitute.
+pub fn choose_route(
+    caps: &ServiceCapabilities,
+    selector: TransportSelector,
+    ours: &[TransportKind],
+) -> Result<TransportChoice> {
+    let Some(kind) = selector.kind() else {
+        return Ok(select_route(caps, ours)?);
+    };
+    if !ours.contains(&kind) {
+        bail!(
+            "transport {kind} was requested, but this verifier cannot query over it \
+             (it speaks: {})",
+            list(ours)
+        );
+    }
+    let Some(endpoint) = caps.endpoint(kind) else {
+        bail!(
+            "transport {kind} was requested, but the registry's DID document advertises no \
+             {kind} service (it advertises: {})",
+            list(&caps.advertised())
+        );
+    };
+    if kind != TransportKind::Https && !endpoint.starts_with("did:") {
+        bail!(
+            "transport {kind} was requested, but the registry's {kind} endpoint {endpoint} is \
+             not a mediator DID"
+        );
+    }
+    Ok(TransportChoice {
+        kind,
+        endpoint: endpoint.to_string(),
+    })
+}
+
+fn list(kinds: &[TransportKind]) -> String {
+    if kinds.is_empty() {
+        return "nothing".to_string();
+    }
+    kinds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Discover how to reach `registry_did`: resolve its DID document and pick
-/// the highest-preference binding in both it and `ours` (see
-/// [`select_route`]).
+/// the binding `selector` asks for among those in both it and `ours` (see
+/// [`choose_route`]).
 ///
 /// There is deliberately **no fallback to guessing a URL from the DID's
 /// domain**: a wrong host is one whose authorization answers we would
@@ -81,6 +174,7 @@ pub fn supported_transports() -> Vec<TransportKind> {
 pub async fn discover_registry_route(
     tdk: &affinidi_tdk::TDK,
     registry_did: &str,
+    selector: TransportSelector,
     ours: &[TransportKind],
 ) -> Result<TransportChoice> {
     let response = tdk
@@ -90,7 +184,7 @@ pub async fn discover_registry_route(
         .map_err(|e| anyhow::anyhow!("could not resolve registry DID {registry_did}: {e}"))?;
     let doc = serde_json::to_value(&response.doc)
         .with_context(|| format!("DID document for {registry_did} did not serialize"))?;
-    let choice = select_route(&ServiceCapabilities::from_document(&doc), ours)
+    let choice = choose_route(&ServiceCapabilities::from_document(&doc), selector, ours)
         .with_context(|| format!("no usable Trust Registry transport on {registry_did}"))?;
     tracing::debug!(kind = %choice.kind, endpoint = %choice.endpoint, "selected registry binding");
     Ok(choice)
@@ -1021,6 +1115,81 @@ mod tests {
         )
         .unwrap();
         assert_eq!(choice.kind, TransportKind::Didcomm);
+    }
+
+    fn all_three() -> ServiceCapabilities {
+        ServiceCapabilities::from_document(&serde_json::json!({
+            "id": REGISTRY,
+            "service": [
+                { "id": "#rest", "type": "TRQPRest",
+                  "serviceEndpoint": { "uri": "https://registry.example" } },
+                { "id": "#dc", "type": "DIDCommMessaging",
+                  "serviceEndpoint": { "uri": "did:web:mediator.example" } },
+                { "id": "#tsp", "type": "TSPTransport", "serviceEndpoint": "did:web:mediator.example" }
+            ]
+        }))
+    }
+
+    #[test]
+    fn a_named_transport_picks_that_binding_and_auto_is_strict_preference() {
+        let every = [
+            TransportKind::Tsp,
+            TransportKind::Didcomm,
+            TransportKind::Https,
+        ];
+        let pick = |s| choose_route(&all_three(), s, &every).unwrap();
+        assert_eq!(pick(TransportSelector::Auto).kind, TransportKind::Tsp);
+        assert_eq!(pick(TransportSelector::Tsp).kind, TransportKind::Tsp);
+        assert_eq!(
+            pick(TransportSelector::Didcomm).kind,
+            TransportKind::Didcomm
+        );
+        let https = pick(TransportSelector::Https);
+        assert_eq!(https.kind, TransportKind::Https);
+        assert_eq!(
+            https.endpoint, "https://registry.example",
+            "the #rest endpoint"
+        );
+    }
+
+    #[test]
+    fn a_named_transport_the_registry_does_not_advertise_is_an_error() {
+        // Never a quiet substitute: asking for HTTPS of a registry with no
+        // #rest fails, even though TSP is right there.
+        let caps = caps_only("TSPTransport", "did:web:mediator.example");
+        let every = [
+            TransportKind::Tsp,
+            TransportKind::Didcomm,
+            TransportKind::Https,
+        ];
+        for s in [TransportSelector::Https, TransportSelector::Didcomm] {
+            let e = choose_route(&caps, s, &every).unwrap_err().to_string();
+            assert!(e.contains("advertises no") && e.contains("tsp"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_named_transport_this_build_cannot_speak_is_an_error() {
+        let e = choose_route(
+            &all_three(),
+            TransportSelector::Tsp,
+            &[TransportKind::Https],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("cannot query over it") && e.contains("https"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_named_mediator_transport_needs_a_mediator_did() {
+        let caps = caps_only("TSPTransport", "https://oops.example");
+        let e = choose_route(&caps, TransportSelector::Tsp, &[TransportKind::Tsp])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a mediator DID"), "{e}");
     }
 
     #[test]
