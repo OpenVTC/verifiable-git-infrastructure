@@ -329,14 +329,18 @@ impl Bridge {
         let _ = ns_id;
     }
 
-    /// Put an adapter's namespaces back after it came into service later
-    /// than start-up (a GitHub App registered at run time).
-    pub(crate) fn restore_host(&self, host: &str) -> Result<()> {
-        let Some(adapter) = self.adapters.get(host) else {
-            return Ok(());
-        };
+    /// Put a GitHub App's namespaces back after it came into service later
+    /// than start-up (registered at run time): those on `host` whose owner
+    /// it serves.
+    pub(crate) fn restore_app(&self, host: &str, owner: &str) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
-            if ns.resource.host() == host {
+            if ns.resource.host() == host
+                && self
+                    .cfg
+                    .github_for(host, ns.resource.owner())
+                    .is_some_and(|g| g.app_owner.eq_ignore_ascii_case(owner))
+                && let Some(adapter) = self.adapters.for_resource(&ns.resource)
+            {
                 adapter.restore(&ns)?;
             }
         }

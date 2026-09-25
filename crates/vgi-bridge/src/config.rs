@@ -104,7 +104,11 @@ pub struct BridgeConfig {
     /// repository can override it (see [`RoleMapConfig`]).
     #[serde(default)]
     pub role_map: RoleMapConfig,
-    /// GitHub (github.com or GHES), one App each.
+    /// GitHub (github.com or GHES): one private App per organisation (or
+    /// account), keyed by `(host, app_owner)`. GitHub installs a private App
+    /// only on the account that owns it, so a community binding several
+    /// organisations on one host registers one App for each; the VTC still
+    /// maps the host to this one bridge.
     #[serde(default)]
     pub github: Vec<GitHubForgeConfig>,
     /// Forgejo instances, one bot each.
@@ -384,7 +388,8 @@ pub struct ForgejoNamespaceConfig {
     pub repos: BTreeMap<String, RepoConfig>,
 }
 
-/// One GitHub the bridge serves as one App.
+/// One GitHub App the bridge holds: its host, and the organisation (or
+/// account) that owns it and whose namespaces it serves.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -392,7 +397,9 @@ pub struct GitHubForgeConfig {
     /// `github.com` or the GHES host.
     #[serde(default = "default_github_host")]
     pub host: String,
-    /// The App's name for the manifest (`acme-vgi-bridge`).
+    /// The App's name for the manifest (`acme-vgi-bridge`). GitHub App names
+    /// are unique per GitHub instance, so every entry on a host names its
+    /// own.
     pub app_name: String,
     /// The organisation (or, with `app_owner_is_user`, the personal account)
     /// the App is registered under and owned by. The manifest exchange
@@ -543,7 +550,23 @@ fn default_committer_email() -> String {
     "vgi-bridge@noreply.invalid".into()
 }
 
+/// A GitHub login is letters, digits and single hyphens: what is safe in a
+/// route segment and a secret's name.
+fn url_segment_ok(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !login.starts_with('-')
+}
+
 impl GitHubForgeConfig {
+    /// The owner as the bridge keys the App by (logins are case-insensitive).
+    pub fn owner_key(&self) -> String {
+        self.app_owner.to_ascii_lowercase()
+    }
+
     /// Whether the Dependabot re-sign is on for the namespace owned by
     /// `owner` (on unless `[github.namespaces.<owner>]` turns it off).
     pub fn resign_dependabot(&self, owner: &str) -> bool {
@@ -557,6 +580,29 @@ impl GitHubForgeConfig {
 type NsLayers<'a> = (Option<RoleMapConfig>, &'a BTreeMap<String, RepoConfig>);
 
 impl BridgeConfig {
+    /// The `[[github]]` entry that serves `owner`'s namespaces on `host`: the
+    /// App `owner` owns, or — on a host with a single App — that App (as
+    /// before several were supported; GitHub itself only lets a private App
+    /// be installed on its owner).
+    pub fn github_for(&self, host: &str, owner: &str) -> Option<&GitHubForgeConfig> {
+        let mut on_host = self.github.iter().filter(|g| g.host == host);
+        let first = on_host.next()?;
+        if first.app_owner.eq_ignore_ascii_case(owner) {
+            return Some(first);
+        }
+        let rest: Vec<&GitHubForgeConfig> = on_host.collect();
+        if rest.is_empty() {
+            return Some(first);
+        }
+        rest.into_iter()
+            .find(|g| g.app_owner.eq_ignore_ascii_case(owner))
+    }
+
+    /// Every `[[github]]` entry on `host`.
+    pub fn github_on(&self, host: &str) -> impl Iterator<Item = &GitHubForgeConfig> {
+        self.github.iter().filter(move |g| g.host == host)
+    }
+
     /// The role map for `repo` (`host/owner/name`): its repository's,
     /// namespace's, forge entry's and the bridge's overrides over the
     /// default. A resource on a host this bridge has no entry for gets the
@@ -566,7 +612,7 @@ impl BridgeConfig {
         let owner = repo.owner().to_ascii_lowercase();
         let name = repo.repo_name().map(str::to_ascii_lowercase);
         let (forge, ns): (Option<RoleMapConfig>, Option<NsLayers<'_>>) =
-            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+            if let Some(g) = self.github_for(host, &owner) {
                 (
                     g.role_map,
                     g.namespaces.get(&owner).map(|n| (n.role_map, &n.repos)),
@@ -625,7 +671,7 @@ impl BridgeConfig {
         };
         for g in &self.github {
             check(
-                format!("github ({})", g.host),
+                format!("github ({}, {})", g.host, g.app_owner),
                 g.role_map,
                 g.namespaces
                     .iter()
@@ -799,20 +845,41 @@ impl BridgeConfig {
                  bridge's DID in their `Signed-by-DID:` trailer"
             );
         }
-        let mut hosts = std::collections::BTreeSet::new();
+        let mut apps = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
         for g in &self.github {
-            Resource::namespace_of(&g.host, "x")
-                .map_err(|e| anyhow::anyhow!("github host `{}`: {e}", g.host))?;
-            if !hosts.insert(g.host.clone()) {
-                bail!("forge host `{}` is configured twice", g.host);
+            Resource::namespace_of(&g.host, &g.app_owner).map_err(|e| {
+                anyhow::anyhow!("github `{}` / app_owner `{}`: {e}", g.host, g.app_owner)
+            })?;
+            if !apps.insert((g.host.clone(), g.owner_key())) {
+                bail!(
+                    "two `[[github]]` entries for `{}` on `{}`: one App per organisation (or \
+                     account), each its own entry",
+                    g.app_owner,
+                    g.host
+                );
+            }
+            if !names.insert((g.host.clone(), g.app_name.to_ascii_lowercase())) {
+                bail!(
+                    "two `[[github]]` entries on `{}` name the App `{}`: GitHub App names are unique \
+                     per instance, so give each organisation's App its own `app_name`",
+                    g.host,
+                    g.app_name
+                );
+            }
+            if !url_segment_ok(&g.app_owner) {
+                bail!("`app_owner` `{}` is not a GitHub login", g.app_owner);
             }
             if g.dependabot_login.is_empty() || g.dependabot_id == 0 {
                 bail!("`dependabot_login` and `dependabot_id` must be set");
             }
         }
+        let github_hosts: std::collections::BTreeSet<&str> =
+            self.github.iter().map(|g| g.host.as_str()).collect();
+        let mut hosts = std::collections::BTreeSet::new();
         for f in &self.forgejo {
             let host = f.host()?;
-            if !hosts.insert(host.clone()) {
+            if github_hosts.contains(host.as_str()) || !hosts.insert(host.clone()) {
                 bail!("forge host `{host}` is configured twice");
             }
             if let Some(label) = &f.runs_on {
@@ -987,6 +1054,37 @@ oauth_client_id = "0b6e3a0c"
         .unwrap_err();
         assert!(err.to_string().contains("master key"), "{err}");
         assert!(BridgeConfig::parse(&format!("did_cache_ttl_secs = 5\n{EXAMPLE}")).is_err());
+    }
+
+    #[test]
+    fn several_apps_on_one_host_are_keyed_by_owner() {
+        let second = |owner: &str, name: &str| {
+            format!("{EXAMPLE}\n[[github]]\napp_name = \"{name}\"\napp_owner = \"{owner}\"\n")
+        };
+        let c = BridgeConfig::parse(&second("globex", "globex-vgi-bridge")).unwrap();
+        assert_eq!(
+            c.github_for("github.com", "ACME").unwrap().app_owner,
+            "acme"
+        );
+        assert_eq!(
+            c.github_for("github.com", "globex").unwrap().app_name,
+            "globex-vgi-bridge"
+        );
+        assert!(
+            c.github_for("github.com", "initech").is_none(),
+            "no fallback with several"
+        );
+        assert!(c.github_for("ghe.example", "acme").is_none());
+        // One App per organisation, and GitHub App names are unique.
+        assert!(BridgeConfig::parse(&second("Acme", "other-name")).is_err());
+        assert!(BridgeConfig::parse(&second("globex", "ACME-vgi-bridge")).is_err());
+        assert!(BridgeConfig::parse(&second("glo/bex", "x")).is_err());
+        // A single App keeps serving the whole host.
+        let one = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(
+            one.github_for("github.com", "initech").unwrap().app_owner,
+            "acme"
+        );
     }
 
     #[test]

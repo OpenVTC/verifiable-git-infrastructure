@@ -575,7 +575,7 @@ async fn run_bootstrap(
     report: &mut Report,
 ) -> bool {
     let forge = ctx.adapter.forge();
-    let Some(vgi) = bridge.adapters.vgi(ctx.host()) else {
+    let Some(vgi) = bridge.adapters.vgi_for(&ctx.ns.resource) else {
         report.fail_with("forgeError", "no bootstrap configuration for this forge");
         return false;
     };
@@ -765,10 +765,12 @@ fn projection(
         p.roles = r.roles.clone();
         p.owners = r.owners.clone();
         p.archived = r.archived;
-        p.required_check = r
-            .required_check
-            .clone()
-            .or_else(|| bridge.adapters.vgi(ctx.host()).map(|v| v.required_check));
+        p.required_check = r.required_check.clone().or_else(|| {
+            bridge
+                .adapters
+                .vgi_for(&ctx.ns.resource)
+                .map(|v| v.required_check)
+        });
     }
     p
 }

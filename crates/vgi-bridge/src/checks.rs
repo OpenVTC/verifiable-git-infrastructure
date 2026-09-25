@@ -971,7 +971,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
 
     let check_name = bridge
         .adapters
-        .vgi(ctx.ns.resource.host())
+        .vgi_for(&ctx.ns.resource)
         .map(|v| v.required_check)
         .unwrap_or_else(|| vgi_forge::DEFAULT_REQUIRED_CHECK.into());
     let _permit = bridge.checks.permits.acquire().await?;

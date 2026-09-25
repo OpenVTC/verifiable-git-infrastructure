@@ -36,7 +36,7 @@ async fn state_and_secrets_live_in_the_vta_and_a_new_host_rebuilds_from_it() {
         assert!(w.bridge.store().flush(Duration::from_secs(5)).await);
         let snap = remote.snapshot();
         assert!(
-            snap.contains_key("secret/github/github.com/app"),
+            snap.contains_key("secret/github/github.com/acme/app"),
             "{:?}",
             snap.keys()
         );

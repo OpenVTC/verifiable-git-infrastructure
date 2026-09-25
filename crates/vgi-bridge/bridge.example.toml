@@ -109,9 +109,15 @@ version = "v0.5.0"
 # maintain = "maintain"     # on Forgejo: write + the merge allow-list
 # commit = "none"           # "write" lets committers push branches
 
+# One [[github]] entry per organisation (or account) the community binds:
+# GitHub installs a private App only on its owner, so each organisation gets
+# its own App — registered with one click each — and this one bridge holds
+# them all, keyed by (host, app_owner). Copy the entry for another org with
+# its own app_owner and app_name.
 [[github]]
 host = "github.com"
-# The App the manifest flow registers.
+# The App the manifest flow registers. Unique per GitHub instance: every
+# entry names its own.
 app_name = "acme-vgi-bridge"
 # Required: the org the App is registered under (and owned by). For a
 # personal account, name it and set app_owner_is_user = true.

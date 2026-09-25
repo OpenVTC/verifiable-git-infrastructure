@@ -38,8 +38,9 @@ Inbound (through your proxy, HTTPS only):
 
 | Path | From |
 |---|---|
-| `POST /github/<host>/webhook`, `POST /forgejo/<host>/webhook` | the forges |
-| `GET /github/<host>/register`, `/registered`, `/setup` | admins' browsers, redirected by GitHub |
+| `POST /github/<host>/<owner>/webhook`, `POST /forgejo/<host>/webhook` | the forges (one GitHub route per App) |
+| `GET /github/<host>/<owner>/register`, `/registered`, `/setup` | admins' browsers, redirected by GitHub |
+| `POST /github/<host>/webhook`, `GET /github/<host>/register`, `/registered`, `/setup` | Apps registered before several Apps per host were supported (their URLs are fixed at GitHub); keep forwarding them |
 | `GET /forgejo/<host>/bind`, `/link` | admins' and members' browsers, redirected by Forgejo |
 | `GET /healthz` | your orchestrator (keep it internal) |
 
@@ -320,8 +321,16 @@ control again. What a lost host does lose is listed in the table above.
 
 ## 3. GitHub: register the App (manifest flow)
 
-One App per community, registered by the bridge itself so nobody copies a
-key by hand.
+One private App per organisation (or account) the community binds,
+registered by the bridge itself so nobody copies a key by hand. GitHub lets a
+private App be installed only on the account that owns it, so a community
+with several organisations gives the bridge one `[[github]]` entry each —
+its `app_owner` and its own `app_name` (App names are unique on a GitHub
+instance) — and registers one App per organisation. One bridge holds them
+all, keyed by `(host, app_owner)`: each App has its own key, webhook secret
+and routes, and the bridge picks the App from a namespace's owner. On a host
+with a single entry, that App serves every namespace there, as before. The
+VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —
    or to your account, with `app_owner_is_user = true`. Optionally put
@@ -331,12 +340,12 @@ key by hand.
    queues). The in-repo and required-workflow plans refuse to plan without
    it; the bridge-posted check works without it, and then fails any
    platform-signed commit.
-2. Start the bridge. With no App registered for a configured host, it logs
-   a **one-time registration URL** (valid 24 hours):
-   `…/github/github.com/register?state=…`.
+2. Start the bridge. For each entry whose App is not registered yet, it
+   logs a **one-time registration URL** (valid 24 hours):
+   `…/github/github.com/<owner>/register?state=…` — one per organisation.
 3. An owner of the `app_owner` organisation opens it. The page posts the
    manifest to GitHub; they approve it; GitHub redirects back to
-   `/github/github.com/registered`, and the bridge exchanges the code for the
+   `/github/github.com/<owner>/registered`, and the bridge exchanges the code for the
    App's id, private key and webhook secret, **seals them**, and puts the
    adapter in service. It refuses an App registered under another account,
    a public App, or one with any permission beyond the reviewed set. If the
@@ -394,9 +403,22 @@ request and delete the branch and Dependabot opens it afresh.
 
 **Binding a namespace** starts at the VTC (`git-ns/namespace/bind`): the VTC
 sends the bridge a `beginBind` job, the admin follows the `next` URL to the
-App's install page, and GitHub's redirect to `/github/<host>/setup` completes
+App's install page, and GitHub's redirect to `/github/<host>/<owner>/setup` completes
 it. The bridge probes whether the organisation has org rulesets (the
 required-workflow guard) and records the answer.
+
+### Upgrading from a single App per host
+
+A bridge from before several Apps per host kept its App at
+`github/<host>/app`. At start it moves it to `github/<host>/<owner>/app` for
+the entry it belongs to — the host's only entry, or the one whose `app_name`
+is the App's — and refuses to start, naming the entry to fix, if it cannot
+tell. The App's webhook and setup URLs at GitHub stay the owner-less ones:
+keep forwarding `/github/<host>/webhook` and `/github/<host>/setup`. With
+several Apps on a host, a webhook on that route goes to the App GitHub names
+in `X-GitHub-Hook-Installation-Target-ID` (and must verify with its secret).
+To move an App to its own routes, change its webhook URL and setup URL on
+its settings page to `…/github/<host>/<owner>/webhook` and `…/setup`.
 
 ## 4. Forgejo: the bot
 

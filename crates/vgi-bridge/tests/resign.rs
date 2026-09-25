@@ -548,7 +548,7 @@ fn required_workflow_resources(w: &World, remote: &Remote) -> (String, Option<St
         .unwrap()
         .set_required_workflow(&acme(), true);
     let vgi = adapters
-        .vgi("github.com")
+        .vgi_for(&acme())
         .unwrap()
         .with_platform_keyring(remote.keyring());
     let plan = adapter

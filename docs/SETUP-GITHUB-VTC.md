@@ -70,12 +70,15 @@ Standing up the VTA, the registry and the VTC is documented in
 
 A personal account works, with less (§9.1).
 
-**One GitHub App per GitHub host, per bridge, and it is private.** The manifest
-registers the App as not public, so GitHub lets only the account that owns it
-install it. On github.com a bridge therefore serves exactly one namespace: the
-`app_owner` in its config. A second organisation needs a second bridge (and a
-second entry in the VTC's `[git_ns] bridges` cannot name the same host twice
-either — the map is keyed by host).
+**One private GitHub App per organisation, all in one bridge.** The manifest
+registers each App as not public, so GitHub lets only the account that owns
+it install it. A community binding several organisations on github.com gives
+the bridge one `[[github]]` entry per organisation (`app_owner`, and an
+`app_name` of its own — GitHub App names are unique) and registers one App
+for each, one click per organisation (§3.1). The bridge picks the App from
+the namespace's owner, and each App has its own key, webhook secret and
+routes (`/github/github.com/<owner>/…`). The VTC's `[git_ns] bridges` still
+names one bridge for the host: nothing changes on the VTC's side.
 
 ---
 
@@ -164,6 +167,13 @@ host         = "github.com"
 app_name     = "acme-vgi-bridge"
 app_owner    = "acme"                                        # the organisation
 platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
+
+# Another organisation of the same community: its own App, same bridge.
+# [[github]]
+# host         = "github.com"
+# app_name     = "acme-labs-vgi-bridge"                       # unique on GitHub
+# app_owner    = "acme-labs"
+# platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 ```
 
 Get the commit for the tag with
@@ -271,15 +281,16 @@ The bridge registers its own App, so no one copies a private key by hand.
 1. Find the warning in the bridge's log:
 
    ```
-   the GitHub App is not registered yet; an admin of `acme` opens
-   https://bridge.acme-vtc.example/github/github.com/register?state=… to register it
+   the GitHub App for `acme` is not registered yet; an admin of `acme` opens
+   https://bridge.acme-vtc.example/github/github.com/acme/register?state=… to register it
    ```
 
    The URL is valid for 24 hours; the bridge logs one at start for as long as
-   no App is registered.
+   no App is registered. With several `[[github]]` entries there is one URL
+   per organisation: each organisation's owner registers its own App.
 2. **An owner of the organisation** opens it. The page posts the manifest to
    GitHub; they review and create the App.
-3. GitHub redirects to `/github/github.com/registered`. The bridge exchanges
+3. GitHub redirects to `/github/github.com/<owner>/registered`. The bridge exchanges
    the code for the App's id, private key and webhook secret, seals them, and
    puts the adapter in service. It refuses an App registered under another
    account, a public one, or one with any permission beyond the reviewed set.
@@ -341,7 +352,7 @@ hands you the `cnm` command.
 organisation. Choose **All repositories**: the bridge must see every
 repository the community creates or adopts, and one outside the
 installation's selection is `notFound` to it. GitHub redirects to
-`/github/github.com/setup`, which completes the bind. The link lives 15
+`/github/github.com/<owner>/setup`, which completes the bind. The link lives 15
 minutes on the bridge's side (`flow_ttl_secs`); an abandoned pending
 namespace is discarded by the VTC after 24 hours, and you bind again.
 

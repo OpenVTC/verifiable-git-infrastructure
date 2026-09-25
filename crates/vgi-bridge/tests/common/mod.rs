@@ -153,6 +153,10 @@ pub struct Options {
     /// VTA mode: the store is a cache of this app-state (seeds go through
     /// it, and the mirror task runs).
     pub vta: Option<Arc<vgi_bridge::appstate::MemoryAppState>>,
+    /// More GitHub Apps on github.com, sealed before start: `(owner, App id,
+    /// webhook secret)`. Each needs its `[[github]]` entry (`github_extra`,
+    /// where `{MOCK}` is the mock server's URL).
+    pub extra_apps: Vec<(&'static str, u64, &'static str)>,
 }
 
 impl Default for Options {
@@ -175,6 +179,7 @@ impl Default for Options {
             github_extra: String::new(),
             event_version: None,
             vta: None,
+            extra_apps: Vec::new(),
         }
     }
 }
@@ -216,7 +221,7 @@ web_base = "{web}"
         uri = server.uri(),
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
         max_body = o.max_body,
-        extra = o.github_extra,
+        extra = o.github_extra.replace("{MOCK}", &server.uri()),
         event_version = o
             .event_version
             .map(|v| format!("event_version = \"{v}\""))
@@ -228,6 +233,7 @@ web_base = "{web}"
 pub fn seed_app(store: &Store) {
     let app = StoredApp {
         app_id: APP_ID,
+        owner: Some("acme".into()),
         slug: "acme-vgi-bridge".into(),
         client_id: "Iv1.testclient".into(),
         client_secret: "client-secret".into(),
@@ -236,7 +242,26 @@ pub fn seed_app(store: &Store) {
     };
     store
         .put_secret(
-            &github_app_secret("github.com"),
+            &github_app_secret("github.com", "acme"),
+            &serde_json::to_vec(&app).unwrap(),
+        )
+        .unwrap();
+}
+
+/// Seal a registered App for `owner` on github.com.
+pub fn seed_app_for(store: &Store, owner: &str, app_id: u64, webhook_secret: &str) {
+    let app = StoredApp {
+        app_id,
+        owner: Some(owner.into()),
+        slug: format!("{owner}-vgi-bridge"),
+        client_id: format!("Iv1.{owner}"),
+        client_secret: "client-secret".into(),
+        webhook_secret: webhook_secret.into(),
+        pem: app_pem().into(),
+    };
+    store
+        .put_secret(
+            &github_app_secret("github.com", owner),
             &serde_json::to_vec(&app).unwrap(),
         )
         .unwrap();
@@ -387,6 +412,9 @@ pub async fn world(o: Options) -> World {
     };
     if o.seed_app {
         seed_app(&store);
+    }
+    for (owner, id, secret) in &o.extra_apps {
+        seed_app_for(&store, owner, *id, secret);
     }
     if o.seed_namespace {
         seed_namespace(&store, o.kind, o.required_workflow);
