@@ -565,7 +565,9 @@ pub async fn wait_for_request(
 /// Wait until delivery `id` on github.com is recorded as handled — every
 /// check it called for has ended (posted or deliberately skipped).
 pub async fn wait_delivery(w: &World, id: &str) {
-    for _ in 0..400 {
+    // A minute: a check fetches from a local git remote and verifies, which
+    // a loaded machine can take well past the ten seconds this once was.
+    for _ in 0..2400 {
         if w.bridge
             .store()
             .get::<i64>(Table::Deliveries, &format!("github.com#{id}"))
