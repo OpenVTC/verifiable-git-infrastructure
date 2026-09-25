@@ -11,7 +11,8 @@ the bridge carries it out and reports back.
 ```
 
 - **Identity.** Its own DID — a VTA-provisioned `did:webvh` (imported) or a
-  locally minted `did:key` — with every key sealed (AES-256-GCM under a
+  locally minted `did:peer:2` whose identifier names the mediator the VTC
+  reaches it through — with every key sealed (AES-256-GCM under a
   mounted master key) in a redb store. It serves **one** VTC and refuses a
   document from any other DID, whatever its proof.
 - **Protocol.** `git-ns/bridge/job` (0.2, and 0.1 from a VTC that has not

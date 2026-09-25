@@ -197,7 +197,12 @@ secret mounted read-only into a container has to exist first.) Back it up
 **apart from** the data directory — the store is useless without it, and the
 two together are every credential the community has on GitHub.
 
-**The bridge's DID: provision a `did:webvh` from the VTA.** Use a DID
+**The bridge's DID.** `vgi-bridge init` mints a `did:peer:2` whose
+identifier carries the bridge's keys and a `DIDCommMessaging` service naming
+`mediator_did` — enough for the VTC to reach it, with nothing to host
+(BRIDGE.md §2). The mediator is fixed in that DID: moving mediators means a
+new identity, registered again. To avoid that, provision a `did:webvh` from
+the VTA instead. Use a DID
 template with an Ed25519 signing key, an X25519 key-agreement key, and a
 `DIDCommMessaging` service naming `mediator_did`. Export its secrets bundle
 and import it (bridge stopped — the admin commands take the store's lock):
@@ -208,14 +213,16 @@ shred -u bundle.json
 vgi-bridge --config /etc/vgi-bridge/bridge.toml identity show
 ```
 
-**Why not the `did:key` `init` mints.** The VTC reaches a bridge the way it
-reaches any peer: it resolves the bridge's DID and uses a transport the
-document advertises (TSP, then DIDComm). A `did:key` document advertises no
-service, so a VTC on `main` has no transport to it: the bind fails
-`unavailable` (*the bridge … refused the job (noMatchingProtocol)*), and so
-would every job after it. `vgi-bridge init` still creates the master key file
-and a `did:key`; `identity import` replaces it. Keep `did:key` for tests
-where nothing sends the bridge a job.
+**Why not a `did:key`.** The VTC reaches a bridge the way it reaches any
+peer: it resolves the bridge's DID and uses a transport the document
+advertises (TSP, then DIDComm). A `did:key` document advertises no service,
+so the VTC has no transport to it: the bind fails `unavailable` (*the bridge
+… refused the job (noMatchingProtocol)*), and so would every job after it.
+Earlier releases of `init` minted one; `vgi-bridge identity mint --replace`
+swaps it for a `did:peer` (register the new DID).
+
+Whichever identity it is, back it up apart from the store:
+`vgi-bridge identity export <file>` (BRIDGE.md §5).
 
 The Ed25519 key in the bundle must be a verification method of the DID's
 document (VTA templates publish it): the bridge signs its re-signed

@@ -124,6 +124,13 @@ pub async fn run(cfg: BridgeConfig, key: seal::MasterKey) -> Result<()> {
     let identity = BridgeIdentity::load(&store)?
         .context("the bridge has no identity yet: run `vgi-bridge init` (or `identity import`)")?;
     tracing::info!(did = %identity.did(), vtc = %cfg.vtc_did, "starting the VGI bridge");
+    // The VTC finds where to send jobs in this DID's document. A did:peer
+    // that names another mediator is refused (jobs would go where the bridge
+    // does not listen); a did:key, which names none, is served with a
+    // warning, since results and events still go out.
+    if let Some(warning) = identity::check_reachable(identity.did(), &cfg.mediator_did)? {
+        tracing::warn!("{warning}");
+    }
     let adapters = build_adapters(&cfg, &store).await?;
     let link = Arc::new(transport::SupervisedLink::new());
     let parts = BridgeParts::new(
