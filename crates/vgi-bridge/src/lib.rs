@@ -169,8 +169,9 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
             let vta_did = cred.vta_did.clone();
             zeroize::Zeroize::zeroize(&mut cred.private_key_multibase);
             let session = session?;
+            let docs: Arc<dyn vta::DidDocuments> = Arc::new(vta::Resolver::new().await?);
             let identity = vta::with_retry(budget, "fetching the bridge's keys", || {
-                session.identity(v.did.as_deref())
+                session.load_identity(v.did.as_deref(), docs.as_ref(), None)
             })
             .await?;
             // Nothing is sealed into the file in VTA mode: the key only
@@ -180,7 +181,7 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
             let (store, mirror, remote) = vta::attach(&session, store, budget).await?;
             tracing::info!(context = %v.context, "the bridge's state and secrets are in the VTA");
             let task = tokio::spawn(mirror.run(remote, store.clone(), stop_rx.clone()));
-            (store, identity, Some((session, task)))
+            (store, identity, Some((session, task, docs)))
         }
     };
     tracing::info!(did = %identity.did(), vtc = %cfg.vtc_did, "starting the VGI bridge");
@@ -272,12 +273,13 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
 
     // VTA mode: pick up a rotation of the bridge's keys — on an interval,
     // and at once on SIGHUP.
-    let refresh = vta_parts.as_ref().map(|(session, _)| {
+    let refresh = vta_parts.as_ref().map(|(session, _, docs)| {
         let v = cfg.vta.clone().expect("VTA mode");
         tokio::spawn(vta::refresh_keys(
             Arc::clone(&bridge),
             session.clone(),
             v,
+            Arc::clone(docs),
             stop_rx.clone(),
         ))
     });
@@ -303,7 +305,7 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
     if let Some(r) = refresh {
         let _ = r.await;
     }
-    if let Some((session, mirror)) = vta_parts {
+    if let Some((session, mirror, _)) = vta_parts {
         // The mirror's last pass has run; say what did not make it.
         let _ = mirror.await;
         if let Some(m) = bridge.store.mirror()

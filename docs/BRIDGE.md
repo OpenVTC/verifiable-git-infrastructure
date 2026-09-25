@@ -231,17 +231,28 @@ same context, the bridge stops writing its state (fail closed), holds its
 results, logs why, and `/healthz` answers 503. Stop the other writer (revoke
 the credential if it is not yours) and restart this bridge.
 
-**Key rotation.** When the VTA rotates the bridge's keys (a `did:webvh` log
-update), the bridge picks the new ones up within `key_refresh_secs`
-(default 60) — the check reads the keys' public halves; the secrets are
-exported again only when they changed — or at once on `SIGHUP`: from then on it signs with the new
-Ed25519 key, reconnects DIDComm with the new X25519 key, and drops the old
-keys from memory. A rotation that names another DID is refused (the VTC
-knows the bridge by its DID). The VTC caches the bridge's DID document for up
-to 5 minutes (VTI's resolver default): until its cache turns over it may
-refuse results signed with the new key — the outbox sends them again — and
-jobs it encrypts to the old key are not readable by the bridge — the VTC
-sends them again.
+**Key rotation.** The bridge's **current DID document** decides which of its
+keys it holds: every signing (`assertionMethod`) and key-agreement key the
+document lists, with the same public key, and nothing else. The private
+halves come from the VTA; one the VTA no longer releases but the document
+still lists stays in memory. The newest listed signing key the VTA releases
+signs.
+
+Every `key_refresh_secs` (default 60), or at once on `SIGHUP`, the bridge
+compares the key list and the document. It reads public halves only and
+exports the secrets again only when something changed. Through a planned
+rotation that means:
+
+1. The VTA mints the successor keys: not listed yet, so not used.
+2. The document lists old and new (the overlap): the bridge holds all of
+   them, signs with the new key, and DIDComm reconnects with every listed
+   key-agreement key, so a job encrypted to either key opens.
+3. The document stops listing the old keys (the end of the overlap): the
+   bridge drops them.
+
+No grace timer is involved; the overlap is the document's. A key whose id
+the document lists with another public key is not used, and a rotation that
+names another DID is refused (the VTC knows the bridge by its DID).
 
 **Recovering a lost host:** issue a new context credential (and revoke the
 old one), put it on the new host, and start the bridge on an empty data

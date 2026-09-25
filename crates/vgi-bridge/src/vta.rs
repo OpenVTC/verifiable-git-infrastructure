@@ -8,7 +8,9 @@
 //! - the bridge's DID (a `did:webvh` the VTA minted into the context) and its
 //!   keys — Ed25519 for Trust Task proofs, job results and Dependabot
 //!   re-signs, X25519 for DIDComm — are fetched into memory at start-up
-//!   ([`Session::identity`]) and never written to disk or logs. They are the
+//!   ([`Session::load_identity`]) and never written to disk or logs. Which
+//!   keys it holds is what its current DID document lists, through every
+//!   step of a rotation ([`refresh_keys`]). They are the
 //!   bridge's own keys: nothing the bridge signs claims the VTC's authority;
 //! - the GitHub App's credentials, webhook secrets and Forgejo tokens, and the
 //!   bridge's own state (namespaces, managed repositories, pins, the
@@ -26,6 +28,7 @@
 //! own context, so it reaches no other context — the VTC's included — and no
 //! unscoped key. `vgi-bridge vta setup` checks that it sees no other context.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,18 +209,35 @@ impl Session {
         self.client.shutdown().await;
     }
 
-    /// The bridge's identity: its context's DID and that DID's secrets,
-    /// fetched in one call and held in memory only. `want`: the DID the
-    /// config names, which the context's must be.
-    pub async fn identity(&self, want: Option<&str>) -> Result<BridgeIdentity> {
+    /// The bridge's identity: its context's DID, and the keys of it the
+    /// bridge holds — every signing (`assertionMethod`) and key-agreement
+    /// key the DID's **current document** lists, with its private half from
+    /// the VTA or, for a key the VTA no longer releases but the document
+    /// still lists (a rotation's overlap), from `held`. A key the document
+    /// does not list is not held, whatever the VTA exports; a key it stops
+    /// listing is dropped. The newest signing key the VTA still exports
+    /// signs. Fetched in one call and held in memory only. `want`: the DID
+    /// the config names, which the context's must be.
+    pub async fn load_identity(
+        &self,
+        want: Option<&str>,
+        docs: &dyn DidDocuments,
+        held: Option<&BridgeIdentity>,
+    ) -> Result<BridgeIdentity> {
         let mut bundle = self
             .client
             .fetch_did_secrets_bundle(&self.context)
             .await
             .map_err(|e| explain(e, &self.context, "fetching the bridge's keys"))?;
-        let identity = identity_from_bundle(&mut bundle, want);
+        let out = async {
+            check_did(&bundle.did, want)?;
+            let created = key_ages(self, &bundle.did).await?;
+            let doc = docs.current(&bundle.did).await?;
+            reconcile(&bundle, held, &doc, &created)
+        }
+        .await;
         wipe(&mut bundle);
-        identity
+        out
     }
 
     /// The key the bridge seals its secrets with before they go to
@@ -293,25 +313,78 @@ impl Session {
     }
 }
 
-/// Fetch the bridge's keys again and put them in service if the VTA rotated
-/// them ([`crate::Bridge::replace_identity`]); the old ones are dropped. One
-/// check; `Ok(true)` if the keys changed.
+/// Where the bridge reads its own DID document: as published **now**,
+/// never a cached copy — the document decides which keys the bridge holds.
+#[async_trait]
+pub trait DidDocuments: Send + Sync {
+    /// `did`'s current document.
+    async fn current(&self, did: &str) -> Result<Value>;
+}
+
+/// The production [`DidDocuments`]: the DID resolver, with the DID evicted
+/// from its cache before every read.
+pub struct Resolver(Arc<affinidi_tdk::did_resolver::DIDCacheClient>);
+
+impl Resolver {
+    /// A resolver of its own.
+    pub async fn new() -> Result<Self> {
+        use affinidi_tdk::did_resolver::DIDCacheClient;
+        use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
+        Ok(Resolver(Arc::new(
+            DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .context("building the DID resolver")?,
+        )))
+    }
+}
+
+#[async_trait]
+impl DidDocuments for Resolver {
+    async fn current(&self, did: &str) -> Result<Value> {
+        let _ = self.0.remove(did).await;
+        let r = self
+            .0
+            .resolve(did)
+            .await
+            .map_err(|e| anyhow!("resolving the bridge's DID `{did}`: {e}"))?;
+        Ok(serde_json::to_value(&r.doc)?)
+    }
+}
+
+/// Check the VTA again and put the result in service
+/// ([`crate::Bridge::replace_identity`]): keys the document now lists are
+/// taken up, keys it stopped listing are dropped. `Ok(true)` if the keys in
+/// service changed.
 pub async fn refresh_once(
     bridge: &crate::Bridge,
     session: &Session,
     cfg: &VtaConfig,
+    docs: &dyn DidDocuments,
 ) -> Result<bool> {
-    let fresh = session.identity(cfg.did.as_deref()).await?;
+    let held = bridge.identity();
+    let fresh = session
+        .load_identity(cfg.did.as_deref(), docs, Some(&held))
+        .await?;
     let changed = bridge.replace_identity(fresh)?;
     if changed {
-        tracing::info!(did = %bridge.did(), "the VTA rotated the bridge's keys; the new ones are in service");
+        let now = bridge.identity();
+        tracing::info!(
+            did = %bridge.did(),
+            keys = now.messaging_secrets().len(),
+            signing = %now.signing_key_id(),
+            "the bridge's keys changed (a rotation); the ones its DID document lists are in service"
+        );
     }
     Ok(changed)
 }
 
-/// The public side of the DID's keys as the VTA lists them (id, public
-/// key): what a rotation changes. Reading it exports nothing.
-async fn published_keys(session: &Session, did: &str) -> Result<Vec<(String, String)>> {
+/// What a rotation changes, without exporting anything: the DID's keys as
+/// the VTA lists them, and the keys its document lists.
+async fn fingerprint(
+    session: &Session,
+    did: &str,
+    docs: &dyn DidDocuments,
+) -> Result<(Vec<(String, String)>, Listed)> {
     let listed = session
         .client
         .list_keys(0, 1000, Some("active"), Some(&session.context))
@@ -325,25 +398,45 @@ async fn published_keys(session: &Session, did: &str) -> Result<Vec<(String, Str
         .map(|k| (k.key_id, k.public_key))
         .collect();
     keys.sort();
-    Ok(keys)
+    Ok((keys, listed_keys(did, &docs.current(did).await?)?))
 }
 
-/// Serve until `stop`: every `cfg.key_refresh_secs`, look at the DID's keys
-/// as the VTA lists them (public halves only), and fetch the secrets again
-/// ([`refresh_once`]) only when they changed — so the VTA's audit log shows
-/// an export per rotation, not per minute. SIGHUP fetches at once. A failed
-/// check keeps the keys in service and tries again at the next tick.
+/// When each of the DID's keys was created in the VTA (for "newest").
+async fn key_ages(session: &Session, did: &str) -> Result<BTreeMap<String, i64>> {
+    let listed = session
+        .client
+        .list_keys(0, 1000, Some("active"), Some(&session.context))
+        .await
+        .map_err(|e| explain(e, &session.context, "listing the context's keys"))?;
+    let prefix = format!("{did}#");
+    Ok(listed
+        .keys
+        .into_iter()
+        .filter(|k| k.key_id.starts_with(&prefix))
+        .map(|k| (k.key_id, k.created_at.timestamp_millis()))
+        .collect())
+}
+
+/// Serve until `stop`: every `cfg.key_refresh_secs`, compare the DID's keys
+/// as the VTA lists them and as its current document lists them (public
+/// halves only), and re-fetch the secrets ([`refresh_once`]) only when
+/// either changed — so the VTA's audit log shows an export per rotation
+/// step, not per minute. SIGHUP re-fetches at once. A failed check keeps
+/// the keys in service and tries again at the next tick.
 pub async fn refresh_keys(
     bridge: Arc<crate::Bridge>,
     session: Session,
     cfg: VtaConfig,
+    docs: Arc<dyn DidDocuments>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let every = Duration::from_secs(cfg.key_refresh_secs.max(30));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     #[cfg(unix)]
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
-    let mut last = published_keys(&session, bridge.did()).await.ok();
+    let mut last = fingerprint(&session, bridge.did(), docs.as_ref())
+        .await
+        .ok();
     loop {
         #[cfg(unix)]
         let hangup = async {
@@ -359,25 +452,25 @@ pub async fn refresh_keys(
         let forced = tokio::select! {
             _ = tick.tick() => false,
             _ = hangup => {
-                tracing::info!("SIGHUP: checking the VTA for rotated keys");
+                tracing::info!("SIGHUP: checking the VTA and the DID document for rotated keys");
                 true
             }
             _ = stop.changed() => return,
         };
-        let now = match published_keys(&session, bridge.did()).await {
+        let now = match fingerprint(&session, bridge.did(), docs.as_ref()).await {
             Ok(k) => Some(k),
             Err(e) => {
-                tracing::warn!(error = %e, "could not check the VTA for rotated keys; the current ones stay in service");
+                tracing::warn!(error = %e, "could not check for rotated keys; the current ones stay in service");
                 continue;
             }
         };
         if !forced && now == last {
             continue;
         }
-        match refresh_once(&bridge, &session, &cfg).await {
+        match refresh_once(&bridge, &session, &cfg, docs.as_ref()).await {
             Ok(_) => last = now,
             Err(e) => {
-                tracing::warn!(error = %e, "could not fetch the rotated keys; the current ones stay in service")
+                tracing::warn!(error = %e, "could not take up the rotated keys; the current ones stay in service")
             }
         }
     }
@@ -399,38 +492,161 @@ fn derive_seal(seed: &[u8; 32]) -> Result<MasterKey> {
     Ok(MasterKey::from_bytes(*out))
 }
 
-/// The identity a bundle carries: its Ed25519 signing key (the lowest-
-/// numbered, `#key-0` for the default template) first, its X25519
-/// key-agreement key, nothing of another DID.
-fn identity_from_bundle(
-    bundle: &mut DidSecretsBundle,
-    want: Option<&str>,
-) -> Result<BridgeIdentity> {
+/// The context's DID must be one, and the one the config names (if any).
+fn check_did(did: &str, want: Option<&str>) -> Result<()> {
     if let Some(w) = want
-        && w != bundle.did
+        && w != did
     {
         bail!(
-            "the VTA context's DID is `{}`, but `vta.did` names `{w}`: point the bridge at the \
-             right context, or correct `vta.did`",
-            bundle.did
+            "the VTA context's DID is `{did}`, but `vta.did` names `{w}`: point the bridge at the \
+             right context, or correct `vta.did`"
         );
     }
-    if !bundle.did.starts_with("did:") {
+    if !did.starts_with("did:") {
         bail!("the VTA context has no DID yet: provision one for the bridge (see BRIDGE.md)");
     }
-    bundle.secrets.sort_by_key(|s| {
-        let n = s
-            .key_id
-            .rsplit_once("#key-")
-            .and_then(|(_, n)| n.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
+    Ok(())
+}
+
+/// The keys a DID document lists, by verification-method id: its
+/// `assertionMethod` (signing) and `keyAgreement` keys, each with its raw
+/// public key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Listed {
+    signing: BTreeMap<String, Vec<u8>>,
+    agreement: BTreeMap<String, Vec<u8>>,
+}
+
+/// Read [`Listed`] from `doc` (ids made absolute against `did`; references
+/// and embedded methods both; `publicKeyMultibase` keys only).
+pub(crate) fn listed_keys(did: &str, doc: &Value) -> Result<Listed> {
+    let abs = |id: &str| {
+        if id.starts_with('#') {
+            format!("{did}{id}")
+        } else {
+            id.to_string()
+        }
+    };
+    let key_of = |vm: &Value| -> Option<(String, Vec<u8>)> {
+        let id = abs(vm.get("id")?.as_str()?);
+        let mb = vm.get("publicKeyMultibase")?.as_str()?;
+        let (_, raw) = multibase::decode(mb).ok()?;
+        // Multicodec-prefixed (ed25519-pub 0xed01, x25519-pub 0xec01) or bare.
+        let bytes = match raw.as_slice() {
+            [0xed, 0x01, rest @ ..] | [0xec, 0x01, rest @ ..] if rest.len() == 32 => rest.to_vec(),
+            r if r.len() == 32 => r.to_vec(),
+            _ => return None,
+        };
+        Some((id, bytes))
+    };
+    let methods: BTreeMap<String, Vec<u8>> = doc
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(key_of).collect())
+        .unwrap_or_default();
+    let relation = |name: &str| -> BTreeMap<String, Vec<u8>> {
+        doc.get(name)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| match e {
+                        Value::String(r) => {
+                            let id = abs(r);
+                            methods.get(&id).map(|k| (id, k.clone()))
+                        }
+                        other => key_of(other),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(Listed {
+        signing: relation("assertionMethod"),
+        agreement: relation("keyAgreement"),
+    })
+}
+
+/// The keys to hold: of what the VTA exports now (`fetched`) and what the
+/// bridge already holds (`held`), exactly those the document lists under
+/// the right relationship **with the same public key**. The newest listed
+/// signing key the VTA still exports signs (by its creation in the VTA,
+/// then its `#key-N` number); if the VTA exports none, the newest one held.
+fn reconcile(
+    fetched: &DidSecretsBundle,
+    held: Option<&BridgeIdentity>,
+    doc: &Value,
+    created: &BTreeMap<String, i64>,
+) -> Result<BridgeIdentity> {
+    use affinidi_tdk::affinidi_crypto::KeyType;
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    let did = fetched.did.as_str();
+    let listed = listed_keys(did, doc)?;
+    let prefix = format!("{did}#");
+    let exported: Vec<Secret> = vta_sdk::did_key::secrets_from_bundle(fetched)
+        .map_err(|e| anyhow!("DID secrets bundle: {e}"))?;
+    let exported_ids: std::collections::BTreeSet<String> =
+        exported.iter().map(|s| s.id.clone()).collect();
+    let mut candidates: BTreeMap<String, Secret> = BTreeMap::new();
+    if let Some(h) = held
+        && h.did() == did
+    {
+        for s in h.secrets() {
+            candidates.insert(s.id.clone(), s.clone());
+        }
+    }
+    for s in exported {
+        candidates.insert(s.id.clone(), s);
+    }
+    let keep: Vec<Secret> = candidates
+        .into_values()
+        .filter(|s| s.id.starts_with(&prefix))
+        .filter(|s| {
+            let want = match s.get_key_type() {
+                KeyType::Ed25519 => listed.signing.get(&s.id),
+                KeyType::X25519 => listed.agreement.get(&s.id),
+                _ => None,
+            };
+            let ok = want.is_some_and(|p| p.as_slice() == s.get_public_bytes());
+            if want.is_some() && !ok {
+                tracing::warn!(key = %s.id, "the DID document lists another public key under this id; not using it");
+            }
+            ok
+        })
+        .collect();
+    let number = |id: &str| {
+        id.rsplit_once("#key-")
+            .and_then(|(_, n)| n.parse::<i64>().ok())
+            .unwrap_or(-1)
+    };
+    let age = |s: &Secret| {
         (
-            s.key_type != vta_sdk::keys::KeyType::Ed25519,
-            n,
-            s.key_id.clone(),
+            created.get(&s.id).copied().unwrap_or(i64::MIN),
+            number(&s.id),
         )
-    });
-    BridgeIdentity::from_bundle(bundle)
+    };
+    let signing_candidates: Vec<&Secret> = keep
+        .iter()
+        .filter(|s| s.get_key_type() == KeyType::Ed25519)
+        .collect();
+    let signing = signing_candidates
+        .iter()
+        .filter(|s| exported_ids.contains(&s.id))
+        .max_by_key(|s| age(s))
+        .or_else(|| signing_candidates.iter().max_by_key(|s| age(s)))
+        .map(|s| (*s).clone())
+        .with_context(|| {
+            format!(
+                "the DID document of `{did}` lists no signing (assertionMethod) key the bridge \
+                 holds a private key for"
+            )
+        })?;
+    if !keep.iter().any(|s| s.get_key_type() == KeyType::X25519) {
+        bail!(
+            "the DID document of `{did}` lists no key-agreement key the bridge holds a private \
+             key for; DIDComm needs one"
+        );
+    }
+    BridgeIdentity::from_secrets(did, signing, keep)
 }
 
 /// Overwrite a bundle's key material.
@@ -684,7 +900,12 @@ impl SetupReport {
 /// Verify a VTA context is ready for the bridge: it exists and has a DID
 /// with an Ed25519 and an X25519 key, the credential can fetch them and use
 /// app-state, and it reaches no other context.
-pub async fn setup(session: &Session, cfg: &VtaConfig, mediator_did: &str) -> SetupReport {
+pub async fn setup(
+    session: &Session,
+    cfg: &VtaConfig,
+    mediator_did: &str,
+    docs: &dyn DidDocuments,
+) -> SetupReport {
     let mut r = SetupReport::default();
     let ctx = session.context().to_string();
     match session.context_did().await {
@@ -702,10 +923,15 @@ pub async fn setup(session: &Session, cfg: &VtaConfig, mediator_did: &str) -> Se
             return r;
         }
     }
-    match session.identity(cfg.did.as_deref()).await {
+    match session.load_identity(cfg.did.as_deref(), docs, None).await {
         Ok(id) => {
             r.did = id.did().to_string();
-            r.ok("the credential fetches the DID's Ed25519 and X25519 keys (held in memory only)");
+            r.ok(format!(
+                "the credential fetches the DID's keys, and its current document lists {} of \
+                 them (signing with `{}`); held in memory only",
+                id.messaging_secrets().len(),
+                id.signing_key_id()
+            ));
             match crate::identity::check_reachable(id.did(), mediator_did) {
                 Ok(None) => {}
                 Ok(Some(w)) => r.warn(w),
@@ -835,6 +1061,70 @@ pub(crate) mod testing {
         pub forbid_secrets: bool,
         /// Keys created in the context: id, label, private multibase.
         keys_made: Mutex<Vec<(String, String, String)>>,
+        /// The DID's keys the VTA has ever held: id → (key type, created
+        /// at, millis). Listed while the bundle carries them.
+        did_keys: Mutex<BTreeMap<String, (String, i64)>>,
+    }
+
+    /// The bridge's DID document as published, set by the test.
+    pub struct FakeDocs(pub Mutex<Value>);
+
+    impl FakeDocs {
+        pub fn listing(did: &str, bundles: &[&DidSecretsBundle]) -> Arc<Self> {
+            Arc::new(FakeDocs(Mutex::new(doc_for(did, bundles))))
+        }
+        /// Publish a new document listing `bundles`' keys.
+        pub fn publish(&self, did: &str, bundles: &[&DidSecretsBundle]) {
+            *self.0.lock().unwrap() = doc_for(did, bundles);
+        }
+    }
+
+    #[async_trait]
+    impl DidDocuments for FakeDocs {
+        async fn current(&self, _did: &str) -> Result<Value> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    /// A DID document listing every key of `bundles`: Ed25519 keys under
+    /// `assertionMethod`, X25519 under `keyAgreement`.
+    pub fn doc_for(did: &str, bundles: &[&DidSecretsBundle]) -> Value {
+        use affinidi_tdk::secrets_resolver::secrets::Secret;
+        let mut vms = Vec::new();
+        let (mut sign, mut agree) = (Vec::new(), Vec::new());
+        for b in bundles {
+            for e in &b.secrets {
+                let secret =
+                    Secret::from_multibase(&e.private_key_multibase, Some(&e.key_id)).unwrap();
+                let prefix: [u8; 2] = match e.key_type {
+                    vta_sdk::keys::KeyType::Ed25519 => {
+                        sign.push(json!(e.key_id));
+                        [0xed, 0x01]
+                    }
+                    _ => {
+                        agree.push(json!(e.key_id));
+                        [0xec, 0x01]
+                    }
+                };
+                let mut raw = prefix.to_vec();
+                raw.extend_from_slice(secret.get_public_bytes());
+                vms.push(json!({
+                    "id": e.key_id, "type": "Multikey", "controller": did,
+                    "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, raw),
+                }));
+            }
+        }
+        json!({
+            "id": did, "verificationMethod": vms,
+            "assertionMethod": sign, "authentication": sign.clone(), "keyAgreement": agree,
+        })
+    }
+
+    /// Two bundles' keys as one (the VTA holding both during a rotation).
+    pub fn merged(a: &DidSecretsBundle, b: &DidSecretsBundle) -> DidSecretsBundle {
+        let mut out = a.clone();
+        out.secrets.extend(b.secrets.iter().cloned());
+        out
     }
 
     /// The wire form of a DID secrets bundle.
@@ -852,9 +1142,14 @@ pub(crate) mod testing {
     /// A fresh key pair for `did` (a `did:webvh` stand-in: `#key-0`
     /// Ed25519, `#key-1` X25519), as a secrets bundle.
     pub fn webvh_bundle(did: &str) -> DidSecretsBundle {
+        webvh_bundle_from(did, 0)
+    }
+
+    /// As [`webvh_bundle`], numbered from `#key-{first}`.
+    pub fn webvh_bundle_from(did: &str, first: usize) -> DidSecretsBundle {
         let (_, mut b) = BridgeIdentity::generate_did_peer("did:web:mediator.example").unwrap();
         for (i, e) in b.secrets.iter_mut().enumerate() {
-            e.key_id = format!("{did}#key-{i}");
+            e.key_id = format!("{did}#key-{}", first + i);
         }
         b.did = did.to_string();
         b
@@ -870,7 +1165,27 @@ pub(crate) mod testing {
                 state: Mutex::new((0, BTreeMap::new())),
                 forbid_secrets: false,
                 keys_made: Mutex::new(Vec::new()),
+                did_keys: Mutex::new(Self::ages(&BTreeMap::new(), bundle)),
             }
+        }
+
+        fn ages(
+            known: &BTreeMap<String, (String, i64)>,
+            bundle: &DidSecretsBundle,
+        ) -> BTreeMap<String, (String, i64)> {
+            let mut out = known.clone();
+            let mut next = known.values().map(|(_, t)| *t).max().unwrap_or(0);
+            for e in &bundle.secrets {
+                out.entry(e.key_id.clone()).or_insert_with(|| {
+                    next += 1000;
+                    let ty = match e.key_type {
+                        vta_sdk::keys::KeyType::Ed25519 => "ed25519",
+                        _ => "x25519",
+                    };
+                    (ty.to_string(), next)
+                });
+            }
+            out
         }
 
         pub fn session(self: &Arc<Self>) -> Session {
@@ -878,8 +1193,10 @@ pub(crate) mod testing {
             Session::from_client(VtaClient::loopback(sink), self.context.clone())
         }
 
-        /// The VTA rolls the DID's keys (a webvh log update).
+        /// The VTA now holds (and releases) exactly `bundle`'s keys.
         pub fn rotate(&self, bundle: &DidSecretsBundle) {
+            let mut ages = self.did_keys.lock().unwrap();
+            *ages = Self::ages(&ages, bundle);
             *self.bundle.lock().unwrap() = bundle_json(bundle);
         }
 
@@ -927,12 +1244,28 @@ pub(crate) mod testing {
                 }
                 u if u == tt::TASK_KEYS_LIST_0_1 => {
                     let keys = self.keys_made.lock().unwrap();
-                    Ok(json!({ "keys": keys.iter().map(|(id, label, _)| json!({
+                    let mut out: Vec<Value> = keys.iter().map(|(id, label, _)| json!({
                         "keyId": id, "derivationPath": "m/1", "keyType": "ed25519",
                         "status": "active", "publicKey": "z", "label": label,
                         "contextId": self.context,
                         "createdAt": "2026-09-25T00:00:00Z", "updatedAt": "2026-09-25T00:00:00Z",
-                    })).collect::<Vec<_>>(), "total": keys.len() }))
+                    })).collect();
+                    let bundle = self.bundle.lock().unwrap().clone();
+                    let ages = self.did_keys.lock().unwrap();
+                    for e in bundle["secrets"].as_array().unwrap() {
+                        let id = e["keyId"].as_str().unwrap();
+                        let (ty, at) = ages[id].clone();
+                        let at = chrono::DateTime::from_timestamp_millis(1_790_000_000_000 + at)
+                            .unwrap()
+                            .to_rfc3339();
+                        out.push(json!({
+                            "keyId": id, "derivationPath": "m/2", "keyType": ty,
+                            "status": "active", "publicKey": format!("z{id}"),
+                            "contextId": self.context, "createdAt": at, "updatedAt": at,
+                        }));
+                    }
+                    let total = out.len();
+                    Ok(json!({ "keys": out, "total": total }))
                 }
                 u if u == tt::TASK_KEYS_CREATE_0_1 => {
                     let mut keys = self.keys_made.lock().unwrap();
@@ -1039,9 +1372,10 @@ mod tests {
 
     const MEDIATOR: &str = "did:web:mediator.acme-vtc.example";
 
-    fn fake() -> (Arc<FakeVta>, BridgeIdentity) {
+    fn fake() -> (Arc<FakeVta>, BridgeIdentity, Arc<super::testing::FakeDocs>) {
         let (id, bundle) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
-        (Arc::new(FakeVta::new("vgi-bridge", &bundle)), id)
+        let docs = super::testing::FakeDocs::listing(id.did(), &[&bundle]);
+        (Arc::new(FakeVta::new("vgi-bridge", &bundle)), id, docs)
     }
 
     #[test]
@@ -1064,9 +1398,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_identity_comes_from_the_context_and_signs_as_before() {
-        let (vta, minted) = fake();
+        let (vta, minted, docs) = fake();
         let s = vta.session();
-        let id = s.identity(None).await.unwrap();
+        let id = s.load_identity(None, docs.as_ref(), None).await.unwrap();
         assert_eq!(id.did(), minted.did());
         assert_eq!(id.messaging_secrets().len(), 2);
         assert_eq!(
@@ -1075,19 +1409,30 @@ mod tests {
         );
         // The config naming another DID is refused.
         let err = s
-            .identity(Some("did:webvh:QmOther:x.example"))
+            .load_identity(Some("did:webvh:QmOther:x.example"), docs.as_ref(), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("vta.did"), "{err}");
+        // A document that lists none of the keys the VTA releases: refused.
+        *docs.0.lock().unwrap() = json!({ "id": id.did() });
+        let err = s
+            .load_identity(None, docs.as_ref(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lists no signing"), "{err}");
     }
 
     #[tokio::test]
     async fn a_credential_without_key_export_is_told_what_role_it_needs() {
         let (id, bundle) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
-        let _ = id;
+        let docs = super::testing::FakeDocs::listing(id.did(), &[&bundle]);
         let mut f = FakeVta::new("vgi-bridge", &bundle);
         f.forbid_secrets = true;
-        let err = Arc::new(f).session().identity(None).await.unwrap_err();
+        let err = Arc::new(f)
+            .session()
+            .load_identity(None, docs.as_ref(), None)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("--role admin --contexts vgi-bridge"),
@@ -1097,7 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_state_round_trips_with_versions_and_conflicts() {
-        let (vta, _) = fake();
+        let (vta, _, _) = fake();
         let remote = VtaAppState::new(&vta.session());
         let v1 = remote.put("state/meta/a", json!(1), Some(0)).await.unwrap();
         assert!(matches!(
@@ -1120,7 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_host_rebuilds_from_the_vta() {
-        let (vta, _) = fake();
+        let (vta, _, _) = fake();
         let session = vta.session();
         let store = Store::in_memory(MasterKey::generate().unwrap()).unwrap();
         let (store, mirror, remote) = attach(&session, store, Duration::from_secs(1))
@@ -1163,6 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn setup_checks_the_context_and_warns_about_a_wide_credential() {
         let (id, bundle) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
+        let docs = super::testing::FakeDocs::listing(id.did(), &[&bundle]);
         let mut f = FakeVta::new("vgi-bridge", &bundle);
         let cfg: VtaConfig =
             toml::from_str("context = \"vgi-bridge\"\ncredential_file = \"/x\"").unwrap();
@@ -1170,6 +1516,7 @@ mod tests {
             &Arc::new(FakeVta::new("vgi-bridge", &bundle)).session(),
             &cfg,
             MEDIATOR,
+            docs.as_ref(),
         )
         .await;
         assert!(!r.failed, "{:#?}", r.lines);
@@ -1183,7 +1530,7 @@ mod tests {
         );
 
         f.contexts.push("vtc".into());
-        let r = setup(&Arc::new(f).session(), &cfg, MEDIATOR).await;
+        let r = setup(&Arc::new(f).session(), &cfg, MEDIATOR, docs.as_ref()).await;
         assert!(
             r.lines
                 .iter()
@@ -1245,16 +1592,21 @@ mod tests {
         trust_tasks_proof::affinidi::Verifier::with_resolver(Arc::new(Published(map)))
     }
 
-    /// The VTA rolls the bridge's keys: the bridge picks the new ones up,
-    /// signs with them, drops the old ones, and jobs keep flowing.
+    /// A rotation, step by step: the bridge holds every key its current DID
+    /// document lists, signs with the newest, keeps the old ones while the
+    /// document still lists them (a message encrypted to either opens), and
+    /// drops a key only when the document stops listing it. Jobs keep
+    /// flowing throughout.
     #[tokio::test]
-    async fn a_key_rotation_in_the_vta_puts_the_new_keys_in_service() {
-        use super::testing::webvh_bundle;
+    async fn the_bridge_holds_what_its_did_document_lists_through_a_rotation() {
+        use super::testing::{FakeDocs, merged, webvh_bundle_from};
         use crate::transport::InboundDoc;
         use crate::transport::memory::ChannelLink;
         const DID: &str = "did:webvh:QmBridge:bridge.acme.example";
-        let before = webvh_bundle(DID);
-        let vta = Arc::new(FakeVta::new("vgi-bridge", &before));
+        let old_keys = webvh_bundle_from(DID, 0);
+        let new_keys = webvh_bundle_from(DID, 2);
+        let vta = Arc::new(FakeVta::new("vgi-bridge", &old_keys));
+        let docs = FakeDocs::listing(DID, &[&old_keys]);
         let session = vta.session();
         let cfg_vta: VtaConfig =
             toml::from_str("context = \"vgi-bridge\"\ncredential_file = \"/x\"").unwrap();
@@ -1273,7 +1625,10 @@ version = "v0.5.0"
             vtc.did()
         ))
         .unwrap();
-        let identity = session.identity(None).await.unwrap();
+        let identity = session
+            .load_identity(None, docs.as_ref(), None)
+            .await
+            .unwrap();
         let old = identity.clone();
         let store = Store::in_memory(MasterKey::generate().unwrap()).unwrap();
         let (link, mut inbox) = ChannelLink::new();
@@ -1286,78 +1641,130 @@ version = "v0.5.0"
             Arc::new(trust_tasks_proof::affinidi::Verifier::for_did_key()),
         ));
         let rotations = bridge.rotations();
-
-        // A job in; its answer, signed.
-        let job = |n: u32| {
-            let vtc = vtc.clone();
-            async move {
-                let id = crate::wire::new_id();
-                let doc = json!({
-                    "id": id, "type": "https://trusttasks.org/spec/git-ns/bridge/job/0.1",
-                    "threadId": id, "issuer": vtc.did(), "recipient": DID,
-                    "issuedAt": chrono::Utc::now().to_rfc3339(),
-                    "payload": { "jobId": format!("job_{n}"), "namespace": "ns_unknown",
-                                 "kind": "inspect", "repo": "github.com/acme/widgets" },
-                });
-                vtc.sign(&doc).await.unwrap()
-            }
+        let ids = |b: &crate::Bridge| -> Vec<String> {
+            let mut v: Vec<String> = b
+                .identity()
+                .messaging_secrets()
+                .iter()
+                .map(|s| s.id.rsplit('#').next().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
         };
-        let answer = |inbox: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Value)>| {
+
+        let mut n = 0;
+        let mut answer = async |bridge: &Arc<crate::Bridge>| -> Value {
+            n += 1;
+            let id = crate::wire::new_id();
+            let doc = json!({
+                "id": id, "type": "https://trusttasks.org/spec/git-ns/bridge/job/0.1",
+                "threadId": id, "issuer": vtc.did(), "recipient": DID,
+                "issuedAt": chrono::Utc::now().to_rfc3339(),
+                "payload": { "jobId": format!("job_{n}"), "namespace": "ns_unknown",
+                             "kind": "inspect", "repo": "github.com/acme/widgets" },
+            });
+            let doc = vtc.sign(&doc).await.unwrap();
+            let arc = bridge;
+            arc.handle_inbound(InboundDoc {
+                doc,
+                authenticated_sender: Some(vtc.did().into()),
+            })
+            .await;
             inbox.try_recv().expect("the bridge answered").1
         };
 
-        bridge
-            .handle_inbound(InboundDoc {
-                doc: job(1).await,
-                authenticated_sender: Some(vtc.did().into()),
-            })
-            .await;
-        let a1 = answer(&mut inbox);
+        let a = answer(&bridge).await;
         published(&old)
-            .verify_raw(&a1)
+            .verify_raw(&a)
             .await
-            .expect("signed with the key in service");
+            .expect("the key in service signs");
+        assert!(
+            !refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .unwrap()
+        );
 
-        // Nothing changed yet: no rotation.
-        assert!(!refresh_once(&bridge, &session, &cfg_vta).await.unwrap());
+        // 1. The VTA mints the successor keys, not yet in the document: not
+        //    held, not used.
+        vta.rotate(&merged(&old_keys, &new_keys));
+        assert!(
+            !refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids(&bridge), ["key-0", "key-1"]);
 
-        // The VTA rolls the keys.
-        let after = webvh_bundle(DID);
-        vta.rotate(&after);
-        assert!(refresh_once(&bridge, &session, &cfg_vta).await.unwrap());
+        // 2. The document lists both (the overlap): all four held, the
+        //    newest signs.
+        docs.publish(DID, &[&old_keys, &new_keys]);
+        assert!(
+            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .unwrap()
+        );
         assert!(
             rotations.has_changed().unwrap(),
-            "the DIDComm link is told to reconnect"
+            "DIDComm reconnects with every listed key"
         );
+        assert_eq!(ids(&bridge), ["key-0", "key-1", "key-2", "key-3"]);
         let new = bridge.identity();
-        assert!(!new.same_keys(&old));
-        assert_eq!(bridge.did(), DID, "a rotation keeps the DID");
-
-        bridge
-            .handle_inbound(InboundDoc {
-                doc: job(2).await,
-                authenticated_sender: Some(vtc.did().into()),
-            })
-            .await;
-        let a2 = answer(&mut inbox);
-        published(&new)
-            .verify_raw(&a2)
-            .await
-            .expect("signed with the new key");
         assert!(
-            published(&old).verify_raw(&a2).await.is_err(),
-            "the old key signs nothing any more"
+            new.signing_key_id().ends_with("#key-2"),
+            "{}",
+            new.signing_key_id()
         );
-        // The re-sign key moved too.
+        let a = answer(&bridge).await;
+        published(&new)
+            .verify_raw(&a)
+            .await
+            .expect("the newest key signs");
+        assert!(published(&old).verify_raw(&a).await.is_err());
+
+        // 3. The VTA stops releasing the old keys, but the document still
+        //    lists them: the bridge keeps its copies.
+        vta.rotate(&new_keys);
+        refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(ids(&bridge), ["key-0", "key-1", "key-2", "key-3"]);
+
+        // 4. The document stops listing them (the end of the overlap): gone.
+        docs.publish(DID, &[&new_keys]);
+        assert!(
+            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids(&bridge), ["key-2", "key-3"]);
+        let a = answer(&bridge).await;
+        published(&new)
+            .verify_raw(&a)
+            .await
+            .expect("jobs keep flowing");
         assert_eq!(
             bridge.identity().git_signing_key().unwrap().key.to_bytes(),
-            new.git_signing_key().unwrap().key.to_bytes()
+            new.git_signing_key().unwrap().key.to_bytes(),
+            "the re-sign key moved too"
         );
 
-        // A context that suddenly names another DID is refused, and the keys
-        // in service stay.
-        vta.rotate(&webvh_bundle("did:webvh:QmOther:elsewhere.example"));
-        assert!(refresh_once(&bridge, &session, &cfg_vta).await.is_err());
-        assert!(bridge.identity().same_keys(&new));
+        // A document whose key id carries another public key is not trusted
+        // with it, and a context that suddenly names another DID is refused;
+        // the keys in service stay.
+        let impostor = webvh_bundle_from(DID, 2);
+        docs.publish(DID, &[&impostor]);
+        assert!(
+            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .is_err()
+        );
+        let other = webvh_bundle_from("did:webvh:QmOther:elsewhere.example", 0);
+        docs.publish(DID, &[&new_keys]);
+        vta.rotate(&other);
+        assert!(
+            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+                .await
+                .is_err()
+        );
+        assert_eq!(ids(&bridge), ["key-2", "key-3"]);
     }
 }

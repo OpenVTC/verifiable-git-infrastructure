@@ -190,7 +190,13 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
         let out = async {
             match command {
                 Cmd::Vta { command: VtaCmd::Setup } | Cmd::Init => {
-                    let report = vgi_bridge::vta::setup(&session, v, &cfg.mediator_did).await;
+                    let report = vgi_bridge::vta::setup(
+                        &session,
+                        v,
+                        &cfg.mediator_did,
+                        &vgi_bridge::vta::Resolver::new().await?,
+                    )
+                    .await;
                     for l in &report.lines {
                         eprintln!("{l}");
                     }
@@ -201,7 +207,11 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
                     eprintln!("register this DID at the VTC as the bridge serving its namespaces");
                 }
                 Cmd::Identity { command: IdentityCmd::Show } => {
-                    println!("{}", session.identity(v.did.as_deref()).await?.did());
+                    let did = session
+                        .context_did()
+                        .await?
+                        .context("the VTA context has no DID yet")?;
+                    println!("{did}");
                 }
                 Cmd::Secret { command } => {
                     let remote = vgi_bridge::vta::VtaAppState::new(&session);

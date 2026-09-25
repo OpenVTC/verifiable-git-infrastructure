@@ -263,6 +263,41 @@ impl BridgeIdentity {
         &self.did
     }
 
+    /// An identity from secrets already checked against the DID's current
+    /// document (VTA mode, [`crate::vta`]): `signing` signs, every secret
+    /// goes to DIDComm (all the key-agreement keys the document lists, so a
+    /// message encrypted to any of them — during a rotation's overlap —
+    /// still opens).
+    pub fn from_secrets(did: &str, signing: Secret, secrets: Vec<Secret>) -> Result<Self> {
+        for s in &secrets {
+            if !s.id.starts_with(&format!("{did}#")) {
+                bail!("key `{}` does not belong to `{did}`", s.id);
+            }
+        }
+        if signing.get_key_type() != KeyType::Ed25519 || !secrets.iter().any(|s| s.id == signing.id)
+        {
+            bail!(
+                "the signing key `{}` is not an Ed25519 key of the set",
+                signing.id
+            );
+        }
+        Ok(BridgeIdentity {
+            did: did.to_string(),
+            signing,
+            secrets,
+        })
+    }
+
+    /// The verification method that signs.
+    pub fn signing_key_id(&self) -> &str {
+        &self.signing.id
+    }
+
+    /// Every secret held.
+    pub(crate) fn secrets(&self) -> &[Secret] {
+        &self.secrets
+    }
+
     /// Whether `other` holds the same keys (ids and public halves).
     pub fn same_keys(&self, other: &BridgeIdentity) -> bool {
         let keys = |i: &BridgeIdentity| {

@@ -80,6 +80,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
+# VTA mode reads the keys the bridge's DID document lists.
+multibase = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 

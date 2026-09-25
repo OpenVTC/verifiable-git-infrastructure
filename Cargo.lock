@@ -6910,6 +6910,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "multibase",
  "pgp",
  "rand 0.8.8",
  "redb",
