@@ -112,6 +112,8 @@ fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("vgi/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(30))
+        // Every URL here is https; a redirect must not downgrade it.
+        .https_only(true)
         .build()
         .context("HTTP client")
 }
@@ -130,19 +132,63 @@ async fn fetch_text(url: &str, accept: &str) -> Result<String> {
     resp.text().await.with_context(|| format!("reading {url}"))
 }
 
-/// The action pinned to the commit `tag` names.
+/// Annotated tags followed before giving up (a tag of a tag of …).
+const MAX_TAG_DEPTH: usize = 5;
+
+/// The `object` a git ref or annotated tag points at: its type and sha.
+fn git_object(v: &Value) -> Result<(String, String)> {
+    let obj = v
+        .get("object")
+        .ok_or_else(|| anyhow!("no `object` in GitHub's reply"))?;
+    let kind = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no object type in GitHub's reply"))?;
+    let sha = obj
+        .get("sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no object sha in GitHub's reply"))?;
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("`{sha}` is not a commit sha");
+    }
+    Ok((kind.to_string(), sha.to_ascii_lowercase()))
+}
+
+async fn fetch_json(url: &str) -> Result<Value> {
+    let text = fetch_text(url, "application/vnd.github+json").await?;
+    serde_json::from_str(&text).with_context(|| format!("{url} is not JSON"))
+}
+
+/// The action pinned to the commit `tag` names: the tag ref
+/// (`git/ref/tags/<tag>` — only a tag, never a branch of that name), with
+/// an annotated tag dereferenced to its commit.
 pub async fn resolve_action(tag: &str) -> Result<String> {
     check_tag(tag)?;
-    let url = format!("https://api.github.com/repos/{VGI_REPO}/commits/{tag}");
-    let sha = fetch_text(&url, "application/vnd.github.sha").await?;
-    let sha = sha.trim();
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("GitHub answered `{sha}` for the commit of {tag}; pass --verify-trust-action");
+    let api = format!("https://api.github.com/repos/{VGI_REPO}/git");
+    let fail = |e: anyhow::Error| {
+        anyhow!("could not resolve the tag {tag} of {VGI_REPO} ({e:#}); pass --verify-trust-action")
+    };
+    let mut obj = git_object(
+        &fetch_json(&format!("{api}/ref/tags/{tag}"))
+            .await
+            .map_err(fail)?,
+    )
+    .map_err(fail)?;
+    for _ in 0..MAX_TAG_DEPTH {
+        if obj.0 != "tag" {
+            break;
+        }
+        obj = git_object(
+            &fetch_json(&format!("{api}/tags/{}", obj.1))
+                .await
+                .map_err(fail)?,
+        )
+        .map_err(fail)?;
     }
-    Ok(format!(
-        "{VGI_REPO}/{ACTION_PATH}@{}",
-        sha.to_ascii_lowercase()
-    ))
+    match obj {
+        (kind, sha) if kind == "commit" => Ok(format!("{VGI_REPO}/{ACTION_PATH}@{sha}")),
+        (kind, _) => Err(fail(anyhow!("the tag names a {kind}, not a commit"))),
+    }
 }
 
 /// The SHA-256 the release publishes next to its Linux x86-64 tarball.
@@ -223,6 +269,21 @@ mod tests {
         ]});
         assert_eq!(registry_referral(&doc), None);
         assert_eq!(registry_referral(&json!({})), None);
+    }
+
+    #[test]
+    fn git_objects_are_read_from_refs_and_annotated_tags() {
+        let sha = "0123456789ABCDEF0123456789abcdef01234567";
+        let r = json!({ "ref": "refs/tags/v1", "object": { "type": "tag", "sha": sha } });
+        assert_eq!(
+            git_object(&r).unwrap(),
+            ("tag".into(), sha.to_ascii_lowercase())
+        );
+        let t = json!({ "tag": "v1", "object": { "type": "commit", "sha": sha } });
+        assert_eq!(git_object(&t).unwrap().0, "commit");
+        assert!(git_object(&json!({ "object": { "type": "commit", "sha": "abc" } })).is_err());
+        // A list of refs (what `git/refs` answers) is not one ref.
+        assert!(git_object(&json!([{ "object": { "type": "commit", "sha": sha } }])).is_err());
     }
 
     #[test]

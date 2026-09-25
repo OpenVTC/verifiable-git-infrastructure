@@ -45,13 +45,21 @@ impl std::fmt::Debug for Client {
 
 /// `https://<host>/`, or `base` checked the way the adapter checks its
 /// instance URL: `https`, or `http` only on loopback (the token travels on
-/// every request).
+/// every request). `base` must be on `host`, the repository's own host (any
+/// port), so the token never goes to a server the resource does not name.
 pub fn base_url(host: &str, base: Option<&Url>) -> Result<Url> {
     let mut url = match base {
         Some(u) => u.clone(),
         None => Url::parse(&format!("https://{host}/")).context("instance URL")?,
     };
     let h = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if !h.eq_ignore_ascii_case(host) {
+        bail!(
+            "--forgejo-url `{url}` is on `{h}`, but the repository is on `{host}`. {TOKEN_ENV} \
+             is sent to --forgejo-url, so it must be the repository's own host; give --resource \
+             as <instance-host>/<owner>/<repo>"
+        );
+    }
     let loopback = matches!(h.as_str(), "localhost" | "127.0.0.1" | "[::1]");
     match url.scheme() {
         "https" => {}
@@ -68,8 +76,53 @@ pub fn base_url(host: &str, base: Option<&Url>) -> Result<Url> {
 }
 
 impl Client {
-    /// A client for the instance at `base` (see [`base_url`]).
-    pub fn new(base: &Url, token: String) -> Result<Self> {
+    /// Connect to the instance at `base` (see [`base_url`]): ask it for
+    /// `GET /api/v1/version` *without* the token, and hand back a client
+    /// carrying the token only if the answer is Forgejo's or Gitea's (JSON
+    /// with a `version` string). `auto`: the forge was guessed from the
+    /// host (`--forge auto`), so a failure suggests `--forge`.
+    pub async fn connect(base: &Url, token: String, auto: bool) -> Result<(Self, InstanceInfo)> {
+        let c = Client::new(base, token)?;
+        match c.version().await {
+            Ok(info) => Ok((c, info)),
+            Err(why) if auto => bail!(
+                "{base} did not answer GET /api/v1/version as Forgejo or Gitea ({why:#}), so \
+                 {TOKEN_ENV} was not sent to it. `--forge auto` takes any host other than \
+                 github.com for Forgejo: pass --forge github for GitHub Enterprise Server, or \
+                 --forge forgejo with --forgejo-url if the instance lives under a sub-path"
+            ),
+            Err(why) => bail!(
+                "{base} did not answer GET /api/v1/version as Forgejo or Gitea ({why:#}), so \
+                 {TOKEN_ENV} was not sent to it; check --forgejo-url"
+            ),
+        }
+    }
+
+    /// `GET /api/v1/version`, unauthenticated.
+    async fn version(&self) -> Result<InstanceInfo> {
+        let url = self.url(&["version"]);
+        let resp = self
+            .http
+            .get(url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| anyhow!("{}", e.without_url()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("HTTP {status}");
+        }
+        let bytes = resp.bytes().await.context("reading the reply")?;
+        let v: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow!("not JSON"))?;
+        let version = v
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("no `version` string"))?;
+        Ok(InstanceInfo::from_version(version))
+    }
+
+    fn new(base: &Url, token: String) -> Result<Self> {
         if token.trim().is_empty() {
             bail!("{TOKEN_ENV} is empty");
         }
@@ -152,13 +205,8 @@ fn message(v: &Value) -> String {
         .unwrap_or_else(|| v.to_string())
 }
 
-/// The instance's version and the token owner's login.
-pub async fn probe(c: &Client) -> Result<(InstanceInfo, String)> {
-    let v = c
-        .get(&["version"])
-        .await?
-        .ok_or_else(|| anyhow!("no /api/v1/version: is this a Forgejo or Gitea instance?"))?;
-    let info = InstanceInfo::from_version(v.get("version").and_then(Value::as_str).unwrap_or(""));
+/// The token owner's login.
+pub async fn whoami(c: &Client) -> Result<String> {
     let me = c
         .get(&["user"])
         .await?
@@ -168,7 +216,7 @@ pub async fn probe(c: &Client) -> Result<(InstanceInfo, String)> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("GET /user: no login"))?
         .to_string();
-    Ok((info, login))
+    Ok(login)
 }
 
 /// The adapter's plan, with the adapter's defaults: fast-forward-only
@@ -199,8 +247,11 @@ pub async fn apply(
     let repo = c.get(&["repos", owner, name]).await?.ok_or_else(|| {
         anyhow!("{owner}/{name} does not exist, or {TOKEN_ENV} cannot see it; create it first")
     })?;
-    if repo.pointer("/permissions/admin").and_then(Value::as_bool) == Some(false) {
-        bail!("{TOKEN_ENV} is not an admin of {owner}/{name}; branch protection needs admin");
+    if repo.pointer("/permissions/admin").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "{TOKEN_ENV} does not show admin on {owner}/{name}; branch protection needs admin \
+             (the account holder, or an organisation owner, runs this)"
+        );
     }
     for step in steps {
         let id = step.id.as_str();
@@ -328,8 +379,13 @@ async fn write_file(
     }
     c.send(method, &segs, &body).await.map_err(|e| {
         e.context(format!(
-            "writing `{file}` — once the default branch is protected, the workflow is a \
-             protected path and changes only through the community's bridge"
+            "writing `{file}` — once the default branch is protected, no one can push to it and \
+             the workflow directories are protected file patterns. To change the workflow (a new \
+             --verify-trust-version, say), an admin temporarily lifts that protection (deletes \
+             the default branch's protection rule, or allows pushes and clears its protected \
+             file patterns) and re-runs `vgi repo init`, which writes the workflow and puts the \
+             protection back; where a community bridge manages the repository, it makes the \
+             change instead"
         ))
     })?;
     Ok(change)
@@ -495,13 +551,31 @@ mod tests {
         );
         let sub = Url::parse("https://example.org/git").unwrap();
         assert_eq!(
-            base_url("x", Some(&sub)).unwrap().as_str(),
+            base_url("example.org", Some(&sub)).unwrap().as_str(),
             "https://example.org/git/"
         );
         let lo = Url::parse("http://127.0.0.1:3000").unwrap();
-        assert!(base_url("x", Some(&lo)).is_ok());
+        assert!(base_url("127.0.0.1", Some(&lo)).is_ok());
         let plain = Url::parse("http://git.example.org/").unwrap();
-        assert!(base_url("x", Some(&plain)).is_err());
+        assert!(base_url("git.example.org", Some(&plain)).is_err());
+    }
+
+    #[test]
+    fn the_instance_url_must_be_on_the_repositorys_host() {
+        let sub = Url::parse("https://Example.org:8443/git").unwrap();
+        assert_eq!(
+            base_url("example.org", Some(&sub)).unwrap().as_str(),
+            "https://example.org:8443/git/"
+        );
+        let err = base_url("codeberg.org", Some(&sub))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("codeberg.org") && err.contains(TOKEN_ENV),
+            "{err}"
+        );
+        let lo = Url::parse("http://127.0.0.1:3000").unwrap();
+        assert!(base_url("codeberg.org", Some(&lo)).is_err());
     }
 
     #[test]

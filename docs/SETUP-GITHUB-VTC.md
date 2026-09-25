@@ -687,6 +687,14 @@ The namespace is bound at once and the binder is its admin. Then:
   (`github.com/acme`, or `github.com/${{ github.repository_owner }}`):
   namespace admins' implied commit rights and namespace-wide grants are
   published there.
+- **The guard is per repository.** `vgi repo init` writes the workflow into
+  each repository and a repository ruleset around it; it does not set the
+  organisation's required workflow (§7.3), which only a bridge sets. On an
+  organisation repository name a second owner with `--code-owner <login>`
+  (you count as one), so `.github/` changes need a code owner's review; with
+  only you it refuses unless you pass `--solo`, because any other member with
+  write access could otherwise edit the workflow in the pull request it
+  judges.
 - **Roles, drift, the Dependabot re-sign, the bridge-posted check:** none.
   Forge roles are yours to keep in step with the rights; a drift revert is
   refused `notRevertible` ("manual mode").

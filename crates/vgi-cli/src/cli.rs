@@ -33,7 +33,8 @@ pub enum RepoCommand {
 /// Which forge API to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ForgeChoice {
-    /// GitHub for `github.com/…`, Forgejo for any other host.
+    /// GitHub for `github.com/…`; any other host is taken for Forgejo once
+    /// it answers, without the token, as Forgejo or Gitea.
     Auto,
     /// GitHub or GitHub Enterprise Server, through `gh`.
     Github,
@@ -51,14 +52,22 @@ registry and VTC DIDs written in as literals, and the exempt web-flow keyring; \
 removes stale TRUST_REGISTRY_DID / VTC_DID repository variables; and converges \
 the \"VGI commit trust\" ruleset on the default branch: pull request required, \
 \"Verify commit trust\" required and pinned to GitHub Actions, no force-push, no \
-deletion, no bypass actors. With two or more owners (the account holder of a \
-personal repository counts, plus each --code-owner) it also writes a managed \
-`.github/CODEOWNERS` block and the ruleset requires a code owner's review, so \
-no pull request can change the check it is judged by without another owner's \
-approval. With one owner, only the check is required.
+deletion, no bypass actors. The owners are the person running this (on a \
+personal repository, the account holder) plus each --code-owner, counted once \
+each. With two or more owners it also writes a managed `.github/CODEOWNERS` \
+block and the ruleset requires a code owner's review, so no pull request can \
+change the check it is judged by without another owner's approval. With one \
+owner, only the check is required. On an organisation repository that is \
+refused unless you pass --solo: anyone else in the organisation with write \
+access could edit the workflow in the very pull request it judges.
+
+These are per-repository guards. They are not the organisation's required \
+workflow, which only the community's bridge sets.
 
 On Forgejo it acts with FORGEJO_TOKEN (a token of yours with write:repository \
-and read:user). It allows fast-forward-only merges, commits \
+and read:user), sent only to the repository's own host and only after \
+GET /api/v1/version, asked without it, answers as Forgejo or Gitea. It \
+allows fast-forward-only merges, commits \
 `.forgejo/workflows/verify-trust.yml` with the DIDs written in, and \
 converges the default branch's protection: no pushes, the check's status \
 context required, the workflow directories protected, applying to admins.
@@ -98,9 +107,19 @@ pub struct InitArgs {
     pub forge: ForgeChoice,
 
     /// GitHub: another owner's login, who may approve workflow changes.
-    /// With two or more owners, workflow changes need a code owner's review.
+    /// Repeat for several. The owners are you (the account holder, on a
+    /// personal repository) plus these, counted once each; with two or more,
+    /// workflow changes need a code owner's review.
     #[arg(long = "code-owner", value_name = "LOGIN")]
     pub code_owners: Vec<String>,
+
+    /// GitHub: accept a single owner on an organisation repository. Only
+    /// the check is required then, and no one has to review workflow
+    /// changes: other members with write access could edit the workflow in
+    /// the pull request it judges. Name a second owner with --code-owner
+    /// instead where you can.
+    #[arg(long, conflicts_with = "code_owners")]
+    pub solo: bool,
 
     /// GitHub: the armored `web-flow` key for the exempt keyring. Default:
     /// downloaded from `https://github.com/web-flow.gpg` (github.com only).

@@ -412,6 +412,8 @@ fn stale_variables_are_removed_and_a_drifted_ruleset_is_rewritten() {
 fn two_owners_get_the_managed_codeowners_and_a_code_owner_review() {
     let fake = Fake::new();
     personal_repo(&fake, "acme", "Organization", 9);
+    // The person running this counts as an owner too.
+    runner(&fake);
     fake.respond("GET", "users/bob", 200, &json!({ "id": 2, "login": "bob" }));
     fake.respond(
         "GET",
@@ -435,14 +437,18 @@ fn two_owners_get_the_managed_codeowners_and_a_code_owner_review() {
     let expected = vgi_forge_github::plan::render_codeowners(
         "",
         &["/.github/".to_string()],
-        &["bob".to_string(), "Carol".to_string()],
+        &["root".to_string(), "bob".to_string(), "Carol".to_string()],
     );
     assert_eq!(content_of(codeowners), expected.as_bytes());
     let rules = changes
         .iter()
         .find(|c| c.path().ends_with("/rulesets"))
         .unwrap();
-    let owners = vec![ForgeAccount::new(2, "bob"), ForgeAccount::new(3, "carol")];
+    let owners = vec![
+        ForgeAccount::new(1, "root"),
+        ForgeAccount::new(2, "bob"),
+        ForgeAccount::new(3, "carol"),
+    ];
     let steps = github_plan(
         &RepoSpec::new(Resource::parse("github.com/acme/gadgets").unwrap()),
         &cfg(),
@@ -462,6 +468,83 @@ fn two_owners_get_the_managed_codeowners_and_a_code_owner_review() {
         rules.stdin.as_ref().unwrap(),
         &ruleset_body(&spec, Some(ACTIONS_APP))
     );
+}
+
+/// The person running `vgi`: `root`, id 1.
+fn runner(fake: &Fake) {
+    fake.respond("GET", "user", 200, &json!({ "id": 1, "login": "root" }));
+    fake.respond("GET", "user/1", 200, &json!({ "id": 1, "login": "root" }));
+}
+
+#[test]
+fn an_organisation_repository_with_one_owner_is_refused_without_solo() {
+    let fake = Fake::new();
+    personal_repo(&fake, "acme", "Organization", 9);
+    runner(&fake);
+    let out = fake.vgi_for("github.com/acme/gadgets", &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--solo"), "{err}");
+    assert!(err.contains("--code-owner"), "{err}");
+    assert!(err.contains("write access"), "{err}");
+    assert!(fake.changes().is_empty(), "{:?}", fake.changes());
+
+    // Naming yourself does not make a second owner.
+    fake.respond(
+        "GET",
+        "users/root",
+        200,
+        &json!({ "id": 1, "login": "root" }),
+    );
+    let out = fake.vgi_for("github.com/acme/gadgets", &["--code-owner", "root"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--solo"));
+    assert!(fake.changes().is_empty(), "{:?}", fake.changes());
+}
+
+#[test]
+fn an_organisation_repository_with_solo_gets_the_check_only() {
+    let fake = Fake::new();
+    personal_repo(&fake, "acme", "Organization", 9);
+    runner(&fake);
+    let text = stdout(&fake.vgi_for("github.com/acme/gadgets", &["--solo"]));
+    assert!(text.contains("solo owner (--solo)"), "{text}");
+    assert!(text.contains("organisation member"), "{text}");
+    assert!(!text.contains("no one else"), "{text}");
+    let changes = fake.changes();
+    assert!(
+        !changes.iter().any(|c| c.path().ends_with("CODEOWNERS")),
+        "{changes:?}"
+    );
+    let rules = changes
+        .iter()
+        .find(|c| c.path().ends_with("/rulesets"))
+        .unwrap();
+    assert_eq!(
+        rules.stdin.as_ref().unwrap(),
+        &ruleset_body(
+            &ProtectionSpec::standard("Verify commit trust"),
+            Some(ACTIONS_APP)
+        )
+    );
+    // --solo and --code-owner contradict each other.
+    let out = fake.vgi_for(
+        "github.com/acme/gadgets",
+        &["--solo", "--code-owner", "bob"],
+    );
+    assert!(!out.status.success());
+}
+
+#[test]
+fn one_code_owner_and_the_runner_are_two_owners() {
+    let fake = Fake::new();
+    personal_repo(&fake, "acme", "Organization", 9);
+    runner(&fake);
+    fake.respond("GET", "users/bob", 200, &json!({ "id": 2, "login": "bob" }));
+    fake.respond("GET", "user/2", 200, &json!({ "id": 2, "login": "bob" }));
+    let text = stdout(&fake.vgi_for("github.com/acme/gadgets", &["--code-owner", "bob"]));
+    assert!(text.contains("owner review"), "{text}");
+    assert!(text.contains("@root, @bob"), "{text}");
 }
 
 #[test]

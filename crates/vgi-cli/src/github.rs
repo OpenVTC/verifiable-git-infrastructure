@@ -188,7 +188,8 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// What the repository and its account say about who owns it.
 #[derive(Debug)]
 pub struct RepoFacts {
-    /// `owner/name` as GitHub spells it.
+    /// The owning account's login as the resource names it (lowercased),
+    /// used in API paths; GitHub matches it case-insensitively.
     pub owner: String,
     /// Repository name.
     pub name: String,
@@ -244,25 +245,49 @@ fn account(v: &Value, what: &str) -> Result<ForgeAccount> {
     Ok(ForgeAccount::new(id, login))
 }
 
-/// The owners the guard is chosen from: the account holder of a personal
-/// repository, each `--code-owner`, and — for an organisation repository
-/// with none named — the person running this.
-pub fn owners(gh: &Gh, facts: &RepoFacts, code_owners: &[String]) -> Result<Vec<ForgeAccount>> {
-    let mut out = Vec::new();
+/// The owners the guard is chosen from: the person running this (on a
+/// personal repository, the account holder — the only admin one can have)
+/// plus each `--code-owner`, counted once per account id.
+///
+/// On an organisation repository fewer than two owners is refused unless
+/// `solo`: with no owner review, any other member with write access could
+/// edit the workflow in the pull request it judges.
+pub fn owners(
+    gh: &Gh,
+    facts: &RepoFacts,
+    code_owners: &[String],
+    solo: bool,
+) -> Result<Vec<ForgeAccount>> {
+    let mut out: Vec<ForgeAccount> = Vec::new();
+    let mut add = |a: ForgeAccount| {
+        if !out.iter().any(|o| o.id == a.id) {
+            out.push(a);
+        }
+    };
     if facts.personal {
-        out.push(facts.account.clone());
+        add(facts.account.clone());
+    } else {
+        let me = gh
+            .get("user")?
+            .ok_or_else(|| anyhow!("could not read your GitHub account"))?;
+        add(account(&me, "your account")?);
     }
     for login in code_owners {
         let v = gh
             .get(&path(&["users", login]))?
             .ok_or_else(|| anyhow!("no GitHub account `{login}`"))?;
-        out.push(account(&v, login)?);
+        add(account(&v, login)?);
     }
-    if out.is_empty() {
-        let me = gh
-            .get("user")?
-            .ok_or_else(|| anyhow!("could not read your GitHub account"))?;
-        out.push(account(&me, "your account")?);
+    if !facts.personal && out.len() < 2 && !solo {
+        bail!(
+            "{}/{} belongs to an organisation and you are its only owner here. With one owner \
+             only the check is required and no one has to review workflow changes, so any other \
+             member with write access could edit .github/workflows/verify-trust.yml in the very \
+             pull request it judges. Name another owner with --code-owner <login> (two or more \
+             owners require a code owner's review of .github/), or pass --solo to accept that",
+            facts.owner,
+            facts.name
+        );
     }
     Ok(out)
 }
@@ -541,8 +566,9 @@ fn protect(
     }
 }
 
-/// A one-line description of `guard` for the report.
-pub fn describe(guard: &CheckGuard) -> String {
+/// A one-line description of `guard` for the report. `personal`: the
+/// repository belongs to a user account rather than an organisation.
+pub fn describe(guard: &CheckGuard, personal: bool) -> String {
     match guard {
         CheckGuard::OwnerReview { owners } => format!(
             "owner review — changes under .github/ need an approving review from one of {}",
@@ -552,8 +578,16 @@ pub fn describe(guard: &CheckGuard) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        CheckGuard::SoloOwner => "solo owner — the ruleset requires the check; with one owner \
-                                  there is no one else to review workflow changes"
+        CheckGuard::SoloOwner if personal => {
+            "solo owner — the ruleset requires the check; no review of workflow changes is \
+             required, so a collaborator with write access could edit the workflow in a pull \
+             request (add --code-owner <login> for a second owner)"
+                .into()
+        }
+        CheckGuard::SoloOwner => "solo owner (--solo) — the ruleset requires the check; no review \
+                                  of workflow changes is required, so any organisation member \
+                                  with write access could edit the workflow in the pull request \
+                                  it judges"
             .into(),
         other => format!("{other:?}"),
     }

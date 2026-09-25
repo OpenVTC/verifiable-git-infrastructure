@@ -114,13 +114,22 @@ async fn instance(converged: Option<(&[u8], &Value)>) -> MockServer {
 }
 
 async fn vgi(server: &MockServer, extra: &[&str], token: Option<&str>) -> Output {
+    vgi_for(server, "127.0.0.1/alice/widgets", extra, token).await
+}
+
+async fn vgi_for(
+    server: &MockServer,
+    resource: &str,
+    extra: &[&str],
+    token: Option<&str>,
+) -> Output {
     let mut args: Vec<String> = [
         "repo",
         "init",
         "--vtc",
         VTC,
         "--resource",
-        "codeberg.org/alice/widgets",
+        resource,
         "--registry",
         REGISTRY,
         "--verify-trust-action",
@@ -173,7 +182,7 @@ fn adapter_plan() -> Vec<vgi_forge::BootstrapStep> {
     let cfg = VgiConfig::new(REGISTRY, VTC, ACTION, VERSION).with_verify_trust_sha256(SHA256);
     let base = Url::parse(DEFAULT_ACTIONS_BASE).unwrap();
     forgejo_plan(
-        &RepoSpec::new(Resource::parse("codeberg.org/alice/widgets").unwrap()),
+        &RepoSpec::new(Resource::parse("127.0.0.1/alice/widgets").unwrap()),
         &cfg,
         &PlanOptions {
             checkout_action: DEFAULT_CHECKOUT_ACTION,
@@ -233,7 +242,7 @@ async fn the_adapters_plan_lands_and_a_rerun_changes_nothing() {
     want["branch_name"] = json!("main");
     let rule: Value = serde_json::from_slice(&sent[2].body).unwrap();
     assert_eq!(rule, want);
-    assert!(out.contains("cnm git adopt codeberg.org/alice/widgets --owner did:web:alice.example"));
+    assert!(out.contains("cnm git adopt 127.0.0.1/alice/widgets --owner did:web:alice.example"));
 
     // Against the instance as it now is: reads only.
     let converged = instance(Some((&written, &rule))).await;
@@ -286,5 +295,85 @@ async fn an_instance_without_fast_forward_only_merges_is_refused_before_any_writ
     let out = vgi(&server, &[], Some(TOKEN)).await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("fast-forward only"));
+    assert!(changes(&server).await.is_empty());
+}
+
+fn authorized(r: &Request) -> bool {
+    r.headers.get("authorization").is_some()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_version_probe_carries_no_token() {
+    let server = instance(None).await;
+    ok(&vgi(&server, &["--dry-run"], Some(TOKEN)).await);
+    let reqs = server.received_requests().await.unwrap();
+    // The probe comes first, and is the only request without the token.
+    assert_eq!(reqs[0].url.path(), "/api/v1/version");
+    assert!(!authorized(&reqs[0]), "{:?}", reqs[0].headers);
+    assert!(reqs[1..].iter().all(authorized));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_is_not_forgejo_never_sees_the_token() {
+    for forge in ["auto", "forgejo"] {
+        // Not Forgejo: no JSON `version` at /api/v1/version.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>hello</html>"))
+            .mount(&server)
+            .await;
+        let out = vgi(&server, &["--forge", forge], Some(TOKEN)).await;
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("was not sent"), "{err}");
+        if forge == "auto" {
+            assert!(err.contains("--forge github"), "{err}");
+        }
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(!authorized(&reqs[0]));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_url_on_another_host_is_refused_before_any_request() {
+    let server = instance(None).await;
+    let out = vgi_for(&server, "codeberg.org/alice/widgets", &[], Some(TOKEN)).await;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--forgejo-url") && err.contains("codeberg.org"),
+        "{err}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_without_admin_is_refused_before_any_write() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "9.0.0" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 7, "login": "alice" })),
+        )
+        .mount(&server)
+        .await;
+    // No `permissions` at all: not shown to be an admin.
+    let mut repo = repo_json(false);
+    repo.as_object_mut().unwrap().remove("permissions");
+    Mock::given(method("GET"))
+        .and(path(REPO))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repo))
+        .mount(&server)
+        .await;
+    let out = vgi(&server, &[], Some(TOKEN)).await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("admin"));
     assert!(changes(&server).await.is_empty());
 }

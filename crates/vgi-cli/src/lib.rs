@@ -36,11 +36,12 @@ pub async fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     }
 }
 
-/// Which forge `resource` is on.
+/// Which forge `resource` is on. `Auto` off github.com stays `Auto`, and is
+/// taken for Forgejo only once the instance answers the unauthenticated
+/// probe ([`forgejo::Client::connect`]).
 fn forge_for(choice: ForgeChoice, resource: &Resource) -> ForgeChoice {
     match choice {
         ForgeChoice::Auto if resource.host() == "github.com" => ForgeChoice::Github,
-        ForgeChoice::Auto => ForgeChoice::Forgejo,
         c => c,
     }
 }
@@ -77,19 +78,23 @@ async fn repo_init(args: InitArgs, out: &mut dyn Write) -> Result<()> {
         None => inputs::resource_from_origin(&std::env::current_dir()?)?,
     };
     let forge = forge_for(args.forge, &resource);
-    if forge != ForgeChoice::Github && !args.code_owners.is_empty() {
+    if forge != ForgeChoice::Github && (!args.code_owners.is_empty() || args.solo) {
         bail!(
-            "--code-owner is GitHub's owner-review guard; Forgejo protects the workflow paths instead"
+            "--code-owner and --solo choose GitHub's owner-review guard; Forgejo protects the \
+             workflow paths instead"
         );
     }
-    let registry = match &args.registry {
-        Some(r) => r.clone(),
-        None => inputs::resolve_registry(&args.vtc).await?,
+    let (registry, registry_from_referral) = match &args.registry {
+        Some(r) => (r.clone(), false),
+        None => (inputs::resolve_registry(&args.vtc).await?, true),
     };
     shell::check_did("--registry", &registry)?;
-    let action = match &args.verify_trust_action {
-        Some(a) => a.clone(),
-        None => inputs::resolve_action(&args.verify_trust_version).await?,
+    let (action, action_resolved) = match &args.verify_trust_action {
+        Some(a) => (a.clone(), false),
+        None => (
+            inputs::resolve_action(&args.verify_trust_version).await?,
+            true,
+        ),
     };
     let mut cfg = VgiConfig::new(
         registry.clone(),
@@ -115,8 +120,23 @@ async fn repo_init(args: InitArgs, out: &mut dyn Write) -> Result<()> {
         }
     ));
     report.line(format!("  VTC       {}", args.vtc));
-    report.line(format!("  registry  {registry}"));
-    report.line(format!("  action    {}", cfg.verify_trust_action));
+    if registry_from_referral {
+        report.line(format!(
+            "  registry  {registry} (the TrustRegistry referral in the VTC's DID document; pass \
+             --registry to name one yourself)"
+        ));
+    } else {
+        report.line(format!("  registry  {registry}"));
+    }
+    if action_resolved {
+        report.line(format!(
+            "  action    {} (the commit {} named when this ran; trust on first use — pass \
+             --verify-trust-action to pin one you verified)",
+            cfg.verify_trust_action, cfg.verify_trust_version
+        ));
+    } else {
+        report.line(format!("  action    {}", cfg.verify_trust_action));
+    }
     report.line(format!("  release   {}", cfg.verify_trust_version));
 
     match forge {
@@ -136,14 +156,28 @@ async fn repo_init(args: InitArgs, out: &mut dyn Write) -> Result<()> {
             cfg = cfg.with_platform_keyring(keyring);
             let gh = github::Gh::new(resource.host());
             let facts = github::repo_facts(&gh, &owner, &name)?;
-            let owners = github::owners(&gh, &facts, &args.code_owners)?;
+            let owners = github::owners(&gh, &facts, &args.code_owners, args.solo)?;
             let guard = CheckGuard::for_owners(&owners);
             let steps = github::plan(&spec, &cfg, &guard)?;
-            report.line(format!("  guard     {}", github::describe(&guard)));
+            report.line(format!(
+                "  guard     {}",
+                github::describe(&guard, facts.personal)
+            ));
             report.line("");
             github::apply(&gh, &facts, &steps, &mut report)?;
         }
         ForgeChoice::Forgejo | ForgeChoice::Auto => {
+            let token = std::env::var(forgejo::TOKEN_ENV).map_err(|_| {
+                anyhow::anyhow!(
+                    "set {} to a token of yours with write:repository and read:user",
+                    forgejo::TOKEN_ENV
+                )
+            })?;
+            let base = forgejo::base_url(resource.host(), args.forgejo_url.as_ref())?;
+            // The token goes only to an instance that has answered, without
+            // it, as Forgejo or Gitea.
+            let (client, info) =
+                forgejo::Client::connect(&base, token, forge == ForgeChoice::Auto).await?;
             let sha = match &args.verify_trust_sha256 {
                 Some(s) => s.to_ascii_lowercase(),
                 None => {
@@ -157,16 +191,8 @@ async fn repo_init(args: InitArgs, out: &mut dyn Write) -> Result<()> {
                 }
             };
             cfg = cfg.with_verify_trust_sha256(sha);
-            let token = std::env::var(forgejo::TOKEN_ENV).map_err(|_| {
-                anyhow::anyhow!(
-                    "set {} to a token of yours with write:repository and read:user",
-                    forgejo::TOKEN_ENV
-                )
-            })?;
-            let base = forgejo::base_url(resource.host(), args.forgejo_url.as_ref())?;
-            let client = forgejo::Client::new(&base, token)?;
             let steps = forgejo::plan(&spec, &cfg, &args.runs_on)?;
-            let (info, me) = forgejo::probe(&client).await?;
+            let me = forgejo::whoami(&client).await?;
             report.line(format!("  instance  {base} ({}), as {me}", info.version));
             report.line("");
             forgejo::apply(&client, &owner, &name, &me, &info, &steps, &mut report).await?;

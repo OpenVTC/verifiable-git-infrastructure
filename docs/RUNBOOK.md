@@ -224,14 +224,49 @@ It commits the workflow (DIDs as literals, `resource-format: qualified`) and the
 `web-flow` keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID` variables,
 and converges the "VGI commit trust" ruleset: pull request required, the check
 required and pinned to GitHub Actions, no force-push or deletion, no bypass.
-Name further owners with `--code-owner <login>`: with two or more (a personal
-repository's account holder counts), `.github/` changes need a code owner's
-review. On Forgejo set `FORGEJO_TOKEN` (`write:repository`, `read:user`); it
-does §4a. The registry DID comes from the VTC's `TrustRegistry` referral unless
-you pass `--registry`. Re-running changes nothing; `--dry-run` shows every
+These are **per-repository guards**: it does not set the organisation's
+required workflow, which only the community's bridge does.
+
+The owners are you (on a personal repository, its account holder) plus each
+`--code-owner <login>`, each counted once. With two or more, `.github/`
+changes need a code owner's review. With one, only the check is required, and
+on an **organisation** repository that is refused unless you pass `--solo`:
+any other member with write access could edit the workflow in the very pull
+request it judges. Prefer `--code-owner`.
+
+On Forgejo set `FORGEJO_TOKEN` (`write:repository`, `read:user`); it does
+§4a. It sends the token only after `GET /api/v1/version`, asked without it,
+answers as Forgejo or Gitea, and only to the repository's own host
+(`--forgejo-url` may add a port or sub-path, not change the host). With
+`--forge auto` any host but `github.com` is taken for Forgejo; for GitHub
+Enterprise Server pass `--forge github`.
+
+The registry DID comes from the VTC's `TrustRegistry` referral unless you pass
+`--registry`; the report says which. The action commit (the
+`--verify-trust-version` tag, dereferenced) and, on Forgejo, the release's
+SHA-256 are what GitHub serves when you run it — trust on first use, labelled
+so in the report; pass `--verify-trust-action` / `--verify-trust-sha256` to
+pin values you checked. Re-running changes nothing; `--dry-run` shows every
 change with its contents. It cannot adopt the repository itself — that is a
 Trust Task signed with a VTA session — so it prints the `cnm git adopt` command.
 In **bridge** mode skip it: adopting runs the bootstrap.
+
+**Upgrading the check** (a new `--verify-trust-version`) once the repository
+is protected:
+
+- **GitHub:** the ruleset has no bypass, so the new workflow lands through a
+  pull request, like any change. `vgi repo init --dry-run
+  --verify-trust-version <tag>` prints the file to commit (each line after
+  its `      | ` margin); open the pull
+  request with it (a code owner reviews it where there are two owners), merge,
+  and a re-run of `vgi repo init` then reports nothing to change.
+- **Forgejo:** no one can push to the default branch and the workflow
+  directories are protected file patterns, so an admin lifts the protection
+  for the change — deletes the default branch's protection rule (or allows
+  pushes and clears its protected file patterns) — and re-runs
+  `vgi repo init --verify-trust-version <tag>`, which writes the new workflow
+  and puts the protection back. The branch is unprotected in between: do it
+  in one sitting. Where a bridge manages the repository, it does this instead.
 
 Outside a VTC-governed namespace, or to see what it writes, set it up by hand:
 
