@@ -786,15 +786,28 @@ impl ForgejoForge {
         files: &[vgi_forge::ExtraFile],
         message: &str,
     ) -> Result<RefreshReport> {
-        for f in files {
-            validate_repo_path(&f.path)?;
-        }
         let (token, owner, name) = self.repo_token(repo)?;
         let r = self.get_repo(&token, owner, name).await?;
         let branch = r.default_branch().ok_or_else(|| ForgeError::Rejected {
             status: 409,
             message: format!("{repo} is empty: nothing to refresh"),
         })?;
+        self.refresh_on_branch(repo, &branch, files, message).await
+    }
+
+    /// [`ForgejoForge::refresh_managed_files`] on `branch`, the repository's
+    /// default branch, already read.
+    async fn refresh_on_branch(
+        &self,
+        repo: &Resource,
+        branch: &str,
+        files: &[vgi_forge::ExtraFile],
+        message: &str,
+    ) -> Result<RefreshReport> {
+        for f in files {
+            validate_repo_path(&f.path)?;
+        }
+        let (token, owner, name) = self.repo_token(repo)?;
         let mut stale = Vec::new();
         for f in files {
             let current = self.current_file(&token, owner, name, &f.path).await?;
@@ -815,7 +828,7 @@ impl ForgejoForge {
             return Ok(report);
         }
 
-        let (rule, shadowing) = self.protection_rule(&token, owner, name, &branch).await?;
+        let (rule, shadowing) = self.protection_rule(&token, owner, name, branch).await?;
         if !shadowing.is_empty() {
             return Err(ForgeError::Rejected {
                 status: 409,
@@ -832,7 +845,7 @@ impl ForgejoForge {
         };
         let prior = rule.as_ref().map(|r| {
             (
-                r.name().unwrap_or(&branch).to_string(),
+                r.name().unwrap_or(branch).to_string(),
                 json!({
                     "enable_push": r.enable_push,
                     "enable_push_whitelist": r.enable_push_whitelist,
@@ -844,6 +857,7 @@ impl ForgejoForge {
                 r.clone(),
             )
         });
+        let mut open_error = None;
         if let Some((rule_name, _, _)) = &prior {
             tracing::warn!(
                 repo = %repo,
@@ -859,7 +873,11 @@ impl ForgejoForge {
                 "push_whitelist_deploy_keys": false,
                 "protected_file_patterns": "",
             });
-            self.api
+            // A failed open may still have applied on the server (a timeout
+            // after the write, a 5xx from a proxy): nothing is written then,
+            // but the restore below is attempted all the same.
+            match self
+                .api
                 .send(
                     Method::PATCH,
                     rule_url(rule_name),
@@ -867,12 +885,18 @@ impl ForgejoForge {
                     Some(&open),
                     "branch protection (open for refresh)",
                 )
-                .await?;
-            report.opened = true;
+                .await
+            {
+                Ok(_) => report.opened = true,
+                Err(e) => open_error = Some(e),
+            }
         }
 
         let mut write_error = None;
         for (i, f) in files.iter().enumerate() {
+            if open_error.is_some() {
+                break;
+            }
             if !stale.iter().any(|s| s.path == f.path) {
                 continue;
             }
@@ -920,14 +944,14 @@ impl ForgejoForge {
             .collect();
         report.detail = format!(
             "{repo}: protection {} for `{}`; wrote {:?}; {}",
-            if report.opened {
-                "opened"
-            } else {
-                "absent, not opened"
+            match (&prior, &open_error) {
+                (None, _) => "absent, not opened".to_string(),
+                (Some(_), None) => "opened".to_string(),
+                (Some(_), Some(e)) => format!("open failed ({e})"),
             },
             bot.login,
             written,
-            match (&restore_error, report.opened) {
+            match (&restore_error, prior.is_some()) {
                 (None, true) => "protection restored and verified".to_string(),
                 (None, false) => "nothing to restore".to_string(),
                 (Some(e), _) => format!("PROTECTION LEFT OPEN: {e}"),
@@ -938,6 +962,16 @@ impl ForgejoForge {
             return Err(ForgeError::Rejected {
                 status: 500,
                 message: report.detail,
+            });
+        }
+        if let Some(e) = open_error {
+            tracing::warn!(repo = %repo, detail = %report.detail, "refresh could not open the protection");
+            return Err(match e {
+                ForgeError::Rejected { status, message } => ForgeError::Rejected {
+                    status,
+                    message: format!("{message} (nothing written; protection restored)"),
+                },
+                other => other,
             });
         }
         tracing::info!(repo = %repo, detail = %report.detail, "managed files refreshed");
@@ -975,20 +1009,15 @@ impl ForgejoForge {
         message: &str,
     ) -> Result<StepOutcome> {
         let (token, owner, name) = self.repo_token(repo)?;
-        if self
-            .get_repo(&token, owner, name)
-            .await?
-            .default_branch()
-            .is_none()
-        {
+        let Some(branch) = self.get_repo(&token, owner, name).await?.default_branch() else {
             return self.write_file(repo, path, contents, message).await;
-        }
+        };
         let file = vgi_forge::ExtraFile {
             path: path.to_string(),
             contents: contents.to_vec(),
         };
         let report = self
-            .refresh_managed_files(repo, std::slice::from_ref(&file), message)
+            .refresh_on_branch(repo, &branch, std::slice::from_ref(&file), message)
             .await?;
         Ok(report
             .files

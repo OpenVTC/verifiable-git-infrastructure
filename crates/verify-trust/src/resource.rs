@@ -550,6 +550,27 @@ mod tests {
             message.contains("is forge-qualified") && message.contains("legacy"),
             "{message}"
         );
+        // A dotted first segment reads as a host: `john.doe/repo` is refused
+        // too, while the bare dotted owner `john.doe` (no owner segment
+        // after it, so not qualified) still passes.
+        assert!(
+            select_resources(
+                ResourceFormat::Legacy,
+                None,
+                Some("john.doe/repo".into()),
+                &github()
+            )
+            .is_err()
+        );
+        assert!(
+            select_resources(
+                ResourceFormat::Legacy,
+                None,
+                Some("john.doe".into()),
+                &github()
+            )
+            .is_ok()
+        );
         // A bare owner is still passed through untouched.
         assert_eq!(
             select_resources(ResourceFormat::Legacy, None, Some("Acme".into()), &github())

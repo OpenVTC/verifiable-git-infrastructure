@@ -1464,3 +1464,82 @@ async fn a_rebootstrap_brings_a_stale_protected_workflow_up_to_date() {
     );
     server.verify().await;
 }
+
+/// An open that errors may still have applied on the server: nothing is
+/// written, and the rule is restored all the same.
+#[tokio::test]
+async fn a_failed_open_writes_nothing_and_still_restores() {
+    let (server, forge) = server_and_forge().await;
+    mount_stale_workflow(&server).await;
+    let rule = "/api/v1/repos/acme/gadgets/branch_protections/main";
+    Mock::given(method("PATCH"))
+        .and(path(rule))
+        .and(BotToken)
+        .and(body_json(open_body()))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(rule))
+        .and(BotToken)
+        .and(body_json(restore_body()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(good_rule(&["alice"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for verb in ["PUT", "POST"] {
+        Mock::given(method(verb))
+            .and(path(WF))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+    let e = forge
+        .run_step(&repo("gadgets"), &refresh_step(&forge))
+        .await
+        .unwrap_err();
+    assert!(
+        !e.to_string().contains("PROTECTION LEFT OPEN"),
+        "restored: {e}"
+    );
+    server.verify().await;
+}
+
+/// The bootstrap's managed write reads the repository once.
+#[tokio::test]
+async fn a_managed_write_reads_the_repository_once() {
+    let (server, forge) = server_and_forge().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/acme/gadgets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repo_json(
+            9001,
+            "acme/gadgets",
+            false,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plan = forge
+        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .unwrap();
+    let step = plan.iter().find(|s| s.id == "workflow").unwrap();
+    let StepAction::WriteFile { contents, .. } = &step.action else {
+        panic!()
+    };
+    Mock::given(method("GET"))
+        .and(path(WF))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "file", "sha": "abc", "encoding": "base64",
+            "content": STANDARD.encode(contents),
+        })))
+        .mount(&server)
+        .await;
+    forbid_writes(&server).await;
+    assert_eq!(
+        forge.run_step(&repo("gadgets"), step).await.unwrap(),
+        StepOutcome::Unchanged
+    );
+    server.verify().await;
+}

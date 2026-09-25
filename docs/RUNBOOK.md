@@ -92,6 +92,17 @@ repository; an org-scoped grant authorizes every repository that passes
 semantics are OR, so a repo-level record **cannot veto** an org-level grant —
 narrowing is a matter of not issuing the broad grant in the first place.
 
+The fallback is checked against the resource. Under `qualified` it must
+contain it: `github.com/acme` for `github.com/acme/widgets`, or the resource
+itself. A fallback naming another owner or another forge is refused, and the
+run fails before it queries anything. Under `legacy`, a fallback that parses
+as forge-qualified is refused, because one run uses one form. That includes a
+legacy value whose first segment has a dot, such as `john.doe/repo`, which
+reads as host `john.doe`. A legacy fallback is a bare owner (`acme`, or
+`john.doe`), and those still pass unchanged. Both checks exist only in
+verify-trust releases that include them: pin one (`version:`) for them to take
+effect. An older release accepts any fallback as given.
+
 This step is the whole access-control decision. There is no second list to
 maintain, and nothing to commit to the repository.
 
@@ -467,7 +478,12 @@ To change a protected workflow later, lift the protection for the change and
 restore it exactly. A community bridge does this as one audited step
 (`refresh-managed-files`): it allows pushes from the bridge's bot alone, writes
 the files, restores the rule and reads it back; a rule left open shows as
-critical drift.
+critical drift. The restore is attempted even when opening the rule failed,
+since a failed request may still have been applied. The bootstrap's own
+workflow and keyring steps use the same step, so re-running the bootstrap
+brings an outdated workflow up to date. It stops early, writing nothing, when
+another branch-protection rule shadows the managed one (for example a stray
+`Main` rule next to `main`). Remove that rule, then run the bootstrap again.
 
 The same problem as on GitHub applies (§4, *Protect the check from the pull
 request it checks*): a Forgejo `pull_request` workflow also runs from the PR's
@@ -720,6 +736,24 @@ required check decides what lands. To give someone a role, grant
   namespace as its fallback resource. A workflow written by a bridge before
   that did not; until it is upgraded (BRIDGE.md §6b) only grants on the
   repository count there.
+- What the upgraded workflows change:
+  - **The forge host must match.** The workflow passes the forge host the
+    bridge is configured with (`[[github]] host`, the Forgejo host) plus the
+    owner the runner reports. verify-trust derives the repository's resource
+    from the runner's server URL (`GITHUB_SERVER_URL`,
+    `FORGEJO_SERVER_URL`). If the two hosts differ, for example a bridge
+    configured with `github.com` for a GHES organisation, the fallback no
+    longer contains the resource. The whole check then fails before any
+    commit is verified, not only the namespace-granted commits. Configure the
+    bridge with the host the runners report.
+  - **Containment needs a current release.** The refusal of a fallback outside
+    the repository's namespace (§2) holds only with a verify-trust release
+    that has it, pinned in `[verify_trust] version`. With an older one, the
+    fallback still names only the running repository's owner, but nothing
+    enforces it.
+  - **Forgejo:** re-running the bootstrap updates the protected workflow
+    through the audited refresh (§4a). It stops early when another rule
+    shadows the managed one: resolve that first.
 
 **Remove.**
 
