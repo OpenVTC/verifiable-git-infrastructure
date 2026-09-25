@@ -1137,10 +1137,24 @@ pub async fn setup(
     let remote = VtaAppState::new(session);
     let probe = "setup/probe";
     let probed = async {
+        // Under the lease: a running bridge's writes stay predictable.
+        let lease = crate::appstate::Lease::acquire(
+            &remote,
+            &format!("setup-{}", crate::wire::new_id()),
+            Duration::from_secs(60),
+        )
+        .await?;
         let v = remote
             .put(probe, json!({ "at": chrono::Utc::now().timestamp() }), None)
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"));
+        let v = match v {
+            Ok(v) => v,
+            Err(e) => {
+                lease.release(&remote).await;
+                return Err(e);
+            }
+        };
         let back = remote
             .get(probe)
             .await?
@@ -1148,10 +1162,12 @@ pub async fn setup(
         if back.version != v {
             bail!("the probe read back at another version");
         }
-        remote
+        let deleted = remote
             .delete(probe, Some(v))
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"));
+        lease.release(&remote).await;
+        deleted?;
         anyhow::Ok(())
     };
     match probed.await {

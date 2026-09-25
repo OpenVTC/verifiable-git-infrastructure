@@ -219,19 +219,31 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
                         SecretCmd::Set { name } => {
                             let value = read_secret(&name)?;
                             let key = secret_key(&name);
-                            let current = remote.get(&key).await?.map(|r| r.version);
-                            let watermark = remote.list().await?.watermark;
                             let seal = session.sealing_key(true).await?;
-                            vgi_bridge::appstate::put_sealed(
+                            // Under the lease, like the running bridge's own
+                            // writes: sealed once, never left unopenable.
+                            let mut lease = vgi_bridge::appstate::Lease::acquire(
                                 &remote,
-                                &seal,
-                                &name,
-                                value.as_bytes(),
-                                current,
-                                watermark,
+                                &format!("secret-set-{}", vgi_bridge::wire::new_id()),
+                                std::time::Duration::from_secs(60),
                             )
-                            .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            .await?;
+                            let written = async {
+                                let current = remote.get(&key).await?.map(|r| r.version);
+                                vgi_bridge::appstate::put_sealed(
+                                    &remote,
+                                    &seal,
+                                    &name,
+                                    value.as_bytes(),
+                                    current,
+                                    &mut lease,
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!("{e}"))
+                            }
+                            .await;
+                            lease.release(&remote).await;
+                            written?;
                             eprintln!(
                                 "stored `{name}` in the VTA context `{}`; restart the bridge to use it",
                                 session.context()

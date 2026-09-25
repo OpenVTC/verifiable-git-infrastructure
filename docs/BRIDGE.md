@@ -243,7 +243,16 @@ data directory does not bring back what another host changed meanwhile:
   recovery host) is dropped from its cache, not written back;
 - only records it never managed to mirror are written;
 - a record the VTA holds at an *older* version than this host wrote (a
-  rolled-back or replayed store) stops the start.
+  rolled-back or replayed store) stops the start, and so does a VTA whose
+  counter is behind the last version this host wrote (restored from a
+  snapshot taken before some of its records existed: those are missing,
+  not deleted).
+
+**One writer at a time.** The running bridge, `secret set` and `vta setup`
+take a short lease (`lease/writer` in app-state, 2 minutes, renewed while
+held) before writing, so each secret is sealed once to the version it lands
+at and is never left in the VTA in a form that does not open. `secret set`
+while the bridge runs waits its turn.
 
 Each secret is sealed to its own record version, so a ciphertext put back
 later does not open (the start is refused, naming the secret). The sealing

@@ -162,6 +162,8 @@ pub struct MemoryAppState {
     inner: Mutex<Versioned>,
     /// When set, every call fails (the VTA unreachable).
     down: std::sync::atomic::AtomicBool,
+    /// Puts per key, for tests that count writes.
+    puts: Mutex<BTreeMap<String, usize>>,
 }
 
 impl MemoryAppState {
@@ -181,6 +183,16 @@ impl MemoryAppState {
         g.1.iter()
             .filter_map(|(k, (_, v))| v.as_ref().map(|v| (k.clone(), v.clone())))
             .collect()
+    }
+
+    /// How many puts `key` has had.
+    pub fn puts(&self, key: &str) -> usize {
+        self.puts
+            .lock()
+            .expect("lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Put `value` at `key` as someone else would (no precondition).
@@ -271,6 +283,12 @@ impl AppState for MemoryAppState {
         g.0 += 1;
         let v = g.0;
         g.1.insert(key.to_string(), (v, Some(value)));
+        *self
+            .puts
+            .lock()
+            .expect("lock")
+            .entry(key.to_string())
+            .or_insert(0) += 1;
         Ok(v)
     }
 
@@ -347,33 +365,146 @@ pub fn secret_bytes(
     })
 }
 
+/// The record every writer of the bridge's app-state holds while it writes
+/// (the mirror for a pass, `secret set`, `vta setup`'s probe).
+///
+/// A secret is sealed to the version its record will take, which is the
+/// namespace counter plus one — exact only while nobody else writes the
+/// namespace. The lease makes that so: one writer at a time, each write's
+/// version known before it is made, so a secret is sealed once and is never
+/// left live and unopenable. It expires after [`LEASE_TTL_SECS`], so a
+/// writer that crashed holding it holds nothing for long.
+pub const LEASE_KEY: &str = "lease/writer";
+
+/// How long a lease lasts unless renewed.
+pub const LEASE_TTL_SECS: i64 = 120;
+
+/// A held [`LEASE_KEY`], and the version the holder's next write takes.
+#[derive(Debug)]
+pub struct Lease {
+    holder: String,
+    version: u64,
+    until: i64,
+    next: u64,
+}
+
+impl Lease {
+    /// Take the lease for `holder`, waiting up to `wait` for another holder
+    /// to release it (or for it to expire).
+    pub async fn acquire(remote: &dyn AppState, holder: &str, wait: Duration) -> Result<Lease> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let now = chrono::Utc::now().timestamp();
+            let current = remote.get(LEASE_KEY).await?;
+            let expected = match &current {
+                None => Some(0),
+                Some(r) => {
+                    let until = r.value.get("until").and_then(Value::as_i64).unwrap_or(0);
+                    let theirs = r.value.get("holder").and_then(Value::as_str).unwrap_or("");
+                    (until < now || theirs == holder).then_some(r.version)
+                }
+            };
+            if let Some(expected) = expected {
+                let until = now + LEASE_TTL_SECS;
+                match remote
+                    .put(
+                        LEASE_KEY,
+                        json!({ "holder": holder, "until": until }),
+                        Some(expected),
+                    )
+                    .await
+                {
+                    Ok(version) => {
+                        return Ok(Lease {
+                            holder: holder.to_string(),
+                            version,
+                            until,
+                            next: version + 1,
+                        });
+                    }
+                    Err(PutError::Conflict(_)) => {}
+                    Err(PutError::Other(e)) => return Err(e),
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "another writer holds the bridge's app-state lease (`{LEASE_KEY}`); try again \
+                     shortly"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Note the version one of the holder's writes (or deletes) took.
+    pub fn observe(&mut self, version: u64) {
+        self.next = self.next.max(version + 1);
+    }
+
+    /// The version the holder's next write takes.
+    pub fn next(&self) -> u64 {
+        self.next
+    }
+
+    /// Extend the lease if less than half of it is left.
+    pub async fn renew_if_due(&mut self, remote: &dyn AppState) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if self.until - now > LEASE_TTL_SECS / 2 {
+            return Ok(());
+        }
+        let until = now + LEASE_TTL_SECS;
+        let v = remote
+            .put(
+                LEASE_KEY,
+                json!({ "holder": self.holder, "until": until }),
+                Some(self.version),
+            )
+            .await
+            .map_err(|e| anyhow!("renewing the app-state lease: {e}"))?;
+        self.version = v;
+        self.until = until;
+        self.observe(v);
+        Ok(())
+    }
+
+    /// Give the lease up.
+    pub async fn release(self, remote: &dyn AppState) {
+        if let Err(e) = remote.delete(LEASE_KEY, Some(self.version)).await {
+            tracing::debug!(error = %e, "could not release the app-state lease; it expires");
+        }
+    }
+}
+
 /// Write a sealed secret whose record is at `current` (`None`: absent),
-/// predicting the version the write takes from the namespace counter
-/// `watermark`, so the ciphertext is bound to it. If the write lands
-/// elsewhere (another write in between), it is written again, bound to the
-/// next version. Returns the version it is stored at.
+/// holding `lease`: sealed to the version the write takes, so it is written
+/// once. If a write outside the lease landed in between (only a writer that
+/// ignores it — not the bridge's own tools), it is sealed again to the
+/// version it did land at, before this returns. Returns the version it is
+/// stored at.
 pub async fn put_sealed(
     remote: &dyn AppState,
     seal: &MasterKey,
     name: &str,
     bytes: &[u8],
     current: Option<u64>,
-    watermark: u64,
+    lease: &mut Lease,
 ) -> std::result::Result<u64, PutError> {
     let key = secret_key(name);
-    let (mut expected, mut predicted) = (current.unwrap_or(0), watermark + 1);
+    let mut expected = current.unwrap_or(0);
     for _ in 0..4 {
+        let predicted = lease.next();
         let value = secret_value(seal, name, predicted, bytes).map_err(PutError::Other)?;
         let v = remote.put(&key, value, Some(expected)).await?;
+        lease.observe(v);
         if v == predicted {
             return Ok(v);
         }
-        tracing::warn!(key = %key, "another write landed in between; sealing the secret again");
-        (expected, predicted) = (v, v + 1);
+        tracing::warn!(key = %key, "a write outside the app-state lease landed in between; sealing again");
+        expected = v;
     }
     Err(PutError::Other(anyhow!(
-        "`{key}` could not be written at a predictable version: something else keeps writing the \
-         bridge's VTA context"
+        "`{key}` could not be written at a predictable version: something ignores the bridge's \
+         app-state lease and keeps writing its VTA context"
     )))
 }
 
@@ -406,8 +537,8 @@ pub struct Mirror {
     dirty: Mutex<BTreeSet<Dirty>>,
     in_flight: Mutex<usize>,
     versions: Mutex<HashMap<String, u64>>,
-    /// The namespace counter as this host last saw it.
-    watermark: Mutex<u64>,
+    /// This mirror's name as a lease holder.
+    holder: String,
     wake: Notify,
     idle: Notify,
     /// Conflicts seen: another host wrote this context. Once non-zero the
@@ -432,7 +563,7 @@ impl Mirror {
             dirty: Mutex::default(),
             in_flight: Mutex::default(),
             versions: Mutex::default(),
-            watermark: Mutex::new(0),
+            holder: format!("mirror-{}", crate::wire::new_id()),
             wake: Notify::new(),
             idle: Notify::new(),
             conflicts: Default::default(),
@@ -486,6 +617,29 @@ impl Mirror {
                 }
             }
         }
+        // The VTA restored to a point before this host's last write: its
+        // counter is behind what this host saw, and a record this host
+        // mirrored after that point is simply missing — not deleted.
+        if let Some((key, m)) = mirrored.iter().max_by_key(|(_, v)| **v)
+            && listing.watermark < *m
+        {
+            self.conflicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bail!(
+                "the VTA's counter for the bridge's state is at {}, behind the {m} this bridge \
+                 wrote `{key}` at: its state was rolled back. The bridge does not run on it (it \
+                 would take what is missing for deleted); restore the VTA's current state (or \
+                 recreate the context) and start again",
+                listing.watermark
+            );
+        }
+        for (key, m) in &mirrored {
+            if !latest.contains_key(key) && *m > listing.watermark {
+                self.conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                bail!("`{key}` vanished from the VTA above its counter: its state was rolled back");
+            }
+        }
         for (key, r) in &latest {
             if let Some(m) = mirrored.get(key)
                 && r.version < *m
@@ -500,7 +654,6 @@ impl Mirror {
                 );
             }
         }
-        *self.watermark.lock().expect("lock") = listing.watermark;
         {
             let mut versions = self.versions.lock().expect("lock");
             versions.clear();
@@ -569,6 +722,13 @@ impl Mirror {
         remote: &dyn AppState,
         store: &crate::store::Store,
     ) -> Result<()> {
+        if self.dirty.lock().expect("lock").is_empty() {
+            self.idle.notify_waiters();
+            return Ok(());
+        }
+        // One writer at a time (see [`Lease`]). Taken before the batch, so a
+        // pass given up while it waits loses nothing.
+        let mut lease = Some(Lease::acquire(remote, &self.holder, Duration::from_secs(10)).await?);
         // Taken and counted in flight under one lock, so `pending` never
         // reads zero while a change is on its way.
         let batch: Vec<Dirty> = {
@@ -579,10 +739,15 @@ impl Mirror {
         };
         let mut failed: Option<anyhow::Error> = None;
         for item in batch {
-            if failed.is_none()
-                && let Err(e) = self.write(remote, store, &item).await
-            {
-                failed = Some(e);
+            if failed.is_none() {
+                let l = lease.as_mut().expect("held");
+                let res = match l.renew_if_due(remote).await {
+                    Ok(()) => self.write(remote, store, &item, l).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = res {
+                    failed = Some(e);
+                }
             }
             if failed.is_some() {
                 // Not written (this one failed, or a failure stopped the
@@ -590,6 +755,9 @@ impl Mirror {
                 self.dirty.lock().expect("lock").insert(item);
             }
             *self.in_flight.lock().expect("lock") -= 1;
+        }
+        if let Some(l) = lease.take() {
+            l.release(remote).await;
         }
         self.idle.notify_waiters();
         match failed {
@@ -605,6 +773,7 @@ impl Mirror {
         remote: &dyn AppState,
         store: &crate::store::Store,
         item: &Dirty,
+        lease: &mut Lease,
     ) -> Result<()> {
         let key = item.remote_key();
         let value: Option<Value> = match item {
@@ -637,8 +806,7 @@ impl Mirror {
             (Some(_), Dirty::Secret(n)) => {
                 let bytes = self.secrets.lock().expect("lock").get(n).cloned();
                 let Some(bytes) = bytes else { return Ok(()) };
-                let wm = *self.watermark.lock().expect("lock");
-                put_sealed(remote, &self.seal, n, &bytes, seen, wm)
+                put_sealed(remote, &self.seal, n, &bytes, seen, lease)
                     .await
                     .map(Some)
             }
@@ -648,11 +816,14 @@ impl Mirror {
                 .put(&key, v.clone(), Some(seen.unwrap_or(0)))
                 .await
                 .map(Some),
-            (None, _) => remote
-                .delete(&key, seen)
-                .await
-                .map(|v| v.map(|_| 0))
-                .map(|_| None),
+            // A deletion takes a version too (its tombstone's): the next
+            // write's is one past it.
+            (None, _) => remote.delete(&key, seen).await.map(|tombstone| {
+                if let Some(t) = tombstone {
+                    lease.observe(t);
+                }
+                None
+            }),
         };
         match res {
             Ok(Some(version)) => {
@@ -660,7 +831,7 @@ impl Mirror {
                     .lock()
                     .expect("lock")
                     .insert(key.clone(), version);
-                self.saw(version);
+                lease.observe(version);
                 store.put_cached(Table::Mirror, &key, &version)?;
                 Ok(())
             }
@@ -687,12 +858,6 @@ impl Mirror {
             }
             Err(PutError::Other(e)) => Err(e),
         }
-    }
-
-    /// Note a version this host's own write took.
-    fn saw(&self, version: u64) {
-        let mut wm = self.watermark.lock().expect("lock");
-        *wm = (*wm).max(version);
     }
 
     /// Serve until `stop`: write changes as they come, retrying with capped
@@ -985,5 +1150,156 @@ mod tests {
         assert_eq!(m.pending(), 1);
         m.sync_once(&remote, &s).await.unwrap();
         assert!(remote.snapshot().contains_key("state/namespaces/ns_9"));
+    }
+
+    /// Probe (re-review of #89): a VTA restored to a snapshot from before a
+    /// record existed must not make the bridge take the missing record for
+    /// deleted.
+    #[tokio::test]
+    async fn a_vta_rolled_back_to_before_a_record_existed_is_refused() {
+        let remote = MemoryAppState::new();
+        let (s, m) = vta_store();
+        s.put(Table::Namespaces, "ns_1", &json!({"id": "ns_1"}))
+            .unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        s.put(Table::Namespaces, "ns_2", &json!({"id": "ns_2"}))
+            .unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        // The VTA is restored to a snapshot holding ns_1 only, its counter
+        // back where it was then.
+        let (_, ns1) = remote.raw("state/namespaces/ns_1").unwrap();
+        let restored = MemoryAppState::new();
+        restored.put_as_other("state/namespaces/ns_1", ns1);
+        assert_eq!(restored.list().await.unwrap().watermark, 1);
+        // The same host, its cache intact.
+        let m2 = Mirror::new(MasterKey::from_bytes([3u8; 32]));
+        let s2 = s.clone().with_mirror(m2.clone());
+        let err = m2.pull(&restored, &s2).await.unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        assert!(m2.stopped(), "fails closed: 503, nothing written");
+        assert!(
+            s2.get::<Value>(Table::Namespaces, "ns_2")
+                .unwrap()
+                .is_some(),
+            "ns_2 is kept, not taken for deleted"
+        );
+    }
+
+    /// A deletion and a secret in one pass: the secret is sealed to the
+    /// version it takes (the deletion's tombstone moved the counter), once.
+    #[tokio::test]
+    async fn a_secret_after_a_deletion_is_sealed_once() {
+        let remote = MemoryAppState::new();
+        let (s, m) = vta_store();
+        s.put(Table::Meta, "a", &json!(1)).unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        s.delete(Table::Meta, "a").unwrap();
+        s.put_secret("github/github.com/acme/app", b"pem").unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        assert_eq!(
+            remote.puts("secret/github/github.com/acme/app"),
+            1,
+            "sealed once"
+        );
+        let (s2, m2) = vta_store();
+        m2.pull(&remote, &s2).await.unwrap();
+        assert_eq!(
+            &*s2.get_secret("github/github.com/acme/app")
+                .unwrap()
+                .unwrap(),
+            b"pem"
+        );
+    }
+
+    /// An operator's `secret set` (or `vta setup`) while the bridge runs:
+    /// the lease keeps their writes apart, and every secret opens.
+    #[tokio::test]
+    async fn writers_take_turns_under_the_lease_and_every_secret_opens() {
+        let remote = Arc::new(MemoryAppState::new());
+        let (s, m) = vta_store();
+        let seal = MasterKey::from_bytes([3u8; 32]);
+        // The operator holds the lease and writes a secret.
+        let mut op = Lease::acquire(remote.as_ref(), "operator", Duration::from_secs(1))
+            .await
+            .unwrap();
+        // The mirror cannot take it meanwhile: its pass waits for it.
+        s.put_secret("forgejo/codeberg.org/bot-token", b"tok")
+            .unwrap();
+        let pass = {
+            let (m, s, remote) = (m.clone(), s.clone(), remote.clone());
+            tokio::spawn(async move { m.sync_once(remote.as_ref(), &s).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pass.is_finished(), "the mirror waits for the lease");
+        put_sealed(
+            remote.as_ref(),
+            &seal,
+            "forgejo/codeberg.org/webhook-secret",
+            b"wh",
+            None,
+            &mut op,
+        )
+        .await
+        .unwrap();
+        op.release(remote.as_ref()).await;
+        pass.await.unwrap().unwrap();
+        let (s2, m2) = vta_store();
+        m2.pull(remote.as_ref(), &s2).await.unwrap();
+        assert_eq!(
+            &*s2.get_secret("forgejo/codeberg.org/bot-token")
+                .unwrap()
+                .unwrap(),
+            b"tok"
+        );
+        assert_eq!(
+            &*s2.get_secret("forgejo/codeberg.org/webhook-secret")
+                .unwrap()
+                .unwrap(),
+            b"wh"
+        );
+    }
+
+    /// A write that ignores the lease lands between: the secret is sealed
+    /// again to the version it took before `put_sealed` returns — never left
+    /// live and unopenable.
+    #[tokio::test]
+    async fn a_write_outside_the_lease_is_resealed_before_returning() {
+        let remote = MemoryAppState::new();
+        let seal = MasterKey::from_bytes([3u8; 32]);
+        let mut lease = Lease::acquire(&remote, "me", Duration::from_secs(1))
+            .await
+            .unwrap();
+        // Someone bumps the counter without the lease.
+        remote.put_as_other("state/meta/x", json!(1));
+        let v = put_sealed(&remote, &seal, "a/b", b"s", None, &mut lease)
+            .await
+            .unwrap();
+        let (at, value) = remote.raw("secret/a/b").unwrap();
+        assert_eq!(v, at);
+        assert_eq!(&*secret_bytes(&seal, "a/b", at, &value).unwrap(), b"s");
+        assert_eq!(
+            remote.puts("secret/a/b"),
+            2,
+            "sealed again after the stray write"
+        );
+    }
+
+    /// A lease its holder crashed with expires.
+    #[tokio::test]
+    async fn an_abandoned_lease_expires() {
+        let remote = MemoryAppState::new();
+        remote.put_as_other(LEASE_KEY, json!({ "holder": "crashed", "until": 0 }));
+        Lease::acquire(&remote, "me", Duration::from_secs(1))
+            .await
+            .unwrap();
+        remote.put_as_other(
+            LEASE_KEY,
+            json!({ "holder": "alive", "until": chrono::Utc::now().timestamp() + 60 }),
+        );
+        assert!(
+            Lease::acquire(&remote, "me", Duration::from_millis(300))
+                .await
+                .is_err()
+        );
     }
 }
