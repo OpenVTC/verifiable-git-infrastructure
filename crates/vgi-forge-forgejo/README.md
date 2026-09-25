@@ -73,7 +73,11 @@ Gitea, best effort), acting as **one community's bot user** on it.
   prior settings and reads them back — attempting the restore whatever
   happened to the writes, and failing loudly if it could not. A rule left
   open shows up in `inspect` as a bypass actor and unprotected paths:
-  critical drift, re-applied by the protection step.
+  critical drift, re-applied by the protection step. The bootstrap's own
+  `workflow` and `keyring` steps go through it too on a repository that has
+  a default branch, so re-running the bootstrap after the rendering changed
+  (the namespace fallback, a new release) converges instead of failing on
+  the protected path; a current file is left alone.
 - **Merge commits.** Fast-forward-only merges land the DID-signed commits
   unchanged. On an instance without them, `MergeFallback::InstanceSigningKey`
   allows instance-signed merge commits only and commits the instance's key

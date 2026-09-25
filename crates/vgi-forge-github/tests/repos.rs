@@ -635,6 +635,7 @@ async fn bootstrap_creates_everything_then_reruns_as_a_no_op() {
     );
     let workflow = String::from_utf8(file_contents(&plan, "workflow")).unwrap();
     assert!(workflow.contains("resource-format: qualified"));
+    assert!(workflow.contains("fallback-resource: github.com/${{ github.repository_owner }}\n"));
     assert!(workflow.contains("vtc-did: 'did:webvh:vtc.acme.example'"));
     assert!(!workflow.contains("${{ vars"));
 

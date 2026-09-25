@@ -118,7 +118,10 @@ Two inputs carry weight that a committed signer list used to:
 - **`--resource`** (and `--fallback-resource`) is the only thing scoping a
   signer to this repository. A grant is accepted exactly when the registry
   authorizes the tuple under it, so widening either widens who may sign, with
-  nothing in the repository to contradict it.
+  nothing in the repository to contradict it. Under `qualified`, the fallback
+  must contain the resource — its namespace (`github.com/acme` for
+  `github.com/acme/widgets`) — and one naming another owner or forge is
+  refused; under `legacy`, a forge-qualified fallback is refused.
 - **`--resource-format`** (default `legacy`) picks the form of both
   resources — see [Resource format](#resource-format).
 - **`--max-signers`** (default 32) bounds the distinct DIDs one range may

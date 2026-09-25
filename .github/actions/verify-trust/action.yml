@@ -29,7 +29,7 @@ inputs:
     required: false
     default: ""
   fallback-resource:
-    description: "Broader resource to also accept a grant under (e.g. the org: acme under legacy, github.com/acme under qualified). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`."
+    description: "Broader resource to also accept a grant under (e.g. the org: acme under legacy, github.com/acme under qualified). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`. Under qualified it must contain the resource (its namespace); another owner's or forge's is refused. To name the running repository's own namespace in a workflow shared by several repositories, pass your forge's host, a slash, and the github.repository_owner expression (as the workflows a VGI bridge bootstraps do)."
     required: false
     default: ""
   resource-format:
