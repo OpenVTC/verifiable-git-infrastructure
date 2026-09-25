@@ -141,10 +141,8 @@ pub struct StoredApp {
     /// Numeric App id.
     pub app_id: u64,
     /// The account that owns the App (lowercase), as GitHub reported it at
-    /// registration. Absent in records written before several Apps per host
-    /// were supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
+    /// registration.
+    pub owner: String,
     /// URL slug.
     pub slug: String,
     /// OAuth client id.
@@ -171,70 +169,29 @@ pub fn github_app_secret(host: &str, owner: &str) -> String {
     format!("github/{host}/{}/app", owner.to_ascii_lowercase())
 }
 
-/// Where a single-App release kept its App: `github/<host>/app`.
+/// Where a single-App release kept its App: `github/<host>/app`. Read only
+/// to refuse it ([`refuse_single_app_layout`]).
 pub fn legacy_github_app_secret(host: &str) -> String {
     format!("github/{host}/app")
 }
 
-/// The URL slug GitHub derives from an App name (lowercase, runs of anything
-/// but letters and digits become one hyphen).
-fn slug_of(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-/// Move a single-App release's `github/<host>/app` to the entry it belongs
-/// to (`github/<host>/<owner>/app`): the only entry on the host, or the one
-/// whose `app_name` is the App's (its slug). Refuses, naming the fix, when
-/// it cannot tell. Idempotent; a no-op once moved.
-pub fn migrate_legacy_github_secrets(cfg: &BridgeConfig, store: &Store) -> Result<()> {
+/// Refuse a store holding a GitHub App in the single-App layout
+/// (`github/<host>/app`, with no owner): this release keys every App by its
+/// owner and does not read or move that record. Deployments are recreated,
+/// not migrated.
+pub fn refuse_single_app_layout(cfg: &BridgeConfig, store: &Store) -> Result<()> {
     let hosts: std::collections::BTreeSet<&str> =
         cfg.github.iter().map(|g| g.host.as_str()).collect();
     for host in hosts {
-        let legacy = legacy_github_app_secret(host);
-        let Some(bytes) = store.get_secret(&legacy)? else {
-            continue;
-        };
-        let app: StoredApp = serde_json::from_slice(&bytes).context("decoding the sealed App")?;
-        let entries: Vec<_> = cfg.github_on(host).collect();
-        let owner = if entries.len() == 1 {
-            entries[0].owner_key()
-        } else {
-            let matching: Vec<_> = entries
-                .iter()
-                .filter(|g| slug_of(&g.app_name) == app.slug.to_ascii_lowercase())
-                .collect();
-            match matching.as_slice() {
-                [g] => g.owner_key(),
-                _ => anyhow::bail!(
-                    "`{legacy}` holds the App `{}` from a single-App config, and none (or more than \
-                     one) of the `[[github]]` entries on `{host}` has that `app_name`: set the \
-                     entry of the organisation that owns it to `app_name = \"{}\"`",
-                    app.slug,
-                    app.slug
-                ),
-            }
-        };
-        let target = github_app_secret(host, &owner);
-        if store.get_secret(&target)?.is_some() {
+        if store.get_secret(&legacy_github_app_secret(host))?.is_some() {
             anyhow::bail!(
-                "both `{legacy}` and `{target}` are stored: the old single-App record is stale; \
-                 remove it once you have checked `{target}` is the App in use"
+                "the store holds a GitHub App for `{host}` in the single-App layout \
+                 (`github/{host}/app`), which this release does not use: every App is now one \
+                 organisation's, with its own routes. Re-register the App: delete it on GitHub, \
+                 start the bridge on a fresh store (an empty `data_dir`, or in VTA mode a fresh \
+                 context), and register one App per organisation from the links it logs"
             );
         }
-        let mut moved = app;
-        moved.owner = Some(owner.clone());
-        let json = Zeroizing::new(serde_json::to_vec(&moved)?);
-        store.put_secret(&target, &json)?;
-        store.delete_secret(&legacy)?;
-        tracing::info!(%host, %owner, "moved the GitHub App's credentials to `{target}`");
     }
     Ok(())
 }
@@ -290,64 +247,22 @@ impl Adapters {
         self.map.write().expect("lock").insert(key, adapter);
     }
 
-    /// The key of the adapter serving `owner` on `host`: the host's (Forgejo),
-    /// the App `owner` owns, or a host's only App.
-    fn key_for(&self, host: &str, owner: Option<&str>) -> Option<Key> {
-        let map = self.map.read().expect("lock");
-        let host_key = (host.to_string(), None);
-        if map.contains_key(&host_key) {
-            return Some(host_key);
-        }
-        if let Some(o) = owner {
-            let k = (host.to_string(), Some(o.to_ascii_lowercase()));
-            if map.contains_key(&k) {
-                return Some(k);
-            }
-        }
-        // A host with one App keeps serving every owner there, as before
-        // several Apps per host were supported (GitHub installs a private App
-        // only on the account that owns it anyway).
-        let mut on_host = map.keys().filter(|(h, _)| h == host);
-        match (on_host.next(), on_host.next()) {
-            (Some(only), None) => Some(only.clone()),
-            _ => None,
-        }
-    }
-
-    /// The adapter for `host` when there is exactly one there (a Forgejo
-    /// host, or a GitHub host with a single App).
+    /// The Forgejo adapter for `host`.
     pub fn get(&self, host: &str) -> Option<Adapter> {
-        let k = self.key_for(host, None)?;
-        self.map.read().expect("lock").get(&k).cloned()
+        self.map
+            .read()
+            .expect("lock")
+            .get(&(host.to_string(), None))
+            .cloned()
     }
 
-    /// The GitHub App `owner` owns on `host` (or the host's only App).
+    /// The GitHub App `owner` owns on `host` — that App and no other.
     pub fn get_github(&self, host: &str, owner: &str) -> Option<Adapter> {
-        let k = self.key_for(host, Some(owner))?;
-        self.map.read().expect("lock").get(&k).cloned()
-    }
-
-    /// Exactly the GitHub App `owner` owns on `host` (no single-App
-    /// fallback): what a route naming the owner reaches.
-    pub fn github_exact(&self, host: &str, owner: &str) -> Option<Adapter> {
         self.map
             .read()
             .expect("lock")
             .get(&(host.to_string(), Some(owner.to_ascii_lowercase())))
             .cloned()
-    }
-
-    /// The GitHub App on `host` whose numeric id is `app_id`.
-    #[cfg(feature = "forge-github")]
-    pub fn github_by_app_id(&self, host: &str, app_id: u64) -> Option<Adapter> {
-        self.map
-            .read()
-            .expect("lock")
-            .iter()
-            .find(|((h, o), a)| {
-                h == host && o.is_some() && a.github().is_some_and(|g| g.config().app_id == app_id)
-            })
-            .map(|(_, a)| a.clone())
     }
 
     /// How many adapters serve `host`.
@@ -360,15 +275,28 @@ impl Adapters {
             .count()
     }
 
-    /// The adapter for a resource: its host's, and on GitHub the App its
-    /// owner owns.
+    /// The key of the adapter serving `r`: its Forgejo host, or the GitHub
+    /// App its owner owns.
+    fn key_of(&self, r: &Resource) -> Option<Key> {
+        let map = self.map.read().expect("lock");
+        [
+            (r.host().to_string(), None),
+            (r.host().to_string(), Some(r.owner().to_ascii_lowercase())),
+        ]
+        .into_iter()
+        .find(|k| map.contains_key(k))
+    }
+
+    /// The adapter for a resource: its Forgejo host's, or the GitHub App its
+    /// owner owns (and no other).
     pub fn for_resource(&self, r: &Resource) -> Option<Adapter> {
-        self.get_github(r.host(), r.owner())
+        let k = self.key_of(r)?;
+        self.map.read().expect("lock").get(&k).cloned()
     }
 
     /// The bootstrap inputs of the adapter serving `r`.
     pub fn vgi_for(&self, r: &Resource) -> Option<VgiConfig> {
-        let k = self.key_for(r.host(), Some(r.owner()))?;
+        let k = self.key_of(r)?;
         self.vgi.read().expect("lock").get(&k).cloned()
     }
 
@@ -417,9 +345,8 @@ pub fn build_github(
         return Ok(None);
     };
     let app: StoredApp = serde_json::from_slice(&bytes).context("decoding the sealed App")?;
-    if let Some(owner) = &app.owner
-        && !owner.eq_ignore_ascii_case(&g.app_owner)
-    {
+    let owner = &app.owner;
+    if !owner.eq_ignore_ascii_case(&g.app_owner) {
         anyhow::bail!(
             "the App stored for `{}` on `{}` is owned by `{owner}`: refusing it",
             g.app_owner,

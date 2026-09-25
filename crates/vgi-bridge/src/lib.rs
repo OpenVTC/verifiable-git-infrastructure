@@ -70,7 +70,7 @@ pub use store::Store;
 pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registry::Adapters> {
     let adapters = registry::Adapters::new();
     #[cfg(feature = "forge-github")]
-    registry::migrate_legacy_github_secrets(cfg, store)?;
+    registry::refuse_single_app_layout(cfg, store)?;
     #[cfg(feature = "forge-github")]
     for g in &cfg.github {
         let keyring = match &g.platform_keyring_file {

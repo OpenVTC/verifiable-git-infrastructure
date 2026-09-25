@@ -40,7 +40,6 @@ Inbound (through your proxy, HTTPS only):
 |---|---|
 | `POST /github/<host>/<owner>/webhook`, `POST /forgejo/<host>/webhook` | the forges (one GitHub route per App) |
 | `GET /github/<host>/<owner>/register`, `/registered`, `/setup` | admins' browsers, redirected by GitHub |
-| `POST /github/<host>/webhook`, `GET /github/<host>/register`, `/registered`, `/setup` | Apps registered before several Apps per host were supported (their URLs are fixed at GitHub); keep forwarding them |
 | `GET /forgejo/<host>/bind`, `/link` | admins' and members' browsers, redirected by Forgejo |
 | `GET /healthz` | your orchestrator (keep it internal) |
 
@@ -328,8 +327,9 @@ with several organisations gives the bridge one `[[github]]` entry each —
 its `app_owner` and its own `app_name` (App names are unique on a GitHub
 instance) — and registers one App per organisation. One bridge holds them
 all, keyed by `(host, app_owner)`: each App has its own key, webhook secret
-and routes, and the bridge picks the App from a namespace's owner. On a host
-with a single entry, that App serves every namespace there, as before. The
+and routes, and the bridge picks the App from a namespace's owner. An App serves
+its own organisation (or account) only, even when it is the host's only one:
+a namespace whose owner has no entry here cannot be bound. The
 VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —
@@ -407,18 +407,13 @@ App's install page, and GitHub's redirect to `/github/<host>/<owner>/setup` comp
 it. The bridge probes whether the organisation has org rulesets (the
 required-workflow guard) and records the answer.
 
-### Upgrading from a single App per host
+### A store from a single-App release
 
-A bridge from before several Apps per host kept its App at
-`github/<host>/app`. At start it moves it to `github/<host>/<owner>/app` for
-the entry it belongs to — the host's only entry, or the one whose `app_name`
-is the App's — and refuses to start, naming the entry to fix, if it cannot
-tell. The App's webhook and setup URLs at GitHub stay the owner-less ones:
-keep forwarding `/github/<host>/webhook` and `/github/<host>/setup`. With
-several Apps on a host, a webhook on that route goes to the App GitHub names
-in `X-GitHub-Hook-Installation-Target-ID` (and must verify with its secret).
-To move an App to its own routes, change its webhook URL and setup URL on
-its settings page to `…/github/<host>/<owner>/webhook` and `…/setup`.
+A release before several Apps per host kept its App at `github/<host>/app`,
+with owner-less routes. This release reads neither. It refuses to start on
+such a store and says to re-register: delete the App on GitHub, start the
+bridge on a fresh store (an empty `data_dir`, or in VTA mode a fresh
+context), and register one App per organisation from the links it logs.
 
 ## 4. Forgejo: the bot
 

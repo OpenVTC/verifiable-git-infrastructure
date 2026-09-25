@@ -482,7 +482,11 @@ async fn a_required_workflow_namespace_or_an_unready_installation_gets_no_bridge
             ready,
         );
         // The world restored before this seed; restore again with it.
-        let adapter = w.bridge.adapters().get("github.com").unwrap();
+        let adapter = w
+            .bridge
+            .adapters()
+            .get_github("github.com", "acme")
+            .unwrap();
         let rec = w
             .bridge
             .store()

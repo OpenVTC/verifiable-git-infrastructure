@@ -233,14 +233,20 @@ pub(crate) async fn bind_callback(
         bail!("this bind was started for another forge");
     }
     // A GitHub App's setup redirect names its owner: it must be the App that
-    // serves the namespace being bound.
-    if let Some(o) = route_owner
-        && !bridge
-            .cfg
-            .github_for(host, resource.owner())
-            .is_some_and(|g| g.app_owner.eq_ignore_ascii_case(o))
-    {
-        bail!("this bind was started for another organisation's App");
+    // serves the namespace being bound. (Forgejo's redirect names none.)
+    let on_github = bridge.cfg.github_on(host).next().is_some();
+    match route_owner {
+        Some(o) => {
+            if !bridge
+                .cfg
+                .github_for(host, resource.owner())
+                .is_some_and(|g| g.app_owner.eq_ignore_ascii_case(o))
+            {
+                bail!("this bind was started for another organisation's App");
+            }
+        }
+        None if on_github => bail!("a GitHub bind completes on its App's own route"),
+        None => {}
     }
     let adapter = bridge
         .adapters
@@ -345,10 +351,7 @@ pub(crate) async fn link_callback(
     if flow_host != host {
         bail!("this link was started for another forge");
     }
-    let adapter = bridge
-        .adapters
-        .get(host)
-        .context("that forge's adapter is not in service")?;
+    let adapter = link_adapter(bridge, &namespace, host)?;
     let outcome = adapter
         .forge()
         .complete_account_link(LinkCallback::redirect(params, member))
@@ -398,6 +401,22 @@ fn spawn_device_poll(bridge: &Arc<Bridge>, state: String) {
     });
 }
 
+/// The adapter an account link in namespace `ns_id` runs through: the one
+/// serving that namespace (on GitHub, its owner's App), on `host`.
+fn link_adapter(bridge: &Bridge, ns_id: &str, host: &str) -> Result<crate::registry::Adapter> {
+    let ns = bridge
+        .store
+        .get::<NamespaceRecord>(Table::Namespaces, ns_id)?
+        .context("the link's namespace is not known to this bridge")?;
+    if ns.resource.host() != host {
+        bail!("the link's namespace is on another forge");
+    }
+    bridge
+        .adapters
+        .for_resource(&ns.resource)
+        .context("that forge's adapter is not in service")
+}
+
 async fn poll_device(bridge: &Bridge, state: &str) -> Result<()> {
     let Some(PendingFlow::Link {
         job_id,
@@ -414,10 +433,7 @@ async fn poll_device(bridge: &Bridge, state: &str) -> Result<()> {
         .store
         .get_secret_string(&device_secret(state))?
         .context("the device code is gone")?;
-    let adapter = bridge
-        .adapters
-        .get(&host)
-        .context("adapter not in service")?;
+    let adapter = link_adapter(bridge, &namespace, &host)?;
     let remaining = (expires_at - now()).max(0) as u64;
     let cb = LinkCallback::DeviceCode {
         device_code: device_code.to_string(),
@@ -567,43 +583,28 @@ fn github_bases(g: &crate::config::GitHubForgeConfig) -> Result<(url::Url, url::
 fn registration_entry<'a>(
     bridge: &'a Bridge,
     host: &str,
-    owner: Option<&str>,
+    owner: &str,
 ) -> Result<&'a crate::config::GitHubForgeConfig> {
-    let mut on_host = bridge.cfg.github_on(host);
-    match owner {
-        Some(o) => on_host
-            .find(|g| g.app_owner.eq_ignore_ascii_case(o))
-            .with_context(|| format!("no `[[github]]` entry for `{o}` on `{host}`")),
-        None => {
-            let first = on_host.next().context("not configured")?;
-            if on_host.next().is_some() {
-                bail!(
-                    "this registration names no organisation and `{host}` has several; start again"
-                );
-            }
-            Ok(first)
-        }
-    }
+    bridge
+        .cfg
+        .github_for(host, owner)
+        .with_context(|| format!("no `[[github]]` entry for `{owner}` on `{host}`"))
 }
 
 /// Whether the owner a route names (`/github/<host>/<owner>/…`) is the one
-/// the flow was opened for. A legacy route (`None`) names none.
-fn same_owner(route: Option<&str>, flow: Option<&str>) -> bool {
-    match (route, flow) {
-        (None, _) => true,
-        (Some(r), Some(f)) => r.eq_ignore_ascii_case(f),
-        (Some(_), None) => false,
-    }
+/// the flow was opened for.
+fn same_owner(route: &str, flow: Option<&str>) -> bool {
+    flow.is_some_and(|f| route.eq_ignore_ascii_case(f))
 }
 
 /// The page that POSTs the manifest to GitHub (the manifest flow starts
 /// with a form submission from the admin's browser). `route_owner`: the
-/// organisation the link's path names (`None` on the pre-multi-App path).
+/// organisation the link's path names.
 #[cfg(feature = "forge-github")]
 pub(crate) fn manifest_page(
     bridge: &Bridge,
     host: &str,
-    route_owner: Option<&str>,
+    route_owner: &str,
     state: &str,
 ) -> Result<String> {
     use vgi_forge_github::manifest::{ManifestParams, app_manifest, registration_url};
@@ -622,7 +623,7 @@ pub(crate) fn manifest_page(
     if h != host || expires_at < now() || !same_owner(route_owner, owner.as_deref()) {
         bail!("unknown or expired registration link");
     }
-    let g = registration_entry(bridge, host, owner.as_deref())?;
+    let g = registration_entry(bridge, host, route_owner)?;
     let (_, web) = github_bases(g)?;
     // Every App's own routes: its webhook secret, its setup redirect.
     let base = format!("github/{host}/{}", g.owner_key());
@@ -660,7 +661,7 @@ pub(crate) fn manifest_page(
 pub(crate) async fn manifest_callback(
     bridge: &Arc<Bridge>,
     host: &str,
-    route_owner: Option<&str>,
+    route_owner: &str,
     code: &str,
     state: &str,
 ) -> Result<String> {
@@ -681,7 +682,7 @@ pub(crate) async fn manifest_callback(
     if h != host || !same_owner(route_owner, owner.as_deref()) {
         bail!("this registration was started for another forge or organisation");
     }
-    let g = registration_entry(bridge, host, owner.as_deref())?.clone();
+    let g = registration_entry(bridge, host, route_owner)?.clone();
     let secret_name = crate::registry::github_app_secret(host, &g.app_owner);
     if bridge.store.get_secret(&secret_name)?.is_some() {
         bail!(
@@ -695,7 +696,7 @@ pub(crate) async fn manifest_callback(
     bridge.store.delete(Table::Pending, state)?;
     let stored = crate::registry::StoredApp {
         app_id: creds.app_id,
-        owner: Some(g.owner_key()),
+        owner: g.owner_key(),
         slug: creds.slug.clone(),
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.expose().to_string(),

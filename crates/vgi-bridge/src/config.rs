@@ -581,21 +581,12 @@ type NsLayers<'a> = (Option<RoleMapConfig>, &'a BTreeMap<String, RepoConfig>);
 
 impl BridgeConfig {
     /// The `[[github]]` entry that serves `owner`'s namespaces on `host`: the
-    /// App `owner` owns, or — on a host with a single App — that App (as
-    /// before several were supported; GitHub itself only lets a private App
-    /// be installed on its owner).
+    /// App `owner` owns, and no other. GitHub installs a private App only on
+    /// its owner, so an owner without an entry of its own has no App here.
     pub fn github_for(&self, host: &str, owner: &str) -> Option<&GitHubForgeConfig> {
-        let mut on_host = self.github.iter().filter(|g| g.host == host);
-        let first = on_host.next()?;
-        if first.app_owner.eq_ignore_ascii_case(owner) {
-            return Some(first);
-        }
-        let rest: Vec<&GitHubForgeConfig> = on_host.collect();
-        if rest.is_empty() {
-            return Some(first);
-        }
-        rest.into_iter()
-            .find(|g| g.app_owner.eq_ignore_ascii_case(owner))
+        self.github
+            .iter()
+            .find(|g| g.host == host && g.app_owner.eq_ignore_ascii_case(owner))
     }
 
     /// Every `[[github]]` entry on `host`.
@@ -1079,12 +1070,9 @@ oauth_client_id = "0b6e3a0c"
         assert!(BridgeConfig::parse(&second("Acme", "other-name")).is_err());
         assert!(BridgeConfig::parse(&second("globex", "ACME-vgi-bridge")).is_err());
         assert!(BridgeConfig::parse(&second("glo/bex", "x")).is_err());
-        // A single App keeps serving the whole host.
+        // A lone App serves only its own owner.
         let one = BridgeConfig::parse(EXAMPLE).unwrap();
-        assert_eq!(
-            one.github_for("github.com", "initech").unwrap().app_owner,
-            "acme"
-        );
+        assert!(one.github_for("github.com", "initech").is_none());
     }
 
     #[test]

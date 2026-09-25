@@ -159,6 +159,19 @@ pub struct Options {
     pub extra_apps: Vec<(&'static str, u64, &'static str)>,
 }
 
+impl Options {
+    /// With a second organisation `owner` on github.com: its own App (id
+    /// `app_id`, the shared webhook secret) and `[[github]]` entry.
+    pub fn with_org(mut self, owner: &'static str, app_id: u64) -> Self {
+        self.github_extra.push_str(&format!(
+            "\n[[github]]\napp_name = \"{owner}-vgi-bridge\"\napp_owner = \"{owner}\"\n\
+             api_base = \"{{MOCK}}\"\nweb_base = \"{{WEB}}\"\n"
+        ));
+        self.extra_apps.push((owner, app_id, WEBHOOK_SECRET));
+        self
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
@@ -207,8 +220,9 @@ action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@012
 version = "v0.5.0"
 
 [[github]]
-app_name = "acme-vgi-bridge"
-app_owner = "acme"
+app_name = "{owner}-vgi-bridge"
+app_owner = "{owner}"
+{user}
 {keyring}
 bridge_checks = {checks}
 api_base = "{uri}"
@@ -216,12 +230,21 @@ web_base = "{web}"
 {extra}
 "#,
         vtc = vtc,
+        owner = owner_of(o.kind),
+        user = if o.kind == NamespaceKind::User {
+            "app_owner_is_user = true"
+        } else {
+            ""
+        },
         keyring = keyring,
         checks = o.bridge_checks,
         uri = server.uri(),
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
         max_body = o.max_body,
-        extra = o.github_extra.replace("{MOCK}", &server.uri()),
+        extra = o
+            .github_extra
+            .replace("{MOCK}", &server.uri())
+            .replace("{WEB}", &o.web_base.clone().unwrap_or_else(|| server.uri())),
         event_version = o
             .event_version
             .map(|v| format!("event_version = \"{v}\""))
@@ -230,31 +253,26 @@ web_base = "{web}"
     .unwrap()
 }
 
-pub fn seed_app(store: &Store) {
-    let app = StoredApp {
-        app_id: APP_ID,
-        owner: Some("acme".into()),
-        slug: "acme-vgi-bridge".into(),
-        client_id: "Iv1.testclient".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: WEBHOOK_SECRET.into(),
-        pem: app_pem().into(),
-    };
-    store
-        .put_secret(
-            &github_app_secret("github.com", "acme"),
-            &serde_json::to_vec(&app).unwrap(),
-        )
-        .unwrap();
+/// The account the test's App belongs to: the namespace's owner.
+pub fn owner_of(kind: NamespaceKind) -> &'static str {
+    match kind {
+        NamespaceKind::User => "alice",
+        _ => "acme",
+    }
+}
+
+/// Seal the test's registered App (owned by `owner`).
+pub fn seed_app(store: &Store, owner: &str) {
+    seed_app_for(store, owner, APP_ID, WEBHOOK_SECRET);
 }
 
 /// Seal a registered App for `owner` on github.com.
 pub fn seed_app_for(store: &Store, owner: &str, app_id: u64, webhook_secret: &str) {
     let app = StoredApp {
         app_id,
-        owner: Some(owner.into()),
+        owner: owner.into(),
         slug: format!("{owner}-vgi-bridge"),
-        client_id: format!("Iv1.{owner}"),
+        client_id: "Iv1.testclient".into(),
         client_secret: "client-secret".into(),
         webhook_secret: webhook_secret.into(),
         pem: app_pem().into(),
@@ -411,7 +429,7 @@ pub async fn world(o: Options) -> World {
         None => store,
     };
     if o.seed_app {
-        seed_app(&store);
+        seed_app(&store, owner_of(o.kind));
     }
     for (owner, id, secret) in &o.extra_apps {
         seed_app_for(&store, owner, *id, secret);
@@ -637,7 +655,8 @@ pub async fn completed_checks(server: &MockServer) -> Vec<Value> {
 pub async fn post_webhook(w: &World, event: &str, delivery: &str, body: &Value) -> StatusCode {
     let bytes = serde_json::to_vec(body).unwrap();
     let sig = sign_body(&Secret::new(WEBHOOK_SECRET), &bytes);
-    let req = Request::post("/github/github.com/webhook")
+    let owner = w.bridge.config().github[0].owner_key();
+    let req = Request::post(format!("/github/github.com/{owner}/webhook"))
         .header("x-github-event", event)
         .header("x-github-delivery", delivery)
         .header("x-hub-signature-256", sig)

@@ -542,7 +542,7 @@ async fn a_clean_dependabot_pull_request_is_re_signed_and_then_trusted() {
 /// `github.repository_owner` substituted, selected the way the binary does.
 fn required_workflow_resources(w: &World, remote: &Remote) -> (String, Option<String>) {
     let adapters = w.bridge.adapters();
-    let adapter = adapters.get("github.com").unwrap();
+    let adapter = adapters.get_github("github.com", "acme").unwrap();
     adapter
         .github()
         .unwrap()
@@ -842,7 +842,7 @@ async fn an_unsigned_push_is_refused() {
     let remote = Remote::new(1);
     let w = resign_world(&remote, true).await;
     let body = serde_json::to_vec(&push_event(ZERO, &remote.commits[0], DEPENDABOT)).unwrap();
-    let req = axum::http::Request::post("/github/github.com/webhook")
+    let req = axum::http::Request::post("/github/github.com/acme/webhook")
         .header("x-github-event", "push")
         .header("x-github-delivery", "p-forged")
         .header("x-hub-signature-256", format!("sha256={}", "0".repeat(64)))

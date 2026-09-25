@@ -7,7 +7,7 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::*;
-use serde_json::{Value, json};
+use serde_json::json;
 use tower::ServiceExt;
 use vgi_bridge::registry::{StoredApp, github_app_secret, legacy_github_app_secret};
 use vgi_forge::Resource;
@@ -114,22 +114,7 @@ async fn webhooks_are_routed_to_their_app_and_verified_with_its_secret() {
         .await,
         StatusCode::NOT_FOUND
     );
-    // The owner-less route of an App registered before: GitHub names the App.
-    let globex_id = GLOBEX_APP.to_string();
-    let by_app = [
-        ("x-github-hook-installation-target-type", "integration"),
-        ("x-github-hook-installation-target-id", globex_id.as_str()),
-    ];
-    assert_eq!(
-        post(&w, "/github/github.com/webhook", GLOBEX_SECRET, &by_app).await,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        post(&w, "/github/github.com/webhook", WEBHOOK_SECRET, &by_app).await,
-        StatusCode::UNAUTHORIZED,
-        "the header picks the App; its secret still has to verify"
-    );
-    // …and without it, with several Apps, there is no telling which.
+    // There is no owner-less route: every App has its own.
     assert_eq!(
         post(&w, "/github/github.com/webhook", WEBHOOK_SECRET, &[]).await,
         StatusCode::NOT_FOUND
@@ -185,105 +170,54 @@ async fn each_organisation_registers_its_own_app_with_its_own_routes() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// A store in the single-App layout (`github/<host>/app`) is refused at
+/// start, with the way out: re-register the App.
 #[tokio::test]
-async fn a_single_app_release_is_moved_to_its_organisation() {
-    // The layout before several Apps: `github/<host>/app`, no owner.
+async fn a_single_app_store_is_refused_with_re_register_guidance() {
     let w = world(Options {
         seed_app: false,
         ..Options::default()
     })
     .await;
     let store = w.bridge.store();
-    let legacy = StoredApp {
-        app_id: APP_ID,
-        owner: None,
-        slug: "acme-vgi-bridge".into(),
-        client_id: "Iv1.testclient".into(),
-        client_secret: "client-secret".into(),
-        webhook_secret: WEBHOOK_SECRET.into(),
-        pem: app_pem().into(),
-    };
+    let legacy = serde_json::json!({
+        "appId": APP_ID, "slug": "acme-vgi-bridge", "clientId": "Iv1.testclient",
+        "clientSecret": "cs", "webhookSecret": WEBHOOK_SECRET, "pem": app_pem(),
+    });
     store
         .put_secret(
             &legacy_github_app_secret("github.com"),
             &serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-    let adapters = vgi_bridge::build_adapters(w.bridge.config(), store)
-        .await
-        .unwrap();
-    assert!(adapters.get("github.com").is_some(), "in service");
-    assert!(
-        store
-            .get_secret(&legacy_github_app_secret("github.com"))
-            .unwrap()
-            .is_none()
-    );
-    let moved: Value = serde_json::from_slice(
-        &store
-            .get_secret(&github_app_secret("github.com", "acme"))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(moved["owner"], "acme");
-    assert_eq!(moved["appId"], APP_ID);
-}
-
-#[tokio::test]
-async fn a_single_app_release_with_several_entries_goes_to_the_entry_with_its_name() {
-    let w = world(Options {
-        seed_app: false,
-        extra_apps: vec![],
-        ..two_orgs()
-    })
-    .await;
-    let store = w.bridge.store();
-    let legacy = StoredApp {
-        app_id: GLOBEX_APP,
-        owner: None,
-        slug: "globex-vgi-bridge".into(),
-        client_id: "Iv1.g".into(),
-        client_secret: "cs".into(),
-        webhook_secret: GLOBEX_SECRET.into(),
-        pem: app_pem().into(),
-    };
-    store
-        .put_secret(
-            &legacy_github_app_secret("github.com"),
-            &serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-    let adapters = vgi_bridge::build_adapters(w.bridge.config(), store)
-        .await
-        .unwrap();
-    let r = Resource::namespace_of("github.com", "globex").unwrap();
-    assert_eq!(
-        adapters
-            .for_resource(&r)
-            .and_then(|a| a.github().map(|g| g.config().app_id)),
-        Some(GLOBEX_APP)
-    );
-    assert!(
-        store
-            .get_secret(&github_app_secret("github.com", "globex"))
-            .unwrap()
-            .is_some()
-    );
-
-    // A record no entry's name matches is refused, naming the fix.
-    let mut unknown = legacy;
-    unknown.slug = "something-else".into();
-    store
-        .put_secret(
-            &legacy_github_app_secret("github.com"),
-            &serde_json::to_vec(&unknown).unwrap(),
         )
         .unwrap();
     let err = vgi_bridge::build_adapters(w.bridge.config(), store)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("app_name"), "{err}");
+    assert!(err.to_string().contains("Re-register the App"), "{err}");
+    // Nothing was moved or read.
+    assert!(
+        store
+            .get_secret(&github_app_secret("github.com", "acme"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A lone App serves its own owner only: GitHub installs a private App only
+/// on its owner, and the bridge does not pretend otherwise.
+#[tokio::test]
+async fn a_lone_app_serves_only_its_own_owner() {
+    let w = world(Options::default()).await;
+    assert_eq!(app_id_for(&w, "acme"), Some(APP_ID));
+    assert_eq!(app_id_for(&w, "initech"), None);
+    let r = Resource::namespace_of("github.com", "initech").unwrap();
+    assert!(
+        w.bridge
+            .config()
+            .github_for("github.com", "initech")
+            .is_none()
+    );
+    assert!(w.bridge.adapters().vgi_for(&r).is_none());
 }
 
 #[tokio::test]
@@ -296,7 +230,7 @@ async fn an_app_stored_for_another_owner_is_refused() {
     // globex's App filed under acme.
     let wrong = StoredApp {
         app_id: GLOBEX_APP,
-        owner: Some("globex".into()),
+        owner: "globex".into(),
         slug: "globex-vgi-bridge".into(),
         client_id: "Iv1.g".into(),
         client_secret: "cs".into(),

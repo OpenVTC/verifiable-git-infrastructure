@@ -28,42 +28,18 @@ use crate::store::{BranchLedger, NamespaceRecord, NamespaceState, RepoRecord, Ta
 /// (spec).
 const NAMESPACE_REPOS: [&str; 1] = [".vgi"];
 
-/// The adapter a delivery is for. `owner`: the GitHub App the route names
-/// (`/github/<host>/<owner>/webhook`) — exactly that App. Without one (a
-/// Forgejo route, or an App registered before several Apps per host were
-/// supported, whose webhook URL has no owner): the host's only adapter, or on
-/// a host with several Apps the one GitHub names in
-/// `X-GitHub-Hook-Installation-Target-ID`. Whichever is picked, its own
+/// The adapter a delivery is for: the GitHub App the route names
+/// (`/github/<host>/<owner>/webhook`), or the Forgejo host's. Its own
 /// webhook secret must verify the delivery.
 fn webhook_adapter(
     bridge: &Bridge,
     host: &str,
     owner: Option<&str>,
-    headers: &HeaderMap,
 ) -> Option<crate::registry::Adapter> {
-    if let Some(o) = owner {
-        return bridge.adapters.github_exact(host, o);
+    match owner {
+        Some(o) => bridge.adapters.get_github(host, o),
+        None => bridge.adapters.get(host),
     }
-    if let Some(a) = bridge.adapters.get(host) {
-        return Some(a);
-    }
-    #[cfg(feature = "forge-github")]
-    {
-        let target_is_app = headers
-            .get("x-github-hook-installation-target-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|t| t.eq_ignore_ascii_case("integration"));
-        let app_id = headers
-            .get("x-github-hook-installation-target-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        if let (true, Some(id)) = (target_is_app, app_id) {
-            return bridge.adapters.github_by_app_id(host, id);
-        }
-    }
-    #[cfg(not(feature = "forge-github"))]
-    let _ = headers;
-    None
 }
 
 /// Handle a webhook for `host` (and, on GitHub, the App `owner` owns).
@@ -75,7 +51,7 @@ pub(crate) async fn on_webhook(
     headers: &HeaderMap,
     body: &[u8],
 ) -> StatusCode {
-    let Some(adapter) = webhook_adapter(bridge, host, owner, headers) else {
+    let Some(adapter) = webhook_adapter(bridge, host, owner) else {
         return StatusCode::NOT_FOUND;
     };
 
