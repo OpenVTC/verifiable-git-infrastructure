@@ -335,7 +335,11 @@ their App's webhook secret, so a delivery that App verifies is acted on only
 when every namespace, repository (by name and by forge id) and installation
 it names is that organisation's. Anything else is dropped and logged. A
 repository transferred between two organisations the bridge serves is
-reported by each organisation's App for its own side. The
+reported by each organisation's App for its own side. If only the new
+organisation's App reports the transfer, the bridge asks GitHub where the
+repository is now, through that App's own installation. Only when GitHub
+confirms the move does it detach the old organisation's record and tell
+that namespace (`repoTransferred`). The
 VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —

@@ -301,10 +301,45 @@ fn detach_from(bridge: &Bridge, ns: &NamespaceRecord, id: u64) -> bool {
     true
 }
 
-/// Whether the bridge records forge id `id` on `host` at all (any
-/// namespace): such a repository is not reported as unmanaged.
-fn known_repo(bridge: &Bridge, host: &str, id: u64) -> bool {
-    repo_record(bridge, host, id).is_some()
+/// A repository came into namespace `to_ns` that another organisation's
+/// namespace still records (that organisation's App sent no transfer, or
+/// has not yet). One organisation's webhook never changes another's
+/// state on its own word: the move is confirmed with GitHub first — where
+/// `to_ns`'s installation sees repository `forge_id` now — and only then is
+/// the old side detached and told (`repoTransferred`).
+async fn confirm_transfer_in(bridge: &Bridge, to_ns: &NamespaceRecord, forge_id: u64) {
+    let Some(rec) = repo_record(bridge, to_ns.resource.host(), forge_id) else {
+        return;
+    };
+    if rec.namespace == to_ns.id {
+        return;
+    }
+    let Some(old_ns) = namespace_record(bridge, &rec.namespace) else {
+        return;
+    };
+    #[cfg(feature = "forge-github")]
+    {
+        let Some(g) = bridge
+            .adapters
+            .for_resource(&to_ns.resource)
+            .and_then(|a| a.github().cloned())
+        else {
+            return;
+        };
+        match g.repository_by_id(&to_ns.resource, forge_id).await {
+            Ok(Some(now)) if to_ns.resource.contains(&now) && !old_ns.resource.contains(&now) => {
+                tracing::info!(from = %rec.resource, to = %now,
+                    "GitHub confirms a repository moved to another organisation; detaching it there");
+                transferred_out(bridge, &old_ns, &rec.resource, &now, forge_id).await;
+            }
+            Ok(other) => tracing::warn!(forge_id, now = ?other,
+                "a transfer in that GitHub does not confirm; the other organisation's record is left alone"),
+            Err(e) => tracing::warn!(forge_id, error = %e,
+                "could not confirm a transfer with GitHub; the other organisation's record is left alone"),
+        }
+    }
+    #[cfg(not(feature = "forge-github"))]
+    let _ = old_ns;
 }
 
 /// Stop governing repository `forge_id` on `host`: its record, its place in
@@ -384,7 +419,8 @@ pub(crate) fn detach_reused_name(
 
 /// Report `resource` (forge id `forge_id`) to namespace `ns` as a repository
 /// the VTC did not create or adopt — unless it is the bridge's own
-/// namespace-level repository, or one it manages. A repository this
+/// namespace-level repository, or one `ns` manages (another organisation's
+/// record of it does not stop the report). A repository this
 /// namespace records at the same name under another forge id is detached
 /// first (name reuse).
 pub(crate) async fn report_unmanaged(
@@ -394,7 +430,7 @@ pub(crate) async fn report_unmanaged(
     forge_id: u64,
 ) {
     if NAMESPACE_REPOS.contains(&resource.repo_name().unwrap_or_default())
-        || known_repo(bridge, resource.host(), forge_id)
+        || repo_in(bridge, ns, forge_id).is_some()
     {
         return;
     }
@@ -460,7 +496,7 @@ async fn handle(bridge: &Arc<Bridge>, scope: &Scope, kind: ForgeEventKind) {
                 return;
             };
             let name = repo.repo_name().unwrap_or_default();
-            if NAMESPACE_REPOS.contains(&name) || known_repo(bridge, repo.host(), forge_id) {
+            if NAMESPACE_REPOS.contains(&name) || repo_in(bridge, &ns, forge_id).is_some() {
                 // The bridge's own (it creates, then records) or part of the
                 // binding.
                 return;
@@ -556,8 +592,12 @@ async fn handle(bridge: &Arc<Bridge>, scope: &Scope, kind: ForgeEventKind) {
                 // this namespace it is a repository the VTC did not create
                 // or adopt, reported as such — never as `repoTransferred`,
                 // whose `from` would lie outside it.
+                // Another organisation's namespace may still record it
+                // (its App's delivery has not come, or will not): confirmed
+                // with GitHub before that side is detached.
                 _ => {
                     if let Some(t) = namespace_in(bridge, scope, &to) {
+                        confirm_transfer_in(bridge, &t, forge_id).await;
                         report_unmanaged(bridge, &t, &to, forge_id).await;
                     }
                 }
