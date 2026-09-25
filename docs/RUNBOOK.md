@@ -220,8 +220,9 @@ vgi repo init --vtc <vtc-did> --resource github.com/alice/gadgets
 cnm git adopt github.com/alice/gadgets --owner <owner-did>   # it prints this line
 ```
 
-It commits the workflow (DIDs as literals, `resource-format: qualified`) and the
-`web-flow` keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID` variables,
+It commits the workflow (DIDs as literals, `resource-format: qualified`, the
+namespace as `fallback-resource`, as the bridge writes it) and the `web-flow`
+keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID` variables,
 and converges the "VGI commit trust" ruleset: pull request required, the check
 required and pinned to GitHub Actions, no force-push or deletion, no bypass.
 These are **per-repository guards**: it does not set the organisation's

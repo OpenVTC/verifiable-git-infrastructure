@@ -26,7 +26,8 @@ what the bridge would write — but as you:
 - **GitHub**, through your `gh` login (`gh auth login`; admin on the
   repository). Every request is one `gh api` process with an argument vector
   and the body on stdin; nothing passes through a shell. It commits
-  `.github/workflows/verify-trust.yml` (the DIDs as literals) and the
+  `.github/workflows/verify-trust.yml` (the DIDs as literals, the namespace as
+  `fallback-resource`) and the
   `web-flow` exempt keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID`
   variables, and converges the "VGI commit trust" ruleset (pull request
   required, the check required and pinned to GitHub Actions, no force-push,

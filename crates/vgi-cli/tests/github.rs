@@ -302,7 +302,18 @@ fn a_personal_repository_gets_the_adapters_files_and_ruleset_then_nothing_change
     assert_eq!(&content_of(&changes[0]), contents);
     assert_eq!(
         content_of(&changes[0]),
-        render_workflow(&cfg(), DEFAULT_CHECKOUT_ACTION).into_bytes()
+        render_workflow(
+            &cfg(),
+            DEFAULT_CHECKOUT_ACTION,
+            &Resource::parse("github.com/alice/gadgets").unwrap()
+        )
+        .into_bytes()
+    );
+    // Namespace-wide rights are published at the namespace.
+    assert!(
+        String::from_utf8(content_of(&changes[0]))
+            .unwrap()
+            .contains("fallback-resource: github.com/")
     );
     assert_eq!(
         changes[0].stdin.as_ref().unwrap()["message"],
