@@ -231,7 +231,7 @@ permissions:
 jobs:
   verify:
     name: {name}
-    runs-on: {runs_on}
+    runs-on: "{runs_on}"
     steps:
       - uses: {checkout}
         with:
@@ -481,6 +481,43 @@ mod tests {
 
     fn ids(plan: &[BootstrapStep]) -> Vec<&str> {
         plan.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_runner_label_is_always_a_yaml_string() {
+        use yaml_rust2::{Yaml, YamlLoader};
+        let b = base();
+        // Every one of these is valid under `check_runs_on`, and each but
+        // `docker` would be null, a bool, a number or a sequence marker if
+        // written bare.
+        for label in [
+            "docker",
+            "-",
+            "null",
+            "true",
+            "1",
+            "1.5",
+            "~",
+            "ubuntu-24.04",
+        ] {
+            if label == "~" {
+                assert!(check_runs_on(label).is_err());
+                continue;
+            }
+            let mut o = opts(&b, MergePlan::FastForwardOnly, false);
+            o.runs_on = label;
+            let plan = forgejo_plan(&spec(), &cfg(), &o).unwrap();
+            let StepAction::WriteFile { contents, .. } = &plan[1].action else {
+                panic!("{:?}", plan[1].action)
+            };
+            let text = std::str::from_utf8(contents).unwrap();
+            let doc = &YamlLoader::load_from_str(text).unwrap()[0];
+            assert_eq!(
+                doc["jobs"]["verify"]["runs-on"],
+                Yaml::String(label.into()),
+                "{label}"
+            );
+        }
     }
 
     #[test]

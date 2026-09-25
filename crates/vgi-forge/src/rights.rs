@@ -84,6 +84,12 @@ impl fmt::Display for Right {
 /// are [held](EffectiveRights::holds) but never
 /// [projected](EffectiveRights::forge_tier); only a repository right granted
 /// in its own name (`own`, `maintain`, `commit.sign`) reaches a forge role.
+///
+/// Two values are equal when they hold the same rights *and* project the
+/// same ones — i.e. when their [canonical grants](EffectiveRights::granted)
+/// are equal. `[ns.admin]` and `[ns.admin, own]` hold the same rights but
+/// are different values: only the second projects `own`. Serialised as the
+/// canonical grants, so a round trip is the identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct EffectiveRights {
     /// Every right held, directly or by implication.
@@ -165,6 +171,21 @@ impl EffectiveRights {
         Self::tier(self.projectable)
     }
 
+    /// The smallest set of grants this value is the closure of, broadest
+    /// first: `ns.admin` if held; `repo.create` if held and not implied by
+    /// `ns.admin`; and the highest repository right granted in its own name.
+    /// `EffectiveRights::from_granted(x.granted()) == x` for every `x`.
+    pub fn granted(self) -> Vec<Right> {
+        let mut out = Vec::new();
+        if self.holds(Right::NsAdmin) {
+            out.push(Right::NsAdmin);
+        } else if self.holds(Right::RepoCreate) {
+            out.push(Right::RepoCreate);
+        }
+        out.extend(self.forge_tier());
+        out
+    }
+
     fn tier(bits: u8) -> Option<Right> {
         [Right::RepoOwn, Right::RepoMaintain, Right::CommitSign]
             .into_iter()
@@ -172,9 +193,12 @@ impl EffectiveRights {
     }
 }
 
+/// As the [canonical grants](EffectiveRights::granted), not every held
+/// right: writing the rights `ns.admin` implies would read back as
+/// repository rights granted in their own name, and project.
 impl Serialize for EffectiveRights {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(self.iter())
+        s.collect_seq(self.granted())
     }
 }
 
@@ -380,7 +404,7 @@ mod tests {
         assert_eq!(Right::from_action("vtc.member"), None);
         let json =
             serde_json::to_string(&EffectiveRights::from_granted([Right::RepoMaintain])).unwrap();
-        assert_eq!(json, r#"["git.repo.maintain","git.commit.sign"]"#);
+        assert_eq!(json, r#"["git.repo.maintain"]"#);
     }
 
     #[test]
@@ -416,6 +440,50 @@ mod tests {
         let both = EffectiveRights::from_granted([Right::NsAdmin, Right::RepoMaintain]);
         assert!(both.holds(Right::RepoOwn));
         assert_eq!(RoleMap::default().requested(both), ForgeRole::Maintain);
+    }
+
+    #[test]
+    fn serde_round_trips_are_the_identity() {
+        use Right::*;
+        let cases: &[(&[Right], &str)] = &[
+            (&[], "[]"),
+            (&[NsAdmin], r#"["git.ns.admin"]"#),
+            (&[NsAdmin, RepoOwn], r#"["git.ns.admin","git.repo.own"]"#),
+            (
+                &[NsAdmin, RepoMaintain],
+                r#"["git.ns.admin","git.repo.maintain"]"#,
+            ),
+            (&[NsAdmin, RepoCreate], r#"["git.ns.admin"]"#),
+            (
+                &[RepoCreate, CommitSign],
+                r#"["git.repo.create","git.commit.sign"]"#,
+            ),
+            (&[RepoOwn, RepoMaintain, CommitSign], r#"["git.repo.own"]"#),
+        ];
+        for (granted, want) in cases {
+            let x = EffectiveRights::from_granted(granted.iter().copied());
+            let json = serde_json::to_string(&x).unwrap();
+            assert_eq!(json, *want, "{granted:?}");
+            let back: EffectiveRights = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, x, "{granted:?}");
+            assert_eq!(back.forge_tier(), x.forge_tier(), "{granted:?}");
+            assert_eq!(EffectiveRights::from_granted(x.granted()), x);
+        }
+        // An ns.admin-only value stays one: it never reads back as an owner.
+        let admin: EffectiveRights = serde_json::from_str(
+            &serde_json::to_string(&EffectiveRights::from_granted([NsAdmin])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(RoleMap::default().requested(admin), ForgeRole::None);
+        // Same rights held, different projection: not equal.
+        assert_ne!(
+            EffectiveRights::from_granted([NsAdmin]),
+            EffectiveRights::from_granted([NsAdmin, RepoOwn])
+        );
+        assert_eq!(
+            EffectiveRights::from_granted([RepoOwn]),
+            EffectiveRights::from_granted([RepoOwn, CommitSign])
+        );
     }
 
     #[test]

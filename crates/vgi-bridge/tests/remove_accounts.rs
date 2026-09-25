@@ -7,17 +7,10 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::*;
 use serde_json::{Value, json};
-use trust_tasks_proof::affinidi::Verifier;
-use vgi_bridge::registry::forgejo_secret;
-use vgi_bridge::seal::MasterKey;
-use vgi_bridge::store::{JobRecord, NamespaceRecord, NamespaceState, RepoRecord, Table};
-use vgi_bridge::transport::memory::ChannelLink;
-use vgi_bridge::{Bridge, BridgeConfig, BridgeIdentity, BridgeParts, Store};
-use vgi_forge::{Namespace, NamespaceBinding, NamespaceKind, Resource};
+use vgi_bridge::store::{JobRecord, RepoRecord, Table};
+use vgi_forge::{NamespaceKind, Resource};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -575,36 +568,11 @@ async fn read_on_a_public_github_repository_is_no_access_left() {
 
 // ── Forgejo ─────────────────────────────────────────────────────────────
 
-const FJ: &str = "127.0.0.1";
-const BOT: &str = "acme-vgi-bot";
-const BOT_ID: u64 = 900;
-
-/// A bridge serving one bound Forgejo organisation, `acme`, with
-/// `acme/widgets` (forge id 812) managed and Alice its projected owner.
+/// [`forgejo_world`], with Alice (`admin`, the projected owner), Eve
+/// (`write`) and the bot as `acme/widgets`' collaborators.
 async fn forgejo_world() -> World {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/version"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "version": "9.0.0+gitea-1.22.0" })),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/user"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "id": BOT_ID, "login": BOT })),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/repos/acme/widgets"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "id": 812, "full_name": "acme/widgets" })),
-        )
-        .mount(&server)
-        .await;
+    let w = common::forgejo_world("").await;
+    let server = &w.server;
     let collaborators = [
         (ALICE, "alice-acme", "admin"),
         (EVE, "eve-renamed", "write"),
@@ -622,7 +590,7 @@ async fn forgejo_world() -> World {
                         .collect(),
                 )),
         )
-        .mount(&server)
+        .mount(server)
         .await;
     for (_, login, perm) in collaborators {
         Mock::given(method("GET"))
@@ -630,83 +598,11 @@ async fn forgejo_world() -> World {
                 "/api/v1/repos/acme/widgets/collaborators/{login}/permission"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "permission": perm })))
-            .mount(&server)
+            .mount(server)
             .await;
     }
 
-    let dir = tempfile::tempdir().unwrap();
-    let (vtc, _) = BridgeIdentity::generate_did_key().unwrap();
-    let cfg = BridgeConfig::parse(&format!(
-        r#"
-vtc_did = "{}"
-trust_registry_did = "did:webvh:QmReg:registry.acme.example"
-mediator_did = "did:web:mediator.acme.example"
-public_url = "https://bridge.acme.example/"
-data_dir = "{}"
-resend_secs = 3600
-
-[verify_trust]
-action = "https://code.example/vgi/verify-trust@0123456789abcdef0123456789abcdef01234567"
-version = "v0.5.0"
-sha256 = "{}"
-
-[[forgejo]]
-base_url = "{}"
-bot_login = "{BOT}"
-oauth_client_id = "cid"
-"#,
-        vtc.did(),
-        dir.path().display(),
-        "a".repeat(64),
-        server.uri(),
-    ))
-    .unwrap();
-    let store = Store::in_memory(MasterKey::generate().unwrap()).unwrap();
-    for (what, v) in [
-        ("bot-token", "bot-token-0000000000000000000000000000abcd"),
-        ("oauth-client-secret", "cs"),
-        ("webhook-secret", "wh"),
-    ] {
-        store
-            .put_secret(&forgejo_secret(FJ, what), v.as_bytes())
-            .unwrap();
-    }
-    let ns_resource = Resource::parse(&format!("{FJ}/acme")).unwrap();
-    let namespace = Namespace::new(ns_resource.clone(), NamespaceKind::Organization)
-        .with_owner_id(600)
-        .with_installation(1);
-    let mut ns = NamespaceRecord::pending(NS, ns_resource.clone());
-    ns.state = NamespaceState::Bound;
-    ns.binding = Some(NamespaceBinding::new(namespace, vec![]));
-    ns.managed.insert(812);
-    store.put(Table::Namespaces, NS, &ns).unwrap();
-    let mut rec = RepoRecord::new(NS, ns_resource.join("widgets").unwrap(), 812);
-    rec.roles_known = true;
-    store.put(Table::Repos, &rec.key(), &rec).unwrap();
-
-    let adapters = vgi_bridge::build_adapters(&cfg, &store).await.unwrap();
-    let identity = BridgeIdentity::store_did_key(&store, &[5u8; 32]).unwrap();
-    let (link, inbox) = ChannelLink::new();
-    let bridge = Bridge::new(BridgeParts::new(
-        cfg,
-        identity,
-        store,
-        adapters,
-        Arc::new(link),
-        Arc::new(Verifier::for_did_key()),
-    ));
-    bridge.restore().await.unwrap();
-    World {
-        server,
-        bridge,
-        vtc,
-        inbox,
-        dir,
-        verifier: Arc::new(FakeVerifier {
-            trusted: vec![],
-            seen: Default::default(),
-        }),
-    }
+    w
 }
 
 #[tokio::test]
