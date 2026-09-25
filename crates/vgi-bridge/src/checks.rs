@@ -198,6 +198,9 @@ impl CommitVerifier for VerifyTrustVerifier {
             range: String::new(),
             max_signers: self.max_signers,
             registry_url: Some(registry_url),
+            // The bridge-posted check queries the registry's `#rest`
+            // endpoint (see `VerifyTrustVerifier`).
+            transport: verify_trust::TransportSelector::Https,
             registry_did: self.registry_did.clone(),
             vtc_did: self.vtc_did.clone(),
             action: "git.commit.sign".into(),

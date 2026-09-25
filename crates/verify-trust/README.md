@@ -65,10 +65,10 @@ remediation applies:
 | `unsigned` | no `gpgsig` header |
 | `noSignerDid` | signed, but the committer names no DID |
 | `unresolvedSigner` | the claimed DID did not resolve |
-| `unknownKey` | the claimed DID publishes no such key |
+| `unknownKey` | the claimed DID publishes no such key — usually rotated out since the commit was signed; re-sign it with the current key |
 | `badSignature` | the DID publishes the key, but the signature fails |
 | `unauthorized` | valid signature, registry says no |
-| `registryUnavailable` | the registry could not be consulted |
+| `registryUnavailable` | the registry could not be consulted — unreachable, or (TSP/DIDComm) its mediator refused this run's DID or no answer authenticated as the registry arrived |
 | `pgpRejected` | PGP-signed, but by no key in the exempt keyring (or none is configured) |
 | `platformSignedEdit` | platform-signed, but not a merge (web-UI or API edit, squash merge, Dependabot) — re-sign it with `did-git-sign` |
 | `platformMergeUnverifiedParent` | platform-signed merge with a parent that neither passes nor is on the base branch |
@@ -80,8 +80,9 @@ name's provenance.
 
 ## Registry discovery
 
-`--registry-url` is optional. By default the endpoint comes from the registry's
-own DID document, which advertises one service entry per binding it serves:
+`--registry-url` is optional, and so is the registry's REST interface. By
+default the binding comes from the registry's own DID document, which
+advertises one service entry per binding it serves:
 
 ```json
 "service": [
@@ -95,21 +96,100 @@ own DID document, which advertises one service entry per binding it serves:
 ]
 ```
 
-Selection takes the highest-preference transport present in **both** the
-document and this build — **TSP, then DIDComm, then HTTPS**. `verify-trust`
-takes `trql-client`'s default features, so today it can construct only the
-HTTPS binding and selects that; a registry offering none of what we speak fails
-with both sides' transports named, rather than downgrading silently.
+Selection takes the highest-preference binding present in **both** the
+document and this build — **TSP, then DIDComm, then HTTPS**. Any one of the
+three is enough: a registry that publishes only `#tsp`, or only `#didcomm`, is
+queried over it. A registry offering none of what this build speaks fails with
+both sides' bindings named, rather than downgrading silently.
+
+`--transport <auto|tsp|didcomm|https>` chooses the binding. `auto` (the
+default) is the strict preference above, with **no fallback**: if the chosen
+binding fails — a mediator that refuses this run's DID — the run fails; it is
+never retried over HTTPS. A named binding is used only if the registry
+advertises it and this build speaks it; otherwise the run fails, naming both
+sides. `--transport https` uses the document's `#rest` endpoint — the setting
+for a registry whose mediator does not yet admit CI's throwaway DIDs.
+
+`--registry-url <url>` is the explicit HTTPS override: it skips discovery and
+queries `POST <url>/trust-tasks`, exactly as before, and implies
+`--transport https` (combining it with `tsp` or `didcomm` is an error). Use it
+for a local registry that publishes no service entry.
 
 There is deliberately **no fallback to guessing a URL from the DID's domain**.
 `vta-sdk` does that for a VTA, where a wrong host merely fails authentication;
 here a wrong host is one whose authorization answers we would believe.
 
-Why discover rather than configure: over the HTTPS binding the registry's reply
-carries no signature — `--registry-did` is only stamped on the *outgoing*
-request as `recipient`. Trust in "is this DID authorized" therefore rests on
-reaching the right host, so the endpoint is better derived from an identifier
-with integrity behind it than supplied as a second value nothing cross-checks.
+### Over TSP and DIDComm
+
+A mediator binding needs a sender, so the reply has somewhere to go. Each run
+generates a fresh **`did:peer:2`** — an Ed25519 and an X25519 key and a DIDComm
+service naming the registry's mediator — when it sends its first query. The
+keys live in memory only: never on disk, in a log, or in the environment, and
+they are dropped when the run ends. The identifier is a return address and
+nothing more; nothing is authorized by it.
+
+What the verdict rests on is the **registry's** key. A reply is believed only
+when the binding authenticated it as the registry DID, and it answers the
+query asked (thread and tuple):
+
+- **DIDComm:** the envelope is read *packed*, before it is unpacked. It must be
+  authcrypt (`ECDH-1PU`) whose protected header's `skid` is a key of
+  `--registry-did` and whose `apu` — the party info the key agreement is
+  actually computed over — names that same key; the sender key id is bound to
+  the key actually used. The unpacked message must report that key as its
+  sender, `from` must name the registry, and a signature by anyone else
+  refuses it (the registry does not sign replies today; authcrypt is the proof
+  of origin).
+- **TSP:** the sender VID the message's signature verified against is
+  `--registry-did`. A relationship is formed with the registry first (Rev 3
+  §7.2.2).
+
+Every query goes out under a fresh random id (UUID v4) and a reply must carry
+it as its thread. A reply from anyone else, correlated or not, is ignored, and
+so is a problem report whose sender is not proven to be the registry or its
+mediator — an unauthenticated "no" cannot end the run early.
+
+**Fail closed.** If the mediator refuses the run's DID, refuses the query, or
+the registry does not answer within 30 seconds, every signer's commits are
+`registryUnavailable` and the run fails. A range with nothing to ask about
+(no DID-signed commits) opens no session at all.
+
+**What the mediator must allow.** The registry's own access list is set by its
+`ACL_MODE` (`ExplicitDeny`, the default, accepts any sender). The run's DID is
+new to the mediator every time, so the *mediator* must admit DIDs it has not
+seen and give them an inbox the registry can answer into:
+
+- `mediator_acl_mode = "explicit_deny"` — in `explicit_allow` the run's DID
+  cannot authenticate, and the check fails closed (`registryUnavailable`).
+- a `global_acl_default` whose inbox is open to unlisted senders
+  (`MODE_EXPLICIT_DENY` or `ALLOW_ALL`) — that is all TSP needs — plus
+  `SEND_FORWARDED` and `RECEIVE_FORWARDED` for DIDComm, whose query and reply
+  travel as routing forwards. The narrowest that works for both:
+  `DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,SEND_FORWARDED,RECEIVE_FORWARDED,MODE_EXPLICIT_DENY`.
+  The mediator's *shipped* default (`DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES`)
+  gives a new DID an empty allowlist, so no reply can reach it: the check
+  fails closed.
+
+A registry whose mediator will not admit unknown DIDs should keep publishing
+`#rest`, or be queried with `--registry-url`.
+
+The CI runner needs outbound HTTPS and WebSocket (`wss://`) to the mediator's
+endpoints, in addition to DID resolution.
+
+### Over HTTPS
+
+The registry's reply carries no signature — `--registry-did` is only stamped
+on the *outgoing* request as `recipient`. Trust in "is this DID authorized"
+therefore rests on reaching the right host, so the endpoint is better derived
+from an identifier with integrity behind it than supplied as a second value
+nothing cross-checks.
+
+### Build features
+
+`didcomm` and `tsp` are default features; the release binaries and the GitHub
+Action carry both. `--no-default-features` builds an HTTPS-only verifier.
+DIDComm costs nothing extra (the TDK's messaging SDK is already linked); TSP
+adds `affinidi-tsp`.
 
 ## Scoping and cost
 

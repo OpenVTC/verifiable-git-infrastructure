@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use verify_trust::resource::{CiEnv, ResourceFormat, select_resources};
-use verify_trust::{VerifyTrustArgs, handle_verify_trust};
+use verify_trust::{TransportSelector, VerifyTrustArgs, handle_verify_trust};
 
 #[derive(Parser)]
 #[command(
@@ -29,14 +29,30 @@ struct Cli {
     #[arg(long, default_value_t = 32)]
     max_signers: usize,
 
-    /// Base URL of the Trust Registry (queries POST to `<url>/trust-tasks`).
+    /// Explicit HTTPS override: query the registry's REST interface at this
+    /// base URL (queries POST to `<url>/trust-tasks`).
     ///
-    /// Optional: by default the endpoint is discovered from --registry-did's
-    /// DID document, preferring TSP, then DIDComm, then HTTPS. Pass this only
-    /// to override discovery — e.g. a local registry that publishes no service
-    /// entry — since it unbinds where we ask from the DID we name.
+    /// Optional, and so is the registry's REST interface: by default the
+    /// binding is discovered from --registry-did's DID document, preferring
+    /// TSP, then DIDComm, then HTTPS. Over TSP and DIDComm the query is sent
+    /// from a did:peer generated for this run (never stored) through the
+    /// registry's mediator, and only an answer authenticated as the registry's
+    /// DID is believed. Pass this only to pin HTTPS or for a local registry
+    /// that publishes no service entry — it unbinds where we ask from the DID
+    /// we name.
     #[arg(long)]
     registry_url: Option<String>,
+
+    /// Which registry binding to query over. `auto` (default): TSP, then
+    /// DIDComm, then HTTPS — the first the registry's DID document
+    /// advertises — with no fallback if it then fails. `tsp`, `didcomm`,
+    /// `https`: that binding only; one the registry does not advertise, or
+    /// this build cannot speak, is an error. `https` uses the document's
+    /// `#rest` endpoint, or --registry-url when given (which implies https).
+    /// Use `https` while the registry's mediator does not admit this run's
+    /// throwaway DID.
+    #[arg(long, value_enum, default_value_t = TransportSelector::Auto)]
+    transport: TransportSelector,
 
     /// DID of the Trust Registry: the recipient of every query, and what the
     /// endpoint is discovered from.
@@ -127,6 +143,7 @@ async fn main() -> Result<()> {
         range: cli.range,
         max_signers: cli.max_signers,
         registry_url: cli.registry_url,
+        transport: cli.transport,
         registry_did: cli.registry_did,
         vtc_did: cli.vtc_did,
         action: cli.action,

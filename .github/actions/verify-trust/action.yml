@@ -17,9 +17,13 @@ inputs:
     description: "DID of your VTC: the community whose authority the trust tuple is evaluated under (TRQP's authority_id)."
     required: true
   registry-url:
-    description: "Base URL of the Trust Registry. Optional — by default the endpoint is discovered from registry-did's DID document, preferring TSP, then DIDComm, then HTTPS. Set this only to override discovery (e.g. a local registry publishing no service entry); it unbinds where we ask from the DID we name."
+    description: "Explicit HTTPS override: base URL of the Trust Registry's REST interface. Optional, as is the REST interface itself — by default the binding is discovered from registry-did's DID document, preferring TSP, then DIDComm, then HTTPS (over TSP/DIDComm the run queries as a throwaway did:peer through the registry's mediator, which must admit unknown DIDs; the runner then needs outbound wss:// to it). Set this only to pin HTTPS or for a local registry publishing no service entry; it unbinds where we ask from the DID we name."
     required: false
     default: ""
+  transport:
+    description: "Which Trust Registry binding to query over: 'auto' (TSP, then DIDComm, then HTTPS — the first registry-did's DID document advertises — with NO fallback if it then fails), 'tsp', 'didcomm' or 'https' (that binding only; one the registry does not advertise is an error). 'https' uses the document's #rest endpoint, or registry-url when set. Use 'https' while the registry's mediator does not yet admit a CI run's throwaway DID. Needs a release that has --transport (this one or later); 'auto' passes nothing, so older pinned versions keep working."
+    required: false
+    default: "auto"
   action:
     description: "TRQP action of the trust tuple."
     required: false
@@ -247,6 +251,7 @@ runs:
         VT_RESOURCE: ${{ inputs.resource }}
         VT_MAX_SIGNERS: ${{ inputs.max-signers }}
         VT_REGISTRY_URL: ${{ inputs.registry-url }}
+        VT_TRANSPORT: ${{ inputs.transport }}
         VT_FALLBACK_RESOURCE: ${{ inputs.fallback-resource }}
         VT_RESOURCE_FORMAT: ${{ inputs.resource-format }}
         VT_EXEMPT_KEYRING: ${{ inputs.exempt-keyring }}
@@ -259,6 +264,10 @@ runs:
         esac
         case "$VT_RANGE" in
           -*) echo "::error::verify-trust: range must be a revision range, not an option"; exit 1 ;;
+        esac
+        case "$VT_TRANSPORT" in
+          ''|auto|tsp|didcomm|https) ;;
+          *) echo "::error::verify-trust: transport must be auto, tsp, didcomm or https"; exit 1 ;;
         esac
         args=(
           --range "$VT_RANGE"
@@ -279,6 +288,10 @@ runs:
         fi
         if [ -n "$VT_REGISTRY_URL" ]; then
           args+=(--registry-url "$VT_REGISTRY_URL")
+        fi
+        # Passed only when not the default, like resource-format.
+        if [ -n "$VT_TRANSPORT" ] && [ "$VT_TRANSPORT" != "auto" ]; then
+          args+=(--transport "$VT_TRANSPORT")
         fi
         if [ -n "$VT_FALLBACK_RESOURCE" ]; then
           args+=(--fallback-resource "$VT_FALLBACK_RESOURCE")

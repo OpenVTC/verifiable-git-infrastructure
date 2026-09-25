@@ -212,6 +212,7 @@ fn args_for(repo: &Path, range: String, registry_url: String) -> VerifyTrustArgs
         max_signers: 32,
         exempt_keyring: None,
         registry_url: Some(registry_url),
+        transport: verify_trust::TransportSelector::Auto,
         registry_did: "did:example:registry".into(),
         vtc_did: "did:example:vtc".into(),
         action: "git.commit.sign".into(),

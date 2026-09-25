@@ -31,6 +31,30 @@ pub enum RepoCommand {
 }
 
 /// Which forge API to talk to.
+/// `--verify-trust-transport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TransportChoice {
+    /// TSP, then DIDComm, then HTTPS.
+    Auto,
+    /// TSP only.
+    Tsp,
+    /// DIDComm only.
+    Didcomm,
+    /// HTTPS only.
+    Https,
+}
+
+impl From<TransportChoice> for vgi_forge::VerifyTransport {
+    fn from(c: TransportChoice) -> Self {
+        match c {
+            TransportChoice::Auto => vgi_forge::VerifyTransport::Auto,
+            TransportChoice::Tsp => vgi_forge::VerifyTransport::Tsp,
+            TransportChoice::Didcomm => vgi_forge::VerifyTransport::Didcomm,
+            TransportChoice::Https => vgi_forge::VerifyTransport::Https,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ForgeChoice {
     /// GitHub for `github.com/…`; any other host is taken for Forgejo once
@@ -141,6 +165,13 @@ pub struct InitArgs {
     /// release publishes (trust on first use; say so to reviewers).
     #[arg(long, value_name = "HEX")]
     pub verify_trust_sha256: Option<String>,
+
+    /// The Trust Registry binding the written workflow uses (the action's
+    /// `transport` input). `auto` (default: TSP, then DIDComm, then HTTPS,
+    /// no fallback) writes no input; use `https` while the registry's
+    /// mediator does not admit a CI run's throwaway DID.
+    #[arg(long, value_enum, value_name = "BINDING", default_value_t = TransportChoice::Auto)]
+    pub verify_trust_transport: TransportChoice,
 
     /// The required check's name (the verify-trust job's name).
     #[arg(long, value_name = "NAME", default_value = DEFAULT_REQUIRED_CHECK)]

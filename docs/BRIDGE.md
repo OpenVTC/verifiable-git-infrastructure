@@ -52,7 +52,7 @@ Outbound:
   for the bridge-posted check — for the registry's DID and the DIDs commits
   claim. Signer DIDs are resolved under verify-trust's public-hosts-only
   policy: a DID naming an internal host is refused, not fetched;
-- the **Trust Registry** endpoint its DID document names.
+- the **Trust Registry**'s `#rest` endpoint, for the bridge-posted check.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
 refuses to start with a `public_url` that is not `https`. Keep the proxy's
@@ -335,6 +335,18 @@ repository writers are trusted not to forge the check —
   repository's qualified resource, with the namespace as the fallback
   resource. An empty range (the head is already in the base) is a success
   only when the head *is* the base tip; otherwise it is a failure.
+- **How it asks the registry.** Over HTTPS, at the `#rest` endpoint the
+  registry's DID document names — the bridge-posted check needs the registry
+  to publish one. It does not query over DIDComm: a reply arriving on the
+  bridge's mediator session reaches it already unpacked, without the envelope
+  needed to bind the authcrypt sender key id to the key actually used, so its
+  sender cannot be proven to be the registry. (The CI workflows take the
+  packed envelope and do check that binding; they can use TSP and DIDComm.)
+- **The workflows it writes** take `transport` under `[verify_trust]` —
+  `auto` (default: TSP, then DIDComm, then HTTPS, no fallback; writes no
+  input), `tsp`, `didcomm` or `https` — passed to the action as its
+  `transport` input. Set `https` while the registry's mediator does not admit
+  a CI run's throwaway DID.
 - It completes "Verify commit trust" as **success** or **failure** with a
   per-commit table. Anything that goes wrong fails the check (closed).
 - **Re-running.** "Re-run" on the check in GitHub (`check_run` /
