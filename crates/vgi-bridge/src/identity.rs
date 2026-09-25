@@ -18,7 +18,12 @@
 //! - **`did:key`**: still loaded from a store that holds one (earlier
 //!   releases minted it), but a VTC cannot send it jobs; `run` says so.
 //!
-//! Either way the private keys are held only in the sealed store, and the
+//! In VTA mode ([`crate::vta`]) the identity is the `did:webvh` of the
+//! bridge's own context in the VTC's VTA: its keys are fetched into memory at
+//! start-up and never stored here, and a rotation in the VTA replaces them at
+//! run time ([`crate::Bridge::replace_identity`]).
+//!
+//! Otherwise the private keys are held only in the sealed store, and the
 //! same keys serve DIDComm (authcrypt) and the Data Integrity proofs on every
 //! Trust Task document the bridge sends.
 
@@ -256,6 +261,20 @@ impl BridgeIdentity {
     /// The bridge's DID.
     pub fn did(&self) -> &str {
         &self.did
+    }
+
+    /// Whether `other` holds the same keys (ids and public halves).
+    pub fn same_keys(&self, other: &BridgeIdentity) -> bool {
+        let keys = |i: &BridgeIdentity| {
+            let mut v: Vec<(String, Vec<u8>)> = i
+                .secrets
+                .iter()
+                .map(|s| (s.id.clone(), s.get_public_bytes().to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+        self.did == other.did && self.signing.id == other.signing.id && keys(self) == keys(other)
     }
 
     /// Every secret DIDComm needs (signing and key agreement).

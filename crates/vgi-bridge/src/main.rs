@@ -42,11 +42,24 @@ enum Cmd {
         #[command(subcommand)]
         command: IdentityCmd,
     },
-    /// Sealed secrets.
+    /// Sealed secrets (in VTA mode: the context's app-state).
     Secret {
         #[command(subcommand)]
         command: SecretCmd,
     },
+    /// VTA mode: the bridge's trust context in the VTC's VTA.
+    Vta {
+        #[command(subcommand)]
+        command: VtaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum VtaCmd {
+    /// Check the context is ready and the credential can do what the bridge
+    /// needs (fetch its DID's keys, use app-state) and nothing wider, and
+    /// print the DID to register at the VTC.
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -127,6 +140,122 @@ fn settable(name: &str) -> bool {
         ["forgejo", host, "bot-token" | "bot-password" | "oauth-client-secret" | "webhook-secret"]
             if !host.is_empty()
     )
+}
+
+/// Load the VTA credential (VTA mode), and clear the environment variable
+/// it came from, as [`load_key`] does for the master key.
+fn load_credential(cfg: &BridgeConfig) -> Result<vta_sdk::credentials::CredentialBundle> {
+    let v = cfg.vta.as_ref().context("no `[vta]` section")?;
+    let cred = vgi_bridge::vta::load_credential(v)?;
+    if v.credential_file.is_none()
+        && let Some(var) = v.credential_env.as_deref()
+    {
+        // SAFETY: as in `load_key` — called before any thread is started.
+        unsafe { std::env::remove_var(var) };
+    }
+    Ok(cred)
+}
+
+/// Refuse a command that only makes sense for a locally held identity.
+fn not_in_vta_mode(cfg: &BridgeConfig, what: &str) -> Result<()> {
+    if cfg.vta.is_some() {
+        bail!(
+            "{what} is for a bridge that holds its own identity; in VTA mode the identity is the \
+             DID in the VTA context (`vgi-bridge vta setup` checks it)"
+        );
+    }
+    Ok(())
+}
+
+/// Connect to the VTA (VTA mode's admin commands).
+async fn vta_session(
+    cfg: &BridgeConfig,
+    cred: vta_sdk::credentials::CredentialBundle,
+) -> Result<vgi_bridge::vta::Session> {
+    let v = cfg.vta.as_ref().context("no `[vta]` section")?;
+    let mut cred = cred;
+    let s = vgi_bridge::vta::Session::connect(v, &cred).await;
+    zeroize::Zeroize::zeroize(&mut cred.private_key_multibase);
+    s
+}
+
+/// VTA mode's admin commands, over one session.
+fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
+    use vgi_bridge::appstate::{AppState as _, secret_key};
+    let cred = load_credential(cfg)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let session = vta_session(cfg, cred).await?;
+        let v = cfg.vta.as_ref().context("no `[vta]` section")?;
+        let out = async {
+            match command {
+                Cmd::Vta { command: VtaCmd::Setup } | Cmd::Init => {
+                    let report = vgi_bridge::vta::setup(&session, v, &cfg.mediator_did).await;
+                    for l in &report.lines {
+                        eprintln!("{l}");
+                    }
+                    if report.failed {
+                        bail!("the VTA context is not ready for the bridge (see above)");
+                    }
+                    println!("{}", report.did);
+                    eprintln!("register this DID at the VTC as the bridge serving its namespaces");
+                }
+                Cmd::Identity { command: IdentityCmd::Show } => {
+                    println!("{}", session.identity(v.did.as_deref()).await?.did());
+                }
+                Cmd::Secret { command } => {
+                    let remote = vgi_bridge::vta::VtaAppState::new(&session);
+                    match command {
+                        SecretCmd::Set { name } => {
+                            let value = read_secret(&name)?;
+                            let key = secret_key(&name);
+                            let current = remote.get(&key).await?.map(|r| r.version);
+                            let seal = session.sealing_key(true).await?;
+                            let sealed =
+                                vgi_bridge::appstate::secret_value(&seal, &name, value.as_bytes())?;
+                            remote
+                                .put(&key, sealed, Some(current.unwrap_or(0)))
+                                .await
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            eprintln!(
+                                "stored `{name}` in the VTA context `{}`; restart the bridge to use it",
+                                session.context()
+                            );
+                        }
+                        SecretCmd::List => {
+                            for r in remote.list().await? {
+                                if let Some(n) = r.key.strip_prefix("secret/") {
+                                    println!("{n}");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => bail!("not a VTA-mode command"),
+            }
+            Ok(())
+        }
+        .await;
+        session.shutdown().await;
+        out
+    })
+}
+
+/// Read a hand-set secret from standard input.
+fn read_secret(name: &str) -> Result<Zeroizing<String>> {
+    if !settable(name) {
+        bail!(
+            "`{name}` is not a secret set by hand (forgejo/<host>/bot-token, \
+             bot-password, oauth-client-secret or webhook-secret)"
+        );
+    }
+    let mut value = Zeroizing::new(String::new());
+    std::io::stdin().read_to_string(&mut value)?;
+    let trimmed = value.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        bail!("empty secret on standard input");
+    }
+    Ok(Zeroizing::new(trimmed.to_string()))
 }
 
 /// Load the master key, and clear the environment variable it came from so
@@ -290,12 +419,33 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("VGI_BRIDGE_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/etc/vgi-bridge/bridge.toml"));
     let cfg = BridgeConfig::load(&path)?;
+    if cfg.vta.is_some() {
+        return match cli.command {
+            Cmd::Run => {
+                let cred = load_credential(&cfg)?;
+                tokio::runtime::Runtime::new()?
+                    .block_on(vgi_bridge::run(cfg, vgi_bridge::Keys::Vta(cred)))
+            }
+            Cmd::Identity {
+                command: IdentityCmd::Import { .. },
+            } => not_in_vta_mode(&cfg, "`identity import`"),
+            Cmd::Identity {
+                command: IdentityCmd::Export { .. },
+            } => not_in_vta_mode(&cfg, "`identity export`"),
+            Cmd::Identity {
+                command: IdentityCmd::Mint { .. },
+            } => not_in_vta_mode(&cfg, "`identity mint`"),
+            other => vta_command(&cfg, other),
+        };
+    }
     match cli.command {
         Cmd::Run => {
             let key = load_key(&cfg)?;
-            tokio::runtime::Runtime::new()?.block_on(vgi_bridge::run(cfg, key))
+            tokio::runtime::Runtime::new()?
+                .block_on(vgi_bridge::run(cfg, vgi_bridge::Keys::Sealed(key)))
         }
         Cmd::Init => init(&cfg),
+        Cmd::Vta { .. } => bail!("the config has no `[vta]` section (VTA mode is off)"),
         Cmd::Identity { command } => {
             let store = open_store(&cfg)?;
             match command {
@@ -359,19 +509,8 @@ fn main() -> Result<()> {
             let store = open_store(&cfg)?;
             match command {
                 SecretCmd::Set { name } => {
-                    if !settable(&name) {
-                        bail!(
-                            "`{name}` is not a secret set by hand (forgejo/<host>/bot-token, \
-                             bot-password, oauth-client-secret or webhook-secret)"
-                        );
-                    }
-                    let mut value = Zeroizing::new(String::new());
-                    std::io::stdin().read_to_string(&mut value)?;
-                    let trimmed = value.trim_end_matches(['\r', '\n']);
-                    if trimmed.is_empty() {
-                        bail!("empty secret on standard input");
-                    }
-                    store.put_secret(&name, trimmed.as_bytes())?;
+                    let value = read_secret(&name)?;
+                    store.put_secret(&name, value.as_bytes())?;
                     eprintln!("stored `{name}`");
                 }
                 SecretCmd::List => {

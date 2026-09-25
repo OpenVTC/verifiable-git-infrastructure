@@ -8,7 +8,8 @@
 //!
 //! Environment overrides (applied after the file):
 //! `VGI_BRIDGE_LISTEN`, `VGI_BRIDGE_DATA_DIR`, `VGI_BRIDGE_PUBLIC_URL`,
-//! `VGI_BRIDGE_MASTER_KEY_FILE`.
+//! `VGI_BRIDGE_MASTER_KEY_FILE`, `VGI_BRIDGE_VTA_CREDENTIAL_FILE` (with a
+//! `[vta]` section).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -57,6 +58,12 @@ pub struct BridgeConfig {
     /// file.
     #[serde(default)]
     pub master_key_env: Option<String>,
+    /// VTA mode: the bridge's identity, secrets and state live in its own
+    /// trust context of the VTC's VTA, and this host holds only a
+    /// context-scoped credential. No master key is needed then. `None`: the
+    /// self-contained mode (sealed store, local identity).
+    #[serde(default)]
+    pub vta: Option<VtaConfig>,
     /// Oldest `issuedAt` a job is accepted with, in seconds (plus a minute of
     /// clock skew). A stale job replayed after later ones would push the
     /// forge back to an old desired state.
@@ -72,6 +79,14 @@ pub struct BridgeConfig {
     /// seconds.
     #[serde(default = "default_resend")]
     pub resend_secs: u64,
+    /// How long a resolved DID document is trusted before it is resolved
+    /// again, in seconds (10–3600): the VTC's (job proofs), the registry's,
+    /// and commit signers' (the bridge-posted check). It bounds how long a
+    /// key its owner rotated out can still be accepted. A proof or commit
+    /// that fails against a cached document is checked once more against a
+    /// fresh resolution before it is refused.
+    #[serde(default = "default_did_cache_ttl")]
+    pub did_cache_ttl_secs: u64,
     /// How long a bind or link waits for the person, in seconds.
     #[serde(default = "default_flow_ttl")]
     pub flow_ttl_secs: u64,
@@ -95,6 +110,52 @@ pub struct BridgeConfig {
     /// Forgejo instances, one bot each.
     #[serde(default)]
     pub forgejo: Vec<ForgejoForgeConfig>,
+}
+
+/// VTA mode (design §5.7, "The bridge works off the VTC's VTA"): where the
+/// bridge's trust context is and how it authenticates to it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct VtaConfig {
+    /// The context's id in the VTA (`vgi-bridge`).
+    pub context: String,
+    /// File holding the context credential bundle the VTA issued (JSON:
+    /// `did`, `privateKeyMultibase`, `vtaDid`, optional `vtaUrl`; or the
+    /// same base64-encoded). Owner-only.
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    /// Environment variable holding the bundle, when there is no file. The
+    /// bridge clears it once read.
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    /// Reach the VTA over DIDComm through this mediator. `None`: REST, at
+    /// the bundle's `vtaUrl` (or `url`).
+    #[serde(default)]
+    pub mediator_did: Option<String>,
+    /// The VTA's REST URL, when the bundle carries none.
+    #[serde(default)]
+    pub url: Option<Url>,
+    /// The bridge's DID. `None`: the context's DID.
+    #[serde(default)]
+    pub did: Option<String>,
+    /// Seconds start-up keeps retrying an unreachable VTA before it gives
+    /// up (the bridge cannot run without its keys).
+    #[serde(default = "default_vta_start_timeout")]
+    pub start_timeout_secs: u64,
+    /// How often the bridge asks the VTA whether its keys were rotated, in
+    /// seconds (at least 30; SIGHUP asks at once). A rotation puts the new
+    /// keys in service and drops the old ones.
+    #[serde(default = "default_key_refresh")]
+    pub key_refresh_secs: u64,
+}
+
+fn default_key_refresh() -> u64 {
+    60
+}
+
+fn default_vta_start_timeout() -> u64 {
+    300
 }
 
 /// A `git-ns/bridge/event` version the bridge can send.
@@ -426,6 +487,9 @@ fn default_sweep() -> u64 {
 fn default_resend() -> u64 {
     60
 }
+fn default_did_cache_ttl() -> u64 {
+    60
+}
 fn default_flow_ttl() -> u64 {
     900
 }
@@ -625,6 +689,11 @@ impl BridgeConfig {
         if let Ok(v) = std::env::var("VGI_BRIDGE_MASTER_KEY_FILE") {
             self.master_key_file = Some(v.into());
         }
+        if let Ok(v) = std::env::var("VGI_BRIDGE_VTA_CREDENTIAL_FILE")
+            && let Some(vta) = self.vta.as_mut()
+        {
+            vta.credential_file = Some(v.into());
+        }
         Ok(())
     }
 
@@ -650,6 +719,37 @@ impl BridgeConfig {
                 "`public_url` must be https (the forges send secrets-bearing redirects and \
                  webhooks to it); got `{s}`"
             ),
+        }
+        if let Some(v) = &self.vta {
+            if self.master_key_file.is_some() || self.master_key_env.is_some() {
+                bail!(
+                    "`[vta]` and a master key are both set: in VTA mode nothing is sealed into the \
+                     local store (secrets live in the VTA), so remove `master_key_file` / \
+                     `master_key_env`"
+                );
+            }
+            if v.context.trim().is_empty() {
+                bail!("`vta.context` must name the bridge's context in the VTA");
+            }
+            if v.credential_file.is_none() && v.credential_env.is_none() {
+                bail!("`[vta]` needs `credential_file` or `credential_env`");
+            }
+            for (what, did) in [("vta.mediator_did", &v.mediator_did), ("vta.did", &v.did)] {
+                if let Some(did) = did
+                    && (!did.starts_with("did:") || did.chars().any(char::is_whitespace))
+                {
+                    bail!("`{what}` must be a DID, got `{did}`");
+                }
+            }
+            if let Some(u) = &v.url
+                && u.scheme() != "https"
+                && !matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            {
+                bail!("`vta.url` must be https (the credential handshake travels over it)");
+            }
+        }
+        if !(10..=3600).contains(&self.did_cache_ttl_secs) {
+            bail!("`did_cache_ttl_secs` must be between 10 and 3600");
         }
         if self.max_body_bytes < 64 * 1024 {
             bail!("`max_body_bytes` below 64 KiB would refuse ordinary webhooks");
@@ -808,6 +908,38 @@ oauth_client_id = "0b6e3a0c"
         );
         let c = BridgeConfig::parse(&no_keyring).unwrap();
         assert!(c.github[0].platform_keyring_file.is_none());
+    }
+
+    #[test]
+    fn vta_mode_parses_and_refuses_a_master_key_beside_it() {
+        let base = EXAMPLE.replace(
+            "master_key_file = \"/run/secrets/vgi-bridge-master-key\"\n",
+            "",
+        );
+        let with = |vta: &str| BridgeConfig::parse(&format!("{base}\n[vta]\n{vta}"));
+        let c = with("context = \"vgi-bridge\"\ncredential_file = \"/run/secrets/c\"").unwrap();
+        let v = c.vta.unwrap();
+        assert_eq!(v.context, "vgi-bridge");
+        assert_eq!(v.key_refresh_secs, 60);
+        assert_eq!(c.did_cache_ttl_secs, 60);
+        assert!(
+            with("context = \"vgi-bridge\"").is_err(),
+            "a credential source is required"
+        );
+        assert!(with("context = \"\"\ncredential_env = \"X\"").is_err());
+        assert!(
+            with("context = \"b\"\ncredential_env = \"X\"\nurl = \"http://vta.example\"").is_err(),
+            "cleartext only to loopback"
+        );
+        assert!(
+            with("context = \"b\"\ncredential_env = \"X\"\nmediator_did = \"mediator\"").is_err()
+        );
+        let err = BridgeConfig::parse(&format!(
+            "{EXAMPLE}\n[vta]\ncontext = \"b\"\ncredential_env = \"X\""
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("master key"), "{err}");
+        assert!(BridgeConfig::parse(&format!("did_cache_ttl_secs = 5\n{EXAMPLE}")).is_err());
     }
 
     #[test]
