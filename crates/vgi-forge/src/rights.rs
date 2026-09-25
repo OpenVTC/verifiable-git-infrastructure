@@ -252,7 +252,7 @@ impl fmt::Display for ForgeRole {
 /// is applied (§4.2's "GitHub projection (org)" column is the default).
 ///
 /// This is the community hook of §5.8 layer 3: a bridge, a namespace or a
-/// repository may override the map (`maintain → admin` on Forgejo instead of
+/// repository may override the map (`maintain → write` on Forgejo instead of
 /// `write` plus the merge allow-list, or committers get `write` on a
 /// repository that opts in to branch-based contribution) without code.
 ///
@@ -260,22 +260,21 @@ impl fmt::Display for ForgeRole {
 /// a namespace admin gets no forge role, so no map can give them one. An
 /// `nsAdmin` key is refused when a map is read.
 ///
-/// A map is always ordered — `own ≥ maintain ≥ commit` — and a committer
-/// gets at most `write`: the check, not the forge role, decides whose
-/// commits land, and a committer with merge rights would be a maintainer.
-/// [`RoleMap::new`] and deserialisation both enforce this.
+/// A map is always ordered — `own ≥ maintain ≥ commit` — and **only `own`
+/// may map to [`ForgeRole::Admin`]** (`git-ns/bridge/job` 0.4): `maintain`
+/// and `commit` are rights their holder may grant themselves, so either at
+/// `admin` would let someone make themselves an administrator of the
+/// repository on the forge on their own authority. A committer gets at most
+/// `write`: the check, not the forge role, decides whose commits land, and a
+/// committer with merge rights would be a maintainer. [`RoleMap::new`] and
+/// deserialisation both enforce this, and the fields are private so that no
+/// map can be changed afterwards to one they would refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", try_from = "RawRoleMap")]
-#[non_exhaustive]
 pub struct RoleMap {
-    /// Role for `git.repo.own`.
-    pub own: ForgeRole,
-    /// Role for `git.repo.maintain`.
-    pub maintain: ForgeRole,
-    /// Role for `git.commit.sign`. `None` by default: committers contribute
-    /// through fork PRs, and the required check — not a forge role — decides
-    /// whether their commits land.
-    pub commit: ForgeRole,
+    own: ForgeRole,
+    maintain: ForgeRole,
+    commit: ForgeRole,
 }
 
 /// The unchecked wire form of [`RoleMap`].
@@ -309,8 +308,18 @@ impl RoleMap {
     pub const MAX_COMMIT: ForgeRole = ForgeRole::Write;
 
     /// A map giving `own`, `maintain` and `commit` to the three tiers.
-    /// Refused unless `own ≥ maintain ≥ commit` and `commit ≤ write`.
+    /// Refused unless `own ≥ maintain ≥ commit`, `maintain` is below
+    /// `admin` and `commit ≤ write`.
     pub fn new(own: ForgeRole, maintain: ForgeRole, commit: ForgeRole) -> Result<Self, String> {
+        for (tier, role) in [("a maintainer", maintain), ("a committer", commit)] {
+            if role >= ForgeRole::Admin {
+                return Err(format!(
+                    "{tier} may not get `{role}`: only an owner (`own`) may map to the forge's \
+                     administrator role, since maintain and commit are rights their holder may \
+                     grant themselves"
+                ));
+            }
+        }
         if maintain > own {
             return Err(format!(
                 "a maintainer (`{maintain}`) may not get more than an owner (`{own}`)"
@@ -333,6 +342,23 @@ impl RoleMap {
             maintain,
             commit,
         })
+    }
+
+    /// Role for `git.repo.own`.
+    pub fn own(&self) -> ForgeRole {
+        self.own
+    }
+
+    /// Role for `git.repo.maintain`. Never [`ForgeRole::Admin`].
+    pub fn maintain(&self) -> ForgeRole {
+        self.maintain
+    }
+
+    /// Role for `git.commit.sign`. `None` by default: committers contribute
+    /// through fork PRs, and the required check — not a forge role — decides
+    /// whether their commits land. At most [`RoleMap::MAX_COMMIT`].
+    pub fn commit(&self) -> ForgeRole {
+        self.commit
     }
 
     /// The default map with committers given `write` — for a repository that
@@ -427,7 +453,7 @@ mod tests {
     fn a_namespace_admin_gets_no_forge_role_under_any_map() {
         let admin = EffectiveRights::from_granted([Right::NsAdmin]);
         let everything =
-            RoleMap::new(ForgeRole::Admin, ForgeRole::Admin, ForgeRole::Write).unwrap();
+            RoleMap::new(ForgeRole::Admin, ForgeRole::Maintain, ForgeRole::Write).unwrap();
         for map in [
             RoleMap::default(),
             RoleMap::with_committer_write(),
@@ -489,21 +515,57 @@ mod tests {
     #[test]
     fn a_role_map_is_ordered_and_committers_stop_at_write() {
         use ForgeRole::*;
-        assert!(RoleMap::new(Admin, Admin, None).is_ok());
+        assert!(RoleMap::new(Admin, Maintain, Write).is_ok());
         assert!(RoleMap::new(Admin, Write, Write).is_ok());
-        assert!(RoleMap::new(Maintain, Admin, None).is_err());
+        assert!(RoleMap::new(Write, Write, None).is_ok());
+        assert!(RoleMap::new(Maintain, Write, None).is_ok());
+        assert!(RoleMap::new(Write, Maintain, None).is_err());
         assert!(RoleMap::new(Admin, Write, Maintain).is_err());
-        assert!(RoleMap::new(Admin, Admin, Admin).is_err());
         let ok: RoleMap =
-            serde_json::from_str(r#"{"own":"admin","maintain":"admin","commit":"write"}"#).unwrap();
-        assert_eq!(ok.maintain, Admin);
+            serde_json::from_str(r#"{"own":"admin","maintain":"write","commit":"write"}"#).unwrap();
+        assert_eq!(ok.maintain(), Write);
         for bad in [
-            r#"{"own":"write","maintain":"admin","commit":"none"}"#,
-            r#"{"own":"admin","maintain":"admin","commit":"admin"}"#,
+            r#"{"own":"write","maintain":"maintain","commit":"none"}"#,
+            r#"{"own":"admin","maintain":"write","commit":"maintain"}"#,
             r#"{"own":"admin","maintain":"maintain","commit":"none","nsAdmin":"admin"}"#,
         ] {
             assert!(serde_json::from_str::<RoleMap>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_an_owner_may_map_to_admin() {
+        use ForgeRole::*;
+        // Maintain or commit at admin is refused, whatever else the map says.
+        for (own, maintain, commit) in [
+            (Admin, Admin, None),
+            (Admin, Admin, Write),
+            (Admin, Admin, Admin),
+            (Admin, Maintain, Admin),
+            (Admin, Write, Admin),
+        ] {
+            let err = RoleMap::new(own, maintain, commit).unwrap_err();
+            assert!(
+                err.contains("only an owner"),
+                "{own}/{maintain}/{commit}: {err}"
+            );
+        }
+        // Deserialisation takes the same path.
+        for bad in [
+            r#"{"own":"admin","maintain":"admin","commit":"none"}"#,
+            r#"{"own":"admin","maintain":"admin","commit":"write"}"#,
+            r#"{"own":"admin","maintain":"maintain","commit":"admin"}"#,
+        ] {
+            let err = serde_json::from_str::<RoleMap>(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only an owner"), "{bad}: {err}");
+        }
+        // Every map that exists gives admin to nobody but an owner.
+        for map in [RoleMap::default(), RoleMap::with_committer_write()] {
+            assert!(map.maintain() < Admin && map.commit() < Admin);
+        }
+        assert_eq!(RoleMap::default().own(), Admin);
     }
 
     #[test]

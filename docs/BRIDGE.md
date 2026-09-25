@@ -568,10 +568,10 @@ overridden, field by field, at four levels; the most specific wins:
 [[forgejo]]
 base_url = "https://codeberg.org/"
 # …
-# Every namespace on this instance: maintainers as repository admins
-# instead of `write` plus the merge allow-list.
+# Every namespace on this instance: maintainers as plain `write`,
+# without the merge allow-list.
 [forgejo.role_map]
-maintain = "admin"
+maintain = "write"
 
 # One namespace (the owner's login, lowercase).
 [forgejo.namespaces.acme.role_map]
@@ -588,7 +588,14 @@ commit = "write"
 `resign_dependabot`). Values are `none`, `read`, `triage`, `write`,
 `maintain`, `admin`. The start fails unless every map the layers can make is
 ordered — `own ≥ maintain ≥ commit` — with `commit` at most `write` (merging
-is a maintainer's; the check, not a role, decides whose commits land).
+is a maintainer's; the check, not a role, decides whose commits land), and
+**only `own` may map to `admin`**. `maintain` and `commit.sign` are rights a
+member may grant themselves, so a map that made either a forge admin would let
+them make themselves a repository administrator on their own authority; the
+start fails with an error naming the layer (`git-ns/bridge/job` 0.4 requires
+this). On a personal account `own` and `maintain` both become `write`, so
+there the forge cannot tell an owner from a maintainer: separation of duties
+is enforced at the VTC, not the forge.
 
 **A namespace admin gets no forge role, and no configuration can give them
 one** (decided 2026-09-25). There is no key for `git.ns.admin` — `ns_admin`,

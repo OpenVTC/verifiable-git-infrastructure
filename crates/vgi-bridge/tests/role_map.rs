@@ -123,10 +123,10 @@ async fn namespace_and_repository_overrides_apply_and_still_give_an_admin_nothin
     let mut w = world(Options {
         github_extra: r#"
 [github.role_map]
-maintain = "write"
+maintain = "maintain"
 
 [github.namespaces.acme.role_map]
-maintain = "admin"
+maintain = "write"
 
 [github.namespaces.acme.repos.gadgets.role_map]
 commit = "write"
@@ -151,7 +151,7 @@ commit = "write"
     assert_eq!(
         puts(&w.server).await,
         vec![
-            ("bob".into(), "admin".into()),
+            ("bob".into(), "push".into()),
             ("dave".into(), "push".into()),
         ]
     );
@@ -286,23 +286,6 @@ async fn forgejo_writes(server: &MockServer) -> (Vec<String>, Vec<Value>) {
         .map(|r| body(r)["merge_whitelist_usernames"].clone())
         .collect();
     (perms, lists)
-}
-
-#[tokio::test]
-async fn forgejo_maintainers_as_admins_are_on_the_merge_allow_list() {
-    let mut w = forgejo_world("[forgejo.role_map]\nmaintain = \"admin\"").await;
-    mount_forgejo_bootstrapped(&w.server).await;
-    let result = project_on(
-        &mut w,
-        FJ,
-        "widgets",
-        vec![fj_role(BOB, "bob", "git.repo.maintain")],
-    )
-    .await;
-    assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
-    let (perms, lists) = forgejo_writes(&w.server).await;
-    assert_eq!(perms, ["admin"]);
-    assert_eq!(lists, [json!([BOT, "bob"])]);
 }
 
 #[tokio::test]

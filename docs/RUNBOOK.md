@@ -921,8 +921,10 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   the merge allow-list); on a personal account both become `write`, the only
   collaborator role there. Committers get no role (fork pull requests). The
   bridge's `role_map` changes this per bridge, forge, namespace or
-  repository — maintainers as `admin`, committers `write` on a repository
-  that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). A member
+  repository — maintainers as `write`, committers `write` on a repository
+  that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). Only
+  `own` may map to `admin`: a map giving it to `maintain` or `commit` fails
+  the start. A member
   with no linked GitHub account gets no role until they link (openvtc `l`).
 - **A repository keeps an owner.** Revoking the last one is
   `git-ns:lastOwner`; grant the replacement first. Only an owner record

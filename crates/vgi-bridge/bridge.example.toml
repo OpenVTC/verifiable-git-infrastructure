@@ -71,8 +71,9 @@ version = "v0.5.0"
 # defaults are shown; [github.role_map], [github.namespaces.<owner>.role_map]
 # and [github.namespaces.<owner>.repos.<name>.role_map] (and the same under
 # [forgejo…]) override them field by field, most specific first. Must stay
-# own >= maintain >= commit, with commit at most "write". There is no key for
-# git.ns.admin: a namespace admin never gets a forge role.
+# own >= maintain >= commit, with commit at most "write", and only own may be
+# "admin" (a map giving maintain or commit "admin" fails the start). There is
+# no key for git.ns.admin: a namespace admin never gets a forge role.
 [role_map]
 # own = "admin"
 # maintain = "maintain"     # on Forgejo: write + the merge allow-list
@@ -106,7 +107,7 @@ platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # resign_dependabot = false
 # Role-map overrides for one namespace, and for one repository in it:
 # [github.namespaces.acme.role_map]
-# maintain = "admin"
+# maintain = "write"
 # [github.namespaces.acme.repos.widgets.role_map]
 # commit = "write"
 
@@ -119,6 +120,6 @@ platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 # The runner label the bootstrap's workflow asks for (runs-on:). Default
 # "docker"; the job image needs glibc 2.39+.
 # runs_on = "docker"
-# Maintainers as admins on this instance, instead of write + merge allow-list:
+# Maintainers as plain write on this instance, without the merge allow-list:
 # [forgejo.role_map]
-# maintain = "admin"
+# maintain = "write"
