@@ -1104,6 +1104,7 @@ async fn forgejo_7_writes_the_dids_into_the_workflow() {
 #[tokio::test]
 async fn bootstrap_refuses_what_it_cannot_see_or_did_not_write() {
     let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "gadgets", repo_json(9001, "acme/gadgets", false)).await;
     let p = "/api/v1/repos/acme/gadgets/contents/.forgejo/workflows/verify-trust.yml";
     Mock::given(method("GET"))
         .and(path(p))
@@ -1121,6 +1122,7 @@ async fn bootstrap_refuses_what_it_cannot_see_or_did_not_write() {
     assert!(e.to_string().contains("directory"), "{e}");
 
     let (server, forge) = server_and_forge().await;
+    mount_repo(&server, "gadgets", repo_json(9001, "acme/gadgets", false)).await;
     Mock::given(method("GET"))
         .and(path(p))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1412,4 +1414,53 @@ async fn refresh_of_current_files_opens_nothing() {
             .unwrap(),
         StepOutcome::Unchanged
     );
+}
+
+/// A repository bootstrapped before the workflow changed (here: before it
+/// named the namespace as the fallback resource) converges on the next
+/// bootstrap. Its workflow is a protected path, so the bootstrap's own
+/// `workflow` step takes the audited refresh: opened for the bot alone,
+/// written, restored exactly.
+#[tokio::test]
+async fn a_rebootstrap_brings_a_stale_protected_workflow_up_to_date() {
+    let (server, forge) = server_and_forge().await;
+    mount_stale_workflow(&server).await;
+    mount_open_and_restore(
+        &server,
+        ResponseTemplate::new(200).set_body_json(good_rule(&["alice"])),
+        1,
+    )
+    .await;
+    let plan = forge
+        .bootstrap_plan(&RepoSpec::new(repo("gadgets")), &vgi_config())
+        .unwrap();
+    let step = plan.iter().find(|s| s.id == "workflow").unwrap();
+    let StepAction::WriteFile {
+        contents, message, ..
+    } = &step.action
+    else {
+        panic!()
+    };
+    assert!(
+        String::from_utf8_lossy(contents)
+            .contains("fallback-resource: codeberg.org/${{ github.repository_owner }}\n"),
+        "the rendered workflow names the namespace as the fallback"
+    );
+    Mock::given(method("PUT"))
+        .and(path(WF))
+        .and(BotToken)
+        .and(body_json(json!({
+            "message": message,
+            "content": STANDARD.encode(contents),
+            "sha": "abc",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        forge.run_step(&repo("gadgets"), step).await.unwrap(),
+        StepOutcome::Updated
+    );
+    server.verify().await;
 }

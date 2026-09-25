@@ -715,10 +715,11 @@ required check decides what lands. To give someone a role, grant
   else is `git-ns:policyDenied` (`external-signers-not-enabled`). Admitting
   outside contributors is a policy change the community makes deliberately —
   for example, `git.commit.sign` only, expiring within 90 days.
-- A namespace-wide grant (`--resource github.com/acme`) is honoured only by
-  the **bridge-posted check**. The workflows the bootstrap writes query the
-  repository alone (SETUP-GITHUB-VTC.md, *Not implemented*), so in a
-  required-workflow, in-repo or Forgejo repository, grant per repository.
+- A namespace-wide grant (`--resource github.com/acme`) covers every
+  repository of the namespace: every check a bridge sets up queries the
+  namespace as its fallback resource. A workflow written by a bridge before
+  that did not; until it is upgraded (BRIDGE.md §6b) only grants on the
+  repository count there.
 
 **Remove.**
 
@@ -867,10 +868,10 @@ When the check still fails, its summary (bridge-posted) or the job's
 - **Someone else pushed to the branch**, or the bridge missed a push while it
   was down: the record is broken. Close the pull request and delete the
   branch; Dependabot opens it afresh and the bridge re-signs the new one.
-- **The repository is checked by a workflow**, not by the bridge (required
-  workflow, in-repo): the bridge's grant is on the namespace, which those
-  workflows do not query, so its re-signed commits fail `unauthorized`
-  (SETUP-GITHUB-VTC.md, *Not implemented*). Re-sign by hand.
+- **The re-signed commits fail `unauthorized`.** The bridge's service grant
+  is missing (its log warns, naming the namespace), or the repository's
+  workflow predates the namespace fallback — it queries only the repository,
+  not the namespace the grant is on. Upgrade the workflow (BRIDGE.md §6b).
 
 **Re-signing by hand.** A maintainer who is an enrolled signer reviews the
 change, then re-signs only the refused commits (the reasoning is in §5):
@@ -1035,7 +1036,7 @@ are in §5; this is what they usually mean here.
 | `unresolvedSigner` | the signer's DID document is unreachable, or names a non-public host (refused, never fetched) | fix the DID's hosting |
 | `unknownKey` | signed with a key the DID does not publish | `did-git-sign init` for the right key |
 | `badSignature` | the commit changed after it was signed | re-sign |
-| `unauthorized` | no right on this repository: never granted, revoked, lapsed, the member left — or a namespace-level right in a workflow-checked repository (§8a), or the bridge's re-signed Dependabot commits there (§8e) | `cnm git view --resource <repository>`; grant on the repository |
+| `unauthorized` | no right on this repository or its namespace: never granted, revoked, lapsed, the member left — or a namespace-level right (a namespace admin's, the bridge's re-signed Dependabot commits) under a workflow that predates the namespace fallback (§8a, §8e) | `cnm git view --resource <repository>`; grant on the repository; upgrade the workflow (BRIDGE.md §6b) |
 | `registryUnavailable` | the registry could not be asked | a registry outage; the check fails closed by design |
 | `pgpRejected` | a PGP signature from a key not in the exempt keyring | set `platform_keyring_file` in the bridge config (GitHub's current `web-flow.gpg`) |
 | `platformSignedEdit` | a web-UI edit, a squash merge, a Dependabot commit not re-signed | re-sign (§8e); merge with merge commits |

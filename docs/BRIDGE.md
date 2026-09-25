@@ -399,6 +399,76 @@ committer_email = "vgi-bridge@noreply.invalid"
 # resign_dependabot = false
 ```
 
+## 6b. The namespace as the check's fallback resource
+
+The VTC publishes a namespace's commit rights on the **namespace** resource
+(`github.com/acme`), not on each repository: every `git.ns.admin`'s implied
+`git.commit.sign`, a namespace-wide `git.commit.sign` grant, and the
+bridge's own service grant, on which the commits it re-signs for Dependabot
+pass (§6a). So every check the bridge sets up queries the repository first
+and the namespace as the fallback (git-ns `right/grant` 0.1):
+
+- **The bridge-posted check** (§6) passes the namespace it serves.
+- **The workflows the bootstrap writes** — the organisation's required
+  workflow in `<org>/.vgi`, the in-repo workflow, the Forgejo workflow —
+  pass, next to `resource-format: qualified`,
+
+  ```yaml
+            # The namespace: where the VTC publishes namespace-wide commit rights.
+            fallback-resource: github.com/${{ github.repository_owner }}
+  ```
+
+  with the forge's host (a GHES host, `codeberg.org`, your Forgejo's). The
+  owner is the one the runner runs the job for, read at run time: one
+  `.vgi` workflow serves every repository of the organisation, and a copy
+  in another owner's repository names that owner, never this one. The value
+  reaches verify-trust through the action's environment, never a script,
+  and verify-trust refuses a qualified fallback that does not contain the
+  repository's resource — another owner, another forge — and a
+  forge-qualified one under `resource-format: legacy`.
+
+**Upgrading.** Workflows written by a bridge before this passed no fallback:
+there, namespace admins who do not own the repository, namespace-wide
+grants and the bridge's re-signed Dependabot commits fail `unauthorized`.
+The bootstrap renders the new workflow; how it lands depends on the guard,
+because the bridge can never push past the protection it set up. Once
+landed, the next bootstrap reports the step unchanged. The bridge does not
+report an outdated workflow as drift, so nothing re-sends the bootstrap on
+its own: have the VTC send the repository's bootstrap job again where the
+steps below say so.
+
+- **Required workflow.** `.vgi` takes changes through pull requests only, so
+  the next bootstrap of any managed repository fails its `workflow` step
+  ("…`.vgi` is protected, so a new workflow lands through a pull request
+  there; the bridge pins it once it is merged") and **the pin does not
+  move**: the old workflow stays required, with no gap. An owner of the
+  organisation opens a pull request in `<org>/.vgi` adding the two lines
+  above to `.github/workflows/verify-trust.yml`, directly below
+  `resource-format: qualified`, indented like it, and merges it. Then send
+  the bootstrap again for any one managed repository: the bridge reads the
+  new head, finds exactly the workflow it renders, and moves the org
+  ruleset's pin to that commit — for every repository at once. It pins only a
+  commit whose file is byte for byte its own rendering; anything else in
+  `.vgi` is never pinned — if the bootstrap still fails, compare the file
+  with the lines above.
+- **In-repo workflow** (owner review, solo). The repository ruleset has no
+  bypass actors, the bridge included, so the bootstrap's `workflow` step
+  fails the same way. An owner opens a pull request adding the two lines to
+  `.github/workflows/verify-trust.yml` (under owner review, another owner
+  approves it); the pull request is checked by the workflow it carries, so
+  it can already use the namespace fallback. Then send the bootstrap again.
+- **Bridge-posted check.** Nothing to do.
+- **Forgejo.** No pull request: send the bootstrap again, and its
+  `workflow` step sees the stale protected file and takes the audited refresh
+  (`refresh_managed_files`) — the managed rule opened to the bot alone, the
+  file written, the rule's exact prior settings restored and read back.
+
+The fallback needs no new verify-trust release: every release that knows
+`resource-format` passes `fallback-resource` on. The refusal of a fallback
+outside the repository's namespace is in the release after this change;
+pinning an older one loses only that defence in depth, since the value the
+workflows pass can only name the running repository's own owner.
+
 ## 7. Operating it
 
 - **Logs** go to standard error (`RUST_LOG=info` by default). They never

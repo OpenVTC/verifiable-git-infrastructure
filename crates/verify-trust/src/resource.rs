@@ -29,7 +29,7 @@
 //! `--resource`.
 
 use anyhow::{Context, Result, bail};
-use vgi_core::{ResourceErrorKind, normalize_resource};
+use vgi_core::{ResourceErrorKind, normalize_resource, resource_contains};
 
 /// Which form the TRQP resource is written in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -162,10 +162,15 @@ pub fn normalize_qualified(what: &str, value: &str, ci: &CiEnv) -> Result<String
 
 /// The primary and fallback resources a run queries, in the chosen form.
 ///
-/// `legacy` is the pre-qualification behaviour exactly: values pass through
-/// untouched, and the primary defaults to `$GITHUB_REPOSITORY`. `qualified`
-/// validates and lowercases explicit values, and derives the default from
-/// [`CiEnv`].
+/// `legacy` is the pre-qualification behaviour: values pass through
+/// untouched, and the primary defaults to `$GITHUB_REPOSITORY`; only a
+/// forge-qualified fallback is refused, since it would mix the two forms in
+/// one run. `qualified` validates and lowercases explicit values, derives the
+/// default from [`CiEnv`], and requires the fallback to **contain** the
+/// primary — the namespace it sits in (`github.com/acme` for
+/// `github.com/acme/widgets`), or the primary itself. A fallback naming
+/// another owner or another forge is refused, so a grant there can never
+/// authorize this repository.
 pub fn select_resources(
     format: ResourceFormat,
     resource: Option<String>,
@@ -181,6 +186,15 @@ pub fn select_resources(
             let resource = resource
                 .or_else(|| ci.github_repository.clone())
                 .context("--resource is required (or set GITHUB_REPOSITORY)")?;
+            if let Some(fallback) = &fallback_resource
+                && let Ok(qualified) = normalize_resource(fallback)
+            {
+                bail!(
+                    "--fallback-resource `{fallback}` is forge-qualified (`{qualified}`) but \
+                     --resource-format is legacy; one run uses one form: pass \
+                     --resource-format qualified, or the bare owner"
+                );
+            }
             Ok((resource, fallback_resource))
         }
         ResourceFormat::Qualified => {
@@ -195,9 +209,28 @@ pub fn select_resources(
             let fallback = fallback_resource
                 .map(|value| normalize_qualified("--fallback-resource", &value, ci))
                 .transpose()?;
+            if let Some(fallback) = &fallback
+                && !resource_contains(fallback, &resource)
+            {
+                bail!(
+                    "--fallback-resource `{fallback}` does not contain --resource `{resource}`: \
+                     the fallback must be the namespace the repository sits in (e.g. `{}`), \
+                     never another owner's or another forge's",
+                    namespace_of(&resource)
+                );
+            }
             Ok((resource, fallback))
         }
     }
+}
+
+/// `host/owner` of a normalised qualified resource (itself when it is one).
+fn namespace_of(resource: &str) -> String {
+    resource
+        .splitn(3, '/')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -452,6 +485,78 @@ mod tests {
         assert!(
             message.contains("did you mean `github.com/acme`?"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_fallback_must_be_the_repositorys_own_namespace() {
+        let select = |fallback: &str| {
+            select_resources(
+                ResourceFormat::Qualified,
+                None,
+                Some(fallback.into()),
+                &github(),
+            )
+        };
+        // The namespace, however it is cased, and the repository itself.
+        for ok in [
+            "github.com/acme",
+            "GitHub.com/Acme",
+            "github.com/acme/widgets",
+        ] {
+            assert!(select(ok).is_ok(), "{ok}");
+        }
+        // Another owner, a byte-prefix owner, another forge, a sibling
+        // repository, a deeper path: never.
+        for other in [
+            "github.com/other",
+            "github.com/acm",
+            "github.com/acme-labs",
+            "codeberg.org/acme",
+            "ghe.example.com/acme",
+            "github.com/acme/other",
+            "github.com/acme/widgets/sub",
+        ] {
+            let message = select(other).unwrap_err().to_string();
+            assert!(
+                message.contains("does not contain --resource `github.com/acme/widgets`")
+                    && message.contains("`github.com/acme`"),
+                "{other}: {message}"
+            );
+        }
+        // The same holds for an explicit primary.
+        let message = select_resources(
+            ResourceFormat::Qualified,
+            Some("github.com/acme/widgets".into()),
+            Some("github.com/evil".into()),
+            &CiEnv::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("does not contain"), "{message}");
+    }
+
+    #[test]
+    fn legacy_mode_refuses_a_qualified_fallback() {
+        let message = select_resources(
+            ResourceFormat::Legacy,
+            None,
+            Some("github.com/acme".into()),
+            &github(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("is forge-qualified") && message.contains("legacy"),
+            "{message}"
+        );
+        // A bare owner is still passed through untouched.
+        assert_eq!(
+            select_resources(ResourceFormat::Legacy, None, Some("Acme".into()), &github())
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("Acme")
         );
     }
 

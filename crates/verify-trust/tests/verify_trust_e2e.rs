@@ -1279,6 +1279,122 @@ async fn a_qualified_org_fallback_authorizes() {
     );
 }
 
+/// The `fallback-resource` the workflows a VGI bridge bootstraps pass
+/// (`<forge-host>/${{ github.repository_owner }}`), as the runner evaluates
+/// it for `Example/Repo`.
+const WORKFLOW_FALLBACK: &str = "github.com/Example";
+
+/// A DID holding only a namespace-level `git.commit.sign` — a namespace
+/// admin's implied right, a namespace-wide grant, the bridge's service grant
+/// — passes a bootstrapped workflow's run through the namespace fallback,
+/// and only through it.
+#[tokio::test]
+async fn a_namespace_grant_passes_a_bootstrapped_workflow_via_the_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let range = format!("{base}..{signed}");
+    let namespace_only =
+        || stub_registry_with(vec![(SIGNER.to_string(), "github.com/example".to_string())]);
+
+    let args = args_in_format(
+        dir.path(),
+        range.clone(),
+        namespace_only().await,
+        ResourceFormat::Qualified,
+        Some(WORKFLOW_FALLBACK),
+    );
+    assert_eq!(args.resource, "github.com/example/repo");
+    assert_eq!(
+        args.fallback_resource.as_deref(),
+        Some("github.com/example")
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+    assert!(report.ok);
+    assert_eq!(
+        report.commits[0].status,
+        CommitStatus::Trusted {
+            signer_did: SIGNER.to_string(),
+            resource: "github.com/example".to_string()
+        }
+    );
+
+    // Without it, the namespace grant does not reach the repository.
+    let args = args_in_format(
+        dir.path(),
+        range,
+        namespace_only().await,
+        ResourceFormat::Qualified,
+        None,
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+    assert!(matches!(
+        report.commits[0].status,
+        CommitStatus::Unauthorized { .. }
+    ));
+}
+
+/// A repository in owner A is never satisfied by a grant on owner B: the
+/// fallback the workflow derives names A, and a fallback naming B (or
+/// another forge) is refused before any query.
+#[tokio::test]
+async fn a_grant_on_another_owner_never_authorizes_this_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+    let other_owner = stub_registry_with(vec![
+        (SIGNER.to_string(), "github.com/other".to_string()),
+        (SIGNER.to_string(), "github.com/example-labs".to_string()),
+        (SIGNER.to_string(), "codeberg.org/example".to_string()),
+    ])
+    .await;
+
+    let args = args_in_format(
+        dir.path(),
+        format!("{base}..{signed}"),
+        other_owner,
+        ResourceFormat::Qualified,
+        Some(WORKFLOW_FALLBACK),
+    );
+    let report = verify(&args, &signers_for(&key), None).await;
+    assert!(!report.ok);
+    assert!(matches!(
+        report.commits[0].status,
+        CommitStatus::Unauthorized { .. }
+    ));
+
+    for other in [
+        "github.com/other",
+        "github.com/example-labs",
+        "codeberg.org/example",
+    ] {
+        let message = select_resources(
+            ResourceFormat::Qualified,
+            None,
+            Some(other.to_string()),
+            &github_actions_env(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("does not contain"), "{other}: {message}");
+    }
+}
+
+/// A legacy run takes no forge-qualified fallback: it would query a
+/// qualified namespace grant from a run whose primary is the bare slug.
+#[tokio::test]
+async fn a_legacy_run_refuses_a_qualified_fallback() {
+    let message = select_resources(
+        ResourceFormat::Legacy,
+        None,
+        Some(WORKFLOW_FALLBACK.to_string()),
+        &github_actions_env(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(message.contains("is forge-qualified"), "{message}");
+}
+
 #[tokio::test]
 async fn one_run_never_accepts_a_grant_in_the_other_form() {
     let dir = tempfile::tempdir().unwrap();

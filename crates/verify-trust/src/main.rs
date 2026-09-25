@@ -65,7 +65,9 @@ struct Cli {
     /// Broader resource to also accept a grant under when the primary resource
     /// does not authorize (e.g. the org for org-wide grants). Grant semantics
     /// are OR — a repo-level record cannot veto an org-level grant. Omitted:
-    /// only the primary resource is queried.
+    /// only the primary resource is queried. Under `qualified` it must contain
+    /// --resource (its namespace, `github.com/acme` for
+    /// `github.com/acme/widgets`); another owner's or forge's is refused.
     #[arg(long)]
     fallback_resource: Option<String>,
 

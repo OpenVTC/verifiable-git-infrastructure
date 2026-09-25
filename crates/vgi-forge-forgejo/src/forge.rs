@@ -958,6 +958,44 @@ impl ForgejoForge {
         Ok(report)
     }
 
+    /// The bootstrap's write of a managed file (the workflow, the keyring).
+    ///
+    /// On a repository that is not protected yet this is a plain write. On
+    /// one bootstrapped before, the file is a protected path no pull request
+    /// may change, so a rendering that moved on (a new verify-trust release,
+    /// the namespace fallback) would otherwise fail every later bootstrap:
+    /// it goes through the audited [`ForgejoForge::refresh_managed_files`]
+    /// instead, which does nothing when the file is current. An empty
+    /// repository has no branch to protect and is written directly.
+    async fn write_managed_file(
+        &self,
+        repo: &Resource,
+        path: &str,
+        contents: &[u8],
+        message: &str,
+    ) -> Result<StepOutcome> {
+        let (token, owner, name) = self.repo_token(repo)?;
+        if self
+            .get_repo(&token, owner, name)
+            .await?
+            .default_branch()
+            .is_none()
+        {
+            return self.write_file(repo, path, contents, message).await;
+        }
+        let file = vgi_forge::ExtraFile {
+            path: path.to_string(),
+            contents: contents.to_vec(),
+        };
+        let report = self
+            .refresh_managed_files(repo, std::slice::from_ref(&file), message)
+            .await?;
+        Ok(report
+            .files
+            .first()
+            .map_or(report.outcome, |(_, outcome)| *outcome))
+    }
+
     /// The single maintenance step that brings the managed workflow (and, in
     /// the signing-key fallback, the keyring) up to date on a bootstrapped
     /// repository — see [`ForgejoForge::refresh_managed_files`].
@@ -2053,6 +2091,13 @@ impl Forge for ForgejoForge {
 
     async fn run_step(&self, repo: &Resource, step: &BootstrapStep) -> Result<StepOutcome> {
         match &step.action {
+            StepAction::WriteFile {
+                path,
+                contents,
+                message,
+            } if path == crate::plan::WORKFLOW_PATH || path == crate::plan::KEYRING_PATH => {
+                self.write_managed_file(repo, path, contents, message).await
+            }
             StepAction::WriteFile {
                 path,
                 contents,

@@ -513,6 +513,17 @@ Every repository also gets the repository ruleset **`VGI commit trust`** on
 the default branch: pull request required, *Verify commit trust* required, no
 force-push, no deletion, no bypass actors — the bridge included.
 
+**The resources the check queries.** The repository's own
+(`github.com/acme/widgets`), then its namespace as the fallback
+(`github.com/acme`), where the VTC publishes namespace-wide commit rights —
+every namespace admin's implied `git.commit.sign`, a namespace-wide grant,
+and the bridge's service grant its re-signed Dependabot commits rely on. The
+workflows pass `fallback-resource: github.com/${{ github.repository_owner }}`
+(read at run time, so the one `.vgi` workflow serves every repository, and
+never names another owner); the bridge-posted check passes the same.
+Workflows written by a bridge before this passed no fallback: upgrade them
+as in [BRIDGE.md §6b](BRIDGE.md#6b-the-namespace-as-the-checks-fallback-resource).
+
 **Repository variables:** none. The managed workflows carry the registry and
 VTC DIDs as literals, because any repository admin can change a variable
 (and a repository variable overrides an organisation one); the bootstrap
@@ -666,7 +677,10 @@ The namespace is bound at once and the binder is its admin. Then:
   by hand, then set the repository up **by hand as in
   [runbook §4](RUNBOOK.md#4-set-up-the-repository)**, then `cnm git adopt`.
   Use `resource-format: qualified` in the workflow: the VTC publishes only the
-  qualified form (`github.com/acme/widgets`), never `acme/widgets`.
+  qualified form (`github.com/acme/widgets`), never `acme/widgets`. Pass
+  the namespace as `fallback-resource` (`github.com/acme`, or
+  `github.com/${{ github.repository_owner }}`): namespace admins' implied
+  commit rights and namespace-wide grants are published there.
 - **Roles, drift, the Dependabot re-sign, the bridge-posted check:** none.
   Forge roles are yours to keep in step with the rights; a drift revert is
   refused `notRevertible` ("manual mode").
@@ -689,17 +703,6 @@ and openvtc when this was written:
   per repository only and refuses a namespace-level `projectRoles`
   (`notCapable`: "project git.ns.admin by hand"). Make namespace admins
   organisation owners (or not) yourself.
-- **Namespace-level commit rights count only under the bridge-posted
-  check.** The VTC publishes `git.ns.admin`'s implied commit right, a
-  namespace-wide `git.commit.sign`, and the bridge's service grant on the
-  namespace resource (`github.com/acme`); the bridge-posted check queries it
-  as the fallback resource. The workflows the bootstrap writes — required
-  workflow, in-repo, Forgejo — pass no `fallback-resource`, so there only
-  repository-level rights count: a namespace admin who does not own the
-  repository, and **commits the bridge re-signs for Dependabot**, fail
-  `unauthorized`. Until the workflows carry the namespace fallback, grant
-  people on the repository, and re-sign Dependabot pull requests by hand in
-  such repositories ([runbook §8e](RUNBOOK.md#8e-dependabot-pull-requests)).
 - **Committers get no GitHub role.** `git.commit.sign` projects to no role
   (the default map; nothing in the bridge config changes it): committers
   contribute through forks, and the required check decides what lands.

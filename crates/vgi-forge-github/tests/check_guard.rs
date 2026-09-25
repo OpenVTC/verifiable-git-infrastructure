@@ -484,6 +484,138 @@ async fn org_mode_creates_and_protects_vgi_and_pins_the_org_ruleset_then_reruns_
     server.verify().await;
 }
 
+/// The required workflow as bridges before the namespace fallback wrote it.
+fn workflow_without_fallback(current: &[u8]) -> Vec<u8> {
+    let current = std::str::from_utf8(current).unwrap();
+    let fallback = "          # The namespace: where the VTC publishes namespace-wide commit rights.\n          \
+                    fallback-resource: github.com/${{ github.repository_owner }}\n";
+    assert!(current.contains(fallback), "{current}");
+    current.replace(fallback, "").into_bytes()
+}
+
+/// An existing organisation, pinned to the workflow without the namespace
+/// fallback, converges on the next bootstrap: `.vgi` is protected, so the
+/// bridge cannot write the new workflow itself and the pin stays where it
+/// is; once the new workflow is merged there (byte for byte what the
+/// bridge renders), the pin moves to it — and only to it.
+#[tokio::test]
+async fn an_upgraded_workflow_is_pinned_once_merged_in_vgi_and_not_before() {
+    let server = MockServer::start().await;
+    let forge = org_forge(&server, &[]);
+    let workflow = central_workflow(&forge);
+    let old = workflow_without_fallback(&workflow);
+    assert_ne!(old, workflow);
+
+    // ── not merged yet: the head still holds the old workflow ──
+    // (`mount_step_reads` without `.vgi`'s protection: the step stops
+    // before it.)
+    mount_token(
+        &server,
+        INSTALLATION,
+        Some("gadgets"),
+        json!({ "metadata": "read" }),
+        1,
+    )
+    .await;
+    mount_get(
+        &server,
+        "/repos/acme/gadgets",
+        repo_json(GADGETS_ID, "acme/gadgets", false),
+    )
+    .await;
+    mount_token(
+        &server,
+        INSTALLATION,
+        Some(".vgi"),
+        json!({ "contents": "write", "metadata": "read" }),
+        1,
+    )
+    .await;
+    mount_get(&server, "/repos/acme/.vgi", central_repo_json()).await;
+    mount_org_ruleset(&server, Some(org_ruleset(PIN, &[GADGETS_ID])), None).await;
+    mount_central_file(&server, PIN, Some(&old)).await;
+    mount_get(
+        &server,
+        "/repos/acme/.vgi/commits/main",
+        json!({ "sha": OTHER }),
+    )
+    .await;
+    mount_central_file(&server, OTHER, Some(&old)).await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/repos/acme/.vgi/contents/.github/workflows/verify-trust.yml",
+        ))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "message": "Repository rule violations found"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/orgs/acme/rulesets/31"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let e = run(&forge, "required-workflow").await.unwrap_err();
+    assert!(
+        e.to_string().contains("lands through a pull request"),
+        "{e}"
+    );
+    assert_eq!(
+        forge.required_workflow_pin(&acme()),
+        None,
+        "the pin did not move"
+    );
+    server.verify().await;
+
+    // ── merged: the head holds exactly the new workflow; it is pinned ──
+    let server = MockServer::start().await;
+    let forge = org_forge(&server, &[]);
+    mount_step_reads(
+        &server,
+        Some(org_ruleset(PIN, &[GADGETS_ID])),
+        Some(org_ruleset(OTHER, &[GADGETS_ID])),
+    )
+    .await;
+    mount_central_file(&server, PIN, Some(&old)).await;
+    mount_get(
+        &server,
+        "/repos/acme/.vgi/commits/main",
+        json!({ "sha": OTHER }),
+    )
+    .await;
+    mount_central_file(&server, OTHER, Some(&workflow)).await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/repos/acme/.vgi/contents/.github/workflows/verify-trust.yml",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/orgs/acme/rulesets/31"))
+        .and(body_json(org_ruleset_body(OTHER, &[GADGETS_ID])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org_ruleset(OTHER, &[GADGETS_ID])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        run(&forge, "required-workflow").await.unwrap(),
+        StepOutcome::Updated
+    );
+    assert_eq!(
+        forge.required_workflow_pin(&acme()),
+        Some(RequiredWorkflowPin::new(
+            CENTRAL_ID,
+            OTHER,
+            "Verify commit trust"
+        ))
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn the_org_ruleset_lists_exactly_the_managed_set() {
     // Managed {77} plus the repository being bootstrapped; GitHub's 1234

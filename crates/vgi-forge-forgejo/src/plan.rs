@@ -11,7 +11,7 @@
 use url::Url;
 use vgi_forge::{
     BootstrapComponent, BootstrapStep, ForgeError, MergeMethod, ProtectionSpec, RepoSettings,
-    RepoSpec, Result, StepAction, VgiConfig, validate_repo_path,
+    RepoSpec, Resource, Result, StepAction, VgiConfig, validate_repo_path,
 };
 
 /// Where the workflow is committed.
@@ -115,7 +115,7 @@ pub fn forgejo_plan(
         BootstrapComponent::Workflow,
         StepAction::WriteFile {
             path: WORKFLOW_PATH.into(),
-            contents: render_workflow(cfg, opts, &action, sha256).into_bytes(),
+            contents: render_workflow(cfg, opts, &repo.resource, &action, sha256).into_bytes(),
             message: "ci: add the VGI commit-trust check".into(),
         },
     ));
@@ -181,9 +181,13 @@ pub fn forgejo_plan(
 ///
 /// The workflow and its job both carry the check name, so the status
 /// context Forgejo reports is `<name> / <name> (pull_request)`.
+///
+/// The namespace is the fallback resource ([`fallback_resource`]): the VTC
+/// publishes namespace-wide commit rights on it, not on each repository.
 pub fn render_workflow(
     cfg: &VgiConfig,
     opts: &PlanOptions<'_>,
+    repo: &Resource,
     action: &str,
     sha256: &str,
 ) -> String {
@@ -236,6 +240,8 @@ jobs:
           registry-did: {registry}
           vtc-did: {vtc}
           resource-format: qualified
+          # The namespace: where the VTC publishes namespace-wide commit rights.
+          fallback-resource: {fallback}
 {keyring}          # A Forgejo runner cannot check the release's attestation; the
           # pinned version and checksum are what hold if a release is replaced.
           version: {version}
@@ -243,8 +249,29 @@ jobs:
 "#,
         runs_on = opts.runs_on,
         checkout = opts.checkout_action,
+        fallback = fallback_resource(repo),
         version = cfg.verify_trust_version,
     )
+}
+
+/// The `fallback-resource` the workflow passes:
+/// `<forge-host>/${{ github.repository_owner }}`.
+///
+/// The VTC publishes a namespace's commit rights — every `git.ns.admin`'s
+/// implied `git.commit.sign`, a namespace-wide grant, the bridge's service
+/// grant — on the namespace resource (`codeberg.org/acme`), and a bridge that
+/// sets up a repository's check must make the namespace its fallback (git-ns
+/// `right/grant` 0.1).
+///
+/// Exactly the repository's own namespace, never broader: the owner is the
+/// one the runner runs the job for, read at run time (Forgejo Actions fills
+/// the `github` context), and the host is this instance's, fixed here. The
+/// value reaches verify-trust through the action's environment, never a
+/// script, and verify-trust refuses a fallback that does not contain the
+/// repository's own resource. It is only ever written next to
+/// `resource-format: qualified`.
+pub fn fallback_resource(repo: &Resource) -> String {
+    format!("{}/${{{{ github.repository_owner }}}}", repo.host())
 }
 
 fn yaml_single_quoted(s: &str) -> String {
@@ -504,14 +531,22 @@ mod tests {
         let b = base();
         let o = opts(&b, MergePlan::FastForwardOnly, false);
         let action = resolve_action(&cfg().verify_trust_action, &b).unwrap();
-        let wf = render_workflow(&cfg(), &o, &action, SUM);
+        let wf = render_workflow(&cfg(), &o, &spec().resource, &action, SUM);
         assert!(wf.contains("name: 'Verify commit trust'\n"));
         assert!(wf.contains("    name: 'Verify commit trust'\n"));
         assert!(wf.contains(&format!(
             "uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@{SHA}"
         )));
         assert!(wf.contains(&format!("uses: {}", crate::config::DEFAULT_CHECKOUT_ACTION)));
-        assert!(wf.contains("resource-format: qualified"));
+        assert!(
+            wf.contains(
+                "          resource-format: qualified\n          \
+                 # The namespace: where the VTC publishes namespace-wide commit rights.\n          \
+                 fallback-resource: codeberg.org/${{ github.repository_owner }}\n"
+            ),
+            "{wf}"
+        );
+        assert_eq!(wf.matches("fallback-resource:").count(), 1);
         assert!(wf.contains("version: v0.5.0\n"));
         assert!(wf.contains(&format!("sha256: {SUM}\n")));
         assert!(wf.contains("registry-did: ${{ vars.TRUST_REGISTRY_DID }}"));
@@ -520,11 +555,33 @@ mod tests {
         assert!(!wf.contains("exempt-keyring"));
 
         let o = opts(&b, MergePlan::SigningKey(KEY.as_bytes()), true);
-        let wf = render_workflow(&cfg(), &o, &action, SUM);
+        let wf = render_workflow(&cfg(), &o, &spec().resource, &action, SUM);
         assert!(wf.contains("exempt-keyring: .forgejo/trusted-platform-keys.asc\n"));
         assert!(wf.contains("registry-did: 'did:webvh:reg'"));
         assert!(wf.contains("vtc-did: 'did:webvh:vtc'"));
         assert!(!wf.contains("vars."));
+    }
+
+    #[test]
+    fn the_fallback_is_the_running_repositorys_own_namespace_on_this_instance() {
+        let b = base();
+        let o = opts(&b, MergePlan::FastForwardOnly, false);
+        let action = resolve_action(&cfg().verify_trust_action, &b).unwrap();
+        let here = Resource::parse("git.example.org/acme/gadgets").unwrap();
+        assert_eq!(
+            fallback_resource(&here),
+            "git.example.org/${{ github.repository_owner }}"
+        );
+        let wf = render_workflow(&cfg(), &o, &here, &action, SUM);
+        assert!(
+            wf.contains("fallback-resource: git.example.org/${{ github.repository_owner }}\n"),
+            "{wf}"
+        );
+        // The same file for every repository of the namespace: nothing in
+        // it names the repository or its owner.
+        let other = Resource::parse("git.example.org/acme/widgets").unwrap();
+        assert_eq!(wf, render_workflow(&cfg(), &o, &other, &action, SUM));
+        assert!(!wf.contains("acme"));
     }
 
     #[test]

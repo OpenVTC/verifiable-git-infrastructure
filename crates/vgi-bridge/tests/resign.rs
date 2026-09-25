@@ -19,9 +19,11 @@ use pgp::types::Password;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_json::{Value, json};
+use verify_trust::resource::{CiEnv, ResourceFormat, select_resources};
 use vgi_bridge::checks::{CommitVerifier, GitFetcher, VerifyTrustVerifier};
 use vgi_bridge::resign::{ResignOutcome, run};
 use vgi_bridge::store::{BranchLedger, Table};
+use vgi_forge::{RepoSpec, StepAction};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -491,6 +493,33 @@ async fn a_clean_dependabot_pull_request_is_re_signed_and_then_trusted() {
         .unwrap();
     assert!(lines.iter().all(|l| !l.passes), "{lines:?}");
 
+    // The same commits under the organisation's required workflow — the
+    // recommended setup, where no bridge posts the check: the resources are
+    // the ones the workflow the bridge pins hands verify-trust.
+    let (resource, fallback) = required_workflow_resources(&w, &remote);
+    assert_eq!(resource, "github.com/acme/widgets");
+    assert_eq!(fallback.as_deref(), Some("github.com/acme"));
+    let lines = verifier
+        .verify(&fetched.commits, &resource, fallback.as_deref().unwrap())
+        .await
+        .unwrap();
+    for l in &lines {
+        assert!(l.passes, "{l:?}");
+        assert_eq!(l.verdict, "trusted");
+    }
+    // Without the namespace as the fallback — what the workflow passed
+    // before — the bridge's service grant does not count.
+    let lines = verifier
+        .verify(&fetched.commits, &resource, &resource)
+        .await
+        .unwrap();
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.passes && l.verdict == "unauthorized"),
+        "{lines:?}"
+    );
+
     // The bridge's own push arrives as a webhook; the pull request moves to
     // the re-signed head. Nothing more is done.
     let s = post_webhook(
@@ -505,6 +534,48 @@ async fn a_clean_dependabot_pull_request_is_re_signed_and_then_trusted() {
     let o = resign(&w).await;
     assert_eq!(skipped(&o), "already re-signed by the bridge");
     assert_eq!(remote.branch_head(), new_head);
+}
+
+/// The resources the organisation's required workflow — as this bridge
+/// renders and pins it — hands verify-trust when GitHub runs it for
+/// `Acme/Widgets`: its `fallback-resource` with the runner's
+/// `github.repository_owner` substituted, selected the way the binary does.
+fn required_workflow_resources(w: &World, remote: &Remote) -> (String, Option<String>) {
+    let adapters = w.bridge.adapters();
+    let adapter = adapters.get("github.com").unwrap();
+    adapter
+        .github()
+        .unwrap()
+        .set_required_workflow(&acme(), true);
+    let vgi = adapters
+        .vgi("github.com")
+        .unwrap()
+        .with_platform_keyring(remote.keyring());
+    let plan = adapter
+        .forge()
+        .bootstrap_plan(&RepoSpec::new(repo("widgets")), &vgi)
+        .unwrap();
+    let contents = plan
+        .into_iter()
+        .find_map(|s| match s.action {
+            StepAction::RequireNamespaceWorkflow { contents, .. } => Some(contents),
+            _ => None,
+        })
+        .expect("the required-workflow guard");
+    let wf = String::from_utf8(contents).unwrap();
+    assert!(wf.contains("resource-format: qualified\n"), "{wf}");
+    let value = wf
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("fallback-resource: "))
+        .expect("the workflow names a fallback resource");
+    let fallback = value.replace("${{ github.repository_owner }}", "Acme");
+    assert!(!fallback.contains("${{"), "{fallback}");
+    let ci = CiEnv::from_lookup(|name| match name {
+        "GITHUB_SERVER_URL" => Some("https://github.com".into()),
+        "GITHUB_REPOSITORY" => Some("Acme/Widgets".into()),
+        _ => None,
+    });
+    select_resources(ResourceFormat::Qualified, None, Some(fallback), &ci).unwrap()
 }
 
 /// GitHub delivers `pull_request` before the pushes: nothing is recorded

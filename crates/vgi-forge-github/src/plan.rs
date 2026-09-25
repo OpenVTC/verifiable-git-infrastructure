@@ -38,8 +38,8 @@
 //!   a required workflow (§9, decided 2026-09-23).
 
 use vgi_forge::{
-    BootstrapComponent, BootstrapStep, ForgeAccount, ForgeError, ProtectionSpec, RepoSpec, Result,
-    StepAction, VgiConfig, validate_repo_path,
+    BootstrapComponent, BootstrapStep, ForgeAccount, ForgeError, ProtectionSpec, RepoSpec,
+    Resource, Result, StepAction, VgiConfig, validate_repo_path,
 };
 
 /// Where the workflow is committed (in the repository, or in `.vgi`).
@@ -159,7 +159,7 @@ pub fn github_plan(
             BootstrapComponent::Workflow,
             StepAction::WriteFile {
                 path: WORKFLOW_PATH.into(),
-                contents: render_workflow(cfg, checkout_action).into_bytes(),
+                contents: render_workflow(cfg, checkout_action, &repo.resource).into_bytes(),
                 message: "ci: add the VGI commit-trust check".into(),
             },
         ));
@@ -216,7 +216,13 @@ pub fn github_plan(
                 "required-workflow",
                 BootstrapComponent::Workflow,
                 StepAction::RequireNamespaceWorkflow {
-                    contents: render_required_workflow(cfg, checkout_action, keyring)?.into_bytes(),
+                    contents: render_required_workflow(
+                        cfg,
+                        checkout_action,
+                        &repo.resource,
+                        keyring,
+                    )?
+                    .into_bytes(),
                     check: cfg.required_check.clone(),
                     message: "ci: pin the VGI commit-trust check".into(),
                 },
@@ -421,7 +427,12 @@ pub fn managed_rules(text: &str) -> Option<Vec<(String, Vec<String>, usize)>> {
 /// `if: vars.TRUST_REGISTRY_DID != ''` guard (a *skipped* required job
 /// counts as passing), and the DIDs are literals rather than `vars.*`,
 /// which any repository admin could change.
-pub fn render_workflow(cfg: &VgiConfig, checkout_action: &str) -> String {
+///
+/// The namespace is the fallback resource ([`fallback_resource`]): the VTC
+/// publishes namespace-wide commit rights — a `git.ns.admin`'s implied
+/// `git.commit.sign`, the bridge's service grant — on it, not on each
+/// repository.
+pub fn render_workflow(cfg: &VgiConfig, checkout_action: &str, repo: &Resource) -> String {
     format!(
         r#"# Managed by this community's VGI bridge. It is rewritten on bootstrap;
 # propose changes to the VTC rather than editing it here.
@@ -459,7 +470,7 @@ jobs:
           registry-did: {registry}
           vtc-did: {vtc}
           resource-format: qualified
-          # GitHub web-UI merge/squash commits are PGP-signed by web-flow;
+{fallback}          # GitHub web-UI merge/squash commits are PGP-signed by web-flow;
           # they pass only via this committed keyring.
           exempt-keyring: {keyring}
           version: {version}
@@ -469,6 +480,7 @@ jobs:
         action = cfg.verify_trust_action,
         registry = yaml_single_quoted(&cfg.trust_registry_did),
         vtc = yaml_single_quoted(&cfg.vtc_did),
+        fallback = fallback_block(repo),
         keyring = KEYRING_PATH,
         version = cfg.verify_trust_version,
     )
@@ -484,9 +496,14 @@ jobs:
 /// - the exempt keyring is written from this file to the runner's temp
 ///   directory, not read from the repository, where the pull request could
 ///   add its own key to it.
+///
+/// It is shared by every managed repository of the organisation, so the
+/// fallback resource names the namespace of the repository it runs for, read
+/// at run time ([`fallback_resource`]) rather than written in.
 pub fn render_required_workflow(
     cfg: &VgiConfig,
     checkout_action: &str,
+    repo: &Resource,
     keyring: &[u8],
 ) -> Result<String> {
     let keyring = std::str::from_utf8(keyring)
@@ -547,7 +564,7 @@ jobs:
           registry-did: {registry}
           vtc-did: {vtc}
           resource-format: qualified
-          exempt-keyring: ${{{{ runner.temp }}}}/vgi-platform-keys.asc
+{fallback}          exempt-keyring: ${{{{ runner.temp }}}}/vgi-platform-keys.asc
           version: {version}
 "#,
         ruleset = ORG_RULESET_NAME,
@@ -557,8 +574,43 @@ jobs:
         action = cfg.verify_trust_action,
         registry = yaml_single_quoted(&cfg.trust_registry_did),
         vtc = yaml_single_quoted(&cfg.vtc_did),
+        fallback = fallback_block(repo),
         version = cfg.verify_trust_version,
     ))
+}
+
+/// The `fallback-resource` value both workflows pass:
+/// `<forge-host>/${{ github.repository_owner }}`.
+///
+/// The VTC publishes a namespace's commit rights — every `git.ns.admin`'s
+/// implied `git.commit.sign`, a namespace-wide grant, the bridge's service
+/// grant that its re-signed Dependabot commits rely on — on the namespace
+/// resource (`github.com/acme`), and a bridge that sets up a repository's
+/// check must make the namespace its fallback (git-ns `right/grant` 0.1).
+///
+/// Exactly the repository's own namespace, never broader:
+///
+/// - the owner is the one GitHub runs the job for, read at run time, so one
+///   file serves every repository of an organisation (the required
+///   workflow) and a copy in another owner's repository names that owner,
+///   never this one;
+/// - the host is the forge's, fixed here (a resource names no scheme, so
+///   `github.server_url` cannot be used as is);
+/// - the value reaches verify-trust through the action's environment, never
+///   a script, and verify-trust refuses a fallback that does not contain the
+///   repository's own resource (another owner, another forge);
+/// - it is only ever written next to `resource-format: qualified` — a legacy
+///   run takes no forge-qualified fallback.
+pub fn fallback_resource(repo: &Resource) -> String {
+    format!("{}/${{{{ github.repository_owner }}}}", repo.host())
+}
+
+fn fallback_block(repo: &Resource) -> String {
+    format!(
+        "          # The namespace: where the VTC publishes namespace-wide commit rights.\n          \
+         fallback-resource: {}\n",
+        fallback_resource(repo)
+    )
 }
 
 fn yaml_single_quoted(s: &str) -> String {
@@ -841,9 +893,13 @@ mod tests {
 
     #[test]
     fn the_required_workflow_fixes_everything_the_pr_could_touch() {
-        let wf =
-            render_required_workflow(&cfg(), CHECKOUT, cfg().platform_keyring.as_deref().unwrap())
-                .unwrap();
+        let wf = render_required_workflow(
+            &cfg(),
+            CHECKOUT,
+            &spec().resource,
+            cfg().platform_keyring.as_deref().unwrap(),
+        )
+        .unwrap();
         assert!(wf.contains("    name: 'Verify commit trust'\n"));
         assert!(wf.contains("  pull_request:\n") && wf.contains("  merge_group:\n"));
         assert!(wf.contains("registry-did: 'did:webvh:reg'\n"));
@@ -860,7 +916,7 @@ mod tests {
         assert!(wf.contains(
             "          VGI_PLATFORM_KEYRING: |\n            -----BEGIN PGP PUBLIC KEY BLOCK-----\n\n            x\n            -----END PGP PUBLIC KEY BLOCK-----\n        run: "
         ));
-        assert!(wf.contains("resource-format: qualified"));
+        assert!(wf.contains(FALLBACK_LINES), "{wf}");
         assert!(!wf.contains("if:"));
 
         let mut c = cfg();
@@ -912,9 +968,52 @@ mod tests {
         assert!(managed_rules("* @acme/owners\n").is_none());
     }
 
+    /// What both workflows pass verify-trust, byte for byte: the qualified
+    /// form, then the namespace of the repository the job runs for as the
+    /// fallback (git-ns `right/grant` 0.1, the namespace projection).
+    const FALLBACK_LINES: &str = "          resource-format: qualified\n          \
+        # The namespace: where the VTC publishes namespace-wide commit rights.\n          \
+        fallback-resource: github.com/${{ github.repository_owner }}\n";
+
+    #[test]
+    fn the_fallback_is_the_running_repositorys_own_namespace_on_this_forge() {
+        // One value for every repository of the namespace — the required
+        // workflow is shared — with the owner read at run time: never a
+        // literal another owner's repository could inherit.
+        let a = Resource::parse("github.com/acme/gadgets").unwrap();
+        let b = Resource::parse("github.com/acme/widgets").unwrap();
+        assert_eq!(
+            fallback_resource(&a),
+            "github.com/${{ github.repository_owner }}"
+        );
+        assert_eq!(fallback_resource(&a), fallback_resource(&b));
+        let keyring = cfg().platform_keyring.unwrap();
+        assert_eq!(
+            render_required_workflow(&cfg(), CHECKOUT, &a, &keyring).unwrap(),
+            render_required_workflow(&cfg(), CHECKOUT, &b, &keyring).unwrap(),
+            "the org's required workflow must not differ per repository"
+        );
+        // An Enterprise Server names its own host.
+        let ghes = Resource::parse("ghe.example.com/acme/gadgets").unwrap();
+        let wf = render_workflow(&cfg(), CHECKOUT, &ghes);
+        assert!(
+            wf.contains("fallback-resource: ghe.example.com/${{ github.repository_owner }}\n"),
+            "{wf}"
+        );
+        // Only ever next to the qualified form, and once.
+        for wf in [
+            render_workflow(&cfg(), CHECKOUT, &a),
+            render_required_workflow(&cfg(), CHECKOUT, &a, &keyring).unwrap(),
+        ] {
+            assert_eq!(wf.matches("fallback-resource:").count(), 1, "{wf}");
+            assert!(wf.contains(FALLBACK_LINES), "{wf}");
+            assert!(!wf.contains("resource-format: legacy"));
+        }
+    }
+
     #[test]
     fn the_workflow_is_pinned_qualified_and_unguarded() {
-        let wf = render_workflow(&cfg(), CHECKOUT);
+        let wf = render_workflow(&cfg(), CHECKOUT, &spec().resource);
         assert!(wf.contains("registry-did: 'did:webvh:reg'\n"));
         assert!(wf.contains("vtc-did: 'did:webvh:vtc'\n"));
         assert!(
@@ -922,7 +1021,7 @@ mod tests {
             "no repository-overridable variables"
         );
         assert!(wf.contains("    name: 'Verify commit trust'\n"));
-        assert!(wf.contains("resource-format: qualified"));
+        assert!(wf.contains(FALLBACK_LINES), "{wf}");
         assert!(wf.contains("  merge_group:\n"));
         assert!(wf.contains(
             "range: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha \
@@ -933,7 +1032,7 @@ mod tests {
         assert!(!wf.contains("if:"));
         let mut quoted = cfg();
         quoted.required_check = "it's".into();
-        assert!(render_workflow(&quoted, "a/b@x").contains("name: 'it''s'"));
+        assert!(render_workflow(&quoted, "a/b@x", &spec().resource).contains("name: 'it''s'"));
     }
 
     #[test]
