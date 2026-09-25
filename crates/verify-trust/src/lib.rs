@@ -70,7 +70,7 @@ use vgi_core::{
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
 use crate::pgp_exempt::ExemptKeyring;
-pub use crate::registry::{Registry, TransportSelector};
+pub use crate::registry::{Registry, RegistryChannel, TransportSelector};
 
 /// Everything `verify-trust` needs for one run.
 #[derive(Debug, Clone)]

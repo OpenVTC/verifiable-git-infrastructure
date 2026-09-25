@@ -377,7 +377,10 @@ both sides named. `registry-url` implies `https`.
 > or `transport = "https"` in the bridge's `[verify_trust]` (the workflows it
 > writes). A DIDComm reply is believed only if the authcrypt sender key id is
 > the key its key agreement actually used, and each query carries a random id.
-> The bridge-posted check queries `#rest` (HTTPS) only.
+> The bridge-posted check queries over DIDComm as the bridge's own DID when the
+> registry advertises it (DIDComm, then HTTPS), which needs affinidi-messaging-sdk
+> 0.27.2 / affinidi-messaging-didcomm 0.15.9 or later; `transport = "tsp"` is
+> refused while GitHub `bridge_checks` are on.
 > `UNKNOWN-KEY` now says what usually causes it: the signer rotated their
 > key, and the commit must be re-signed with the current one.
 

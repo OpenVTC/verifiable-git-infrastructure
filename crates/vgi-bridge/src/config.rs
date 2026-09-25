@@ -125,10 +125,13 @@ pub struct VerifyTrustConfig {
     /// The required check's name.
     #[serde(default = "default_check")]
     pub required_check: String,
-    /// The Trust Registry binding the written workflows use (the action's
-    /// `transport` input): `auto` (default — TSP, then DIDComm, then HTTPS,
-    /// no fallback), `tsp`, `didcomm` or `https`. Set `https` while the
-    /// registry's mediator does not admit a CI run's throwaway DID.
+    /// The Trust Registry binding: for the written workflows (the action's
+    /// `transport` input) `auto` (default — TSP, then DIDComm, then HTTPS,
+    /// no fallback), `tsp`, `didcomm` or `https`; for the check the bridge
+    /// posts itself `auto` is DIDComm (as the bridge's own DID, over its
+    /// mediator session), then HTTPS. `tsp` is refused while a GitHub forge
+    /// has `bridge_checks` on: the bridge never speaks TSP. Set `https` while
+    /// the registry's mediator does not admit a CI run's throwaway DID.
     #[serde(default)]
     pub transport: VerifyTransport,
 }
@@ -657,6 +660,16 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
+        if self.verify_trust.transport == VerifyTransport::Tsp
+            && self.github.iter().any(|g| g.bridge_checks)
+        {
+            bail!(
+                "`verify_trust.transport = \"tsp\"`: the check this bridge posts itself queries \
+                 the registry over the bridge's DIDComm session or HTTPS, never TSP. Use `auto` \
+                 (TSP > DIDComm > HTTPS in the written workflows; DIDComm > HTTPS for the \
+                 bridge's own check), `didcomm` or `https` — or turn `bridge_checks` off"
+            );
+        }
 
         check_ident("resign.committer_name", &self.resign.committer_name)?;
         check_ident("resign.committer_email", &self.resign.committer_email)?;
@@ -780,6 +793,23 @@ oauth_client_id = "0b6e3a0c"
             "version = \"v0.5.0\"\n\n[checks]\ntransport = \"didcomm\"\n",
         );
         assert!(BridgeConfig::parse(&check).is_err());
+    }
+
+    #[test]
+    fn tsp_is_refused_while_the_bridge_posts_checks() {
+        let tsp = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\ntransport = \"tsp\"\n",
+        );
+        let e = BridgeConfig::parse(&tsp).unwrap_err().to_string();
+        assert!(e.contains("never TSP"), "{e}");
+        // With the bridge not posting checks, only the workflows use it.
+        let off = tsp.replace(
+            "platform_keyring_file",
+            "bridge_checks = false\nplatform_keyring_file",
+        );
+        let c = BridgeConfig::parse(&off).unwrap();
+        assert_eq!(c.verify_trust.transport, VerifyTransport::Tsp);
     }
 
     #[test]
