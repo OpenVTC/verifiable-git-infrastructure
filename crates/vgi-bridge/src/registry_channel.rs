@@ -66,14 +66,25 @@ impl RegistryReplies {
         self.pending.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn register(&self, id: &str) -> oneshot::Receiver<Value> {
+    /// Register a query in flight. The entry lives as long as the returned
+    /// guard: however the wait ends — answer, timeout, send failure, or the
+    /// exchange future being dropped (abort, shutdown) — it is removed, so a
+    /// late reply to it is never taken and the map cannot grow.
+    fn register(&self, id: &str) -> (Pending<'_>, oneshot::Receiver<Value>) {
         let (tx, rx) = oneshot::channel();
         self.lock().insert(id.to_string(), tx);
-        rx
+        (
+            Pending {
+                replies: self,
+                id: id.to_string(),
+            },
+            rx,
+        )
     }
 
-    fn abandon(&self, id: &str) {
-        self.lock().remove(id);
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.lock().len()
     }
 
     /// Take `inbound` if it is the registry's answer to a query in flight.
@@ -99,7 +110,23 @@ impl RegistryReplies {
     }
 }
 
+/// A query's entry in [`RegistryReplies`], removed when this is dropped.
+struct Pending<'a> {
+    replies: &'a RegistryReplies,
+    id: String,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.replies.lock().remove(&self.id);
+    }
+}
+
 /// [`RegistryChannel`] over the bridge's VTC link, as the bridge's DID.
+///
+/// It keeps [`RegistryChannel::exchange`]'s security contract through
+/// [`RegistryReplies::route`]: only a reply whose transport-verified sender
+/// is the registry DID, on the thread of a query in flight, is returned.
 pub struct BridgeRegistryChannel {
     link: Arc<dyn VtcLink>,
     did: String,
@@ -156,25 +183,19 @@ impl RegistryChannel for BridgeRegistryChannel {
             .and_then(Value::as_str)
             .ok_or_else(|| TrqlError::Contract("request document has no id".to_string()))?
             .to_string();
-        // Register before sending, so a fast reply cannot be lost.
-        let reply = self.replies.register(&id);
+        // Register before sending, so a fast reply cannot be lost. `_pending`
+        // unregisters on every exit, including this future being dropped.
+        let (_pending, reply) = self.replies.register(&id);
         if let Err(e) = self.link.send(recipient, &request).await {
-            self.replies.abandon(&id);
             return Err(transport(format!("sending to the registry: {e:#}")));
         }
         match tokio::time::timeout(self.timeout, reply).await {
             Ok(Ok(doc)) => Ok(doc),
-            Ok(Err(_)) => {
-                self.replies.abandon(&id);
-                Err(transport("the reply channel closed".to_string()))
-            }
-            Err(_) => {
-                self.replies.abandon(&id);
-                Err(TrqlError::Timeout {
-                    kind: TransportKind::Didcomm,
-                    waited_secs: self.timeout.as_secs(),
-                })
-            }
+            Ok(Err(_)) => Err(transport("the reply channel closed".to_string())),
+            Err(_) => Err(TrqlError::Timeout {
+                kind: TransportKind::Didcomm,
+                waited_secs: self.timeout.as_secs(),
+            }),
         }
     }
 }
@@ -240,6 +261,26 @@ mod tests {
         assert!(matches!(e, TrqlError::Timeout { .. }), "{e}");
         // The late reply — or a job from a registry that is also the VTC —
         // goes on to the job path.
+        let late = serde_json::json!({ "threadId": "urn:uuid:q" });
+        assert!(!replies.route(&inbound(Some(REGISTRY), late)));
+    }
+
+    #[tokio::test]
+    async fn an_exchange_dropped_mid_wait_leaves_no_query_in_flight() {
+        let (link, mut sent) = ChannelLink::new();
+        let replies = Arc::new(RegistryReplies::new(REGISTRY));
+        let channel =
+            BridgeRegistryChannel::new(Arc::new(link), "did:key:z6MkBridge", replies.clone());
+        let waiting = tokio::spawn(async move {
+            channel
+                .exchange(REGISTRY, serde_json::json!({ "id": "urn:uuid:q" }))
+                .await
+        });
+        sent.recv().await.unwrap();
+        assert_eq!(replies.in_flight(), 1);
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(replies.in_flight(), 0, "an aborted query must unregister");
         let late = serde_json::json!({ "threadId": "urn:uuid:q" });
         assert!(!replies.route(&inbound(Some(REGISTRY), late)));
     }

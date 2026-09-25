@@ -9,7 +9,7 @@
 #![cfg(feature = "forge-github")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use affinidi_messaging_test_mediator::{
@@ -20,6 +20,7 @@ use affinidi_tdk::did_common::document::DocumentExt;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use trql_client::{TrqlError, TrqpQuery};
 use vgi_bridge::BridgeIdentity;
 use vgi_bridge::registry_channel::{BridgeRegistryChannel, RegistryReplies};
@@ -127,14 +128,28 @@ async fn ka(tdk: &affinidi_tdk::TDK, did: &str) -> (String, PublicKeyAgreement) 
     )
 }
 
+/// What the fake registry got onto the mediator.
+#[derive(Debug, PartialEq)]
+enum Delivered {
+    Honest,
+    Forged,
+    /// An uncorrelated registry message sent right after a forged reply: its
+    /// arrival proves the bridge's stream was live past the forged one.
+    Canary,
+}
+
+const CANARY_THREAD: &str = "urn:uuid:canary";
+
 /// The fake registry: answers each query to `registry` — honestly, or with
 /// an envelope Mallory seals with her own key while naming the registry's
-/// key as the party the key agreement is for.
+/// key as the party the key agreement is for, followed by an honest canary.
+/// Each message the mediator accepted is reported on `delivered`.
 fn serve(
     env: Arc<TestEnvironment>,
     registry: TestUser,
     mallory: TestUser,
     forged: bool,
+    delivered: mpsc::UnboundedSender<Delivered>,
 ) -> tokio::task::JoinHandle<()> {
     use affinidi_tdk::didcomm::Message;
     tokio::spawn(async move {
@@ -149,28 +164,17 @@ fn serve(
             .clone();
         let mpriv = PrivateKeyAgreement::from_raw_bytes(Curve::X25519, msecret.get_private_bytes())
             .unwrap();
-        loop {
-            let Ok(Some((message, _))) = env
-                .atm
-                .message_pickup()
-                .live_stream_next(&registry.profile, Some(Duration::from_millis(500)), true)
-                .await
-            else {
-                continue;
-            };
-            if message.typ != DIDCOMM_ENVELOPE {
-                continue;
-            }
-            let sender = message.from.clone().unwrap();
-            let reply = answer(&message.body, &registry.did);
+        // Seal `body` honestly as the registry, or forged by Mallory, and
+        // forward it to `to` through the mediator.
+        let send = async |body: Value, thid: String, to: &str, forge: bool| {
             let id = uuid::Uuid::new_v4().to_string();
-            let msg = Message::build(id.clone(), DIDCOMM_ENVELOPE.to_string(), reply)
+            let msg = Message::build(id.clone(), DIDCOMM_ENVELOPE.to_string(), body)
                 .from(registry.did.clone())
-                .to(sender.clone())
-                .thid(message.body["id"].as_str().unwrap().to_string())
+                .to(to.to_string())
+                .thid(thid)
                 .finalize();
-            let (packed, via) = if forged {
-                let (rkid, rpub) = ka(&tdk, &sender).await;
+            let (packed, via) = if forge {
+                let (rkid, rpub) = ka(&tdk, to).await;
                 let plaintext = serde_json::to_vec(&msg).unwrap();
                 (
                     forge_jwe(
@@ -186,37 +190,82 @@ fn serve(
             } else {
                 let (p, _) = env
                     .atm
-                    .pack_encrypted(&msg, &sender, Some(&registry.did), Some(&registry.did))
+                    .pack_encrypted(&msg, to, Some(&registry.did), Some(&registry.did))
                     .await
                     .unwrap();
                 (p, &registry)
             };
-            let _ = env
-                .atm
+            env.atm
                 .forward_and_send_message(
                     &via.profile,
                     false,
                     &packed,
                     Some(&id),
                     env.mediator.did(),
-                    &sender,
+                    to,
                     None,
                     None,
                     false,
                 )
-                .await;
+                .await
+                .map(|_| ())
+        };
+        loop {
+            let Ok(Some((message, _))) = env
+                .atm
+                .message_pickup()
+                .live_stream_next(&registry.profile, Some(Duration::from_millis(500)), true)
+                .await
+            else {
+                continue;
+            };
+            if message.typ != DIDCOMM_ENVELOPE {
+                continue;
+            }
+            let sender = message.from.clone().unwrap();
+            let reply = answer(&message.body, &registry.did);
+            let thid = message.body["id"].as_str().unwrap().to_string();
+            send(reply, thid, &sender, forged)
+                .await
+                .expect("the mediator accepts the reply");
+            let _ = delivered.send(if forged {
+                Delivered::Forged
+            } else {
+                Delivered::Honest
+            });
+            if forged {
+                let canary = json!({
+                    "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    "threadId": CANARY_THREAD,
+                    "issuer": registry.did,
+                });
+                send(canary, CANARY_THREAD.to_string(), &sender, false)
+                    .await
+                    .expect("the mediator accepts the canary");
+                let _ = delivered.send(Delivered::Canary);
+            }
         }
     })
 }
 
-async fn run(forged: bool) -> Result<bool, TrqlError> {
+/// One query's outcome, what the fake registry delivered, and every
+/// document the bridge's link surfaced (with its authenticated sender).
+struct Run {
+    result: Result<bool, TrqlError>,
+    delivered: Vec<Delivered>,
+    surfaced: Vec<(Value, Option<String>)>,
+    registry_did: String,
+}
+
+async fn run(forged: bool) -> Run {
     let env = open_mediator().await;
     let registry = env.add_user("Registry").await.unwrap();
     let mallory = env.add_user("Mallory").await.unwrap();
     for u in [&registry, &mallory] {
         env.atm.profile_enable_websocket(&u.profile).await.unwrap();
     }
-    let server = serve(env.clone(), registry.clone(), mallory, forged);
+    let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
+    let server = serve(env.clone(), registry.clone(), mallory, forged, delivered_tx);
 
     // The bridge: a did:peer routed through this mediator, on its real link.
     let (identity, _) = BridgeIdentity::generate_did_peer(env.mediator.did()).unwrap();
@@ -225,11 +274,18 @@ async fn run(forged: bool) -> Result<bool, TrqlError> {
         .unwrap();
     let link = Arc::new(link);
     let replies = Arc::new(RegistryReplies::new(registry.did.clone()));
-    // The bridge's inbound loop, reduced to the registry-reply hook.
+    let surfaced = Arc::new(Mutex::new(Vec::new()));
+    // The bridge's inbound loop, reduced to the registry-reply hook, noting
+    // everything the link surfaces.
     let pump = {
         let replies = Arc::clone(&replies);
+        let surfaced = Arc::clone(&surfaced);
         tokio::spawn(async move {
             while let Some(doc) = inbound.next().await {
+                surfaced
+                    .lock()
+                    .unwrap()
+                    .push((doc.doc.clone(), doc.authenticated_sender.clone()));
                 let _ = replies.route(&doc);
             }
         })
@@ -250,19 +306,53 @@ async fn run(forged: bool) -> Result<bool, TrqlError> {
     pump.abort();
     server.abort();
     link.shutdown().await;
-    result
+    let mut delivered = Vec::new();
+    while let Ok(d) = delivered_rx.try_recv() {
+        delivered.push(d);
+    }
+    let surfaced = std::mem::take(&mut *surfaced.lock().unwrap());
+    Run {
+        result,
+        delivered,
+        surfaced,
+        registry_did: registry.did,
+    }
 }
 
 #[tokio::test]
 async fn the_bridge_queries_the_registry_over_didcomm_as_its_own_did() {
-    assert!(run(false).await.unwrap(), "the honest answer is authorized");
+    let run = run(false).await;
+    assert!(run.result.unwrap(), "the honest answer is authorized");
+    assert_eq!(run.delivered, [Delivered::Honest]);
 }
 
 #[tokio::test]
 async fn a_reply_whose_key_agreement_names_another_key_never_reaches_the_bridge() {
-    let result = run(true).await;
+    let run = run(true).await;
     assert!(
-        matches!(result, Err(TrqlError::Timeout { .. })),
-        "a forged reply must not answer the bridge's query: {result:?}"
+        matches!(run.result, Err(TrqlError::Timeout { .. })),
+        "a forged reply must not answer the bridge's query: {:?}",
+        run.result
+    );
+    // Not vacuous: the forged reply was on the mediator, and the honest
+    // canary sent after it came out of the bridge's link authenticated as
+    // the registry — so the link was live past the forged envelope, and the
+    // messaging SDK refused that one rather than never seeing it.
+    assert_eq!(run.delivered, [Delivered::Forged, Delivered::Canary]);
+    let canary = run
+        .surfaced
+        .iter()
+        .find(|(doc, _)| doc["threadId"] == CANARY_THREAD)
+        .expect("the canary sent after the forged reply reached the bridge");
+    assert_eq!(
+        canary.1.as_deref().map(|s| s.split('#').next().unwrap()),
+        Some(run.registry_did.as_str())
+    );
+    assert!(
+        run.surfaced
+            .iter()
+            .all(|(doc, _)| doc["threadId"] == CANARY_THREAD),
+        "the forged reply must not surface from the link at all: {:?}",
+        run.surfaced
     );
 }

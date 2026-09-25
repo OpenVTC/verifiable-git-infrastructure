@@ -242,6 +242,20 @@ pub fn select_route(
 ///
 /// The bridge implements this over its existing mediator session, so its
 /// queries go out as its own DID on the socket it already holds.
+///
+/// # Security
+///
+/// **Implementing this trait is security-critical.** verify-trust does not
+/// see the transport envelope on this path, so it cannot check who sent a
+/// reply: the channel is the only thing standing between a forged answer and
+/// an authorization verdict. An implementation **MUST** return from
+/// [`exchange`](Self::exchange) only a reply whose *transport-verified*
+/// sender is the registry DID it was sent to — authenticated by the
+/// registry's own key (for DIDComm, authcrypt whose sender the key agreement
+/// actually used, never a sender merely claimed in a header or the body) —
+/// and **MUST** drop anything else (unauthenticated, anoncrypt, another
+/// sender) rather than return it. A channel that
+/// cannot prove the sender must not be used with [`Registry::over_channel`].
 #[async_trait::async_trait]
 pub trait RegistryChannel: Send + Sync {
     /// The binding this channel speaks.
@@ -363,6 +377,13 @@ impl Registry {
     /// Query through a channel the caller owns (the bridge's session), as the
     /// channel's DID ([`RegistryChannel::sender_did`] is stamped as each
     /// document's `issuer`).
+    ///
+    /// # Security
+    ///
+    /// The verdict is only as trustworthy as `channel`: this constructor
+    /// cannot check that replies came from `registry_did`. The channel
+    /// **MUST** meet [`RegistryChannel`]'s security contract — deliver only
+    /// replies whose transport-verified sender is `registry_did`.
     pub fn over_channel(channel: Arc<dyn RegistryChannel>, registry_did: &str) -> Self {
         let kind = channel.kind();
         let sender = channel.sender_did().to_string();
