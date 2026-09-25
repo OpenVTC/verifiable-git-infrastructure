@@ -95,17 +95,29 @@ the mediator the bridge listens at. Both identities carry one:
 - **The `did:peer:2` `init` mints** encodes its keys *and* that service in
   the identifier, so there is nothing to host. The flip side: the mediator is
   part of the DID. Change `mediator_did` and the bridge refuses to start
-  rather than have the VTC deliver jobs where it no longer listens; mint a new
-  identity (`vgi-bridge identity mint --replace`) and register the new DID at
-  the VTC. `init` refuses a mediator whose own DID would make the `did:peer`
+  rather than have the VTC deliver jobs where it no longer listens. For a
+  bridge serving bound namespaces the fix is to set `mediator_did` back: a new
+  DID is a different bridge (below). `init` refuses a mediator whose own DID would make the `did:peer`
   longer than the 1000 bytes DID resolvers accept.
 - **A `did:webvh`** publishes the service in its document (the VTA template
   adds it), and can move mediators without changing DID.
 
 A store from an earlier release may hold a `did:key`, which advertises no
 service: no VTC can send it jobs (they fail `noMatchingProtocol`). `run` warns
-about it at start; mint a `did:peer` in its place (`identity mint --replace`)
-and register that.
+about it at start; mint a `did:peer` in its place (`identity mint --replace
+--backup <file>`) and register that.
+
+**Replacing the identity is not a key rotation.** `identity mint --replace`
+and an `identity import` of a different DID write the current identity to
+`--backup <file>` first (required), and refuse — listing them — while the
+store holds namespaces bound or being bound to it, or when the current DID
+is one the bridge did not mint (a VTA-provisioned `did:webvh`), unless given
+`--abandon-current-did`. What a new DID breaks: the VTC's `[git_ns] bridges`
+must name it; the VTC accepts a namespace's results and events only from the
+DID it bound, so those namespaces are no longer served; the registry's
+`git.commit.sign` service grant is held by the old DID, so Dependabot commits
+the new one re-signs fail the check; and with no re-attach yet, binding them
+again needs an unbind, which revokes every right in them.
 
 The admin commands (`init`, `identity`, `secret`) open the store directly,
 and redb allows one process at a time: stop the bridge first.

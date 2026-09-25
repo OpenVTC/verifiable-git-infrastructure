@@ -218,7 +218,7 @@ peer: it resolves the bridge's DID and uses a transport the document
 advertises (TSP, then DIDComm). A `did:key` document advertises no service,
 so the VTC has no transport to it: the bind fails `unavailable` (*the bridge
 … refused the job (noMatchingProtocol)*), and so would every job after it.
-Earlier releases of `init` minted one; `vgi-bridge identity mint --replace`
+Earlier releases of `init` minted one; `vgi-bridge identity mint --replace --backup <file>`
 swaps it for a `did:peer` (register the new DID).
 
 Whichever identity it is, back it up apart from the store:

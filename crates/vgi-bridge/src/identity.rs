@@ -191,6 +191,24 @@ impl BridgeIdentity {
         bundle_of(&self.did, &self.secrets)
     }
 
+    /// The sealed identity as a secrets bundle, for export: an imported or
+    /// minted bundle exactly as stored — every key it carries, whatever its
+    /// type — and a `did:key` seed as the bundle of its two keys. `None`
+    /// before `init` / `identity import`.
+    pub fn stored_bundle(store: &Store) -> Result<Option<DidSecretsBundle>> {
+        let Some(bytes) = store.get_secret(IDENTITY_SECRET)? else {
+            return Ok(None);
+        };
+        let stored: StoredIdentity =
+            serde_json::from_slice(&bytes).context("decoding the sealed identity")?;
+        match stored {
+            StoredIdentity::Bundle { bundle } => Ok(Some(bundle)),
+            StoredIdentity::DidKey { .. } => {
+                Self::load(store)?.map(|id| id.to_bundle()).transpose()
+            }
+        }
+    }
+
     /// Seal a `did:key` seed as the bridge's identity.
     pub fn store_did_key(store: &Store, seed: &[u8; 32]) -> Result<Self> {
         let identity = Self::from_seed(seed)?;
@@ -343,14 +361,18 @@ pub fn check_reachable(did: &str, mediator_did: &str) -> Result<Option<String>> 
         Some(m) => bail!(
             "the bridge's DID `{did}` advertises the mediator `{m}`, but the config names \
              `{mediator_did}`. A did:peer names its mediator in its identifier, so the VTC \
-             would send jobs to `{m}`. Either set `mediator_did` back, or mint a new identity \
-             (`vgi-bridge identity mint --replace`) and register the new DID at the VTC"
+             would send jobs to `{m}`, where this bridge would not be listening.\n\
+             Fix (recommended, and the only one that keeps bound namespaces working): set \
+             `mediator_did = \"{m}\"` back in the config.\n\
+             Only for a bridge that serves no bound namespace: mint a new identity \
+             (`vgi-bridge identity mint --replace --backup <file>`) and register the new DID \
+             at the VTC — see `identity mint --help` for what a new DID breaks"
         ),
         None => Ok(Some(format!(
             "the bridge's DID `{did}` advertises no DIDComm service, so no VTC can send it \
              jobs (they fail with `noMatchingProtocol`). Mint a did:peer that names the \
-             mediator (`vgi-bridge identity mint --replace`) and register the new DID at \
-             the VTC"
+             mediator (`vgi-bridge identity mint --replace --backup <file>`) and register \
+             the new DID at the VTC"
         ))),
     }
 }
@@ -485,10 +507,32 @@ mod tests {
             Some(MEDIATOR)
         );
         assert_eq!(check_reachable(id.did(), MEDIATOR).unwrap(), None);
+        // The ids DIDComm looks secrets up by are the ones the document
+        // names: `#key-1` signs and authenticates, `#key-2` agrees keys.
+        let doc: affinidi_tdk::did_common::DID = id.did().parse().unwrap();
+        let doc = serde_json::to_value(doc.resolve().unwrap()).unwrap();
+        let x25519 = id
+            .messaging_secrets()
+            .into_iter()
+            .find(|s| s.get_key_type() == KeyType::X25519)
+            .unwrap();
+        assert_eq!(x25519.id, format!("{}#key-2", id.did()));
+        assert_eq!(doc["keyAgreement"], serde_json::json!([x25519.id]));
+        assert_eq!(
+            doc["assertionMethod"],
+            serde_json::json!([format!("{}#key-1", id.did())])
+        );
         // Served from another mediator, the DID would send the VTC to the
         // wrong place: refused.
-        let err = check_reachable(id.did(), "did:web:elsewhere.example").unwrap_err();
-        assert!(err.to_string().contains(MEDIATOR), "{err}");
+        let err = check_reachable(id.did(), "did:web:elsewhere.example")
+            .unwrap_err()
+            .to_string();
+        // Setting the mediator back is the first fix offered: it is the one
+        // that keeps bound namespaces working.
+        let first_fix = err
+            .find(&format!("`mediator_did = \"{MEDIATOR}\"`"))
+            .unwrap();
+        assert!(first_fix < err.find("mint").unwrap(), "{err}");
 
         // It signs what the production verifier accepts ([`crate::proof_checker`]
         // is the same resolver-backed one the VTC's side is): a did:peer
