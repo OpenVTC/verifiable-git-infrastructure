@@ -256,6 +256,9 @@ async fn resign_world(remote: &Remote, keyring: bool) -> World {
         // The config names this file; put the real (test) web-flow key in.
         std::fs::write(w.dir.path().join("web-flow.asc"), remote.keyring()).unwrap();
     }
+    // The provenance ledger is kept only for a repository the namespace
+    // manages.
+    seed_repo(w.bridge.store(), &repo("widgets"), REPO_ID);
     w
 }
 
@@ -786,6 +789,7 @@ async fn a_namespace_can_turn_the_re_sign_off() {
     })
     .await;
     std::fs::write(w.dir.path().join("web-flow.asc"), remote.keyring()).unwrap();
+    seed_repo(w.bridge.store(), &repo("widgets"), REPO_ID);
     mount_github(&w, &remote, remote.head(), DEPENDABOT).await;
     dependabot_pushes(&w, &remote).await;
     let o = resign(&w).await;

@@ -10,6 +10,7 @@ use common::*;
 use serde_json::json;
 use tower::ServiceExt;
 use vgi_bridge::registry::{StoredApp, github_app_secret, legacy_github_app_secret};
+use vgi_bridge::store::{NamespaceRecord, Table};
 use vgi_forge::Resource;
 use vgi_forge_github::Secret;
 use vgi_forge_github::webhook::sign_body;
@@ -248,5 +249,172 @@ async fn an_app_stored_for_another_owner_is_refused() {
         vgi_bridge::build_adapters(w.bridge.config(), w.bridge.store())
             .await
             .is_err()
+    );
+}
+
+// ── one organisation's App never acts on another's namespace ─────────────
+//
+// Regression tests from the review of #90: a GitHub App's webhook secret is
+// set by the organisation that owns the App, so its verified deliveries must
+// never reach another organisation's namespace, repositories or
+// installation.
+
+/// A delivery signed for `app`'s route, as GitHub (or that App's owner)
+/// would send it.
+async fn deliver(
+    w: &World,
+    owner: &str,
+    secret: &str,
+    event: &str,
+    body: &serde_json::Value,
+) -> StatusCode {
+    let body = serde_json::to_vec(body).unwrap();
+    let req = Request::post(format!("/github/github.com/{owner}/webhook"))
+        .header("x-github-event", event)
+        .header("x-github-delivery", vgi_bridge::wire::new_id())
+        .header(
+            "x-hub-signature-256",
+            sign_body(&Secret::new(secret), &body),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    vgi_bridge::http::router(w.bridge.clone())
+        .oneshot(req)
+        .await
+        .unwrap()
+        .status()
+}
+
+fn acme_widgets_managed(w: &World) -> bool {
+    let rec: Option<vgi_bridge::store::RepoRecord> = w
+        .bridge
+        .store()
+        .get(Table::Repos, "github.com#812")
+        .unwrap();
+    let ns: NamespaceRecord = w
+        .bridge
+        .store()
+        .get(Table::Namespaces, NS)
+        .unwrap()
+        .unwrap();
+    rec.is_some() && ns.managed.contains(&812)
+}
+
+#[tokio::test]
+async fn another_orgs_app_cannot_delete_or_rename_this_orgs_repository() {
+    let mut w = world(two_orgs()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    // globex's App claims acme/widgets was deleted.
+    let deleted = json!({ "action": "deleted",
+        "repository": { "id": 812, "full_name": "acme/widgets" } });
+    assert_eq!(
+        deliver(&w, "globex", GLOBEX_SECRET, "repository", &deleted).await,
+        StatusCode::NO_CONTENT
+    );
+    // …or names a globex repository with acme's forge id.
+    let by_id = json!({ "action": "deleted",
+        "repository": { "id": 812, "full_name": "globex/decoy" } });
+    deliver(&w, "globex", GLOBEX_SECRET, "repository", &by_id).await;
+    let renamed = json!({ "action": "renamed",
+        "repository": { "id": 812, "full_name": "globex/decoy2" },
+        "changes": { "repository": { "name": { "from": "decoy" } } } });
+    deliver(&w, "globex", GLOBEX_SECRET, "repository", &renamed).await;
+    // …or that it was transferred out of acme.
+    let transferred = json!({ "action": "transferred",
+        "repository": { "id": 812, "full_name": "globex/widgets" },
+        "changes": { "owner": { "from": { "user": { "login": "acme" } } } } });
+    deliver(&w, "globex", GLOBEX_SECRET, "repository", &transferred).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(acme_widgets_managed(&w), "acme's repository is untouched");
+    let rec: vgi_bridge::store::RepoRecord = w
+        .bridge
+        .store()
+        .get(Table::Repos, "github.com#812")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.resource.as_str(), "github.com/acme/widgets");
+    w.quiet().await;
+}
+
+#[tokio::test]
+async fn another_orgs_app_cannot_remove_this_orgs_installation() {
+    let mut w = world(two_orgs()).await;
+    let removed = |login: &str, id: u64| {
+        json!({ "action": "deleted",
+            "installation": { "id": id, "account": { "id": 500, "login": login } } })
+    };
+    // Through globex's App, for acme: dropped.
+    assert_eq!(
+        deliver(
+            &w,
+            "globex",
+            GLOBEX_SECRET,
+            "installation",
+            &removed("acme", INSTALLATION)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    // Through acme's own App, but for another installation: not acme's.
+    deliver(
+        &w,
+        "acme",
+        WEBHOOK_SECRET,
+        "installation",
+        &removed("acme", INSTALLATION + 1),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    w.quiet().await;
+    // acme's own App, its own installation: reported.
+    deliver(
+        &w,
+        "acme",
+        WEBHOOK_SECRET,
+        "installation",
+        &removed("acme", INSTALLATION),
+    )
+    .await;
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(ev["payload"]["event"]["type"], "installationRemoved");
+    assert_eq!(ev["payload"]["namespace"], NS);
+}
+
+#[tokio::test]
+async fn another_orgs_app_cannot_feed_the_provenance_ledger_or_trigger_checks() {
+    let w = world(two_orgs()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    let push = |full_name: &str| {
+        json!({ "ref": "refs/heads/dependabot/cargo/serde-1.0.200",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "1111111111111111111111111111111111111111",
+            "created": true, "deleted": false, "forced": false,
+            "repository": { "id": 812, "full_name": full_name, "pushed_at": 1_790_000_000 },
+            "pusher": { "name": "dependabot[bot]" },
+            "sender": { "login": "dependabot[bot]", "id": 49699333, "type": "Bot" } })
+    };
+    for name in ["acme/widgets", "globex/decoy"] {
+        assert_eq!(
+            deliver(&w, "globex", GLOBEX_SECRET, "push", &push(name)).await,
+            StatusCode::NO_CONTENT,
+            "{name}"
+        );
+    }
+    assert!(
+        w.bridge
+            .store()
+            .list::<vgi_bridge::store::BranchLedger>(Table::Branches)
+            .unwrap()
+            .is_empty(),
+        "no provenance recorded from another organisation's App"
+    );
+    let pr = json!({ "action": "opened",
+        "repository": { "id": 812, "full_name": "acme/widgets" },
+        "pull_request": { "number": 5, "head": { "sha": "1111111111111111111111111111111111111111" },
+                          "base": { "ref": "main", "sha": "2222222222222222222222222222222222222222" } } });
+    assert_eq!(
+        deliver(&w, "globex", GLOBEX_SECRET, "pull_request", &pr).await,
+        StatusCode::NO_CONTENT,
+        "no check for another organisation's repository"
     );
 }

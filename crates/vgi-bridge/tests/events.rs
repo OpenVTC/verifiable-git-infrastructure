@@ -63,16 +63,21 @@ fn open_events(w: &World) -> usize {
         .count()
 }
 
-/// A managed repository transferred to another namespace this same bridge
-/// serves: reported to its old namespace as `repoTransferred`, and to the
-/// new one as `repoCreatedUnmanaged` — its record, its place in the managed
-/// set and its Dependabot provenance never follow it. Same handling on
-/// either event version; only the type differs.
+/// A managed repository transferred to another organisation this same
+/// bridge serves (through that organisation's own App): the old
+/// organisation's App reports it to its namespace as `repoTransferred`, and
+/// the new one's App reports it to its namespace as `repoCreatedUnmanaged` —
+/// each App speaks for its own organisation only, and the record, the place
+/// in the managed set and the Dependabot provenance never follow it. Same
+/// handling on either event version; only the type differs.
 async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty: &str) {
-    let mut w = world(Options {
-        event_version: version,
-        ..Options::default()
-    })
+    let mut w = world(
+        Options {
+            event_version: version,
+            ..Options::default()
+        }
+        .with_org("acme-labs", 3004),
+    )
     .await;
     seed_labs(&w);
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
@@ -98,6 +103,17 @@ async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty:
         json!({ "type": "repoTransferred", "forgeId": "812",
                 "from": "github.com/acme/widgets", "to": "github.com/acme-labs/widgets" })
     );
+    // acme's App says nothing for acme-labs: its own App does.
+    w.quiet().await;
+    let s = post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "t-1-labs",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
     let arrived = w.next_of(ty).await;
     assert_eq!(arrived["payload"]["namespace"], LABS);
     assert_eq!(
@@ -135,6 +151,15 @@ async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty:
     assert_eq!(s, StatusCode::ACCEPTED);
     let again = w.next_of(ty).await;
     assert_eq!(again["payload"]["event"]["type"], "repoTransferred");
+    let s = post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "t-2-labs",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
     let again = w.next_of(ty).await;
     assert_eq!(again["payload"]["event"]["type"], "repoCreatedUnmanaged");
     assert!(record(&w, 812).is_none());

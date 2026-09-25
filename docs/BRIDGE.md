@@ -329,7 +329,13 @@ instance) — and registers one App per organisation. One bridge holds them
 all, keyed by `(host, app_owner)`: each App has its own key, webhook secret
 and routes, and the bridge picks the App from a namespace's owner. An App serves
 its own organisation (or account) only, even when it is the host's only one:
-a namespace whose owner has no entry here cannot be bound. The
+a namespace whose owner has no entry here cannot be bound. Each App also
+**speaks only for its own organisation**. An organisation's owners can set
+their App's webhook secret, so a delivery that App verifies is acted on only
+when every namespace, repository (by name and by forge id) and installation
+it names is that organisation's. Anything else is dropped and logged. A
+repository transferred between two organisations the bridge serves is
+reported by each organisation's App for its own side. The
 VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —
@@ -580,7 +586,9 @@ requests still merge without a human step, a GitHub bridge **re-signs them
 with its own DID** (design §9, "Dependabot re-sign bot"). Provenance comes
 from **signed `push` webhooks, never from who a commit says wrote it**:
 
-- **The record.** Every verified `push` to a `dependabot/*` branch is kept:
+- **The record.** Every verified `push` to a `dependabot/*` branch of a
+  repository the namespace manages — delivered by that organisation's own
+  App — is kept:
   before, after, who GitHub says pushed (login and numeric id), and whether
   the push created the branch. Deleting the branch clears its record, and
   creating it again starts a new one — but only a delivery at least as new

@@ -651,11 +651,23 @@ pub async fn completed_checks(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-/// Deliver a signed GitHub webhook to the bridge's router.
+/// Deliver a signed GitHub webhook to the bridge's router, on the test App's
+/// route.
 pub async fn post_webhook(w: &World, event: &str, delivery: &str, body: &Value) -> StatusCode {
+    let owner = w.bridge.config().github[0].owner_key();
+    post_webhook_as(w, &owner, event, delivery, body).await
+}
+
+/// Deliver a signed GitHub webhook on `owner`'s App route.
+pub async fn post_webhook_as(
+    w: &World,
+    owner: &str,
+    event: &str,
+    delivery: &str,
+    body: &Value,
+) -> StatusCode {
     let bytes = serde_json::to_vec(body).unwrap();
     let sig = sign_body(&Secret::new(WEBHOOK_SECRET), &bytes);
-    let owner = w.bridge.config().github[0].owner_key();
     let req = Request::post(format!("/github/github.com/{owner}/webhook"))
         .header("x-github-event", event)
         .header("x-github-delivery", delivery)
