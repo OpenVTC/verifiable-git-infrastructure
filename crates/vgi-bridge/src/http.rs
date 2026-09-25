@@ -2,7 +2,7 @@
 //!
 //! | Route | Who calls it |
 //! |---|---|
-//! | `GET  /healthz` | the orchestrator (503 on a VTA state conflict) |
+//! | `GET  /healthz` | the orchestrator (503 on a VTA state conflict, or state not reaching the VTA) |
 //! | `GET  /github/{host}/register?state=` | the admin, from the URL the bridge logs (manifest flow) |
 //! | `GET  /github/{host}/registered?code=&state=` | GitHub, after the App is registered |
 //! | `GET  /github/{host}/setup?installation_id=&setup_action=&state=` | GitHub, after the App is installed (bind) |
@@ -50,14 +50,11 @@ pub fn router(bridge: Arc<Bridge>) -> Router {
 }
 
 /// `ok`, or 503 when the bridge must not be left to run unattended: in VTA
-/// mode, someone else wrote its state (the mirror stopped, fail closed).
+/// mode, someone else wrote its state (the mirror stopped, fail closed), or
+/// its state has not reached the VTA for a while ([`crate::appstate::Mirror::health`]).
 async fn healthz(State(bridge): State<Arc<Bridge>>) -> Response {
-    if bridge.store.mirror().is_some_and(|m| m.stopped()) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "state conflict: another writer on the bridge's VTA context",
-        )
-            .into_response();
+    if let Some(Err(why)) = bridge.store.mirror().map(|m| m.health()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, why).into_response();
     }
     "ok".into_response()
 }

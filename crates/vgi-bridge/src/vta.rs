@@ -44,7 +44,9 @@ use vta_sdk::protocols::app_state::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::appstate::{AppState, Listing, NAMESPACE, PutError, Record};
+use crate::appstate::{
+    AppState, Listing, ListingMode, NAMESPACE, PutError, REQUEST_TIMEOUT, Record,
+};
 use crate::config::VtaConfig;
 use crate::identity::BridgeIdentity;
 use crate::seal::MasterKey;
@@ -844,33 +846,43 @@ impl VtaAppState {
 
     /// Every page of the change feed from 0 (`feed`), or of the snapshot.
     async fn pages(&self, feed: bool) -> Result<Listing> {
-        let mut out = Listing::default();
+        let mut out = Listing {
+            mode: if feed {
+                ListingMode::Feed
+            } else {
+                ListingMode::Snapshot
+            },
+            ..Listing::default()
+        };
         let mut cursor: Option<String> = None;
         loop {
-            let v = if feed {
-                self.client
-                    .app_state_changes_since(
-                        &self.context,
-                        NAMESPACE,
-                        0,
-                        None,
-                        true,
-                        Some(500),
-                        cursor.as_deref(),
-                    )
-                    .await
-            } else {
-                self.client
-                    .app_state_list(
-                        &self.context,
-                        Some(NAMESPACE),
-                        None,
-                        true,
-                        Some(500),
-                        cursor.as_deref(),
-                    )
-                    .await
-            }
+            let v = bounded(async {
+                if feed {
+                    self.client
+                        .app_state_changes_since(
+                            &self.context,
+                            NAMESPACE,
+                            0,
+                            None,
+                            true,
+                            Some(500),
+                            cursor.as_deref(),
+                        )
+                        .await
+                } else {
+                    self.client
+                        .app_state_list(
+                            &self.context,
+                            Some(NAMESPACE),
+                            None,
+                            true,
+                            Some(500),
+                            cursor.as_deref(),
+                        )
+                        .await
+                }
+            })
+            .await
             .map_err(|e| explain(e, &self.context, "listing the bridge's app-state"))?;
             let page: AppStateListResponse =
                 serde_json::from_value(v).context("decoding an app-state list")?;
@@ -884,6 +896,7 @@ impl VtaAppState {
                     version: r.version,
                     deleted: r.deleted,
                     value: r.value.unwrap_or(Value::Null),
+                    updated_at: unix_seconds(&r.updated_at),
                 });
             }
             match (page.truncated, page.cursor) {
@@ -898,6 +911,29 @@ impl VtaAppState {
     }
 }
 
+/// An RFC 3339 time as unix seconds (`None` if it is not one).
+fn unix_seconds(t: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .ok()
+        .map(|d| d.timestamp())
+}
+
+/// One app-state request, given up after [`REQUEST_TIMEOUT`] — well inside
+/// the writer's lease, so a request is never still being waited on once the
+/// lease it was sent under could have run out.
+async fn bounded<T>(
+    f: impl std::future::Future<Output = std::result::Result<T, VtaError>>,
+) -> std::result::Result<T, VtaError> {
+    tokio::time::timeout(REQUEST_TIMEOUT, f)
+        .await
+        .unwrap_or_else(|_| {
+            Err(VtaError::Protocol(format!(
+                "the VTA did not answer an app-state request within {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )))
+        })
+}
+
 /// A precondition failure, however the transport reported it (sdk 0.51
 /// folds the trust-task error into a message).
 fn is_conflict(e: &VtaError) -> bool {
@@ -909,8 +945,9 @@ impl AppState for VtaAppState {
     /// The change feed from the start: every record's latest version,
     /// **tombstones included**, and the namespace counter. When the VTA has
     /// reaped tombstones older than the start (`watermarkTooOld`), the
-    /// snapshot of live records instead — the mirror treats a record it
-    /// mirrored and no longer finds the same way either way.
+    /// snapshot of live records instead, marked as such: only then may a
+    /// record the mirror wrote and no longer finds be taken for deleted
+    /// (in the feed, it is a rollback).
     async fn list(&self) -> Result<Listing> {
         match self.pages(true).await {
             Ok(l) => Ok(l),
@@ -920,10 +957,11 @@ impl AppState for VtaAppState {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Record>> {
-        match self
-            .client
-            .app_state_get(&self.context, NAMESPACE, key, false)
-            .await
+        match bounded(
+            self.client
+                .app_state_get(&self.context, NAMESPACE, key, false),
+        )
+        .await
         {
             Ok(v) => {
                 let r: AppStateGetResponse =
@@ -936,6 +974,7 @@ impl AppState for VtaAppState {
                     version: r.record.version,
                     deleted: false,
                     value: r.record.value.unwrap_or(Value::Null),
+                    updated_at: unix_seconds(&r.record.updated_at),
                 }))
             }
             Err(VtaError::NotFound(_)) => Ok(None),
@@ -949,10 +988,11 @@ impl AppState for VtaAppState {
         value: Value,
         expected: Option<u64>,
     ) -> std::result::Result<u64, PutError> {
-        match self
-            .client
-            .app_state_put(&self.context, NAMESPACE, key, value, expected)
-            .await
+        match bounded(
+            self.client
+                .app_state_put(&self.context, NAMESPACE, key, value, expected),
+        )
+        .await
         {
             Ok(v) => {
                 let r: AppStatePutResponse = serde_json::from_value(v)
@@ -975,10 +1015,11 @@ impl AppState for VtaAppState {
     ) -> std::result::Result<Option<u64>, PutError> {
         // `Some(0)` is never a valid delete precondition.
         let expected = expected.filter(|v| *v > 0);
-        match self
-            .client
-            .app_state_delete(&self.context, NAMESPACE, key, expected)
-            .await
+        match bounded(
+            self.client
+                .app_state_delete(&self.context, NAMESPACE, key, expected),
+        )
+        .await
         {
             Ok(v) => Ok(serde_json::from_value::<
                 vta_sdk::protocols::app_state::AppStateDeleteResponse,
@@ -1008,6 +1049,10 @@ where
     loop {
         match f().await {
             Ok(v) => return Ok(v),
+            // Refused state is final: the same pull refuses it again.
+            Err(e) if crate::appstate::is_state_refused(&e) => {
+                return Err(e.context(format!("{what}: refused, not retried")));
+            }
             Err(e) if is_refusal(&e) || tokio::time::Instant::now() + backoff > deadline => {
                 return Err(e.context(format!("{what} (the VTA did not answer in time)")));
             }
@@ -1412,7 +1457,7 @@ pub(crate) mod testing {
             let mut r = json!({
                 "contextId": self.context, "namespace": NAMESPACE, "key": key,
                 "version": version, "deleted": value.is_none(),
-                "updatedAt": "2026-09-25T00:00:00Z",
+                "updatedAt": chrono::Utc::now().to_rfc3339(),
             });
             if let Some(v) = value {
                 r["value"] = v.clone();
@@ -1538,7 +1583,7 @@ pub(crate) mod testing {
                     st.1.insert(key.clone(), (v, Some(p["value"].clone())));
                     Ok(json!({
                         "contextId": self.context, "namespace": NAMESPACE, "key": key,
-                        "version": v, "created": current.is_none(), "updatedAt": "2026-09-25T00:00:00Z",
+                        "version": v, "created": current.is_none(), "updatedAt": chrono::Utc::now().to_rfc3339(),
                     }))
                 }
                 u if u == tt::TASK_VTA_APP_STATE_DELETE_1_0 => {

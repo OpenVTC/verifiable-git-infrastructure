@@ -97,6 +97,43 @@ pub struct Record {
     pub deleted: bool,
     /// The value (`Null` on a tombstone).
     pub value: Value,
+    /// When the remote applied the write that produced `version`, by the
+    /// **remote's** clock (unix seconds; `None` if it did not say). Unlike
+    /// anything in `value`, no writer chooses it.
+    pub updated_at: Option<i64>,
+}
+
+/// How complete a [`Listing`]'s record of deletions is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListingMode {
+    /// The change feed from the start: **every** deletion is there as a
+    /// tombstone, so a key with no record at all was never deleted.
+    #[default]
+    Feed,
+    /// The snapshot of live records, because the remote has reaped
+    /// tombstones since the start: a key that is missing may have been
+    /// deleted (its tombstone reaped).
+    Snapshot,
+}
+
+/// The remote's state is refused: rolled back, replayed, or written by
+/// someone else. Final — retrying reads the same state and refuses it again,
+/// so the start fails at once with this message instead of retrying.
+#[derive(Debug)]
+pub struct StateRefused(pub String);
+
+impl std::fmt::Display for StateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StateRefused {}
+
+/// Whether `e` is a [`StateRefused`] (anywhere in its chain).
+pub fn is_state_refused(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<StateRefused>().is_some())
 }
 
 /// Everything the remote holds for the bridge: live records **and the
@@ -107,6 +144,8 @@ pub struct Listing {
     pub records: Vec<Record>,
     /// The namespace counter (the version the latest write took).
     pub watermark: u64,
+    /// Whether every deletion is in `records` (the change feed) or not.
+    pub mode: ListingMode,
 }
 
 /// Why a conditional write did not apply.
@@ -164,6 +203,12 @@ pub struct MemoryAppState {
     down: std::sync::atomic::AtomicBool,
     /// Puts per key, for tests that count writes.
     puts: Mutex<BTreeMap<String, usize>>,
+    /// When each key's latest write was applied (unix seconds, this
+    /// store's clock: the VTA's `updatedAt`).
+    stamps: Mutex<BTreeMap<String, i64>>,
+    /// Tombstones were reaped: the change feed from the start is gone, and
+    /// a listing is a snapshot (as the VTA answers `watermarkTooOld`).
+    reaped: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryAppState {
@@ -197,11 +242,43 @@ impl MemoryAppState {
 
     /// Put `value` at `key` as someone else would (no precondition).
     pub fn put_as_other(&self, key: &str, value: Value) -> u64 {
+        self.put_as_other_at(key, value, chrono::Utc::now().timestamp())
+    }
+
+    /// [`MemoryAppState::put_as_other`], applied at `updated_at` by this
+    /// store's clock.
+    pub fn put_as_other_at(&self, key: &str, value: Value, updated_at: i64) -> u64 {
         let mut g = self.inner.lock().expect("lock");
         g.0 += 1;
         let v = g.0;
         g.1.insert(key.to_string(), (v, Some(value)));
+        self.stamp(key, updated_at);
         v
+    }
+
+    /// Lose `key` entirely, tombstone and all, while the change feed still
+    /// covers the start: what a restore from an older copy leaves, once the
+    /// counter has moved past the restore point.
+    pub fn forget(&self, key: &str) {
+        self.inner.lock().expect("lock").1.remove(key);
+    }
+
+    /// Advance the namespace counter by `n` without touching the bridge's
+    /// records (other writes, later deleted and reaped, or a restored VTA
+    /// written to since).
+    pub fn bump(&self, n: u64) {
+        self.inner.lock().expect("lock").0 += n;
+    }
+
+    fn stamp(&self, key: &str, at: i64) {
+        self.stamps
+            .lock()
+            .expect("lock")
+            .insert(key.to_string(), at);
+    }
+
+    fn stamp_of(&self, key: &str) -> Option<i64> {
+        self.stamps.lock().expect("lock").get(key).copied()
     }
 
     /// The live record at `key`, raw.
@@ -214,6 +291,7 @@ impl MemoryAppState {
     pub fn reap_tombstones(&self) {
         let mut g = self.inner.lock().expect("lock");
         g.1.retain(|_, (_, v)| v.is_some());
+        self.reaped.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn check(&self) -> Result<()> {
@@ -251,9 +329,15 @@ impl AppState for MemoryAppState {
                     version: *v,
                     deleted: value.is_none(),
                     value: value.clone().unwrap_or(Value::Null),
+                    updated_at: self.stamp_of(k),
                 })
                 .collect(),
             watermark: g.0,
+            mode: if self.reaped.load(std::sync::atomic::Ordering::SeqCst) {
+                ListingMode::Snapshot
+            } else {
+                ListingMode::Feed
+            },
         })
     }
 
@@ -266,6 +350,7 @@ impl AppState for MemoryAppState {
                 version: *v,
                 deleted: false,
                 value: value.clone(),
+                updated_at: self.stamp_of(key),
             })
         }))
     }
@@ -283,6 +368,7 @@ impl AppState for MemoryAppState {
         g.0 += 1;
         let v = g.0;
         g.1.insert(key.to_string(), (v, Some(value)));
+        self.stamp(key, chrono::Utc::now().timestamp());
         *self
             .puts
             .lock()
@@ -307,6 +393,7 @@ impl AppState for MemoryAppState {
         g.0 += 1;
         let v = g.0;
         g.1.insert(key.to_string(), (v, None));
+        self.stamp(key, chrono::Utc::now().timestamp());
         Ok(Some(v))
     }
 }
@@ -379,12 +466,41 @@ pub const LEASE_KEY: &str = "lease/writer";
 /// How long a lease lasts unless renewed.
 pub const LEASE_TTL_SECS: i64 = 120;
 
+/// The longest the bridge waits for one app-state request. Well under half
+/// the lease's TTL: a lease is renewed once half of it is left, so a write
+/// sent under a held lease is answered (or given up on) long before the
+/// lease could have run out and another writer taken it.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+const _: () = assert!(
+    REQUEST_TIMEOUT.as_secs() * 3 <= (LEASE_TTL_SECS as u64) / 2,
+    "an app-state request must fit well inside half a lease"
+);
+
+/// When the lease `r` records runs out for everyone but its holder: the
+/// holder's `until`, but **never later than the VTA's own time of the write
+/// plus [`LEASE_TTL_SECS`]**. `until` is the holder's clock and the
+/// holder's choice; `updated_at` is neither, so a writer with a wrong clock
+/// — or one that writes a far-off `until` on purpose — holds the lease for
+/// at most one TTL past its last write. A record without the VTA's time
+/// cannot be bounded, so it is taken as expired.
+pub fn lease_expiry(r: &Record) -> i64 {
+    let until = r.value.get("until").and_then(Value::as_i64).unwrap_or(0);
+    match r.updated_at {
+        Some(at) => until.min(at.saturating_add(LEASE_TTL_SECS)),
+        None => i64::MIN,
+    }
+}
+
 /// A held [`LEASE_KEY`], and the version the holder's next write takes.
 #[derive(Debug)]
 pub struct Lease {
     holder: String,
     version: u64,
-    until: i64,
+    /// When the lease runs out, by this host's monotonic clock, counted
+    /// from before the write that took (or renewed) it was sent: never
+    /// later than the VTA's own expiry for it.
+    deadline: tokio::time::Instant,
     next: u64,
 }
 
@@ -399,17 +515,16 @@ impl Lease {
             let expected = match &current {
                 None => Some(0),
                 Some(r) => {
-                    let until = r.value.get("until").and_then(Value::as_i64).unwrap_or(0);
                     let theirs = r.value.get("holder").and_then(Value::as_str).unwrap_or("");
-                    (until < now || theirs == holder).then_some(r.version)
+                    (lease_expiry(r) < now || theirs == holder).then_some(r.version)
                 }
             };
             if let Some(expected) = expected {
-                let until = now + LEASE_TTL_SECS;
+                let sent = tokio::time::Instant::now();
                 match remote
                     .put(
                         LEASE_KEY,
-                        json!({ "holder": holder, "until": until }),
+                        json!({ "holder": holder, "until": now + LEASE_TTL_SECS }),
                         Some(expected),
                     )
                     .await
@@ -418,7 +533,7 @@ impl Lease {
                         return Ok(Lease {
                             holder: holder.to_string(),
                             version,
-                            until,
+                            deadline: sent + Duration::from_secs(LEASE_TTL_SECS as u64),
                             next: version + 1,
                         });
                     }
@@ -446,13 +561,21 @@ impl Lease {
         self.next
     }
 
-    /// Extend the lease if less than half of it is left.
+    /// Extend the lease if less than half of it is left, so the next write
+    /// (at most [`REQUEST_TIMEOUT`]) lands well inside it. A lease that has
+    /// already run out is not renewed: another writer may hold it now.
     pub async fn renew_if_due(&mut self, remote: &dyn AppState) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        if self.until - now > LEASE_TTL_SECS / 2 {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if left > Duration::from_secs((LEASE_TTL_SECS / 2) as u64) {
             return Ok(());
         }
-        let until = now + LEASE_TTL_SECS;
+        if left.is_zero() {
+            bail!("the app-state lease ran out before this pass finished; it is taken again");
+        }
+        let sent = tokio::time::Instant::now();
+        let until = chrono::Utc::now().timestamp() + LEASE_TTL_SECS;
         let v = remote
             .put(
                 LEASE_KEY,
@@ -462,7 +585,7 @@ impl Lease {
             .await
             .map_err(|e| anyhow!("renewing the app-state lease: {e}"))?;
         self.version = v;
-        self.until = until;
+        self.deadline = sent + Duration::from_secs(LEASE_TTL_SECS as u64);
         self.observe(v);
         Ok(())
     }
@@ -492,6 +615,9 @@ pub async fn put_sealed(
     let key = secret_key(name);
     let mut expected = current.unwrap_or(0);
     for _ in 0..4 {
+        // Each attempt is one request: renewed first, so every one of them
+        // is sent with at least half a lease left.
+        lease.renew_if_due(remote).await.map_err(PutError::Other)?;
         let predicted = lease.next();
         let value = secret_value(seal, name, predicted, bytes).map_err(PutError::Other)?;
         let v = remote.put(&key, value, Some(expected)).await?;
@@ -544,7 +670,16 @@ pub struct Mirror {
     /// Conflicts seen: another host wrote this context. Once non-zero the
     /// mirror writes nothing more (fails closed).
     conflicts: std::sync::atomic::AtomicU64,
+    /// Since when every pass has failed (the VTA unreachable, or the lease
+    /// held by someone else); `None` after a pass that worked.
+    stalled_since: Mutex<Option<tokio::time::Instant>>,
 }
+
+/// How long changes may wait with every pass failing before `/healthz`
+/// says so: more than two leases, so one writer's honest pass (or a VTA
+/// restart) does not trip it, and a writer that keeps the lease — or a VTA
+/// that stays away — does.
+pub const STALL_LIMIT: Duration = Duration::from_secs(300);
 
 impl std::fmt::Debug for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -567,6 +702,7 @@ impl Mirror {
             wake: Notify::new(),
             idle: Notify::new(),
             conflicts: Default::default(),
+            stalled_since: Mutex::default(),
         })
     }
 
@@ -591,13 +727,47 @@ impl Mirror {
         self.conflicts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// `Ok`, or why the bridge must not be left to run unattended: someone
+    /// else wrote its state (the mirror stopped), or changes have waited
+    /// [`STALL_LIMIT`] with every pass failing — nothing reaches the VTA,
+    /// and results and events are held behind it.
+    pub fn health(&self) -> std::result::Result<(), String> {
+        self.health_at(tokio::time::Instant::now())
+    }
+
+    /// [`Mirror::health`] at `now`.
+    pub fn health_at(&self, now: tokio::time::Instant) -> std::result::Result<(), String> {
+        if self.stopped() {
+            return Err("state conflict: another writer on the bridge's VTA context".into());
+        }
+        let since = *self.stalled_since.lock().expect("lock");
+        let pending = self.pending();
+        if let Some(since) = since
+            && pending > 0
+        {
+            let stalled = now.saturating_duration_since(since);
+            if stalled >= STALL_LIMIT {
+                return Err(format!(
+                    "state not reaching the VTA: {pending} change(s) waiting, every write failing \
+                     for {}s (the VTA unreachable, or its app-state lease held by another writer)",
+                    stalled.as_secs()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Load everything the remote holds, the remote being the authority:
     ///
     /// - secrets into memory, opened at the version they are stored at;
     /// - records into the local cache, over a cached copy;
-    /// - a cached record this host **mirrored** that the remote no longer
-    ///   has (deleted by another host — a tombstone, or one the VTA has
-    ///   since reaped) is dropped here, never written back;
+    /// - a cached record this host **mirrored** that the remote deleted (a
+    ///   tombstone) is dropped here, never written back. One the remote has
+    ///   **no record of at all** is dropped too if the listing is a snapshot
+    ///   (its tombstone may have been reaped) — but if it is the change feed
+    ///   from the start, which carries every deletion, a record with no
+    ///   tombstone was never deleted: the remote lost it, which is a
+    ///   rollback, however far its counter has moved on since: fail closed;
     /// - a cached record this host **never mirrored** (written while the VTA
     ///   was unreachable) is marked for writing, unless the remote holds a
     ///   tombstone for it (deleted since: dropped);
@@ -606,6 +776,11 @@ impl Mirror {
     ///   written by someone replaying one): fail closed.
     pub async fn pull(&self, remote: &dyn AppState, store: &crate::store::Store) -> Result<()> {
         let listing = remote.list().await?;
+        let refuse = |msg: String| -> anyhow::Error {
+            self.conflicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::Error::new(StateRefused(msg))
+        };
         let mirrored: BTreeMap<String, u64> =
             store.list::<u64>(Table::Mirror)?.into_iter().collect();
         let mut latest: BTreeMap<String, Record> = BTreeMap::new();
@@ -623,35 +798,49 @@ impl Mirror {
         if let Some((key, m)) = mirrored.iter().max_by_key(|(_, v)| **v)
             && listing.watermark < *m
         {
-            self.conflicts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            bail!(
+            return Err(refuse(format!(
                 "the VTA's counter for the bridge's state is at {}, behind the {m} this bridge \
                  wrote `{key}` at: its state was rolled back. The bridge does not run on it (it \
                  would take what is missing for deleted); restore the VTA's current state (or \
                  recreate the context) and start again",
                 listing.watermark
-            );
+            )));
         }
         for (key, m) in &mirrored {
-            if !latest.contains_key(key) && *m > listing.watermark {
-                self.conflicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                bail!("`{key}` vanished from the VTA above its counter: its state was rolled back");
+            if latest.contains_key(key) {
+                continue;
+            }
+            if *m > listing.watermark {
+                return Err(refuse(format!(
+                    "`{key}` vanished from the VTA above its counter: its state was rolled back"
+                )));
+            }
+            if listing.mode == ListingMode::Feed {
+                return Err(refuse(format!(
+                    "the VTA has no record of `{key}` — not even a deletion — although this \
+                     bridge wrote it at version {m} and the VTA's change feed still reaches back \
+                     to the start: its state was rolled back (restored from an older copy and \
+                     written to since). The bridge does not run on it (it would take what is \
+                     missing for deleted); restore the VTA's current state (or recreate the \
+                     context) and start again"
+                )));
+            }
+            // A snapshot: taken for deleted, its tombstone reaped. (State
+            // records are dropped from the cache below.)
+            if key.starts_with("secret/") {
+                store.delete_cached(Table::Mirror, key)?;
             }
         }
         for (key, r) in &latest {
             if let Some(m) = mirrored.get(key)
                 && r.version < *m
             {
-                self.conflicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                bail!(
+                return Err(refuse(format!(
                     "the VTA holds `{key}` at version {}, older than the {m} this bridge wrote: \
                      its state was rolled back or replayed. The bridge does not run on it; restore \
                      the VTA's current state (or recreate the context) and start again",
                     r.version
-                );
+                )));
             }
         }
         {
@@ -671,7 +860,7 @@ impl Mirror {
                 // Refused rather than skipped: running without a secret the
                 // context holds would fail later and less clearly.
                 let b = secret_bytes(&self.seal, name, r.version, &r.value)
-                    .map_err(|e| e.context(format!("reading `{key}` from the VTA")))?;
+                    .map_err(|e| refuse(format!("reading `{key}` from the VTA: {e:#}")))?;
                 self.secrets
                     .lock()
                     .expect("lock")
@@ -716,12 +905,25 @@ impl Mirror {
     }
 
     /// Write every pending change, once. `Err` when the VTA could not be
-    /// reached: what was not written stays pending.
+    /// reached (or the lease not taken): what was not written stays
+    /// pending, and [`Mirror::health`] counts how long that has lasted.
     pub async fn sync_once(
         &self,
         remote: &dyn AppState,
         store: &crate::store::Store,
     ) -> Result<()> {
+        let res = self.sync_pass(remote, store).await;
+        let mut stalled = self.stalled_since.lock().expect("lock");
+        match &res {
+            Ok(()) => *stalled = None,
+            Err(_) => {
+                stalled.get_or_insert_with(tokio::time::Instant::now);
+            }
+        }
+        res
+    }
+
+    async fn sync_pass(&self, remote: &dyn AppState, store: &crate::store::Store) -> Result<()> {
         if self.dirty.lock().expect("lock").is_empty() {
             self.idle.notify_waiters();
             return Ok(());
@@ -1301,5 +1503,158 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The holder's `until` is its own claim: the VTA's time of the write
+    /// caps it at one TTL, so a far-off `until` (a wrong clock, or on
+    /// purpose) does not keep everyone else out.
+    #[tokio::test]
+    async fn a_lease_lasts_one_ttl_past_the_vtas_time_whatever_its_holder_claims() {
+        let remote = MemoryAppState::new();
+        let now = chrono::Utc::now().timestamp();
+        let forever = json!({ "holder": "greedy", "until": now + 1_000_000_000 });
+        // Written just now: held, for now.
+        remote.put_as_other_at(LEASE_KEY, forever.clone(), now);
+        assert!(
+            Lease::acquire(&remote, "me", Duration::from_millis(300))
+                .await
+                .is_err()
+        );
+        // Written more than a TTL ago and not renewed since: expired, far-off
+        // `until` or not.
+        remote.put_as_other_at(LEASE_KEY, forever, now - LEASE_TTL_SECS - 1);
+        Lease::acquire(&remote, "me", Duration::from_secs(1))
+            .await
+            .unwrap();
+        // A record the VTA gave no time for cannot be bounded: expired.
+        let r = Record {
+            key: LEASE_KEY.into(),
+            version: 1,
+            deleted: false,
+            value: json!({ "holder": "x", "until": now + 1_000 }),
+            updated_at: None,
+        };
+        assert!(lease_expiry(&r) < now);
+        // Otherwise the earlier of the two.
+        let r = Record {
+            updated_at: Some(now),
+            value: json!({ "holder": "x", "until": now + 10 }),
+            ..r
+        };
+        assert_eq!(lease_expiry(&r), now + 10);
+    }
+
+    #[test]
+    fn a_request_fits_well_inside_half_a_lease() {
+        assert!(REQUEST_TIMEOUT.as_secs() * 3 <= (LEASE_TTL_SECS / 2) as u64);
+    }
+
+    /// Restored from an older copy, then written to until the counter is
+    /// past where this host last wrote: the counter check cannot see it.
+    /// The change feed from the start still carries every deletion, so a
+    /// record this host mirrored with no tombstone was lost, not deleted:
+    /// fail closed — and only a snapshot (tombstones reaped) may take it
+    /// for deleted.
+    #[tokio::test]
+    async fn a_rollback_the_counter_has_moved_past_is_refused_from_the_feed() {
+        let remote = MemoryAppState::new();
+        let (a, ma) = vta_store();
+        a.put(Table::Namespaces, "ns_1", &json!({"id": "ns_1"}))
+            .unwrap();
+        a.put(Table::Namespaces, "ns_2", &json!({"id": "ns_2"}))
+            .unwrap();
+        ma.sync_once(&remote, &a).await.unwrap();
+        // The restore loses ns_2 (no tombstone); others write since.
+        remote.forget("state/namespaces/ns_2");
+        remote.bump(10);
+        let restart = || {
+            let (a2, ma2) = vta_store();
+            for t in [Table::Namespaces, Table::Mirror] {
+                for (k, v) in a.list::<Value>(t).unwrap() {
+                    a2.put_cached(t, &k, &v).unwrap();
+                }
+            }
+            (a2, ma2)
+        };
+        let (a2, ma2) = restart();
+        let err = ma2.pull(&remote, &a2).await.unwrap_err();
+        assert!(is_state_refused(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("rolled back"), "{err:#}");
+        assert!(ma2.stopped());
+        // Nothing was taken for deleted.
+        assert!(
+            a2.get::<Value>(Table::Namespaces, "ns_2")
+                .unwrap()
+                .is_some()
+        );
+        // A snapshot (the VTA reaped tombstones) cannot tell a lost record
+        // from a deleted one: taken for deleted.
+        remote.reap_tombstones();
+        let (a3, ma3) = restart();
+        ma3.pull(&remote, &a3).await.unwrap();
+        assert!(
+            a3.get::<Value>(Table::Namespaces, "ns_2")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ma3.pending(), 0);
+    }
+
+    /// A refused state is final: the start does not retry it.
+    #[tokio::test]
+    async fn a_refused_state_is_not_retried_at_start() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let err = crate::vta::with_retry(Duration::from_secs(30), "pulling", || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<(), _>(anyhow::Error::new(StateRefused("rolled back".into())))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(is_state_refused(&err));
+        // A rollback found by a real pull is one.
+        let remote = MemoryAppState::new();
+        let (a, ma) = vta_store();
+        a.put(Table::Meta, "k", &json!(1)).unwrap();
+        ma.sync_once(&remote, &a).await.unwrap();
+        let (b, mb) = vta_store();
+        for (k, v) in a.list::<u64>(Table::Mirror).unwrap() {
+            b.put_cached(Table::Mirror, &k, &(v + 5)).unwrap();
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        crate::vta::with_retry(Duration::from_secs(30), "pulling", || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            mb.pull(&remote, &b)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Changes that do not reach the VTA for a while fail `/healthz`, and
+    /// the first pass that works clears it.
+    #[tokio::test]
+    async fn changes_that_stop_reaching_the_vta_fail_health() {
+        let remote = MemoryAppState::new();
+        let (s, m) = vta_store();
+        remote.set_down(true);
+        s.put(Table::Meta, "k", &json!(1)).unwrap();
+        assert!(m.sync_once(&remote, &s).await.is_err());
+        let now = tokio::time::Instant::now();
+        assert!(
+            m.health_at(now).is_ok(),
+            "a failed pass or two is not a stall"
+        );
+        let err = m.health_at(now + STALL_LIMIT).unwrap_err();
+        assert!(err.contains("not reaching the VTA"), "{err}");
+        assert!(err.contains("1 change"), "{err}");
+        // Still failing: still counted from the first failure.
+        assert!(m.sync_once(&remote, &s).await.is_err());
+        assert!(m.health_at(now + STALL_LIMIT).is_err());
+        remote.set_down(false);
+        m.sync_once(&remote, &s).await.unwrap();
+        assert!(m.health_at(now + STALL_LIMIT * 2).is_ok());
     }
 }

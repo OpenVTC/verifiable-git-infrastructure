@@ -223,12 +223,24 @@ VTA). `secret set` / `secret list` work on the context's app-state in VTA mode
 **Start-up and an unreachable VTA.** The bridge cannot run without its keys:
 start-up retries an unreachable VTA with capped backoff for
 `start_timeout_secs` (default 300), and gives up at once on a refusal (a
-revoked credential). While running, state changes reach the VTA from a
+revoked credential) or on state it will not run on (rolled back, replayed —
+below): retrying would read the same state again. While running, state changes reach the VTA from a
 background task a moment after they happen, retried with backoff; a result
 or event goes to the VTC only once the state it reports is in the VTA (it is
 held in the outbox until then), a Forgejo bot token is retired only once its
 successor is in the VTA, and the App registration page says so if the App's
-credentials could not be written yet.
+credentials could not be written yet. If changes wait five minutes with
+every write failing — the VTA unreachable, or its app-state lease kept by
+another writer — `/healthz` answers 503 with how many are waiting, so
+results held behind them do not go unnoticed.
+
+**One writer at a time.** Writers of the context's app-state (the running
+bridge, `secret set`, `vta setup`) take a lease record first. It lasts two
+minutes unless renewed, judged by the **VTA's** time of the write, not the
+holder's claim: a writer with a wrong clock, or one that claims the lease
+for longer, holds it for at most two minutes past its last write. Every
+app-state request is given up after 20 seconds, well inside the half-lease
+the bridge keeps in hand before each write.
 
 **A second writer.** Every write is conditional on the version this host
 last saw. If another bridge — or anyone holding the credential — writes the
@@ -239,8 +251,13 @@ the credential if it is not yours) and restart this bridge.
 **The VTA is the authority on a restart.** A host that comes back on an old
 data directory does not bring back what another host changed meanwhile:
 
-- a record it had mirrored that the VTA no longer holds (deleted by the
-  recovery host) is dropped from its cache, not written back;
+- a record it had mirrored that the VTA deleted (the recovery host) is
+  dropped from its cache, not written back. While the VTA's change feed
+  still reaches back to the start it carries every deletion, so a mirrored
+  record the VTA has **no record of at all** was lost, not deleted: a
+  rollback, which stops the start even when the counter has moved past the
+  restore point since. Only once the VTA has reaped old deletions (and
+  answers with a snapshot) is a missing record taken for deleted;
 - only records it never managed to mirror are written;
 - a record the VTA holds at an *older* version than this host wrote (a
   rolled-back or replayed store) stops the start, and so does a VTA whose
@@ -792,7 +809,8 @@ baseline drift is measured against until then, so they are not reported.
 - **Logs** go to standard error (`RUST_LOG=info` by default). They never
   contain secrets.
 - **`/healthz`** answers `ok` while the HTTP server runs, and 503 in VTA mode
-  once another writer was found on the bridge's context (§2a).
+  once another writer was found on the bridge's context, or once changes
+  have waited five minutes with every write to the VTA failing (§2a).
 - **DID documents are cached** for `did_cache_ttl_secs` (default 60, at most
   3600): the VTC's (job proofs), the registry's (and its endpoint) and commit
   signers' (the bridge-posted check). That bounds how long a key its owner
