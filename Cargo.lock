@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-core"
-version = "0.1.8"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "425dbba0ee832dc1a255e661e42daa9e038c60330acf8ac14e5b7433a4676741"
+checksum = "4095bae8f56ae80b0b2ca5a29aced5948f2693fa77a8c372696b85d542666681"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -298,9 +298,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-delivery"
-version = "0.1.15"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "326337fea064026b9a29862737ee6615d9dbde799ccd1f1aa2558b0c41f6d7b4"
+checksum = "07e75a6211b5785a61c6903178eed47bd50370275a4a7b8cc310cb2012768e05"
 dependencies = [
  "affinidi-messaging-core",
  "async-trait",
@@ -6779,6 +6779,8 @@ name = "verify-trust"
 version = "0.4.15"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-sdk",
  "affinidi-messaging-test-mediator",
  "affinidi-tdk",
  "anyhow",
@@ -6817,6 +6819,9 @@ version = "0.4.15"
 dependencies = [
  "affinidi-messaging-core",
  "affinidi-messaging-delivery",
+ "affinidi-messaging-didcomm",
+ "affinidi-messaging-sdk",
+ "affinidi-messaging-test-mediator",
  "affinidi-tdk",
  "anyhow",
  "async-trait",
@@ -6845,6 +6850,7 @@ dependencies = [
  "trust-tasks-proof",
  "trust-tasks-rs 0.22.5",
  "url",
+ "uuid",
  "verify-trust",
  "vgi-core",
  "vgi-forge",

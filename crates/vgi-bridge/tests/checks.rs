@@ -699,3 +699,115 @@ async fn the_real_verifier_trusts_a_namespace_grant_and_refuses_the_rest() {
         .unwrap();
     assert!(!lines[0].passes);
 }
+
+/// The bridge-posted check over DIDComm: the real verifier queries the
+/// registry **as the bridge's DID**, over the bridge's own link, and the
+/// registry's answer comes back through `Bridge::handle_inbound` — taken off
+/// the job path only when the transport proved it is from the registry.
+#[tokio::test]
+async fn the_bridge_queries_the_registry_as_its_own_did_over_its_link() {
+    use std::sync::Arc;
+    use vgi_bridge::registry_channel::BridgeRegistryChannel;
+    use vgi_bridge::transport::InboundDoc;
+    use vgi_bridge::transport::memory::ChannelLink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["config", "uploadpack.allowFilter", "true"]);
+    git(p, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    std::fs::write(p.join("f.txt"), "base").unwrap();
+    git(p, &["add", "f.txt"]);
+    git(
+        p,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+    );
+    let alice = SigningKey::from_bytes(&[1u8; 32]);
+    let (alice_did, c1) = signed_commit(p, &alice, "one");
+    let remote = url::Url::from_directory_path(p).unwrap();
+
+    for forged in [false, true] {
+        // No web-flow keyring: not needed for DID-signed commits.
+        let w = world(Options {
+            keyring: false,
+            ..Options::default()
+        })
+        .await;
+        let registry_did = w.bridge.config().trust_registry_did.clone();
+        let bridge_did = w.bridge.did().to_string();
+        let (link, mut to_registry) = ChannelLink::new();
+        let channel = BridgeRegistryChannel::new(
+            Arc::new(link),
+            bridge_did.clone(),
+            Arc::clone(w.bridge.registry_replies()),
+        )
+        .with_timeout(std::time::Duration::from_millis(500));
+        let verifier = VerifyTrustVerifier::new(w.bridge.config())
+            .with_channel(Arc::new(channel))
+            .with_route(trql_client::TransportChoice {
+                kind: trql_client::TransportKind::Didcomm,
+                endpoint: "did:web:mediator.acme.example".into(),
+            });
+
+        // The fake registry: grants Alice on the namespace, and answers
+        // through the bridge's inbound path — as itself, or (forged) as
+        // someone else with the right thread.
+        let bridge = Arc::clone(&w.bridge);
+        let (reg, alice_did2, bridge_did2) =
+            (registry_did.clone(), alice_did.clone(), bridge_did.clone());
+        let registry = tokio::spawn(async move {
+            while let Some((to, q)) = to_registry.recv().await {
+                assert_eq!(to, reg);
+                assert_eq!(q["issuer"], bridge_did2, "sent as the bridge's DID");
+                let pl = &q["payload"];
+                let authorized =
+                    pl["entity_id"] == alice_did2.as_str() && pl["resource"] == "github.com/acme";
+                let reply = json!({
+                    "id": format!("urn:uuid:r-{}", q["id"].as_str().unwrap()),
+                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                    "threadId": q["id"],
+                    "issuer": reg,
+                    "payload": {
+                        "entity_id": pl["entity_id"], "authority_id": pl["authority_id"],
+                        "action": pl["action"], "resource": pl["resource"],
+                        "authorized": authorized, "time_evaluated": "2026-09-25T00:00:00Z"
+                    }
+                });
+                let sender = if forged {
+                    "did:key:z6MkMallory".to_string()
+                } else {
+                    format!("{reg}#key-2")
+                };
+                bridge
+                    .handle_inbound(InboundDoc {
+                        doc: reply,
+                        authenticated_sender: Some(sender),
+                    })
+                    .await;
+            }
+        });
+
+        let fetched = GitFetcher::new(&w.bridge.config().checks)
+            .with_local_remote(remote.clone())
+            .fetch(&remote, None, &c1, std::slice::from_ref(&c1))
+            .await
+            .unwrap();
+        let lines = verifier
+            .verify(
+                &fetched.commits,
+                "github.com/acme/widgets",
+                "github.com/acme",
+            )
+            .await
+            .unwrap();
+        if forged {
+            assert!(!lines[0].passes, "{:?}", lines[0]);
+            assert_eq!(lines[0].verdict, "registryUnavailable");
+        } else {
+            assert!(lines[0].passes, "{:?}", lines[0]);
+            assert_eq!(lines[0].verdict, "trusted");
+        }
+        drop(verifier);
+        registry.abort();
+    }
+}

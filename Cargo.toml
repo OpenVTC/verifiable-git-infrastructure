@@ -227,6 +227,20 @@ trust-tasks-trql = { package = "trust-tasks-rs", version = "0.21.2", default-fea
 # 0.17/0.27 one.
 vta-sdk = { version = "0.51", default-features = false }
 affinidi-tdk = "0.17"
+# **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
+# 0.15.9 below) binds an authcrypt message's reported sender to the key the
+# key agreement actually used — `skid` must equal the `apu` party info, and
+# the decrypted sender key id must be that `skid`. Before it, the sender the
+# SDK reported came from `apu` while the key it resolved came from `skid`, so
+# the unpacked sender was not proof of origin. The bridge's DIDComm registry
+# queries believe that sender, so they require these versions.
+#
+# The 0.26 SDK line must not come back into this graph: it declares
+# `affinidi-messaging-didcomm = "0.15"`, and against 0.15.9 its unpack calls
+# the deprecated `decrypt`, which now refuses every authcrypt message — the
+# 0.26 line cannot receive DIDComm at all on the fixed crate.
+affinidi-messaging-sdk = "0.27.2"
+affinidi-messaging-didcomm = "0.15.9"
 # Named directly for one reason: the **floor**. The verifier resolves DIDs a
 # pull-request author chose — the `Signed-by-DID` trailer and the committer
 # header are attacker-supplied on a fork PR — so which hosts resolution may
@@ -322,8 +336,8 @@ wiremock = "0.6"
 # An in-process mediator (memory store, loopback port) for verify-trust's
 # mediator-binding tests: the run's ephemeral DID really connects, a fake
 # registry on the same mediator really answers, and an `ExplicitAllow`
-# mediator really refuses. Dev-only. 0.10 is the line built on the messaging
-# SDK 0.27 / TDK 0.17 that verify-trust's transports use.
+# mediator really refuses. Dev-only. 0.10 is the line on the messaging SDK
+# 0.27 / TDK 0.17 that verify-trust's transports and the bridge use.
 affinidi-messaging-test-mediator = { version = "0.10.2", features = ["tsp"] }
 
 # ── the bridge (vgi-bridge) ─────────────────────────────────────────────────
@@ -360,8 +374,8 @@ trust-tasks-proof = "0.22.4"
 # messaging SDK; they are named so the bridge keeps the proven sender of each
 # inbound message, which vta-sdk's session helpers drop (and those helpers also
 # flush the mediator inbox on connect, which would lose queued jobs).
-affinidi-messaging-delivery = "0.1.15"
-affinidi-messaging-core = "0.1.8"
+affinidi-messaging-delivery = "0.1.18"
+affinidi-messaging-core = "0.1.10"
 # The bridge's HTTP surface (GitHub App registration, setup and webhooks;
 # Forgejo OAuth redirects and webhooks). axum is the VTI stack's server
 # (vtc-service, vta-service); hyper, hyper-util and tower under it are already

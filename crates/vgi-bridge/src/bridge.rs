@@ -42,6 +42,10 @@ pub struct BridgeParts {
     /// How the bridge-posted check verifies commits.
     #[cfg(feature = "forge-github")]
     pub commits: Arc<dyn crate::checks::CommitVerifier>,
+    /// Registry answers in flight for the default verifier's DIDComm
+    /// channel, taken off the inbound stream ahead of the job path.
+    #[cfg(feature = "forge-github")]
+    pub registry_replies: Arc<crate::registry_channel::RegistryReplies>,
     /// How commits are fetched for the check.
     #[cfg(feature = "forge-github")]
     pub fetcher: crate::checks::GitFetcher,
@@ -58,10 +62,21 @@ impl BridgeParts {
         proof: Arc<dyn wire::ProofCheck>,
     ) -> Self {
         #[cfg(feature = "forge-github")]
-        let (commits, fetcher) = {
-            let c: Arc<dyn crate::checks::CommitVerifier> =
-                Arc::new(crate::checks::VerifyTrustVerifier::new(&config));
-            (c, crate::checks::GitFetcher::new(&config.checks))
+        let (commits, fetcher, registry_replies) = {
+            // The check queries the registry as the bridge's own DID over
+            // this link when the registry advertises DIDComm.
+            let replies = Arc::new(crate::registry_channel::RegistryReplies::new(
+                config.trust_registry_did.clone(),
+            ));
+            let channel = crate::registry_channel::BridgeRegistryChannel::new(
+                Arc::clone(&link),
+                identity.did(),
+                Arc::clone(&replies),
+            );
+            let c: Arc<dyn crate::checks::CommitVerifier> = Arc::new(
+                crate::checks::VerifyTrustVerifier::new(&config).with_channel(Arc::new(channel)),
+            );
+            (c, crate::checks::GitFetcher::new(&config.checks), replies)
         };
         BridgeParts {
             config,
@@ -74,6 +89,8 @@ impl BridgeParts {
             commits,
             #[cfg(feature = "forge-github")]
             fetcher,
+            #[cfg(feature = "forge-github")]
+            registry_replies,
         }
     }
 
@@ -106,6 +123,8 @@ pub struct Bridge {
     pub(crate) checks: crate::checks::CheckRunner,
     #[cfg(feature = "forge-github")]
     pub(crate) resign: crate::resign::ResignRunner,
+    #[cfg(feature = "forge-github")]
+    pub(crate) registry_replies: Arc<crate::registry_channel::RegistryReplies>,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -170,12 +189,21 @@ impl Bridge {
             checks,
             #[cfg(feature = "forge-github")]
             resign,
+            #[cfg(feature = "forge-github")]
+            registry_replies: parts.registry_replies,
         })
     }
 
     /// The bridge's DID.
     pub fn did(&self) -> &str {
         self.identity.did()
+    }
+
+    /// Registry answers in flight (tests drive a channel against them).
+    #[cfg(feature = "forge-github")]
+    #[doc(hidden)]
+    pub fn registry_replies(&self) -> &Arc<crate::registry_channel::RegistryReplies> {
+        &self.registry_replies
     }
 
     /// The configuration.
@@ -299,6 +327,12 @@ impl Bridge {
 
     /// One document in from the transport.
     pub async fn handle_inbound(self: &Arc<Self>, inbound: InboundDoc) {
+        // The registry's answer to a check's query (proven sender, a thread
+        // in flight) is not a job; anything else goes on as before.
+        #[cfg(feature = "forge-github")]
+        if self.registry_replies.route(&inbound) {
+            return;
+        }
         let verified = match self
             .checker
             .check(&inbound.doc, inbound.authenticated_sender.as_deref())
