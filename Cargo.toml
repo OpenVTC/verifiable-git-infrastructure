@@ -85,6 +85,21 @@ verify-trust = { version = "0.4.15", path = "crates/verify-trust" }
 # step below; the registry published 0.18 so this workspace could land the whole
 # frontier at once rather than leaving the split standing behind a fresh pin.
 trql-client = "0.18"
+# The Trust Task document type on the line trql-client 0.18 speaks, named only
+# because `TrqlTransport::exchange` takes and returns one: verify-trust
+# implements that trait for its mediator transports (DIDComm and TSP), which
+# check that every reply was authenticated as the registry's DID before
+# handing it back — trql-client's own mediator transports route by `threadId`
+# alone. This is **the same node** trql-client already resolves, not a new
+# line: `cargo tree -i trust-tasks-rs@0.21` still shows one 0.21 row, under
+# trql-client and verify-trust. What it does change is the note above that
+# "verify-trust passes no trust-tasks type across the trql-client boundary":
+# it now passes exactly this one, so when trql-client moves lines this alias
+# must move with it — a mismatch is a compile error at the `impl
+# TrqlTransport`, not a silent second copy. Renamed so it cannot be confused
+# with the bridge's `trust-tasks-rs` (the 0.22 line, in the bridge's
+# section below). Default features off: the document envelope is all it needs.
+trust-tasks-trql = { package = "trust-tasks-rs", version = "0.21.2", default-features = false }
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -252,6 +267,8 @@ dialoguer = { version = "0.12", features = ["password"] }
 sysinfo = "0.39"
 chrono = "0.4"
 hex = "0.4"
+# Message ids for the registry queries verify-trust sends over a mediator.
+uuid = { version = "1", features = ["v4"] }
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 linux-keyutils-keyring-store = "1"
 windows-native-keyring-store = "1"
@@ -298,6 +315,12 @@ url = "2.5"
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 # HTTP mocking for the adapter tests. Dev-only; no test touches the network.
 wiremock = "0.6"
+# An in-process mediator (memory store, loopback port) for verify-trust's
+# mediator-binding tests: the run's ephemeral DID really connects, a fake
+# registry on the same mediator really answers, and an `ExplicitAllow`
+# mediator really refuses. Dev-only. 0.9 is the line built on the messaging
+# SDK 0.26 / TDK 0.16 that verify-trust's transports use; 0.10 moved to 0.27.
+affinidi-messaging-test-mediator = { version = "0.9.17", features = ["tsp"] }
 
 # ── the bridge (vgi-bridge) ─────────────────────────────────────────────────
 # The per-community service that holds the forge credentials and runs the

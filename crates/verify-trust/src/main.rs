@@ -29,12 +29,17 @@ struct Cli {
     #[arg(long, default_value_t = 32)]
     max_signers: usize,
 
-    /// Base URL of the Trust Registry (queries POST to `<url>/trust-tasks`).
+    /// Explicit HTTPS override: query the registry's REST interface at this
+    /// base URL (queries POST to `<url>/trust-tasks`).
     ///
-    /// Optional: by default the endpoint is discovered from --registry-did's
-    /// DID document, preferring TSP, then DIDComm, then HTTPS. Pass this only
-    /// to override discovery — e.g. a local registry that publishes no service
-    /// entry — since it unbinds where we ask from the DID we name.
+    /// Optional, and so is the registry's REST interface: by default the
+    /// binding is discovered from --registry-did's DID document, preferring
+    /// TSP, then DIDComm, then HTTPS. Over TSP and DIDComm the query is sent
+    /// from a did:peer generated for this run (never stored) through the
+    /// registry's mediator, and only an answer authenticated as the registry's
+    /// DID is believed. Pass this only to pin HTTPS or for a local registry
+    /// that publishes no service entry — it unbinds where we ask from the DID
+    /// we name.
     #[arg(long)]
     registry_url: Option<String>,
 

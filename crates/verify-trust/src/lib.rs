@@ -12,14 +12,16 @@
 //!    where `authority` is the **VTC's** DID — the community the tuple is
 //!    evaluated under.
 //!
-//! The registry's endpoint is discovered from its DID document rather than
-//! configured alongside it: [`resolve_registry_endpoint`] picks the
-//! highest-preference transport both sides support (TSP, then DIDComm, then
-//! HTTPS). Over the HTTPS binding the registry's answer carries no signature —
-//! the registry DID is only stamped on the *outgoing* request as `recipient` —
-//! so the endpoint is what the answer's trustworthiness rests on, and deriving
-//! it from the DID document keeps it bound to an identifier with integrity
-//! behind it.
+//! How to reach the registry is discovered from its DID document rather than
+//! configured alongside it: [`registry::discover_registry_route`] picks the
+//! highest-preference binding both sides support — TSP, then DIDComm, then
+//! HTTPS — so the registry's REST interface is optional. Over TSP and DIDComm
+//! the answer is authenticated as the registry's DID (see [`registry`] for
+//! who the query is sent as, and why that does not matter to the verdict).
+//! Over HTTPS the answer carries no signature — the registry DID is only
+//! stamped on the *outgoing* request as `recipient` — so the endpoint is what
+//! the answer's trustworthiness rests on, and deriving it from the DID
+//! document keeps it bound to an identifier with integrity behind it.
 //!
 //! The signer set is **derived from the commits themselves** — there is no
 //! per-repository allowlist. The committer header is author-controlled text,
@@ -50,20 +52,17 @@
 //! surfaces use, so a DID is abbreviated identically wherever it appears.
 
 pub mod pgp_exempt;
+pub mod registry;
 pub mod resource;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use ssh_key::{SshSig, public::KeyData};
-use trql_client::{
-    HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportKind, TrqlClient,
-    TrqlError, TrqpQuery,
-};
+use trql_client::{TransportKind, TrqlClient, TrqlError, TrqpQuery};
 use vgi_core::{
     GIT_SSHSIG_NAMESPACE, committer_identity, conflicting_signer_dids, ed25519_keys_from_doc,
     normalize_sshsig_armor, signer_did, split_signed_commit,
@@ -71,6 +70,7 @@ use vgi_core::{
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
 use crate::pgp_exempt::ExemptKeyring;
+pub use crate::registry::{Registry, RegistryChannel};
 
 /// Everything `verify-trust` needs for one run.
 #[derive(Debug, Clone)]
@@ -88,19 +88,22 @@ pub struct VerifyTrustArgs {
     /// author picked. Distinct DIDs are deduplicated first; this bounds what
     /// remains. Exceeding it fails the run rather than resolving anyway.
     pub max_signers: usize,
-    /// Base URL of the Trust Registry (`POST <url>/trust-tasks`).
+    /// Explicit HTTPS override: query the registry's REST interface at this
+    /// base URL (`POST <url>/trust-tasks`) instead of discovering a binding.
     ///
-    /// `None` until discovery fills it in from `registry_did`'s DID document;
-    /// set explicitly to override discovery (a local or dev registry that
-    /// publishes no service endpoint). [`verify_prepared`] requires it
-    /// resolved — [`handle_verify_trust`] does that before calling.
+    /// `None` (the default) discovers the binding from `registry_did`'s DID
+    /// document — TSP, then DIDComm, then HTTPS, whichever it advertises — so
+    /// a registry need not run a REST interface at all. Set this for a local
+    /// or dev registry that publishes no service, or to pin HTTPS.
+    /// [`verify_prepared`] queries over HTTPS and so requires it;
+    /// [`verify_prepared_with`] takes a [`Registry`] instead.
     ///
     /// Prefer discovery. Over the HTTPS binding the registry's answer is not
     /// signed — `registry_did` is only stamped on the outgoing request as
     /// `recipient` — so trust in "is this DID authorized" rests on reaching
-    /// the right host. Deriving the URL from the DID document makes the
-    /// endpoint inherit that DID's integrity instead of being a second,
-    /// independently mutable value that nothing cross-checks.
+    /// the right host. A URL from the DID document inherits that DID's
+    /// integrity; this one is a second, independently mutable value that
+    /// nothing cross-checks.
     pub registry_url: Option<String>,
     /// DID of the registry (the `recipient` on every query document, and what
     /// the endpoint is discovered from).
@@ -274,23 +277,39 @@ impl ResolvedSigners {
     }
 }
 
-/// Run the check end to end: discover the registry endpoint, collect the DIDs
-/// the range claims, resolve them, then verify. Returns the process exit code
-/// (0 = every commit passes).
-pub async fn handle_verify_trust(mut args: VerifyTrustArgs) -> Result<i32> {
+/// Run the check end to end: discover how to reach the registry, collect the
+/// DIDs the range claims, resolve them, then verify. Returns the process exit
+/// code (0 = every commit passes).
+///
+/// Over TSP or DIDComm the queries go out as a `did:peer:2` minted for this
+/// run (see [`registry`]); its session is opened on the first query and
+/// closed before this returns.
+pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
     let exempt = load_exempt_keyring(&args)?;
     let commits = read_range(&args.repo_dir, &args.range)?;
     let claimed = claimed_signer_dids(&commits, args.max_signers)?;
 
-    // One resolver for both lookups: the registry's endpoint and the signers'
+    // One resolver for both lookups: the registry's binding and the signers'
     // keys come from the same cache.
     let tdk = build_resolver(args.resolve_agent_names).await?;
-    if args.registry_url.is_none() {
-        args.registry_url = Some(resolve_registry_endpoint(&tdk, &args.registry_did).await?);
-    }
+    let registry = match &args.registry_url {
+        Some(url) => Registry::https(url, &args.registry_did)?,
+        None => {
+            let route = registry::discover_registry_route(
+                &tdk,
+                &args.registry_did,
+                &registry::supported_transports(),
+            )
+            .await?;
+            Registry::for_route(&tdk, &route, &args.registry_did)?
+        }
+    };
+    tracing::debug!(kind = %registry.kind(), "querying the registry");
     let signers = resolve_signer_keys(&tdk, &claimed).await?;
 
-    let report = verify_prepared(&args, &commits, &signers, exempt.as_ref()).await?;
+    let report = verify_prepared_with(&args, &commits, &signers, exempt.as_ref(), &registry).await;
+    registry.close().await;
+    let report = report?;
     print_report(&args, &report)?;
     Ok(if report.ok { 0 } else { 1 })
 }
@@ -337,13 +356,35 @@ pub fn claimed_signer_dids(commits: &[RangeCommit], max_signers: usize) -> Resul
     Ok(dids.into_iter().collect())
 }
 
-/// Verify commits already read and resolved. Split from
+/// Verify commits already read and resolved, querying the registry over
+/// HTTPS at [`VerifyTrustArgs::registry_url`]. Split from
 /// [`handle_verify_trust`] so tests can supply keys without a live resolver.
 pub async fn verify_prepared(
     args: &VerifyTrustArgs,
     commits: &[RangeCommit],
     signers: &ResolvedSigners,
     exempt: Option<&ExemptKeyring>,
+) -> Result<TrustReport> {
+    let registry_url = args.registry_url.as_deref().context(
+        "registry URL not resolved: discover it from --registry-did or pass --registry-url",
+    )?;
+    let registry = Registry::https(registry_url, &args.registry_did)?;
+    verify_prepared_with(args, commits, signers, exempt, &registry).await
+}
+
+/// [`verify_prepared`], querying through `registry` — any binding, and any
+/// sender: a run's ephemeral DID ([`Registry::for_route`]) or a caller's own
+/// session ([`Registry::over_channel`], the bridge). `args.registry_url` is
+/// not read.
+///
+/// A registry that cannot be consulted fails each signer's commits as
+/// [`CommitStatus::RegistryUnavailable`]; it is never a pass.
+pub async fn verify_prepared_with(
+    args: &VerifyTrustArgs,
+    commits: &[RangeCommit],
+    signers: &ResolvedSigners,
+    exempt: Option<&ExemptKeyring>,
+    registry: &Registry,
 ) -> Result<TrustReport> {
     // Pass 1: cryptographic verification, collecting the DIDs that signed.
     let mut checked = Vec::with_capacity(commits.len());
@@ -357,7 +398,7 @@ pub async fn verify_prepared(
     }
 
     // Pass 2: one registry query per distinct signer DID.
-    let decisions = query_registry(args, &signer_dids).await?;
+    let decisions = query_registry(args, registry.client(), &signer_dids).await;
 
     let mut verdicts: Vec<CommitVerdict> = checked
         .into_iter()
@@ -827,52 +868,26 @@ pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::T
     .context("TDK init")
 }
 
-/// Discover the Trust Registry's endpoint from its DID document.
+/// The Trust Registry's **REST** endpoint, from its DID document.
 ///
-/// The document advertises one service entry per binding it serves;
-/// [`ServiceCapabilities::select`] takes the highest-preference transport
-/// present in **both** the document and this build — TSP, then DIDComm, then
-/// HTTPS. `TransportKind::compiled()` is what this binary can actually
-/// construct, so a registry offering only bindings we were not built with
-/// fails with both sides listed rather than silently downgrading.
+/// HTTPS only: for a caller that can speak nothing else. A registry that
+/// advertises no REST service — which is allowed; the interface is optional
+/// — is an error here, naming what it does advertise. To reach any registry,
+/// use [`registry::discover_registry_route`] with
+/// [`registry::supported_transports`] and [`Registry::for_route`].
 ///
 /// There is deliberately **no fallback to guessing a URL from the DID's
 /// domain**. `vta-sdk` does that for a VTA, where a wrong host merely fails
 /// authentication; here a wrong host is one whose authorization answers we
-/// would believe. A registry that advertises nothing is an error, and
-/// [`VerifyTrustArgs::registry_url`] is the explicit override.
+/// would believe.
 pub async fn resolve_registry_endpoint(
     tdk: &affinidi_tdk::TDK,
     registry_did: &str,
 ) -> Result<String> {
-    let response = tdk
-        .did_resolver()
-        .resolve(registry_did)
-        .await
-        .map_err(|e| anyhow::anyhow!("could not resolve registry DID {registry_did}: {e}"))?;
-    let doc = serde_json::to_value(&response.doc)
-        .with_context(|| format!("DID document for {registry_did} did not serialize"))?;
-
-    let capabilities = ServiceCapabilities::from_document(&doc);
-    let choice = capabilities
-        .select(&TransportKind::compiled())
-        .with_context(|| format!("no usable Trust Registry transport on {registry_did}"))?;
-
-    match choice.kind {
-        TransportKind::Https => {
-            tracing::debug!(endpoint = %choice.endpoint, "discovered registry REST endpoint");
-            Ok(choice.endpoint)
-        }
-        // Unreachable while `compiled()` is HTTPS-only, but the TSP and DIDComm
-        // endpoints are *mediator DIDs*, not URLs — handing one to an HTTPS
-        // transport would be a category error, so refuse explicitly.
-        kind => bail!(
-            "registry {registry_did} was selected for the {kind} binding, whose endpoint \
-             ({}) is a mediator DID rather than a URL; verify-trust can only query over \
-             HTTPS. Set --registry-url to a REST endpoint.",
-            choice.endpoint
-        ),
-    }
+    let choice =
+        registry::discover_registry_route(tdk, registry_did, &[TransportKind::Https]).await?;
+    tracing::debug!(endpoint = %choice.endpoint, "discovered registry REST endpoint");
+    Ok(choice.endpoint)
 }
 
 /// Resolve every DID the range claimed: collect the Ed25519 keys their
@@ -956,19 +971,13 @@ type RegistryDecisions = BTreeMap<String, Result<Option<String>, String>>;
 /// One TRQP authorization query per distinct signer DID.
 async fn query_registry(
     args: &VerifyTrustArgs,
+    client: &TrqlClient,
     signer_dids: &BTreeSet<String>,
-) -> Result<RegistryDecisions> {
+) -> RegistryDecisions {
     let mut decisions = RegistryDecisions::new();
     if signer_dids.is_empty() {
-        return Ok(decisions);
+        return decisions;
     }
-    // Resolved by `handle_verify_trust` (discovered from `registry_did`, or
-    // taken from the explicit override) before this point.
-    let registry_url = args.registry_url.as_deref().context(
-        "registry URL not resolved: discover it from --registry-did or pass --registry-url",
-    )?;
-    let transport = HttpsTransport::new(HttpsTransportConfig::new(registry_url))?;
-    let client = TrqlClient::new(Arc::new(transport), &args.registry_did);
     // The primary resource, then the broader fallback if it did not grant.
     let mut resources = vec![args.resource.clone()];
     if let Some(fallback) = &args.fallback_resource
@@ -1003,7 +1012,7 @@ async fn query_registry(
         }
         decisions.insert(did.clone(), decision);
     }
-    Ok(decisions)
+    decisions
 }
 
 /// Combine the signature check with the registry decision.
@@ -1282,6 +1291,8 @@ mod tests {
 
     use super::*;
     use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
+    use trql_client::ServiceCapabilities;
     use vgi_core::create_ssh_signature;
 
     fn test_key() -> (SigningKey, [u8; 32]) {
@@ -1799,18 +1810,32 @@ mod tests {
     }
 
     #[test]
-    fn this_build_selects_https_because_that_is_what_it_can_construct() {
-        // `compiled()` is feature-gated, and verify-trust takes trql-client's
-        // default features (https only): the preference order is honoured, we
-        // simply cannot construct the two above it. Selecting against what we
-        // advertise rather than a hard-coded list is what stops us choosing a
-        // transport and then failing to build it.
-        let compiled = TransportKind::compiled();
-        assert_eq!(compiled, vec![TransportKind::Https]);
+    fn this_build_selects_the_most_preferred_binding_the_registry_offers() {
+        // verify-trust constructs the mediator bindings itself (with its
+        // registry-sender check), so selection runs against what *this* crate
+        // can build, not trql-client's `compiled()`.
+        let choice = registry::select_route(
+            &ServiceCapabilities::from_document(&registry_document()),
+            &registry::supported_transports(),
+        )
+        .unwrap();
+        #[cfg(feature = "tsp")]
+        assert_eq!(choice.kind, TransportKind::Tsp);
+        #[cfg(all(feature = "didcomm", not(feature = "tsp")))]
+        assert_eq!(choice.kind, TransportKind::Didcomm);
+        #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+        assert_eq!(choice.endpoint, "https://registry.example");
+    }
 
-        let choice = ServiceCapabilities::from_document(&registry_document())
-            .select(&compiled)
-            .unwrap();
+    #[test]
+    fn the_rest_helper_still_finds_the_https_endpoint_beside_the_others() {
+        // `resolve_registry_endpoint` (HTTPS only) picks `#rest` even when
+        // TSP and DIDComm are advertised ahead of it.
+        let choice = registry::select_route(
+            &ServiceCapabilities::from_document(&registry_document()),
+            &[TransportKind::Https],
+        )
+        .unwrap();
         assert_eq!(choice.kind, TransportKind::Https);
         assert_eq!(choice.endpoint, "https://registry.example");
     }
@@ -1845,7 +1870,7 @@ mod tests {
             "id": "did:webvh:QmRegistryScid:registry.example"
         }));
         assert_eq!(caps, ServiceCapabilities::default());
-        assert!(caps.select(&TransportKind::compiled()).is_err());
+        assert!(registry::select_route(&caps, &registry::supported_transports()).is_err());
     }
 
     #[test]
@@ -1881,6 +1906,202 @@ mod tests {
             status_of(SignatureCheck::Valid { signer_did: did }, &decisions),
             CommitStatus::RegistryUnavailable { .. }
         ));
+    }
+
+    // --- querying through a Registry ---
+
+    /// A channel standing in for a mediator session: answers every query
+    /// with `authorized`, or fails every exchange with `failure`, recording
+    /// what it was sent.
+    struct FakeChannel {
+        sender: String,
+        authorized: bool,
+        failure: Option<TrqlError>,
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl FakeChannel {
+        fn answering(authorized: bool) -> Self {
+            Self {
+                sender: "did:webvh:QmBridge:bridge.example".to_string(),
+                authorized,
+                failure: None,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(failure: TrqlError) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Self::answering(false)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RegistryChannel for FakeChannel {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Didcomm
+        }
+
+        fn sender_did(&self) -> &str {
+            &self.sender
+        }
+
+        async fn exchange(
+            &self,
+            recipient: &str,
+            request: serde_json::Value,
+        ) -> Result<serde_json::Value, TrqlError> {
+            assert_eq!(recipient, "did:example:registry");
+            self.seen.lock().unwrap().push(request.clone());
+            if let Some(failure) = &self.failure {
+                // TrqlError is not Clone; rebuild the one variant tests use.
+                return Err(match failure {
+                    TrqlError::Timeout { kind, waited_secs } => TrqlError::Timeout {
+                        kind: *kind,
+                        waited_secs: *waited_secs,
+                    },
+                    other => TrqlError::Transport {
+                        kind: TransportKind::Didcomm,
+                        detail: other.to_string(),
+                    },
+                });
+            }
+            let p = &request["payload"];
+            Ok(serde_json::json!({
+                "id": "urn:uuid:reply",
+                "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                "threadId": request["id"],
+                "issuer": "did:example:registry",
+                "payload": {
+                    "entity_id": p["entity_id"],
+                    "authority_id": p["authority_id"],
+                    "action": p["action"],
+                    "resource": p["resource"],
+                    "authorized": self.authorized,
+                    "time_evaluated": "2026-09-25T00:00:00Z"
+                }
+            }))
+        }
+    }
+
+    fn args_for_registry() -> VerifyTrustArgs {
+        VerifyTrustArgs {
+            repo_dir: PathBuf::new(),
+            range: String::new(),
+            max_signers: 32,
+            registry_url: None,
+            registry_did: "did:example:registry".to_string(),
+            vtc_did: "did:example:vtc".to_string(),
+            action: "git.commit.sign".to_string(),
+            resource: "github.com/acme/widgets".to_string(),
+            fallback_resource: Some("github.com/acme".to_string()),
+            exempt_keyring: None,
+            resolve_agent_names: false,
+            json: false,
+        }
+    }
+
+    fn one_signed_commit() -> (Vec<RangeCommit>, ResolvedSigners) {
+        let (key, public) = test_key();
+        let commit = RangeCommit {
+            sha: "a".repeat(40),
+            raw: sign_commit(&unsigned_commit(), &key).into_bytes(),
+        };
+        (vec![commit], signers_publishing(public))
+    }
+
+    #[tokio::test]
+    async fn a_channel_query_is_sent_as_the_channel_owners_did() {
+        // The bridge-posted check: the query goes out as the bridge's own
+        // DID (the document's `issuer`), over the bridge's session.
+        let channel = Arc::new(FakeChannel::answering(true));
+        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let (commits, signers) = one_signed_commit();
+        let report =
+            verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                .await
+                .unwrap();
+        assert!(report.ok, "{:?}", report.commits);
+        let seen = channel.seen.lock().unwrap();
+        assert_eq!(seen[0]["issuer"], "did:webvh:QmBridge:bridge.example");
+        assert_eq!(seen[0]["recipient"], "did:example:registry");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_cannot_be_reached_fails_closed_as_unavailable() {
+        // The ExplicitAllow case: the mediator refuses the sender, or drops
+        // the query. The verdict is UNAVAILABLE, and the run fails.
+        for failure in [
+            TrqlError::Transport {
+                kind: TransportKind::Didcomm,
+                detail: "mediator refused the sender".to_string(),
+            },
+            TrqlError::Timeout {
+                kind: TransportKind::Tsp,
+                waited_secs: 30,
+            },
+        ] {
+            let registry = Registry::over_channel(
+                Arc::new(FakeChannel::failing(failure)),
+                "did:example:registry",
+            );
+            let (commits, signers) = one_signed_commit();
+            let report =
+                verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                    .await
+                    .unwrap();
+            assert!(!report.ok);
+            assert!(
+                matches!(
+                    report.commits[0].status,
+                    CommitStatus::RegistryUnavailable { .. }
+                ),
+                "{:?}",
+                report.commits[0].status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denial_over_a_channel_is_unauthorized_after_the_fallback() {
+        let channel = Arc::new(FakeChannel::answering(false));
+        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let (commits, signers) = one_signed_commit();
+        let report =
+            verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                .await
+                .unwrap();
+        assert!(matches!(
+            report.commits[0].status,
+            CommitStatus::Unauthorized { .. }
+        ));
+        // The repository, then the namespace.
+        assert_eq!(channel.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_range_with_nothing_to_ask_never_queries_the_registry() {
+        // An unsigned range queries nobody — and since the ephemeral session
+        // opens on the first query, a CI run on it never mints a DID or
+        // touches the mediator.
+        let channel = Arc::new(FakeChannel::answering(true));
+        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let commits = vec![RangeCommit {
+            sha: "b".repeat(40),
+            raw: unsigned_commit().into_bytes(),
+        }];
+        let _ = verify_prepared_with(
+            &args_for_registry(),
+            &commits,
+            &ResolvedSigners::default(),
+            None,
+            &registry,
+        )
+        .await
+        .unwrap();
+        assert!(channel.seen.lock().unwrap().is_empty());
     }
 
     // --- signer naming ---

@@ -15,9 +15,29 @@ repository.workspace = true
 name = "verify-trust"
 path = "src/main.rs"
 
+[features]
+# The registry bindings verify-trust can query over, beside HTTPS (always
+# built). Discovery picks the highest-preference binding the registry's DID
+# document advertises *and* this build has — TSP, then DIDComm, then HTTPS —
+# so a registry need not publish a REST service at all.
+#
+# Both are default: the CLI and the release binaries speak every binding. The
+# cost is small — DIDComm rides the messaging SDK the TDK already links (its
+# `messaging` feature is default-on), and TSP adds `affinidi-tsp`. A build
+# with `--no-default-features` is HTTPS-only and fails a registry that
+# advertises nothing else, naming both sides' bindings.
+default = ["didcomm", "tsp"]
+didcomm = []
+tsp = ["affinidi-tdk/tsp"]
+
 [dependencies]
 vgi-core = { workspace = true }
 trql-client = { workspace = true }
+# `TrustTask`, for the mediator transports' `TrqlTransport` impls. The line
+# trql-client resolves; see the workspace manifest.
+trust-tasks-trql = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
 affinidi-tdk = { workspace = true }
 # The resolver the TDK above builds, named directly so `build_resolver` can
 # state the host policy it runs under. See the workspace manifest.
@@ -43,3 +63,5 @@ tempfile = { workspace = true }
 rand = { workspace = true }
 # Parses `.github/` for the workflow-injection regression test.
 yaml-rust2 = { workspace = true }
+# The mediator-binding tests (tests/mediated.rs).
+affinidi-messaging-test-mediator = { workspace = true }
