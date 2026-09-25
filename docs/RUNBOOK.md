@@ -297,9 +297,9 @@ jobs:
 `fetch-depth: 0` is not optional — without the base ref present the range does
 not resolve.
 
-**Registry endpoint discovery.** There is no `registry-url` to set. The
-endpoint comes from the registry's own DID document, which advertises one
-service entry per binding it serves:
+**Registry discovery.** There is no `registry-url` to set, and the registry
+does not need a REST interface. The binding comes from the registry's own DID
+document, which advertises one service entry per binding it serves:
 
 ```json
 "service": [
@@ -314,20 +314,53 @@ service entry per binding it serves:
 ```
 
 Selection takes the highest-preference binding present in **both** the document
-and the verifier: **TSP → DIDComm → HTTPS**. `verify-trust` is built with
-`trql-client`'s default features, so today it can construct only HTTPS and
-selects that; if your registry advertises none of what the verifier speaks, the
-run fails naming both sides' transports rather than downgrading quietly.
+and the verifier: **TSP → DIDComm → HTTPS**. The released verifier speaks all
+three, so any one entry is enough — `#rest` is optional. If your registry
+advertises none of what the verifier speaks, the run fails naming both sides'
+bindings rather than downgrading quietly.
 
 Note the `#tsp` and `#didcomm` endpoints are **mediator DIDs**, not URLs — a
 consumer of those bindings resolves a second hop. Only `#rest` carries a URL.
 
-`registry-url` remains as an override for a registry that publishes no service
-entry (local, dev). Prefer discovery: over HTTPS the registry's reply is
-unsigned — `registry-did` is only stamped on the *outgoing* request as
-`recipient` — so trust in the answer rests on reaching the right host. Two
-independently settable values that nothing cross-checks is exactly the gap an
-override reintroduces.
+*Over TSP or DIDComm*, each run queries as a fresh `did:peer:2` generated in
+memory for that run (never written to disk or logs) whose service names the
+registry's mediator, so the reply routes back. The verdict does not rest on
+that identifier: an answer is believed only if the binding authenticated it as
+`registry-did` (authcrypt / TSP sender) and it answers the query asked. If the
+mediator refuses the run's DID, or no such answer arrives within 30 seconds,
+the commits are `UNAVAILABLE` and the check fails — never passes.
+
+Because the run's DID is new every time, **the registry's mediator must admit
+DIDs it has not seen** for this to work:
+
+| Mediator setting | Needed | Why |
+|---|---|---|
+| `mediator_acl_mode` | `explicit_deny` | in `explicit_allow` an unknown DID cannot authenticate |
+| `global_acl_default` | an open inbox (`MODE_EXPLICIT_DENY`, or `ALLOW_ALL`) | a new DID cannot add the registry to its own allowlist, so an allowlist inbox never receives the answer |
+| `global_acl_default` (DIDComm) | `SEND_FORWARDED,RECEIVE_FORWARDED` | the query and the reply are routing forwards |
+
+The narrowest default that serves both bindings is
+`DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,SEND_FORWARDED,RECEIVE_FORWARDED,MODE_EXPLICIT_DENY`.
+The mediator's *shipped* default (`DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES`)
+admits the DID but closes its inbox, so every run is `UNAVAILABLE`. The
+registry's own `ACL_MODE` (default `ExplicitDeny`) must also accept unknown
+senders.
+
+There is **no automatic fallback** from a refused mediator binding to HTTPS:
+discovery picks the most-preferred binding advertised, and a failure there is
+a failure. A registry that advertises `#tsp` or `#didcomm` on a mediator that
+will not admit unknown DIDs therefore fails every CI run until either the
+mediator is opened as above, the mediator entries are withdrawn from its DID
+document, or workflows pin `registry-url` to its REST interface.
+
+The runner needs outbound HTTPS and WebSocket (`wss://`) to the mediator.
+
+`registry-url` remains as an explicit **HTTPS override** — for a registry that
+publishes no service entry (local, dev), or to pin HTTPS. Prefer discovery:
+over HTTPS the registry's reply is unsigned — `registry-did` is only stamped
+on the *outgoing* request as `recipient` — so trust in the answer rests on
+reaching the right host. Two independently settable values that nothing
+cross-checks is exactly the gap an override reintroduces.
 
 **Platform keyring** — `.github/trusted-platform-keys.asc`:
 

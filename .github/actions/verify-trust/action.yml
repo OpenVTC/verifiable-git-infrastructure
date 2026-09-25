@@ -17,7 +17,7 @@ inputs:
     description: "DID of your VTC: the community whose authority the trust tuple is evaluated under (TRQP's authority_id)."
     required: true
   registry-url:
-    description: "Base URL of the Trust Registry. Optional — by default the endpoint is discovered from registry-did's DID document, preferring TSP, then DIDComm, then HTTPS. Set this only to override discovery (e.g. a local registry publishing no service entry); it unbinds where we ask from the DID we name."
+    description: "Explicit HTTPS override: base URL of the Trust Registry's REST interface. Optional, as is the REST interface itself — by default the binding is discovered from registry-did's DID document, preferring TSP, then DIDComm, then HTTPS (over TSP/DIDComm the run queries as a throwaway did:peer through the registry's mediator, which must admit unknown DIDs; the runner then needs outbound wss:// to it). Set this only to pin HTTPS or for a local registry publishing no service entry; it unbinds where we ask from the DID we name."
     required: false
     default: ""
   action:

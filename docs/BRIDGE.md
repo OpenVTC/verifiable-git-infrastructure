@@ -52,7 +52,9 @@ Outbound:
   for the bridge-posted check — for the registry's DID and the DIDs commits
   claim. Signer DIDs are resolved under verify-trust's public-hosts-only
   policy: a DID naming an internal host is refused, not fetched;
-- the **Trust Registry** endpoint its DID document names.
+- the **Trust Registry**, over the binding its DID document advertises: over
+  DIDComm the query rides the bridge's existing mediator link (nothing extra
+  to open), over HTTPS it goes to the `#rest` URL.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
 refuses to start with a `public_url` that is not `https`. Keep the proxy's
@@ -335,6 +337,19 @@ repository writers are trusted not to forge the check —
   repository's qualified resource, with the namespace as the fallback
   resource. An empty range (the head is already in the base) is a success
   only when the head *is* the base tip; otherwise it is a failure.
+- **How it asks the registry.** If the registry's DID document advertises
+  DIDComm, the bridge queries **as its own DID** over the mediator session it
+  already holds for the VTC (the mediator allows one websocket per DID, so it
+  does not open another); otherwise over its `#rest` URL. The registry's REST
+  interface is therefore optional here too. A DIDComm answer counts only if
+  authcrypt proves it came from the registry's DID and it answers a query in
+  flight; anything else from the inbound stream goes to the job path as
+  before. Because the bridge's DID is stable, a registry in private mode
+  (`ACL_MODE=ExplicitAllow`) can admit it by name — add the bridge DID to the
+  registry's allow list. A registry that refuses it, or does not answer in
+  30 seconds, fails the check (`registryUnavailable`). TSP is not used by the
+  bridge: its link to the mediator is DIDComm. The bridge's DID document must
+  route DIDComm to the bridge's mediator, which it already must for the VTC.
 - It completes "Verify commit trust" as **success** or **failure** with a
   per-commit table. Anything that goes wrong fails the check (closed).
 - **Re-running.** "Re-run" on the check in GitHub (`check_run` /
