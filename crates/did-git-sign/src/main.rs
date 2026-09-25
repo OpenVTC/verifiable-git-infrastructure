@@ -389,15 +389,12 @@ async fn cmd_init(
     //    interactive context / DID / key picker.
     println!();
     println!("Authenticating as {}…", admin.admin_did);
-    // The client must carry a ClientIdentity: `keys/export-secret` (and every
-    // other proof-bearing trust task) names an in-band recipient and signs the
-    // request, and the SDK refuses to send it from an identity-less client.
-    let identity = vta_sdk::client::ClientIdentity::did_key(
+    let client = vta::client_with_identity(
+        &vta_url,
         &admin.admin_did,
         &admin.admin_private_key_mb,
         &vta_did,
     );
-    let client = vta_sdk::client::VtaClient::new(&vta_url).with_identity(identity);
     let token = vta_sdk::session::challenge_response(
         &vta_url,
         &admin.admin_did,
