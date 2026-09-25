@@ -122,8 +122,16 @@ pub(crate) fn repo_record_by_resource(bridge: &Bridge, r: &Resource) -> Option<R
 ///
 /// A namespace admin gets no forge role (decided 2026-09-25): an entry whose
 /// right is `git.ns.admin` (or `git.repo.create`) asks for
-/// [`ForgeRole::None`], whatever the map says, so a role the bridge
-/// projected for it before is taken away.
+/// [`ForgeRole::None`], whatever the map says. An account listed with
+/// `None` has **any** direct collaborator role on the repository removed —
+/// one given by hand on the forge as much as one the bridge projected —
+/// because the adapter converges every listed account to exactly its
+/// desired role. (Only unlisted accounts are left alone, `Unlisted::Keep`.)
+///
+/// This only takes effect end to end when the VTC sends `git.ns.admin` for
+/// a namespace admin. A VTC that folds `ns.admin` into `git.repo.own` (by
+/// implication) before sending makes the entry indistinguishable from an
+/// owner's, and it projects as one.
 fn desired_roles(
     bridge: &Bridge,
     ctx: &Ctx,

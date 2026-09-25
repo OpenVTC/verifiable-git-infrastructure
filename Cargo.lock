@@ -6121,6 +6121,7 @@ dependencies = [
  "url",
  "vgi-forge",
  "wiremock",
+ "yaml-rust2",
  "zeroize",
 ]
 

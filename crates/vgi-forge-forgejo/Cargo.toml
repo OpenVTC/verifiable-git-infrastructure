@@ -28,3 +28,4 @@ zeroize = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
 wiremock = { workspace = true }
+yaml-rust2 = { workspace = true }

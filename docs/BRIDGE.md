@@ -581,9 +581,18 @@ is a maintainer's; the check, not a role, decides whose commits land).
 **A namespace admin gets no forge role, and no configuration can give them
 one** (decided 2026-09-25). There is no key for `git.ns.admin` — `ns_admin`,
 `admin` or any other unknown key fails the start — and a job whose desired
-role carries `git.ns.admin` projects nothing (a role the bridge gave that
-account before is taken off). A namespace-level role job (organisation
-owners) is refused `notCapable`. `git.ns.admin` is exercised through the VTC
+role carries `git.ns.admin` projects nothing. Nothing here means *no
+direct role at all*: an account a job lists with no role has **any** direct
+collaborator role on that repository removed, one given by hand on the
+forge as much as one the bridge projected (only accounts a job does not
+list are left alone). A namespace-level role job (organisation owners) is
+refused `notCapable`.
+
+This holds end to end only when the VTC sends `git.ns.admin` for a
+namespace admin. A VTC that folds `ns.admin` into `git.repo.own` by
+implication before sending — as VTC releases before the fix for this do —
+sends namespace admins as owners, and the bridge, which cannot tell them
+apart, projects them as owners. `git.ns.admin` is exercised through the VTC
 and the bridge; who owns the organisation stays yours to manage by hand.
 Someone who is both a namespace admin and, in their own name, a
 repository's owner or maintainer gets that repository right's role.
