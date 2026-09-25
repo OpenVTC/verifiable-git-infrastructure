@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -57,8 +57,8 @@ use zeroize::Zeroizing;
 use crate::seal::MasterKey;
 use crate::store::Table;
 
-/// A namespace counter and its records, by key.
-type Versioned = (u64, BTreeMap<String, (u64, Value)>);
+/// A namespace counter and its records by key (`None`: a tombstone).
+type Versioned = (u64, BTreeMap<String, (u64, Option<Value>)>);
 
 /// The app-state namespace the bridge writes under, in its own context.
 pub const NAMESPACE: &str = "vgi-bridge";
@@ -93,8 +93,20 @@ pub struct Record {
     pub key: String,
     /// Its version (the namespace counter its last write took).
     pub version: u64,
-    /// The value.
+    /// A tombstone: the record was deleted at `version`.
+    pub deleted: bool,
+    /// The value (`Null` on a tombstone).
     pub value: Value,
+}
+
+/// Everything the remote holds for the bridge: live records **and the
+/// tombstones it still retains**, and the namespace counter.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    /// Each key's latest record.
+    pub records: Vec<Record>,
+    /// The namespace counter (the version the latest write took).
+    pub watermark: u64,
 }
 
 /// Why a conditional write did not apply.
@@ -120,8 +132,9 @@ impl std::fmt::Display for PutError {
 /// `app-state`, or an in-memory one for tests.
 #[async_trait]
 pub trait AppState: Send + Sync {
-    /// Every live record in the bridge's namespace.
-    async fn list(&self) -> Result<Vec<Record>>;
+    /// Every record in the bridge's namespace, tombstones included, and
+    /// the namespace counter.
+    async fn list(&self) -> Result<Listing>;
     /// One live record.
     async fn get(&self, key: &str) -> Result<Option<Record>>;
     /// Write `value` at `key`. `expected`: `Some(0)` only if no live record
@@ -133,8 +146,13 @@ pub trait AppState: Send + Sync {
         value: Value,
         expected: Option<u64>,
     ) -> std::result::Result<u64, PutError>;
-    /// Remove `key` (a no-op if there is nothing there).
-    async fn delete(&self, key: &str, expected: Option<u64>) -> std::result::Result<(), PutError>;
+    /// Remove `key` (a no-op if there is nothing there). Returns the
+    /// version the tombstone took, if a record was removed.
+    async fn delete(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+    ) -> std::result::Result<Option<u64>, PutError>;
 }
 
 /// An in-memory [`AppState`], for tests and dry runs. Behaves as the VTA's
@@ -157,12 +175,33 @@ impl MemoryAppState {
         self.down.store(down, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// A snapshot of every record, by key.
+    /// A snapshot of every live record, by key.
     pub fn snapshot(&self) -> BTreeMap<String, Value> {
         let g = self.inner.lock().expect("lock");
         g.1.iter()
-            .map(|(k, (_, v))| (k.clone(), v.clone()))
+            .filter_map(|(k, (_, v))| v.as_ref().map(|v| (k.clone(), v.clone())))
             .collect()
+    }
+
+    /// Put `value` at `key` as someone else would (no precondition).
+    pub fn put_as_other(&self, key: &str, value: Value) -> u64 {
+        let mut g = self.inner.lock().expect("lock");
+        g.0 += 1;
+        let v = g.0;
+        g.1.insert(key.to_string(), (v, Some(value)));
+        v
+    }
+
+    /// The live record at `key`, raw.
+    pub fn raw(&self, key: &str) -> Option<(u64, Value)> {
+        let g = self.inner.lock().expect("lock");
+        g.1.get(key).and_then(|(v, x)| x.clone().map(|x| (*v, x)))
+    }
+
+    /// Forget the tombstones (the VTA's retention window passed).
+    pub fn reap_tombstones(&self) {
+        let mut g = self.inner.lock().expect("lock");
+        g.1.retain(|_, (_, v)| v.is_some());
     }
 
     fn check(&self) -> Result<()> {
@@ -188,26 +227,34 @@ impl MemoryAppState {
 
 #[async_trait]
 impl AppState for MemoryAppState {
-    async fn list(&self) -> Result<Vec<Record>> {
+    async fn list(&self) -> Result<Listing> {
         self.check()?;
         let g = self.inner.lock().expect("lock");
-        Ok(g.1
-            .iter()
-            .map(|(k, (v, value))| Record {
-                key: k.clone(),
-                version: *v,
-                value: value.clone(),
-            })
-            .collect())
+        Ok(Listing {
+            records: g
+                .1
+                .iter()
+                .map(|(k, (v, value))| Record {
+                    key: k.clone(),
+                    version: *v,
+                    deleted: value.is_none(),
+                    value: value.clone().unwrap_or(Value::Null),
+                })
+                .collect(),
+            watermark: g.0,
+        })
     }
 
     async fn get(&self, key: &str) -> Result<Option<Record>> {
         self.check()?;
         let g = self.inner.lock().expect("lock");
-        Ok(g.1.get(key).map(|(v, value)| Record {
-            key: key.to_string(),
-            version: *v,
-            value: value.clone(),
+        Ok(g.1.get(key).and_then(|(v, value)| {
+            value.as_ref().map(|value| Record {
+                key: key.to_string(),
+                version: *v,
+                deleted: false,
+                value: value.clone(),
+            })
         }))
     }
 
@@ -219,25 +266,40 @@ impl AppState for MemoryAppState {
     ) -> std::result::Result<u64, PutError> {
         self.check().map_err(PutError::Other)?;
         let mut g = self.inner.lock().expect("lock");
-        let current = g.1.get(key).map(|(v, _)| *v);
+        let current = g.1.get(key).and_then(|(v, x)| x.as_ref().map(|_| *v));
         Self::precondition(current, expected)?;
         g.0 += 1;
         let v = g.0;
-        g.1.insert(key.to_string(), (v, value));
+        g.1.insert(key.to_string(), (v, Some(value)));
         Ok(v)
     }
 
-    async fn delete(&self, key: &str, expected: Option<u64>) -> std::result::Result<(), PutError> {
+    async fn delete(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+    ) -> std::result::Result<Option<u64>, PutError> {
         self.check().map_err(PutError::Other)?;
         let mut g = self.inner.lock().expect("lock");
-        let current = g.1.get(key).map(|(v, _)| *v);
-        if current.is_some() {
-            Self::precondition(current, expected)?;
-            g.0 += 1;
-            g.1.remove(key);
+        let current = g.1.get(key).and_then(|(v, x)| x.as_ref().map(|_| *v));
+        if current.is_none() {
+            return Ok(None);
         }
-        Ok(())
+        Self::precondition(current, expected)?;
+        g.0 += 1;
+        let v = g.0;
+        g.1.insert(key.to_string(), (v, None));
+        Ok(Some(v))
     }
+}
+
+/// The table and local key a remote `state/<table>/<key>` names, if it is
+/// one this release mirrors.
+fn parse_state_key(key: &str) -> Option<(Table, &str)> {
+    let rest = key.strip_prefix("state/")?;
+    let (table, local) = rest.split_once('/')?;
+    let table = Table::from_name(table).filter(|t| record_is_mirrored(*t, local))?;
+    Some((table, local))
 }
 
 /// The remote key of a mirrored record.
@@ -250,19 +312,69 @@ pub fn secret_key(name: &str) -> String {
     format!("secret/{name}")
 }
 
-/// A secret as the remote holds it: sealed under `seal`, bound to its name.
-pub fn secret_value(seal: &MasterKey, name: &str, bytes: &[u8]) -> Result<Value> {
-    Ok(json!({ "sealed": B64.encode(seal.seal(&secret_key(name), bytes)?) }))
+/// The associated data a secret is sealed under: its name **and the version
+/// of the record that holds it**. A ciphertext put back later (a replay by
+/// anyone with app-state access, or a rolled-back store) lands at another
+/// version and does not open.
+fn secret_aad(name: &str, version: u64) -> String {
+    format!("{}@{version}", secret_key(name))
 }
 
-/// Open a secret record.
-pub fn secret_bytes(seal: &MasterKey, name: &str, v: &Value) -> Result<Zeroizing<Vec<u8>>> {
+/// A secret as the remote holds it at record version `version`: sealed
+/// under `seal`, bound to its name and that version.
+pub fn secret_value(seal: &MasterKey, name: &str, version: u64, bytes: &[u8]) -> Result<Value> {
+    Ok(json!({ "sealed": B64.encode(seal.seal(&secret_aad(name, version), bytes)?) }))
+}
+
+/// Open a secret record read at version `version`.
+pub fn secret_bytes(
+    seal: &MasterKey,
+    name: &str,
+    version: u64,
+    v: &Value,
+) -> Result<Zeroizing<Vec<u8>>> {
     let s = v
         .get("sealed")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("not a sealed secret record"))?;
-    seal.open(&secret_key(name), &B64.decode(s)?)
-        .map_err(|_| anyhow!("the secret `{name}` does not open with this context's sealing key"))
+    seal.open(&secret_aad(name, version), &B64.decode(s)?).map_err(|_| {
+        anyhow!(
+            "the secret `{name}` does not open with this context's sealing key at the version it \
+             is stored at: it was written by someone other than this bridge (or put back from an \
+             older copy). Re-set it (`vgi-bridge secret set`, or register the App again), and \
+             revoke any credential that is not the bridge's"
+        )
+    })
+}
+
+/// Write a sealed secret whose record is at `current` (`None`: absent),
+/// predicting the version the write takes from the namespace counter
+/// `watermark`, so the ciphertext is bound to it. If the write lands
+/// elsewhere (another write in between), it is written again, bound to the
+/// next version. Returns the version it is stored at.
+pub async fn put_sealed(
+    remote: &dyn AppState,
+    seal: &MasterKey,
+    name: &str,
+    bytes: &[u8],
+    current: Option<u64>,
+    watermark: u64,
+) -> std::result::Result<u64, PutError> {
+    let key = secret_key(name);
+    let (mut expected, mut predicted) = (current.unwrap_or(0), watermark + 1);
+    for _ in 0..4 {
+        let value = secret_value(seal, name, predicted, bytes).map_err(PutError::Other)?;
+        let v = remote.put(&key, value, Some(expected)).await?;
+        if v == predicted {
+            return Ok(v);
+        }
+        tracing::warn!(key = %key, "another write landed in between; sealing the secret again");
+        (expected, predicted) = (v, v + 1);
+    }
+    Err(PutError::Other(anyhow!(
+        "`{key}` could not be written at a predictable version: something else keeps writing the \
+         bridge's VTA context"
+    )))
 }
 
 /// One pending change: what the next mirror pass writes.
@@ -294,6 +406,8 @@ pub struct Mirror {
     dirty: Mutex<BTreeSet<Dirty>>,
     in_flight: Mutex<usize>,
     versions: Mutex<HashMap<String, u64>>,
+    /// The namespace counter as this host last saw it.
+    watermark: Mutex<u64>,
     wake: Notify,
     idle: Notify,
     /// Conflicts seen: another host wrote this context. Once non-zero the
@@ -318,6 +432,7 @@ impl Mirror {
             dirty: Mutex::default(),
             in_flight: Mutex::default(),
             versions: Mutex::default(),
+            watermark: Mutex::new(0),
             wake: Notify::new(),
             idle: Notify::new(),
             conflicts: Default::default(),
@@ -345,54 +460,102 @@ impl Mirror {
         self.conflicts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Load everything the remote holds: secrets into memory, records into
-    /// the local cache (the remote wins over a cached copy), and mark every
-    /// cached record the remote does not have for writing — what this host
-    /// wrote and had not yet mirrored when it stopped.
+    /// Load everything the remote holds, the remote being the authority:
+    ///
+    /// - secrets into memory, opened at the version they are stored at;
+    /// - records into the local cache, over a cached copy;
+    /// - a cached record this host **mirrored** that the remote no longer
+    ///   has (deleted by another host — a tombstone, or one the VTA has
+    ///   since reaped) is dropped here, never written back;
+    /// - a cached record this host **never mirrored** (written while the VTA
+    ///   was unreachable) is marked for writing, unless the remote holds a
+    ///   tombstone for it (deleted since: dropped);
+    /// - a remote record at an **older** version than this host mirrored
+    ///   means the remote went back in time (restored from an older copy, or
+    ///   written by someone replaying one): fail closed.
     pub async fn pull(&self, remote: &dyn AppState, store: &crate::store::Store) -> Result<()> {
-        let records = remote.list().await?;
-        let mut remote_keys = BTreeSet::new();
+        let listing = remote.list().await?;
+        let mirrored: BTreeMap<String, u64> =
+            store.list::<u64>(Table::Mirror)?.into_iter().collect();
+        let mut latest: BTreeMap<String, Record> = BTreeMap::new();
+        for r in listing.records {
+            match latest.get(&r.key) {
+                Some(have) if have.version >= r.version => {}
+                _ => {
+                    latest.insert(r.key.clone(), r);
+                }
+            }
+        }
+        for (key, r) in &latest {
+            if let Some(m) = mirrored.get(key)
+                && r.version < *m
+            {
+                self.conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                bail!(
+                    "the VTA holds `{key}` at version {}, older than the {m} this bridge wrote: \
+                     its state was rolled back or replayed. The bridge does not run on it; restore \
+                     the VTA's current state (or recreate the context) and start again",
+                    r.version
+                );
+            }
+        }
+        *self.watermark.lock().expect("lock") = listing.watermark;
         {
             let mut versions = self.versions.lock().expect("lock");
             versions.clear();
-            for r in &records {
-                versions.insert(r.key.clone(), r.version);
+            for (k, r) in &latest {
+                if !r.deleted {
+                    versions.insert(k.clone(), r.version);
+                }
             }
         }
-        for r in records {
-            remote_keys.insert(r.key.clone());
-            if let Some(name) = r.key.strip_prefix("secret/") {
-                match secret_bytes(&self.seal, name, &r.value) {
-                    Ok(b) => {
-                        self.secrets
-                            .lock()
-                            .expect("lock")
-                            .insert(name.to_string(), b);
-                    }
-                    Err(e) => {
-                        // Refused rather than skipped: running without a
-                        // secret the context holds would fail later and
-                        // less clearly.
-                        return Err(e.context(format!("reading `{}` from the VTA", r.key)));
-                    }
+        for (key, r) in &latest {
+            if let Some(name) = key.strip_prefix("secret/") {
+                if r.deleted {
+                    continue;
                 }
-            } else if let Some(rest) = r.key.strip_prefix("state/") {
-                let Some((table, key)) = rest.split_once('/') else {
-                    continue;
-                };
-                let Some(table) = Table::from_name(table).filter(|t| record_is_mirrored(*t, key))
-                else {
-                    tracing::debug!(key = %r.key, "ignoring a record of a table this release does not mirror");
-                    continue;
-                };
-                store.put_cached(table, key, &r.value)?;
+                // Refused rather than skipped: running without a secret the
+                // context holds would fail later and less clearly.
+                let b = secret_bytes(&self.seal, name, r.version, &r.value)
+                    .map_err(|e| e.context(format!("reading `{key}` from the VTA")))?;
+                self.secrets
+                    .lock()
+                    .expect("lock")
+                    .insert(name.to_string(), b);
+                store.put_cached(Table::Mirror, key, &r.version)?;
+            } else if let Some((table, local)) = parse_state_key(key) {
+                if r.deleted {
+                    if store.get_raw(table, local)?.is_some() {
+                        tracing::info!(key = %key, "dropping a cached record deleted in the VTA");
+                    }
+                    store.delete_cached(table, local)?;
+                    store.delete_cached(Table::Mirror, key)?;
+                } else {
+                    store.put_cached(table, local, &r.value)?;
+                    store.put_cached(Table::Mirror, key, &r.version)?;
+                }
+            } else {
+                tracing::debug!(key = %key, "ignoring a record this release does not mirror");
             }
         }
         for table in MIRRORED {
-            for key in store.keys(table)? {
-                if record_is_mirrored(table, &key) && !remote_keys.contains(&state_key(table, &key))
-                {
-                    self.mark(Dirty::Record(table, key));
+            for local in store.keys(table)? {
+                if !record_is_mirrored(table, &local) {
+                    continue;
+                }
+                let key = state_key(table, &local);
+                if latest.contains_key(&key) {
+                    continue;
+                }
+                if mirrored.contains_key(&key) {
+                    // Mirrored once, gone from the VTA now (its tombstone
+                    // reaped): another host deleted it.
+                    tracing::info!(key = %key, "dropping a cached record the VTA no longer holds");
+                    store.delete_cached(table, &local)?;
+                    store.delete_cached(Table::Mirror, &key)?;
+                } else {
+                    self.mark(Dirty::Record(table, local));
                 }
             }
         }
@@ -446,10 +609,12 @@ impl Mirror {
         let key = item.remote_key();
         let value: Option<Value> = match item {
             Dirty::Record(t, k) => store.get_raw(*t, k)?,
+            // Sealed in `put_sealed`, bound to the version it lands at; the
+            // size check below uses a stand-in of the same length.
             Dirty::Secret(n) => {
                 let bytes = self.secrets.lock().expect("lock").get(n).cloned();
                 match bytes {
-                    Some(b) => Some(secret_value(&self.seal, n, &b)?),
+                    Some(b) => Some(secret_value(&self.seal, n, u64::MAX, &b)?),
                     None => None,
                 }
             }
@@ -468,14 +633,26 @@ impl Mirror {
             }
         }
         let seen = self.versions.lock().expect("lock").get(&key).copied();
-        let res = match &value {
+        let res = match (&value, item) {
+            (Some(_), Dirty::Secret(n)) => {
+                let bytes = self.secrets.lock().expect("lock").get(n).cloned();
+                let Some(bytes) = bytes else { return Ok(()) };
+                let wm = *self.watermark.lock().expect("lock");
+                put_sealed(remote, &self.seal, n, &bytes, seen, wm)
+                    .await
+                    .map(Some)
+            }
             // `Some(0)`: create only — the remote held nothing when this host
             // last looked.
-            Some(v) => remote
+            (Some(v), _) => remote
                 .put(&key, v.clone(), Some(seen.unwrap_or(0)))
                 .await
                 .map(Some),
-            None => remote.delete(&key, seen).await.map(|_| None),
+            (None, _) => remote
+                .delete(&key, seen)
+                .await
+                .map(|v| v.map(|_| 0))
+                .map(|_| None),
         };
         match res {
             Ok(Some(version)) => {
@@ -483,10 +660,13 @@ impl Mirror {
                     .lock()
                     .expect("lock")
                     .insert(key.clone(), version);
+                self.saw(version);
+                store.put_cached(Table::Mirror, &key, &version)?;
                 Ok(())
             }
             Ok(None) => {
                 self.versions.lock().expect("lock").remove(&key);
+                store.delete_cached(Table::Mirror, &key)?;
                 Ok(())
             }
             Err(PutError::Conflict(_)) => {
@@ -507,6 +687,12 @@ impl Mirror {
             }
             Err(PutError::Other(e)) => Err(e),
         }
+    }
+
+    /// Note a version this host's own write took.
+    fn saw(&self, version: u64) {
+        let mut wm = self.watermark.lock().expect("lock");
+        *wm = (*wm).max(version);
     }
 
     /// Serve until `stop`: write changes as they come, retrying with capped
@@ -697,11 +883,96 @@ mod tests {
             .unwrap()
             .with_mirror(other.clone());
         assert!(other.pull(&remote, &s2).await.is_err());
-        // Bound to its name: moved to another key, it does not open either.
-        let v = remote.snapshot()["secret/github/github.com/app"].clone();
-        assert!(
-            secret_bytes(&MasterKey::from_bytes([3u8; 32]), "forgejo/x/bot-token", &v).is_err()
-        );
+        // Bound to its name and version: it opens where it is, and nowhere
+        // else.
+        let seal = MasterKey::from_bytes([3u8; 32]);
+        let (ver, v) = remote.raw("secret/github/github.com/app").unwrap();
+        assert!(secret_bytes(&seal, "github/github.com/app", ver, &v).is_ok());
+        assert!(secret_bytes(&seal, "forgejo/x/bot-token", ver, &v).is_err());
+        assert!(secret_bytes(&seal, "github/github.com/app", ver + 1, &v).is_err());
+    }
+
+    /// Probe (review of #89): a host restarted on its old cache must not
+    /// bring back what a recovery host deleted in the meantime.
+    #[tokio::test]
+    async fn a_removed_record_is_not_resurrected_by_a_stale_host() {
+        let remote = MemoryAppState::new();
+        // Host A mirrors a namespace and a repository, then goes away.
+        let (a, ma) = vta_store();
+        a.put(Table::Namespaces, "ns_1", &json!({"id": "ns_1"}))
+            .unwrap();
+        a.put(Table::Repos, "github.com#812", &json!({"forgeId": 812}))
+            .unwrap();
+        ma.sync_once(&remote, &a).await.unwrap();
+        // Host B (recovery) pulls and removes the repository.
+        let (b, mb) = vta_store();
+        mb.pull(&remote, &b).await.unwrap();
+        b.delete(Table::Repos, "github.com#812").unwrap();
+        mb.sync_once(&remote, &b).await.unwrap();
+        assert!(!remote.snapshot().contains_key("state/repos/github.com#812"));
+        // Host A comes back on its old cache: the record is dropped, not
+        // written back — while the tombstone is retained, and after.
+        for reaped in [false, true] {
+            let (a2, ma2) = vta_store();
+            a2.put_cached(Table::Repos, "github.com#812", &json!({"forgeId": 812}))
+                .unwrap();
+            // What A had mirrored, as its cache remembers it.
+            for (k, v) in a.list::<u64>(Table::Mirror).unwrap() {
+                a2.put_cached(Table::Mirror, &k, &v).unwrap();
+            }
+            if reaped {
+                remote.reap_tombstones();
+            }
+            ma2.pull(&remote, &a2).await.unwrap();
+            assert_eq!(ma2.pending(), 0, "nothing to push (reaped: {reaped})");
+            assert!(
+                a2.get::<Value>(Table::Repos, "github.com#812")
+                    .unwrap()
+                    .is_none()
+            );
+            ma2.sync_once(&remote, &a2).await.unwrap();
+            assert!(!remote.snapshot().contains_key("state/repos/github.com#812"));
+            assert!(remote.snapshot().contains_key("state/namespaces/ns_1"));
+        }
+    }
+
+    /// A record the remote holds at an older version than this host wrote
+    /// means the remote went back in time: fail closed.
+    #[tokio::test]
+    async fn a_rolled_back_remote_is_refused() {
+        let remote = MemoryAppState::new();
+        let (a, ma) = vta_store();
+        a.put(Table::Meta, "k", &json!(1)).unwrap();
+        ma.sync_once(&remote, &a).await.unwrap();
+        let mirrored: Vec<(String, u64)> = a.list(Table::Mirror).unwrap();
+        // The cache remembers a later version than the remote holds.
+        let (b, mb) = vta_store();
+        for (k, v) in mirrored {
+            b.put_cached(Table::Mirror, &k, &(v + 5)).unwrap();
+        }
+        let err = mb.pull(&remote, &b).await.unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        assert!(mb.stopped());
+    }
+
+    /// A sealed secret put back later (a replay) lands at another version
+    /// and does not open: the start is refused.
+    #[tokio::test]
+    async fn a_replayed_secret_does_not_open() {
+        let remote = MemoryAppState::new();
+        let (s, m) = vta_store();
+        s.put_secret("forgejo/codeberg.org/bot-token", b"old-token")
+            .unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        let (_, old) = remote.raw("secret/forgejo/codeberg.org/bot-token").unwrap();
+        s.put_secret("forgejo/codeberg.org/bot-token", b"new-token")
+            .unwrap();
+        m.sync_once(&remote, &s).await.unwrap();
+        // Someone with app-state access puts the old ciphertext back.
+        remote.put_as_other("secret/forgejo/codeberg.org/bot-token", old);
+        let (s2, m2) = vta_store();
+        let err = m2.pull(&remote, &s2).await.unwrap_err();
+        assert!(format!("{err:#}").contains("does not open"), "{err:#}");
     }
 
     #[tokio::test]

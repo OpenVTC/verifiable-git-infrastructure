@@ -220,21 +220,28 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
                             let value = read_secret(&name)?;
                             let key = secret_key(&name);
                             let current = remote.get(&key).await?.map(|r| r.version);
+                            let watermark = remote.list().await?.watermark;
                             let seal = session.sealing_key(true).await?;
-                            let sealed =
-                                vgi_bridge::appstate::secret_value(&seal, &name, value.as_bytes())?;
-                            remote
-                                .put(&key, sealed, Some(current.unwrap_or(0)))
-                                .await
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            vgi_bridge::appstate::put_sealed(
+                                &remote,
+                                &seal,
+                                &name,
+                                value.as_bytes(),
+                                current,
+                                watermark,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                             eprintln!(
                                 "stored `{name}` in the VTA context `{}`; restart the bridge to use it",
                                 session.context()
                             );
                         }
                         SecretCmd::List => {
-                            for r in remote.list().await? {
-                                if let Some(n) = r.key.strip_prefix("secret/") {
+                            for r in remote.list().await?.records {
+                                if !r.deleted
+                                    && let Some(n) = r.key.strip_prefix("secret/")
+                                {
                                     println!("{n}");
                                 }
                             }

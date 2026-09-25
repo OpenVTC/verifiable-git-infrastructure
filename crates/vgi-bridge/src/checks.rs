@@ -129,6 +129,8 @@ pub struct VerifyTrustVerifier {
     /// check discovers it again (a registry that moved is found without a
     /// restart).
     registry_url: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Signer DIDs resolved again after an unknown key, and when.
+    re_resolved: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// A fixed endpoint (tests; a registry that publishes none).
     registry_override: Option<String>,
 }
@@ -150,6 +152,7 @@ impl VerifyTrustVerifier {
             tdk: OnceCell::new(),
             ttl: std::time::Duration::from_secs(cfg.did_cache_ttl_secs),
             registry_url: tokio::sync::Mutex::new(None),
+            re_resolved: Default::default(),
             registry_override: None,
         }
     }
@@ -216,6 +219,20 @@ impl CommitVerifier for VerifyTrustVerifier {
                 _ => None,
             })
             .collect();
+        if stale.is_empty() {
+            return Ok(lines.0);
+        }
+        // At most once per DID per interval (a signer DID is attacker-chosen
+        // on a fork PR: it must not steer the bridge into re-fetching at will).
+        let stale: Vec<String> = {
+            let mut last = self.re_resolved.lock().await;
+            let now = std::time::Instant::now();
+            last.retain(|_, t| now.duration_since(*t) < crate::wire::RE_RESOLVE_EVERY);
+            stale
+                .into_iter()
+                .filter(|d| last.insert(d.clone(), now).is_none())
+                .collect()
+        };
         if stale.is_empty() {
             return Ok(lines.0);
         }

@@ -44,7 +44,7 @@ use vta_sdk::protocols::app_state::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::appstate::{AppState, NAMESPACE, PutError, Record};
+use crate::appstate::{AppState, Listing, NAMESPACE, PutError, Record};
 use crate::config::VtaConfig;
 use crate::identity::BridgeIdentity;
 use crate::seal::MasterKey;
@@ -217,8 +217,8 @@ impl Session {
     /// the VTA or, for a key the VTA no longer releases but the document
     /// still lists (a rotation's overlap), from `held`. A key the document
     /// does not list is not held, whatever the VTA exports; a key it stops
-    /// listing is dropped. The newest signing key the VTA still exports
-    /// signs. Fetched in one call and held in memory only. `want`: the DID
+    /// listing is dropped. The newest listed signing key the VTA still
+    /// exports signs; with none, this fails. Fetched in one call and held in memory only. `want`: the DID
     /// the config names, which the context's must be.
     pub async fn load_identity(
         &self,
@@ -254,14 +254,28 @@ impl Session {
             .list_keys(0, 1000, Some("active"), Some(&self.context))
             .await
             .map_err(|e| explain(e, &self.context, "listing the context's keys"))?;
-        let found = listed
+        let labelled: Vec<String> = listed
             .keys
             .iter()
-            .find(|k| {
+            .filter(|k| {
                 k.label.as_deref() == Some(SEAL_KEY_LABEL)
                     && k.context_id.as_deref() == Some(self.context.as_str())
             })
-            .map(|k| k.key_id.clone());
+            .map(|k| k.key_id.clone())
+            .collect();
+        // Exactly one: a second key under the label could be someone else's,
+        // and which one sealed a secret must never be a guess.
+        if labelled.len() > 1 {
+            bail!(
+                "the context `{}` has {} active keys labelled `{SEAL_KEY_LABEL}` ({}): the bridge \
+                 seals its secrets under exactly one. Revoke the ones you did not create with \
+                 `vta setup`, or recreate the context",
+                self.context,
+                labelled.len(),
+                labelled.join(", ")
+            );
+        }
+        let found = labelled.into_iter().next();
         let key_id = match found {
             Some(id) => id,
             None if create => {
@@ -572,7 +586,7 @@ pub(crate) fn listed_keys(did: &str, doc: &Value) -> Result<Listed> {
 /// bridge already holds (`held`), exactly those the document lists under
 /// the right relationship **with the same public key**. The newest listed
 /// signing key the VTA still exports signs (by its creation in the VTA,
-/// then its `#key-N` number); if the VTA exports none, the newest one held.
+/// then its `#key-N` number); if the VTA exports none, the bridge refuses.
 fn reconcile(
     fetched: &DidSecretsBundle,
     held: Option<&BridgeIdentity>,
@@ -630,16 +644,19 @@ fn reconcile(
         .iter()
         .filter(|s| s.get_key_type() == KeyType::Ed25519)
         .collect();
+    // Only a key the VTA still releases signs: one it stopped releasing is
+    // on its way out (retired, or withdrawn), and is kept only so what was
+    // encrypted or signed under it still resolves while the document lists
+    // it.
     let signing = signing_candidates
         .iter()
         .filter(|s| exported_ids.contains(&s.id))
         .max_by_key(|s| age(s))
-        .or_else(|| signing_candidates.iter().max_by_key(|s| age(s)))
         .map(|s| (*s).clone())
         .with_context(|| {
             format!(
-                "the DID document of `{did}` lists no signing (assertionMethod) key the bridge \
-                 holds a private key for"
+                "the DID document of `{did}` lists no signing (assertionMethod) key the VTA still \
+                 releases to the bridge: refusing to sign with a key the VTA has withdrawn"
             )
         })?;
     if !keep.iter().any(|s| s.get_key_type() == KeyType::X25519) {
@@ -698,6 +715,57 @@ impl VtaAppState {
         }
     }
 
+    /// Every page of the change feed from 0 (`feed`), or of the snapshot.
+    async fn pages(&self, feed: bool) -> Result<Listing> {
+        let mut out = Listing::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let v = if feed {
+                self.client
+                    .app_state_changes_since(
+                        &self.context,
+                        NAMESPACE,
+                        0,
+                        None,
+                        true,
+                        Some(500),
+                        cursor.as_deref(),
+                    )
+                    .await
+            } else {
+                self.client
+                    .app_state_list(
+                        &self.context,
+                        Some(NAMESPACE),
+                        None,
+                        true,
+                        Some(500),
+                        cursor.as_deref(),
+                    )
+                    .await
+            }
+            .map_err(|e| explain(e, &self.context, "listing the bridge's app-state"))?;
+            let page: AppStateListResponse =
+                serde_json::from_value(v).context("decoding an app-state list")?;
+            if let Some(w) = page.high_watermark {
+                out.watermark = out.watermark.max(w);
+            }
+            for r in page.records {
+                out.watermark = out.watermark.max(r.version);
+                out.records.push(Record {
+                    key: r.key,
+                    version: r.version,
+                    deleted: r.deleted,
+                    value: r.value.unwrap_or(Value::Null),
+                });
+            }
+            match (page.truncated, page.cursor) {
+                (true, Some(c)) => cursor = Some(c),
+                _ => return Ok(out),
+            }
+        }
+    }
+
     async fn current_version(&self, key: &str) -> Option<u64> {
         self.get(key).await.ok().flatten().map(|r| r.version)
     }
@@ -711,38 +779,16 @@ fn is_conflict(e: &VtaError) -> bool {
 
 #[async_trait]
 impl AppState for VtaAppState {
-    async fn list(&self) -> Result<Vec<Record>> {
-        let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let v = self
-                .client
-                .app_state_list(
-                    &self.context,
-                    Some(NAMESPACE),
-                    None,
-                    true,
-                    Some(500),
-                    cursor.as_deref(),
-                )
-                .await
-                .map_err(|e| explain(e, &self.context, "listing the bridge's app-state"))?;
-            let page: AppStateListResponse =
-                serde_json::from_value(v).context("decoding an app-state list")?;
-            for r in page.records {
-                if r.deleted {
-                    continue;
-                }
-                out.push(Record {
-                    key: r.key,
-                    version: r.version,
-                    value: r.value.unwrap_or(Value::Null),
-                });
-            }
-            match (page.truncated, page.cursor) {
-                (true, Some(c)) => cursor = Some(c),
-                _ => return Ok(out),
-            }
+    /// The change feed from the start: every record's latest version,
+    /// **tombstones included**, and the namespace counter. When the VTA has
+    /// reaped tombstones older than the start (`watermarkTooOld`), the
+    /// snapshot of live records instead — the mirror treats a record it
+    /// mirrored and no longer finds the same way either way.
+    async fn list(&self) -> Result<Listing> {
+        match self.pages(true).await {
+            Ok(l) => Ok(l),
+            Err(e) if format!("{e:#}").contains("watermarkTooOld") => self.pages(false).await,
+            Err(e) => Err(e),
         }
     }
 
@@ -761,6 +807,7 @@ impl AppState for VtaAppState {
                 Ok(Some(Record {
                     key: r.record.key,
                     version: r.record.version,
+                    deleted: false,
                     value: r.record.value.unwrap_or(Value::Null),
                 }))
             }
@@ -794,7 +841,11 @@ impl AppState for VtaAppState {
         }
     }
 
-    async fn delete(&self, key: &str, expected: Option<u64>) -> std::result::Result<(), PutError> {
+    async fn delete(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+    ) -> std::result::Result<Option<u64>, PutError> {
         // `Some(0)` is never a valid delete precondition.
         let expected = expected.filter(|v| *v > 0);
         match self
@@ -802,8 +853,12 @@ impl AppState for VtaAppState {
             .app_state_delete(&self.context, NAMESPACE, key, expected)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(VtaError::NotFound(_)) => Ok(()),
+            Ok(v) => Ok(serde_json::from_value::<
+                vta_sdk::protocols::app_state::AppStateDeleteResponse,
+            >(v)
+            .ok()
+            .and_then(|r| if r.existed { r.version } else { None })),
+            Err(VtaError::NotFound(_)) => Ok(None),
             Err(e) if is_conflict(&e) => Err(PutError::Conflict(self.current_version(key).await)),
             Err(e) => Err(PutError::Other(explain(
                 e,
@@ -975,15 +1030,10 @@ pub async fn setup(
         Err(e) => r.fail(format!("app-state: {e:#}")),
     }
     match remote.list().await {
-        Ok(records) => {
-            let secrets = records
-                .iter()
-                .filter(|x| x.key.starts_with("secret/"))
-                .count();
-            let state = records
-                .iter()
-                .filter(|x| x.key.starts_with("state/"))
-                .count();
+        Ok(listing) => {
+            let live = || listing.records.iter().filter(|x| !x.deleted);
+            let secrets = live().filter(|x| x.key.starts_with("secret/")).count();
+            let state = live().filter(|x| x.key.starts_with("state/")).count();
             r.ok(format!(
                 "app-state holds {secrets} secrets and {state} state records"
             ));
@@ -1052,8 +1102,8 @@ pub(crate) mod testing {
     use vta_sdk::client::loopback::LoopbackSink;
     use vta_sdk::trust_tasks as tt;
 
-    /// A namespace counter and its records, by key.
-    type Versioned = (u64, BTreeMap<String, (u64, Value)>);
+    /// A namespace counter and its records by key (`None`: a tombstone).
+    type Versioned = (u64, BTreeMap<String, (u64, Option<Value>)>);
 
     pub struct FakeVta {
         pub context: String,
@@ -1202,14 +1252,20 @@ pub(crate) mod testing {
             *self.bundle.lock().unwrap() = bundle_json(bundle);
         }
 
+        /// The live keys.
         pub fn keys(&self) -> Vec<String> {
-            self.state.lock().unwrap().1.keys().cloned().collect()
+            let st = self.state.lock().unwrap();
+            st.1.iter()
+                .filter(|(_, (_, v))| v.is_some())
+                .map(|(k, _)| k.clone())
+                .collect()
         }
 
         fn record(&self, key: &str, version: u64, value: Option<&Value>) -> Value {
             let mut r = json!({
                 "contextId": self.context, "namespace": NAMESPACE, "key": key,
-                "version": version, "deleted": false, "updatedAt": "2026-09-25T00:00:00Z",
+                "version": version, "deleted": value.is_none(),
+                "updatedAt": "2026-09-25T00:00:00Z",
             });
             if let Some(v) = value {
                 r["value"] = v.clone();
@@ -1314,11 +1370,13 @@ pub(crate) mod testing {
                     })).collect::<Vec<_>>()
                 })),
                 u if u == tt::TASK_VTA_APP_STATE_GET_1_0 => match st.1.get(&key) {
-                    Some((v, value)) => Ok(json!({ "record": self.record(&key, *v, Some(value)) })),
-                    None => Err(VtaError::NotFound(key)),
+                    Some((v, Some(value))) => {
+                        Ok(json!({ "record": self.record(&key, *v, Some(value)) }))
+                    }
+                    _ => Err(VtaError::NotFound(key)),
                 },
                 u if u == tt::TASK_VTA_APP_STATE_PUT_1_0 => {
-                    let current = st.1.get(&key).map(|(v, _)| *v);
+                    let current = st.1.get(&key).and_then(|(v, x)| x.as_ref().map(|_| *v));
                     let expected = p.get("expectedVersion").and_then(Value::as_u64);
                     let ok = match (expected, current) {
                         (None, _) | (Some(0), None) => true,
@@ -1330,30 +1388,39 @@ pub(crate) mod testing {
                     }
                     st.0 += 1;
                     let v = st.0;
-                    st.1.insert(key.clone(), (v, p["value"].clone()));
+                    st.1.insert(key.clone(), (v, Some(p["value"].clone())));
                     Ok(json!({
                         "contextId": self.context, "namespace": NAMESPACE, "key": key,
                         "version": v, "created": current.is_none(), "updatedAt": "2026-09-25T00:00:00Z",
                     }))
                 }
                 u if u == tt::TASK_VTA_APP_STATE_DELETE_1_0 => {
-                    let current = st.1.get(&key).map(|(v, _)| *v);
+                    let current = st.1.get(&key).and_then(|(v, x)| x.as_ref().map(|_| *v));
                     if let Some(e) = p.get("expectedVersion").and_then(Value::as_u64)
                         && Some(e) != current
                     {
                         return Err(conflict());
                     }
-                    let existed = st.1.remove(&key).is_some();
+                    let Some(_) = current else {
+                        return Ok(json!({ "contextId": self.context, "namespace": NAMESPACE,
+                            "key": key, "existed": false }));
+                    };
                     st.0 += 1;
+                    let v = st.0;
+                    st.1.insert(key.clone(), (v, None));
                     Ok(
                         json!({ "contextId": self.context, "namespace": NAMESPACE, "key": key,
-                        "existed": existed, "version": st.0, "deletedAt": "2026-09-25T00:00:00Z" }),
+                        "existed": true, "version": v, "deletedAt": "2026-09-25T00:00:00Z" }),
                     )
                 }
                 u if u == tt::TASK_VTA_APP_STATE_LIST_1_0 => {
+                    // The change feed (`sinceVersion`) carries tombstones; the
+                    // snapshot does not.
+                    let feed = p.get("sinceVersion").is_some();
                     let records: Vec<Value> =
                         st.1.iter()
-                            .map(|(k, (v, value))| self.record(k, *v, Some(value)))
+                            .filter(|(_, (_, value))| feed || value.is_some())
+                            .map(|(k, (v, value))| self.record(k, *v, value.as_ref()))
                             .collect();
                     Ok(json!({ "records": records, "truncated": false, "highWatermark": st.0 }))
                 }
@@ -1459,7 +1526,7 @@ mod tests {
             remote.get("state/meta/a").await.unwrap().unwrap().version,
             v2
         );
-        assert_eq!(remote.list().await.unwrap().len(), 1);
+        assert_eq!(remote.list().await.unwrap().records.len(), 1);
         remote.delete("state/meta/a", Some(v2)).await.unwrap();
         assert!(remote.get("state/meta/a").await.unwrap().is_none());
         remote.delete("state/meta/a", None).await.unwrap();
@@ -1768,5 +1835,39 @@ version = "v0.5.0"
                 .is_err()
         );
         assert_eq!(ids(&bridge), ["key-2", "key-3"]);
+    }
+
+    /// A document listing only signing keys the VTA no longer releases:
+    /// refused, never signed with a withdrawn key.
+    #[tokio::test]
+    async fn a_signing_key_the_vta_withdrew_is_never_used() {
+        use super::testing::{FakeDocs, webvh_bundle_from};
+        const DID: &str = "did:webvh:QmBridge:bridge.acme.example";
+        let old_keys = webvh_bundle_from(DID, 0);
+        let vta = Arc::new(FakeVta::new("vgi-bridge", &old_keys));
+        let docs = FakeDocs::listing(DID, &[&old_keys]);
+        let s = vta.session();
+        let held = s.load_identity(None, docs.as_ref(), None).await.unwrap();
+        // The VTA withdraws them (releases others the document does not list).
+        vta.rotate(&webvh_bundle_from(DID, 4));
+        let err = s
+            .load_identity(None, docs.as_ref(), Some(&held))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("withdrawn"), "{err}");
+    }
+
+    /// Two keys under the sealing label: the bridge refuses to guess.
+    #[tokio::test]
+    async fn a_second_sealing_key_is_refused() {
+        let (vta, _, _) = fake();
+        let s = vta.session();
+        s.sealing_key(true).await.unwrap();
+        let mut req = vta_sdk::client::CreateKeyRequest::new(vta_sdk::keys::KeyType::Ed25519);
+        req.label = Some(SEAL_KEY_LABEL.into());
+        req.context_id = Some("vgi-bridge".into());
+        s.client().create_key(req).await.unwrap();
+        let err = s.sealing_key(true).await.unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
     }
 }

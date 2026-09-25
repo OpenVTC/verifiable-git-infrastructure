@@ -236,6 +236,20 @@ same context, the bridge stops writing its state (fail closed), holds its
 results, logs why, and `/healthz` answers 503. Stop the other writer (revoke
 the credential if it is not yours) and restart this bridge.
 
+**The VTA is the authority on a restart.** A host that comes back on an old
+data directory does not bring back what another host changed meanwhile:
+
+- a record it had mirrored that the VTA no longer holds (deleted by the
+  recovery host) is dropped from its cache, not written back;
+- only records it never managed to mirror are written;
+- a record the VTA holds at an *older* version than this host wrote (a
+  rolled-back or replayed store) stops the start.
+
+Each secret is sealed to its own record version, so a ciphertext put back
+later does not open (the start is refused, naming the secret). The sealing
+key must be the only active key labelled `vgi-bridge/app-state-seal` in the
+context; the bridge refuses to guess between two.
+
 **Key rotation.** The bridge's **current DID document** decides which of its
 keys it holds: every signing (`assertionMethod`) and key-agreement key the
 document lists, with the same public key, and nothing else. The private

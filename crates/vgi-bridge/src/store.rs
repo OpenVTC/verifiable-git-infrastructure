@@ -67,10 +67,15 @@ pub enum Table {
     /// [`BranchLedger`] by `<host>#<repository id>#<branch>`: the Dependabot
     /// re-sign's provenance ledger.
     Branches,
+    /// VTA mode, this host only: the version each app-state record was at
+    /// when this host last wrote or read it (`u64` by remote key). What
+    /// tells a record this host mirrored (and another host has since
+    /// deleted) from one it never did.
+    Mirror,
 }
 
 impl Table {
-    const ALL: [Table; 9] = [
+    const ALL: [Table; 10] = [
         Table::Jobs,
         Table::Namespaces,
         Table::Repos,
@@ -80,6 +85,7 @@ impl Table {
         Table::Secrets,
         Table::Meta,
         Table::Branches,
+        Table::Mirror,
     ];
 
     /// The table's name (redb's, and the VTA mirror's key segment).
@@ -94,6 +100,7 @@ impl Table {
             Table::Secrets => "secrets",
             Table::Meta => "meta",
             Table::Branches => "branches",
+            Table::Mirror => "mirror",
         }
     }
 
@@ -625,10 +632,24 @@ impl Store {
 
     /// Write a record pulled from the VTA, without marking it for the
     /// mirror.
-    pub(crate) fn put_cached(&self, table: Table, key: &str, value: &Value) -> Result<()> {
+    pub(crate) fn put_cached<T: Serialize>(
+        &self,
+        table: Table,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
         let bytes = serde_json::to_vec(value)?;
         let w = self.db.begin_write()?;
         w.open_table(table.def())?.insert(key, bytes.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Delete a record without marking it for the mirror (what the VTA
+    /// already dropped).
+    pub(crate) fn delete_cached(&self, table: Table, key: &str) -> Result<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(table.def())?.remove(key)?;
         w.commit()?;
         Ok(())
     }

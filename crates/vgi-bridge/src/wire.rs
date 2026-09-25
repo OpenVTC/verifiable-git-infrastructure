@@ -139,12 +139,40 @@ impl Evict for affinidi_tdk::did_resolver::DIDCacheClient {
 pub struct ReResolving {
     inner: Arc<dyn ProofCheck>,
     cache: Arc<dyn Evict>,
+    /// When each DID was last resolved again: at most once per
+    /// [`RE_RESOLVE_EVERY`], so a stream of bad proofs cannot make the bridge
+    /// hammer (or be steered into flooding) the DID's host.
+    last: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// The least time between two fresh resolutions of one DID on a failure.
+pub const RE_RESOLVE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ReResolving {
     /// Over `inner`, evicting from `cache`.
     pub fn new(inner: Arc<dyn ProofCheck>, cache: Arc<dyn Evict>) -> Self {
-        ReResolving { inner, cache }
+        ReResolving {
+            inner,
+            cache,
+            last: Default::default(),
+        }
+    }
+
+    /// Whether `did` may be resolved again now (and note that it is).
+    fn may_re_resolve(&self, did: &str) -> bool {
+        let mut last = self.last.lock().expect("lock");
+        let now = std::time::Instant::now();
+        if last
+            .get(did)
+            .is_some_and(|t| now.duration_since(*t) < RE_RESOLVE_EVERY)
+        {
+            return false;
+        }
+        if last.len() > 1024 {
+            last.retain(|_, t| now.duration_since(*t) < RE_RESOLVE_EVERY);
+        }
+        last.insert(did.to_string(), now);
+        true
     }
 }
 
@@ -158,7 +186,10 @@ impl ProofCheck for ReResolving {
                     return Err(first);
                 };
                 // Only a network-resolved DID can have changed.
-                if issuer.starts_with("did:key:") || issuer.starts_with("did:peer:") {
+                if issuer.starts_with("did:key:")
+                    || issuer.starts_with("did:peer:")
+                    || !self.may_re_resolve(issuer)
+                {
                     return Err(first);
                 }
                 tracing::info!(%issuer, "a proof failed against the cached DID document; resolving it again");
@@ -600,6 +631,21 @@ mod tests {
             );
             assert!(s.evicted.load(SeqCst));
         }
+        // Once per DID per interval: a second failure soon after is refused
+        // without resolving again.
+        let s = Arc::new(Stale {
+            evicted: false.into(),
+            checks: 0.into(),
+            fresh_passes: false,
+        });
+        let r = ReResolving::new(s.clone(), s.clone());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert_eq!(
+            s.checks.load(SeqCst),
+            3,
+            "the second failure is not re-resolved"
+        );
         // A did:key cannot have changed: no second try.
         let s = Arc::new(Stale {
             evicted: false.into(),
