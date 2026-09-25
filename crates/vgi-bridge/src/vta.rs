@@ -144,18 +144,20 @@ impl Session {
         }
     }
 
-    /// Authenticate once: DIDComm through `mediator_did` when configured,
-    /// else REST at the bundle's (or the config's) URL.
+    /// Authenticate once, over DIDComm through `vta.mediator_did` (the
+    /// bridge's mediator by default). Never REST: the VTA releases the
+    /// bridge's keys only over an end-to-end channel.
     pub async fn connect(cfg: &VtaConfig, cred: &CredentialBundle) -> Result<Self> {
+        let mediator = cfg
+            .mediator_did
+            .as_deref()
+            .context("`vta.mediator_did` is not set (the config fills it from `mediator_did`)")?;
         let url = cfg
             .url
             .as_ref()
             .map(|u| u.as_str().trim_end_matches('/').to_string())
             .or_else(|| cred.vta_url.clone())
             .unwrap_or_default();
-        if cfg.mediator_did.is_none() && url.is_empty() {
-            bail!("the VTA credential carries no `vtaUrl`: set `vta.url` or `vta.mediator_did`");
-        }
         if !url.is_empty() && !url_is_secure(&url) {
             bail!("the VTA URL must be https (cleartext only to loopback), got `{url}`");
         }
@@ -164,7 +166,7 @@ impl Session {
             vta_did: &cred.vta_did,
             credential_did: &cred.did,
             private_key_multibase: &cred.private_key_multibase,
-            mediator_did: cfg.mediator_did.as_deref(),
+            mediator_did: Some(mediator),
         })
         .await
         .map_err(|e| anyhow!("authenticating to the VTA as `{}`: {e}", cred.did))?;

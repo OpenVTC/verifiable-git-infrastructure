@@ -41,8 +41,8 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 # credential_file = "/run/secrets/vgi-bridge-vta-credential"
 # # …or an environment variable (cleared once read):
 # # credential_env = "VGI_BRIDGE_VTA_CREDENTIAL"
-# # DIDComm to the VTA through this mediator; REST at the bundle's vtaUrl
-# # (or `url`) when absent.
+# # The bridge reaches the VTA over DIDComm, always (the VTA releases keys
+# # only end to end); through this mediator, by default the bridge's own.
 # # mediator_did = "did:web:mediator.acme-vtc.example"
 # # url = "https://vta.acme-vtc.example"
 # # The bridge's DID; default: the context's DID.

@@ -129,11 +129,14 @@ pub struct VtaConfig {
     /// bridge clears it once read.
     #[serde(default)]
     pub credential_env: Option<String>,
-    /// Reach the VTA over DIDComm through this mediator. `None`: REST, at
-    /// the bundle's `vtaUrl` (or `url`).
+    /// The mediator the VTA is reached through, over DIDComm. Default: the
+    /// bridge's own `mediator_did`. Always DIDComm: the VTA releases a
+    /// private key only over a channel confidential end to end (never over
+    /// REST, where the key would exist wherever TLS terminates).
     #[serde(default)]
     pub mediator_did: Option<String>,
-    /// The VTA's REST URL, when the bundle carries none.
+    /// The VTA's REST URL, when the bundle carries none: used only as the
+    /// DIDComm client's fallback for unauthenticated calls.
     #[serde(default)]
     pub url: Option<Url>,
     /// The bridge's DID. `None`: the context's DID.
@@ -660,7 +663,8 @@ fn yes() -> bool {
 impl BridgeConfig {
     /// Parse `text` and check it.
     pub fn parse(text: &str) -> Result<Self> {
-        let cfg: BridgeConfig = toml::from_str(text).context("parsing the bridge config")?;
+        let mut cfg: BridgeConfig = toml::from_str(text).context("parsing the bridge config")?;
+        cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -672,8 +676,18 @@ impl BridgeConfig {
         let mut cfg: BridgeConfig =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.apply_env()?;
+        cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Defaults that depend on other settings.
+    fn fill_defaults(&mut self) {
+        if let Some(v) = self.vta.as_mut()
+            && v.mediator_did.is_none()
+        {
+            v.mediator_did = Some(self.mediator_did.clone());
+        }
     }
 
     fn apply_env(&mut self) -> Result<()> {
@@ -918,10 +932,15 @@ oauth_client_id = "0b6e3a0c"
         );
         let with = |vta: &str| BridgeConfig::parse(&format!("{base}\n[vta]\n{vta}"));
         let c = with("context = \"vgi-bridge\"\ncredential_file = \"/run/secrets/c\"").unwrap();
-        let v = c.vta.unwrap();
+        let v = c.vta.clone().unwrap();
         assert_eq!(v.context, "vgi-bridge");
         assert_eq!(v.key_refresh_secs, 60);
         assert_eq!(c.did_cache_ttl_secs, 60);
+        assert_eq!(
+            v.mediator_did.as_deref(),
+            Some("did:web:mediator.acme.example"),
+            "the VTA is reached over DIDComm, through the bridge's mediator by default"
+        );
         assert!(
             with("context = \"vgi-bridge\"").is_err(),
             "a credential source is required"

@@ -196,9 +196,14 @@ entries in it), which is why it is issued to the bridge host alone.
 [vta]
 context = "vgi-bridge"
 credential_file = "/run/secrets/vgi-bridge-vta-credential"
-# DIDComm to the VTA (else REST at the bundle's vtaUrl):
+# The VTA is reached over DIDComm, through the bridge's `mediator_did`
+# unless this names another:
 # mediator_did = "did:web:mediator.acme-vtc.example"
 ```
+
+The bridge talks to the VTA over DIDComm only: the VTA releases a private
+key only over a channel confidential end to end, never over REST, where the
+key would exist wherever TLS terminates.
 
 **4. Check it.** `vta setup` verifies the context has a DID with both keys,
 the credential can fetch them and read, write and delete app-state, creates
