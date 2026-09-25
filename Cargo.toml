@@ -221,8 +221,12 @@ trust-tasks-trql = { package = "trust-tasks-rs", version = "0.21.2", default-fea
 # Old floor notes (0.21.10 for trust-tasks-rs 0.4; the 0.23 move in #26) are
 # below this line by construction and kept in git history rather than as a wall
 # of satisfied constraints.
+#
+# `affinidi-tdk` 0.17 is the line vta-sdk 0.51 declares, so it and the messaging
+# SDK it carries (0.27) resolve one node instead of a 0.16/0.26 copy beside the
+# 0.17/0.27 one.
 vta-sdk = { version = "0.51", default-features = false }
-affinidi-tdk = "0.16"
+affinidi-tdk = "0.17"
 # Named directly for one reason: the **floor**. The verifier resolves DIDs a
 # pull-request author chose — the `Signed-by-DID` trailer and the committer
 # header are attacker-supplied on a fork PR — so which hosts resolution may
@@ -318,9 +322,9 @@ wiremock = "0.6"
 # An in-process mediator (memory store, loopback port) for verify-trust's
 # mediator-binding tests: the run's ephemeral DID really connects, a fake
 # registry on the same mediator really answers, and an `ExplicitAllow`
-# mediator really refuses. Dev-only. 0.9 is the line built on the messaging
-# SDK 0.26 / TDK 0.16 that verify-trust's transports use; 0.10 moved to 0.27.
-affinidi-messaging-test-mediator = { version = "0.9.17", features = ["tsp"] }
+# mediator really refuses. Dev-only. 0.10 is the line built on the messaging
+# SDK 0.27 / TDK 0.17 that verify-trust's transports use.
+affinidi-messaging-test-mediator = { version = "0.10.2", features = ["tsp"] }
 
 # ── the bridge (vgi-bridge) ─────────────────────────────────────────────────
 # The per-community service that holds the forge credentials and runs the
