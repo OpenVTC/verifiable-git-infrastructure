@@ -55,9 +55,14 @@ enum IdentityCmd {
     Show,
     /// Replace the identity with a secrets bundle — a VTA-provisioned DID's,
     /// or one `identity export` wrote (JSON: `{ "did": …, "secrets": [ … ] }`).
+    ///
+    /// Replacing an identity with a different DID takes the same guards as
+    /// `mint --replace`.
     Import {
         /// The bundle file. Delete it once imported.
         bundle: PathBuf,
+        #[command(flatten)]
+        replace: ReplaceArgs,
     },
     /// Write the identity's secrets bundle to a new file (0600), for a
     /// backup kept apart from the store: importing it into a fresh store
@@ -66,14 +71,38 @@ enum IdentityCmd {
         /// The file to create. Never overwritten.
         out: PathBuf,
     },
-    /// Mint a new `did:peer` identity naming the configured mediator. The
-    /// new DID must be registered at the VTC; namespaces bound to the old
-    /// one are not served by it.
+    /// Mint a new `did:peer` identity naming the configured mediator.
+    ///
+    /// Replacing an identity is not a key rotation: the new DID is a
+    /// different bridge. The VTC's `[git_ns] bridges` must name the new DID;
+    /// the VTC accepts results and events for a namespace only from the DID
+    /// it bound, so namespaces bound to the old one are not served; the
+    /// registry's `git.commit.sign` service grant is held by the old DID, so
+    /// Dependabot commits the new one re-signs fail the check; and with no
+    /// re-attach today, binding those namespaces again needs an unbind,
+    /// which revokes every right in them.
     Mint {
         /// Replace an identity the store already holds.
         #[arg(long)]
         replace: bool,
+        #[command(flatten)]
+        guard: ReplaceArgs,
     },
+}
+
+/// The guards on replacing the bridge's identity with another DID.
+#[derive(clap::Args)]
+struct ReplaceArgs {
+    /// Where to write the current identity's secrets bundle (0600, never
+    /// over an existing file) before it is replaced. Required whenever there
+    /// is one to replace.
+    #[arg(long, value_name = "FILE")]
+    backup: Option<PathBuf>,
+    /// Replace the identity although the store holds namespaces bound (or
+    /// being bound) to it, or it is a DID this bridge did not mint (a
+    /// VTA-provisioned `did:webvh`). Those namespaces stop being served.
+    #[arg(long)]
+    abandon_current_did: bool,
 }
 
 #[derive(Subcommand)]
@@ -155,7 +184,79 @@ fn mint(cfg: &BridgeConfig, store: &Store) -> Result<BridgeIdentity> {
     BridgeIdentity::store_bundle(store, bundle)
 }
 
-/// Create `path` owner-only and write `bytes`; refuse an existing file.
+/// What replacing the identity breaks, printed whenever it happens.
+const REPLACE_CONSEQUENCES: &str = "\
+a new DID is a different bridge, not a rotated key:
+  - the VTC's `[git_ns] bridges` must name the new DID;
+  - the VTC accepts results and events for a namespace only from the DID it bound,
+    so namespaces bound to the old DID are no longer served;
+  - the registry's `git.commit.sign` service grant is held by the old DID, so
+    Dependabot commits the new DID re-signs fail the check;
+  - there is no re-attach yet: binding those namespaces again needs
+    `cnm git namespace unbind` first, which revokes every right in them.";
+
+/// Check that the identity in `store` may be replaced by `new_did`, and back
+/// it up to `args.backup` first. Nothing to do when the store holds no
+/// identity, or already holds `new_did`.
+fn guard_replace(store: &Store, new_did: Option<&str>, args: &ReplaceArgs) -> Result<()> {
+    use vgi_bridge::store::{NamespaceRecord, Table};
+    let Some(old) = BridgeIdentity::load(store)? else {
+        return Ok(());
+    };
+    if new_did == Some(old.did()) {
+        return Ok(());
+    }
+    let namespaces = store.list::<NamespaceRecord>(Table::Namespaces)?;
+    let minted_here = old.did().starts_with("did:peer:") || old.did().starts_with("did:key:");
+    if (!namespaces.is_empty() || !minted_here) && !args.abandon_current_did {
+        let mut why = Vec::new();
+        if !namespaces.is_empty() {
+            why.push(format!(
+                "it serves {} namespace(s):\n{}",
+                namespaces.len(),
+                namespaces
+                    .iter()
+                    .map(|(id, ns)| format!("    {id}  {}  ({:?})", ns.resource, ns.state))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !minted_here {
+            why.push(
+                "it is a DID this bridge did not mint (a VTA-provisioned DID), which may be \
+                 moved to another mediator without changing it"
+                    .to_string(),
+            );
+        }
+        bail!(
+            "refusing to replace the bridge's identity `{}`: {}\n{REPLACE_CONSEQUENCES}\n\
+             If a did:peer names the wrong mediator, set `mediator_did` back instead. To \
+             replace it anyway, pass --abandon-current-did (and --backup <file>).",
+            old.did(),
+            why.join("; ")
+        );
+    }
+    let Some(backup) = args.backup.as_deref() else {
+        bail!(
+            "the store holds the identity `{}`; pass --backup <file> to keep a copy of it \
+             before it is replaced\n{REPLACE_CONSEQUENCES}",
+            old.did()
+        );
+    };
+    let bundle = BridgeIdentity::stored_bundle(store)?.context("the identity vanished")?;
+    write_new_private(backup, &Zeroizing::new(serde_json::to_vec_pretty(&bundle)?))?;
+    eprintln!(
+        "replacing the identity `{}`; its secrets bundle is in {} (`identity import` \
+         restores it)\n{REPLACE_CONSEQUENCES}",
+        old.did(),
+        backup.display()
+    );
+    Ok(())
+}
+
+/// Create `path` owner-only and write `bytes`; refuse an existing file or a
+/// symlink (`O_EXCL`). A failed write removes the partial file, so a retry
+/// is not refused over it.
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -168,8 +269,11 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = opts
         .open(path)
         .with_context(|| format!("creating {} (it must not exist)", path.display()))?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
     Ok(())
 }
 
@@ -199,7 +303,7 @@ fn main() -> Result<()> {
                     let id = BridgeIdentity::load(&store)?.context("no identity: run `init`")?;
                     println!("{}", id.did());
                 }
-                IdentityCmd::Import { bundle } => {
+                IdentityCmd::Import { bundle, replace } => {
                     let text = Zeroizing::new(
                         std::fs::read_to_string(&bundle)
                             .with_context(|| format!("reading {}", bundle.display()))?,
@@ -210,6 +314,10 @@ fn main() -> Result<()> {
                     // names another mediator would have the VTC deliver
                     // jobs where this bridge does not listen.
                     let warning = check_reachable(&bundle.did, &cfg.mediator_did)?;
+                    // Checked before it is sealed, so a bundle that does not
+                    // load replaces nothing.
+                    BridgeIdentity::from_bundle(&bundle)?;
+                    guard_replace(&store, Some(&bundle.did), &replace)?;
                     let id = BridgeIdentity::store_bundle(&store, bundle)?;
                     println!("{}", id.did());
                     if let Some(warning) = warning {
@@ -217,26 +325,29 @@ fn main() -> Result<()> {
                     }
                 }
                 IdentityCmd::Export { out } => {
-                    let id = BridgeIdentity::load(&store)?.context("no identity: run `init`")?;
-                    let json = Zeroizing::new(serde_json::to_vec_pretty(&id.to_bundle()?)?);
+                    // As stored: every key an imported bundle carries.
+                    let bundle = BridgeIdentity::stored_bundle(&store)?
+                        .context("no identity: run `init`")?;
+                    let json = Zeroizing::new(serde_json::to_vec_pretty(&bundle)?);
                     write_new_private(&out, &json)?;
-                    println!("{}", id.did());
+                    println!("{}", bundle.did);
                     eprintln!(
                         "wrote the identity's private keys to {} — keep it apart from the store \
                          and the master key; `identity import` restores it",
                         out.display()
                     );
                 }
-                IdentityCmd::Mint { replace } => {
+                IdentityCmd::Mint { replace, guard } => {
                     if let Some(old) = BridgeIdentity::load(&store)?
                         && !replace
                     {
                         bail!(
-                            "the store already holds `{}`; pass --replace to mint a new \
-                             identity in its place (namespaces bound to it are then not served)",
+                            "the store already holds `{}`; pass --replace --backup <file> to \
+                             mint a new identity in its place\n{REPLACE_CONSEQUENCES}",
                             old.did()
                         );
                     }
+                    guard_replace(&store, None, &guard)?;
                     let id = mint(&cfg, &store)?;
                     println!("{}", id.did());
                     eprintln!("register this DID at the VTC as the bridge serving its namespaces");
