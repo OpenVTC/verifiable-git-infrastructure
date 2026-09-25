@@ -159,12 +159,6 @@ pub struct CheckConfig {
     /// Checks run at once; more wait.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
-    /// The Trust Registry binding the bridge-posted check uses: `auto`
-    /// (default — DIDComm over the bridge's own session, then HTTPS, no
-    /// fallback), `didcomm` or `https`. The bridge never uses TSP, so `tsp`
-    /// is refused.
-    #[serde(default)]
-    pub transport: VerifyTransport,
 }
 
 impl Default for CheckConfig {
@@ -176,7 +170,6 @@ impl Default for CheckConfig {
             fetch_timeout_secs: default_fetch_timeout(),
             max_fetch_bytes: default_max_fetch_bytes(),
             concurrency: default_concurrency(),
-            transport: VerifyTransport::Auto,
         }
     }
 }
@@ -664,12 +657,7 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
-        if self.checks.transport == VerifyTransport::Tsp {
-            bail!(
-                "`checks.transport = \"tsp\"`: the bridge-posted check queries the registry over \
-                 the bridge's DIDComm session or HTTPS, never TSP; use `auto`, `didcomm` or `https`"
-            );
-        }
+
         check_ident("resign.committer_name", &self.resign.committer_name)?;
         check_ident("resign.committer_email", &self.resign.committer_email)?;
         if self.resign.committer_email.starts_with("did:") {
@@ -765,35 +753,33 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn the_transports_default_to_auto_and_the_check_refuses_tsp() {
+    fn the_workflow_transport_defaults_to_auto_and_is_carried_into_the_plan() {
         let c = BridgeConfig::parse(EXAMPLE).unwrap();
         assert_eq!(c.verify_trust.transport, VerifyTransport::Auto);
-        assert_eq!(c.checks.transport, VerifyTransport::Auto);
 
         let pinned = EXAMPLE.replace(
             "version = \"v0.5.0\"\n",
-            "version = \"v0.5.0\"\ntransport = \"https\"\n\n[checks]\ntransport = \"didcomm\"\n",
+            "version = \"v0.5.0\"\ntransport = \"https\"\n",
         );
         let c = BridgeConfig::parse(&pinned).unwrap();
         assert_eq!(c.verify_trust.transport, VerifyTransport::Https);
-        assert_eq!(c.checks.transport, VerifyTransport::Didcomm);
         assert_eq!(
             crate::registry::vgi_config(&c, None).verify_trust_transport,
             VerifyTransport::Https,
             "the written workflows carry the pin"
         );
 
-        let tsp = EXAMPLE.replace(
-            "version = \"v0.5.0\"\n",
-            "version = \"v0.5.0\"\n\n[checks]\ntransport = \"tsp\"\n",
-        );
-        let e = BridgeConfig::parse(&tsp).unwrap_err().to_string();
-        assert!(e.contains("never TSP"), "{e}");
         let bogus = EXAMPLE.replace(
             "version = \"v0.5.0\"\n",
             "version = \"v0.5.0\"\ntransport = \"carrier-pigeon\"\n",
         );
         assert!(BridgeConfig::parse(&bogus).is_err());
+        // The bridge-posted check has no transport option: it is HTTPS.
+        let check = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\n\n[checks]\ntransport = \"didcomm\"\n",
+        );
+        assert!(BridgeConfig::parse(&check).is_err());
     }
 
     #[test]

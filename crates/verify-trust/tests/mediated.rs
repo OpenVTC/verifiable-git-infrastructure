@@ -10,6 +10,8 @@
 
 #![cfg(any(feature = "didcomm", feature = "tsp"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// Some helpers serve only one binding's tests.
+#![cfg_attr(not(all(feature = "didcomm", feature = "tsp")), allow(dead_code))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -328,4 +330,173 @@ async fn a_tsp_query_forms_the_relationship_and_is_answered_by_the_registry() {
     assert!(answer.authorized);
     client.close().await;
     server.abort();
+}
+
+// --- the authcrypt sender binding, end to end ---
+
+use affinidi_tdk::affinidi_crypto::jose::{aes_kw, content_encryption, ecdh, key_agreement::*};
+use affinidi_tdk::did_common::document::DocumentExt;
+use sha2::{Digest, Sha256};
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Authcrypt with the *sender's own* key (`skid` = `real_kid`), but with
+/// PartyUInfo (`apu`) naming `claimed_kid`: an envelope whose two sender
+/// members disagree. verify-trust must not believe `claimed_kid`.
+fn forge_jwe(
+    plaintext: &[u8],
+    real_kid: &str,
+    claimed_kid: &str,
+    sender_private: &PrivateKeyAgreement,
+    recipient_kid: &str,
+    recipient_pub: &PublicKeyAgreement,
+) -> String {
+    let ephemeral = EphemeralKeyPair::generate(Curve::X25519);
+    let apu_raw = claimed_kid.as_bytes();
+    let apv_raw = Sha256::digest(recipient_kid.as_bytes()).to_vec();
+    let cek = content_encryption::generate_cek();
+    let iv = content_encryption::generate_iv();
+    let header = json!({
+        "typ": "application/didcomm-encrypted+json",
+        "alg": "ECDH-1PU+A256KW",
+        "enc": "A256CBC-HS512",
+        "skid": real_kid,
+        "apu": b64url(apu_raw),
+        "apv": b64url(&apv_raw),
+        "epk": ephemeral.public.to_jwk(),
+    });
+    let protected_b64 = b64url(header.to_string().as_bytes());
+    let (ct, tag) =
+        content_encryption::encrypt(plaintext, &cek, &iv, protected_b64.as_bytes()).unwrap();
+    let kek = ecdh::derive_sender_key_1pu(
+        &ephemeral,
+        sender_private,
+        recipient_pub,
+        apu_raw,
+        &apv_raw,
+        &tag,
+    )
+    .unwrap();
+    let wrapped = aes_kw::wrap(&kek, &cek).unwrap();
+    json!({
+        "protected": protected_b64,
+        "recipients": [{ "header": { "kid": recipient_kid }, "encrypted_key": b64url(&wrapped) }],
+        "iv": b64url(&iv),
+        "ciphertext": b64url(&ct),
+        "tag": b64url(&tag),
+    })
+    .to_string()
+}
+
+async fn ka(tdk: &affinidi_tdk::TDK, did: &str) -> (String, PublicKeyAgreement) {
+    let doc = tdk.did_resolver().resolve(did).await.unwrap().doc;
+    let kid = doc.find_key_agreement(None)[0].to_string();
+    let (_, bytes) = doc
+        .get_verification_method(&kid)
+        .unwrap()
+        .decode_public_key()
+        .unwrap();
+    (
+        kid,
+        PublicKeyAgreement::from_raw_bytes(Curve::X25519, &bytes).unwrap(),
+    )
+}
+
+/// Regression: a reply sealed with another DID's key but naming the
+/// registry's key in its party info must never be believed — the query
+/// times out (`registryUnavailable`), never answers.
+#[cfg(feature = "didcomm")]
+#[tokio::test]
+async fn a_reply_whose_key_agreement_names_another_key_is_not_believed() {
+    use affinidi_tdk::didcomm::Message;
+    let env = open_mediator().await;
+    let registry = env.add_user("Registry").await.unwrap();
+    let mallory = env.add_user("Mallory").await.unwrap();
+    online(&env, &registry).await;
+    online(&env, &mallory).await;
+    let tdk = verify_trust::build_resolver(false).await.unwrap();
+    let (registry_kid, _) = ka(&tdk, &registry.did).await;
+    let (mallory_kid, _) = ka(&tdk, &mallory.did).await;
+    let msecret = mallory
+        .secrets
+        .iter()
+        .find(|s| s.id == mallory_kid)
+        .expect("mallory ka secret");
+    let mpriv =
+        PrivateKeyAgreement::from_raw_bytes(Curve::X25519, msecret.get_private_bytes()).unwrap();
+
+    // The registry never answers. Its inbox is read only to learn the
+    // threadId (stands in for a guessed/leaked request id); the reply is
+    // built and sent by Mallory with Mallory's key alone.
+    let env2 = env.clone();
+    let reg2 = registry.clone();
+    let mal2 = mallory.clone();
+    let tdk2 = verify_trust::build_resolver(false).await.unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok(Some((message, _))) = env2
+                .atm
+                .message_pickup()
+                .live_stream_next(&reg2.profile, Some(Duration::from_millis(500)), true)
+                .await
+            else {
+                continue;
+            };
+            if message.typ != DIDCOMM_ENVELOPE {
+                continue;
+            }
+            let sender = message.from.clone().unwrap();
+            let mut reply = answer(&message.body, true, &reg2.did);
+            reply["payload"]["authorized"] = json!(true);
+            let id = uuid::Uuid::new_v4().to_string();
+            let msg = Message::build(id.clone(), DIDCOMM_ENVELOPE.to_string(), reply)
+                .from(reg2.did.clone())
+                .to(sender.clone())
+                .thid(message.body["id"].as_str().unwrap().to_string())
+                .finalize();
+            let (rkid, rpub) = ka(&tdk2, &sender).await;
+            let plaintext = serde_json::to_vec(&msg).unwrap();
+            let forged = forge_jwe(
+                &plaintext,
+                &mallory_kid,
+                &registry_kid,
+                &mpriv,
+                &rkid,
+                &rpub,
+            );
+            let r = env2
+                .atm
+                .forward_and_send_message(
+                    &mal2.profile,
+                    false,
+                    &forged,
+                    Some(&id),
+                    env2.mediator.did(),
+                    &sender,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+            let _ = r;
+        }
+    });
+
+    let client = ephemeral(
+        &env,
+        TransportKind::Didcomm,
+        &registry.did,
+        Duration::from_secs(10),
+    )
+    .await;
+    let result = client.client().authorization(query()).await;
+    client.close().await;
+    server.abort();
+    assert!(
+        matches!(result, Err(TrqlError::Timeout { .. })),
+        "a forged reply must not answer the query: {result:?}"
+    );
 }

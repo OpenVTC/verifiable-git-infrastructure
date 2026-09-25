@@ -70,7 +70,7 @@ use vgi_core::{
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
 use crate::pgp_exempt::ExemptKeyring;
-pub use crate::registry::{Registry, RegistryChannel, TransportSelector};
+pub use crate::registry::{Registry, TransportSelector};
 
 /// Everything `verify-trust` needs for one run.
 #[derive(Debug, Clone)]
@@ -390,10 +390,9 @@ pub async fn verify_prepared(
     verify_prepared_with(args, commits, signers, exempt, &registry).await
 }
 
-/// [`verify_prepared`], querying through `registry` — any binding, and any
-/// sender: a run's ephemeral DID ([`Registry::for_route`]) or a caller's own
-/// session ([`Registry::over_channel`], the bridge). `args.registry_url` is
-/// not read.
+/// [`verify_prepared`], querying through `registry` — any binding
+/// ([`Registry::for_route`]; over TSP and DIDComm, as the run's ephemeral
+/// DID). `args.registry_url` is not read.
 ///
 /// A registry that cannot be consulted fails each signer's commits as
 /// [`CommitStatus::RegistryUnavailable`]; it is never a pass.
@@ -1937,11 +1936,10 @@ mod tests {
 
     // --- querying through a Registry ---
 
-    /// A channel standing in for a mediator session: answers every query
+    /// A transport standing in for a mediator session: answers every query
     /// with `authorized`, or fails every exchange with `failure`, recording
     /// what it was sent.
     struct FakeChannel {
-        sender: String,
         authorized: bool,
         failure: Option<TrqlError>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
@@ -1950,7 +1948,6 @@ mod tests {
     impl FakeChannel {
         fn answering(authorized: bool) -> Self {
             Self {
-                sender: "did:webvh:QmBridge:bridge.example".to_string(),
                 authorized,
                 failure: None,
                 seen: std::sync::Mutex::new(Vec::new()),
@@ -1966,21 +1963,17 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RegistryChannel for FakeChannel {
+    impl trql_client::TrqlTransport for FakeChannel {
         fn kind(&self) -> TransportKind {
             TransportKind::Didcomm
         }
 
-        fn sender_did(&self) -> &str {
-            &self.sender
-        }
-
         async fn exchange(
             &self,
-            recipient: &str,
-            request: serde_json::Value,
-        ) -> Result<serde_json::Value, TrqlError> {
-            assert_eq!(recipient, "did:example:registry");
+            request: trust_tasks_trql::TrustTask<serde_json::Value>,
+        ) -> Result<trust_tasks_trql::TrustTask<serde_json::Value>, TrqlError> {
+            let request = serde_json::to_value(&request).unwrap();
+            assert_eq!(request["recipient"], "did:example:registry");
             self.seen.lock().unwrap().push(request.clone());
             if let Some(failure) = &self.failure {
                 // TrqlError is not Clone; rebuild the one variant tests use.
@@ -1996,7 +1989,7 @@ mod tests {
                 });
             }
             let p = &request["payload"];
-            Ok(serde_json::json!({
+            Ok(serde_json::from_value(serde_json::json!({
                 "id": "urn:uuid:reply",
                 "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
                 "threadId": request["id"],
@@ -2010,6 +2003,7 @@ mod tests {
                     "time_evaluated": "2026-09-25T00:00:00Z"
                 }
             }))
+            .unwrap())
         }
     }
 
@@ -2055,20 +2049,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_channel_query_is_sent_as_the_channel_owners_did() {
-        // The bridge-posted check: the query goes out as the bridge's own
-        // DID (the document's `issuer`), over the bridge's session.
+    async fn an_authorized_answer_through_a_registry_passes() {
         let channel = Arc::new(FakeChannel::answering(true));
-        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
         let (commits, signers) = one_signed_commit();
         let report =
             verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
                 .await
                 .unwrap();
         assert!(report.ok, "{:?}", report.commits);
-        let seen = channel.seen.lock().unwrap();
-        assert_eq!(seen[0]["issuer"], "did:webvh:QmBridge:bridge.example");
-        assert_eq!(seen[0]["recipient"], "did:example:registry");
+        assert_eq!(
+            channel.seen.lock().unwrap()[0]["recipient"],
+            "did:example:registry"
+        );
     }
 
     #[tokio::test]
@@ -2085,7 +2078,7 @@ mod tests {
                 waited_secs: 30,
             },
         ] {
-            let registry = Registry::over_channel(
+            let registry = Registry::with_transport(
                 Arc::new(FakeChannel::failing(failure)),
                 "did:example:registry",
             );
@@ -2109,7 +2102,7 @@ mod tests {
     #[tokio::test]
     async fn a_denial_over_a_channel_is_unauthorized_after_the_fallback() {
         let channel = Arc::new(FakeChannel::answering(false));
-        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
         let (commits, signers) = one_signed_commit();
         let report =
             verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
@@ -2129,7 +2122,7 @@ mod tests {
         // opens on the first query, a CI run on it never mints a DID or
         // touches the mediator.
         let channel = Arc::new(FakeChannel::answering(true));
-        let registry = Registry::over_channel(channel.clone(), "did:example:registry");
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
         let commits = vec![RangeCommit {
             sha: "b".repeat(40),
             raw: unsigned_commit().into_bytes(),

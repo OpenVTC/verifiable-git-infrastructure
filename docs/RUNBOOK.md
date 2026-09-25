@@ -374,7 +374,10 @@ both sides named. `registry-url` implies `https`.
 > see *Registry discovery* in the runbook). There is no fallback: until the
 > mediator is configured, runs fail `registryUnavailable`. To keep today's
 > HTTPS behaviour, set `transport: https` (Action), `--transport https` (CLI),
-> or `transport = "https"` in the bridge's `[verify_trust]` / `[checks]`.
+> or `transport = "https"` in the bridge's `[verify_trust]` (the workflows it
+> writes). A DIDComm reply is believed only if the authcrypt sender key id is
+> the key its key agreement actually used, and each query carries a random id.
+> The bridge-posted check queries `#rest` (HTTPS) only.
 > `UNKNOWN-KEY` now says what usually causes it: the signer rotated their
 > key, and the commit must be re-signed with the current one.
 

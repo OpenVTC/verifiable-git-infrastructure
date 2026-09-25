@@ -42,8 +42,6 @@ mod jobs;
 pub mod mapping;
 pub mod registry;
 #[cfg(feature = "forge-github")]
-pub mod registry_channel;
-#[cfg(feature = "forge-github")]
 pub mod resign;
 pub mod seal;
 pub mod status;

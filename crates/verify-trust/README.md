@@ -129,12 +129,25 @@ they are dropped when the run ends. The identifier is a return address and
 nothing more; nothing is authorized by it.
 
 What the verdict rests on is the **registry's** key. A reply is believed only
-when the binding authenticated it as the registry DID — DIDComm authcrypt whose
-sender key belongs to `--registry-did` and whose `from` names it, or a TSP
-message whose verified sender is `--registry-did` — and it answers the query
-asked (thread and tuple). A reply from anyone else, correlated or not, is
-ignored. Over TSP, a relationship is formed with the registry first (Rev 3
-§7.2.2).
+when the binding authenticated it as the registry DID, and it answers the
+query asked (thread and tuple):
+
+- **DIDComm:** the envelope is read *packed*, before it is unpacked. It must be
+  authcrypt (`ECDH-1PU`) whose protected header's `skid` is a key of
+  `--registry-did` and whose `apu` — the party info the key agreement is
+  actually computed over — names that same key; the sender key id is bound to
+  the key actually used. The unpacked message must report that key as its
+  sender, `from` must name the registry, and a signature by anyone else
+  refuses it (the registry does not sign replies today; authcrypt is the proof
+  of origin).
+- **TSP:** the sender VID the message's signature verified against is
+  `--registry-did`. A relationship is formed with the registry first (Rev 3
+  §7.2.2).
+
+Every query goes out under a fresh random id (UUID v4) and a reply must carry
+it as its thread. A reply from anyone else, correlated or not, is ignored, and
+so is a problem report whose sender is not proven to be the registry or its
+mediator — an unauthenticated "no" cannot end the run early.
 
 **Fail closed.** If the mediator refuses the run's DID, refuses the query, or
 the registry does not answer within 30 seconds, every signer's commits are

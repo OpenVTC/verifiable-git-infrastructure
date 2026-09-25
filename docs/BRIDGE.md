@@ -52,9 +52,7 @@ Outbound:
   for the bridge-posted check — for the registry's DID and the DIDs commits
   claim. Signer DIDs are resolved under verify-trust's public-hosts-only
   policy: a DID naming an internal host is refused, not fetched;
-- the **Trust Registry**, over the binding its DID document advertises: over
-  DIDComm the query rides the bridge's existing mediator link (nothing extra
-  to open), over HTTPS it goes to the `#rest` URL.
+- the **Trust Registry**'s `#rest` endpoint, for the bridge-posted check.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
 refuses to start with a `public_url` that is not `https`. Keep the proxy's
@@ -337,25 +335,18 @@ repository writers are trusted not to forge the check —
   repository's qualified resource, with the namespace as the fallback
   resource. An empty range (the head is already in the base) is a success
   only when the head *is* the base tip; otherwise it is a failure.
-- **How it asks the registry.** If the registry's DID document advertises
-  DIDComm, the bridge queries **as its own DID** over the mediator session it
-  already holds for the VTC (the mediator allows one websocket per DID, so it
-  does not open another); otherwise over its `#rest` URL. The registry's REST
-  interface is therefore optional here too. A DIDComm answer counts only if
-  authcrypt proves it came from the registry's DID and it answers a query in
-  flight; anything else from the inbound stream goes to the job path as
-  before. Because the bridge's DID is stable, a registry in private mode
-  (`ACL_MODE=ExplicitAllow`) can admit it by name — add the bridge DID to the
-  registry's allow list. A registry that refuses it, or does not answer in
-  30 seconds, fails the check (`registryUnavailable`) — with no fallback to
-  HTTPS. `transport` under `[checks]` chooses: `auto` (default: DIDComm, then
-  HTTPS), `didcomm` or `https`; set `https` while the registry does not admit
-  the bridge's DID. TSP is not used by the bridge — its link to the mediator
-  is DIDComm — and `tsp` is refused. The workflows the bridge *writes* take
-  their own `transport` under `[verify_trust]` (`auto`, `tsp`, `didcomm`,
-  `https`; default `auto` writes no input), passed to the action as its
-  `transport` input. The bridge's DID document must
-  route DIDComm to the bridge's mediator, which it already must for the VTC.
+- **How it asks the registry.** Over HTTPS, at the `#rest` endpoint the
+  registry's DID document names — the bridge-posted check needs the registry
+  to publish one. It does not query over DIDComm: a reply arriving on the
+  bridge's mediator session reaches it already unpacked, without the envelope
+  needed to bind the authcrypt sender key id to the key actually used, so its
+  sender cannot be proven to be the registry. (The CI workflows take the
+  packed envelope and do check that binding; they can use TSP and DIDComm.)
+- **The workflows it writes** take `transport` under `[verify_trust]` —
+  `auto` (default: TSP, then DIDComm, then HTTPS, no fallback; writes no
+  input), `tsp`, `didcomm` or `https` — passed to the action as its
+  `transport` input. Set `https` while the registry's mediator does not admit
+  a CI run's throwaway DID.
 - It completes "Verify commit trust" as **success** or **failure** with a
   per-commit table. Anything that goes wrong fails the check (closed).
 - **Re-running.** "Re-run" on the check in GitHub (`check_run` /

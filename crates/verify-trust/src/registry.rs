@@ -10,29 +10,35 @@
 //! # Who asks, and why the answer can be believed
 //!
 //! Over the mediator bindings a query has to come *from* a DID, so the reply
-//! has somewhere to go. Two senders exist:
+//! has somewhere to go: **a fresh `did:peer:2` per run**
+//! ([`Registry::ephemeral`]). It is generated in memory when the first query
+//! is sent, carries a DIDComm service naming the registry's mediator so
+//! replies route back, and is never written anywhere: not to disk, not to a
+//! log, not to the environment. It identifies nothing and is trusted for
+//! nothing — it is a return address. The mediator accepts it only if it
+//! admits unknown DIDs; one that refuses it fails the query, and so the
+//! check, closed.
 //!
-//! - **A fresh `did:peer:2` per run** ([`Registry::ephemeral`]) — the CI
-//!   paths (the GitHub required and in-repo workflows, the Forgejo workflow,
-//!   a local run). It is generated in memory when the first query is sent,
-//!   carries a DIDComm service naming the registry's mediator so replies route
-//!   back, and is never written anywhere: not to disk, not to a log, not to
-//!   the environment. It identifies nothing and is trusted for nothing — it is
-//!   a return address. The mediator accepts it only if it admits unknown
-//!   senders (the registry's default access-list mode, `ExplicitDeny`); one
-//!   that refuses it fails the query, and so the check, closed.
-//! - **A caller-owned channel** ([`Registry::over_channel`]) — the bridge,
-//!   which already holds a stable, VTA-provisioned DID and a live session on
-//!   its mediator. The mediator permits one websocket per DID, so the bridge
-//!   lends its session rather than verify-trust opening a second one.
-//!
-//! Neither sender's identity is what makes the answer trustworthy. That rests
+//! The sender's identity is not what makes the answer trustworthy. That rests
 //! on the **registry's** key: a reply is accepted only when the binding
-//! authenticated it as the registry DID (DIDComm authcrypt whose sender key
-//! belongs to that DID and whose `from` names it; a TSP message whose
-//! verified sender VID is that DID). Anything else — a correlated reply from
-//! some other DID included — is ignored, and a query that never gets a proven
-//! answer times out as `registryUnavailable`, never as a pass.
+//! authenticated it as the registry DID and it answers the query sent.
+//!
+//! - **DIDComm:** the raw envelope must be authcrypt (`ECDH-1PU`) whose
+//!   protected header's `skid` is the registry's key *and* whose `apu` — the
+//!   party info the key agreement actually binds — names that same key
+//!   ([`authcrypt_sender_kid`]). The unpacked message must then report that
+//!   key as its sender, `from` must name the registry, and any signature on
+//!   it must be the registry's. The registry does not sign its replies today
+//!   (authcrypt is the proof of origin); a signature by anyone else refuses
+//!   the reply.
+//! - **TSP:** the sender VID the message's signature verified against must be
+//!   the registry DID.
+//!
+//! Each query goes out under a fresh random id (UUID v4 from the OS CSPRNG),
+//! whatever id the client chose, and a reply must carry that id as its
+//! thread. Anything else — a correlated reply from some other DID, a problem
+//! report nobody authenticated — is ignored, and a query that never gets a
+//! proven answer times out as `registryUnavailable`, never as a pass.
 //!
 //! Over HTTPS the answer carries no signature, as before: trust rests on
 //! reaching the endpoint the registry's DID document names (or the explicit
@@ -219,29 +225,6 @@ pub fn select_route(
     }
 }
 
-/// A channel to the registry owned by the caller, for [`Registry::over_channel`].
-///
-/// The bridge implements this over its existing mediator session, so its
-/// queries go out as its own DID on the socket it already holds.
-#[async_trait::async_trait]
-pub trait RegistryChannel: Send + Sync {
-    /// The binding this channel speaks.
-    fn kind(&self) -> TransportKind;
-
-    /// The DID queries are sent as. Stamped as the documents' `issuer`, which
-    /// the registry checks against the transport-authenticated sender.
-    fn sender_did(&self) -> &str;
-
-    /// Send the Trust Task `request` document to `recipient` and return the
-    /// reply document.
-    ///
-    /// **Contract:** return only a reply the transport authenticated as sent
-    /// by `recipient`. Everything above this — correlation, the tuple echo,
-    /// the verdict — assumes it. A wait must be finite: a registry that never
-    /// answers is a [`TrqlError::Timeout`].
-    async fn exchange(&self, recipient: &str, request: Value) -> Result<Value, TrqlError>;
-}
-
 /// How verify-trust queries the registry for one run: the client, and the
 /// session behind it when there is one.
 pub struct Registry {
@@ -271,14 +254,14 @@ impl Registry {
         })
     }
 
-    /// Query through a channel the caller owns (the bridge's session).
-    pub fn over_channel(channel: Arc<dyn RegistryChannel>, registry_did: &str) -> Self {
-        let kind = channel.kind();
-        let sender = channel.sender_did().to_string();
+    /// Query over an arbitrary transport — tests only. A real transport must
+    /// prove every reply came from the registry; this constructor cannot
+    /// check that it does.
+    #[doc(hidden)]
+    pub fn with_transport(transport: Arc<dyn TrqlTransport>, registry_did: &str) -> Self {
         Self {
-            client: TrqlClient::new(Arc::new(ChannelTransport(channel)), registry_did)
-                .with_client_did(sender),
-            kind,
+            kind: transport.kind(),
+            client: TrqlClient::new(transport, registry_did),
             #[cfg(any(feature = "didcomm", feature = "tsp"))]
             session: None,
         }
@@ -370,26 +353,72 @@ impl Registry {
     }
 }
 
-/// [`TrqlTransport`] over a [`RegistryChannel`], in JSON so the channel's
-/// owner needs no `trust-tasks-rs` of this line.
-struct ChannelTransport(Arc<dyn RegistryChannel>);
+/// Bind an authcrypt envelope's sender key id to the key agreement actually
+/// used, and return that key id.
+///
+/// A DIDComm authcrypt JWE names its sender twice in the protected header:
+/// `skid`, the key id a recipient looks up, and `apu`, the PartyUInfo the
+/// ECDH-1PU key agreement is computed over. Only `apu` is bound by the key
+/// agreement, so a key id is believed here only when both name the same key:
+/// `alg` is `ECDH-1PU…`, `skid` and `apu` are present, and
+/// `base64url(apu)` decodes to exactly `skid`. A sender naming either member
+/// outside the protected header (the `unprotected` or per-recipient header,
+/// where it would not be integrity-protected) is refused outright.
+///
+/// Anything else — anoncrypt, a plaintext or signed-only message, a header
+/// that does not parse — is not an authenticated sender and is an error.
+pub fn authcrypt_sender_kid(packed: &str) -> Result<String, String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-#[async_trait::async_trait]
-impl TrqlTransport for ChannelTransport {
-    fn kind(&self) -> TransportKind {
-        self.0.kind()
-    }
+    const SENDER_MEMBERS: [&str; 4] = ["alg", "skid", "apu", "epk"];
 
-    async fn exchange(&self, request: TrustTask<Value>) -> Result<TrustTask<Value>, TrqlError> {
-        let recipient = request.recipient.clone().ok_or_else(|| {
-            TrqlError::Config("request document has no recipient to route to".to_string())
+    let jwe: Value =
+        serde_json::from_str(packed).map_err(|e| format!("not a JSON-serialized JWE: {e}"))?;
+    let protected = jwe
+        .get("protected")
+        .and_then(Value::as_str)
+        .ok_or("not a JWE: no protected header")?;
+    let header: Value = URL_SAFE_NO_PAD
+        .decode(protected.trim_end_matches('='))
+        .map_err(|e| format!("protected header is not base64url: {e}"))
+        .and_then(|b| {
+            serde_json::from_slice(&b).map_err(|e| format!("protected header is not JSON: {e}"))
         })?;
-        let body = serde_json::to_value(&request)
-            .map_err(|e| TrqlError::Contract(format!("request did not serialize: {e}")))?;
-        let reply = self.0.exchange(&recipient, body).await?;
-        serde_json::from_value(reply)
-            .map_err(|e| TrqlError::Contract(format!("reply is not a Trust Task document: {e}")))
+    let unprotected = std::iter::once(jwe.get("unprotected")).chain(
+        jwe.get("recipients")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|r| r.get("header")),
+    );
+    for h in unprotected.flatten() {
+        if let Some(m) = SENDER_MEMBERS.iter().find(|m| h.get(**m).is_some()) {
+            return Err(format!("`{m}` appears outside the protected header"));
+        }
     }
+    let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
+    if !alg.starts_with("ECDH-1PU") {
+        return Err(format!("not authcrypt (alg {alg:?})"));
+    }
+    let skid = header
+        .get("skid")
+        .and_then(Value::as_str)
+        .ok_or("authcrypt without skid")?;
+    let apu = header
+        .get("apu")
+        .and_then(Value::as_str)
+        .ok_or("authcrypt without apu")?;
+    let apu = URL_SAFE_NO_PAD
+        .decode(apu.trim_end_matches('='))
+        .map_err(|e| format!("apu is not base64url: {e}"))?;
+    if apu != skid.as_bytes() {
+        return Err(format!(
+            "skid {skid} is not the key the key agreement names (apu {:?})",
+            String::from_utf8_lossy(&apu)
+        ));
+    }
+    Ok(skid.to_string())
 }
 
 /// The DID part of a DID URL (`did:x:y#key-1` → `did:x:y`).
@@ -462,6 +491,7 @@ mod mediated {
     #[cfg_attr(not(feature = "tsp"), allow(dead_code))]
     pub(crate) const TSP_ENVELOPE_TYPE: &str = "https://trusttasks.org/binding/tsp/0.1/envelope";
     /// DIDComm problem reports: how a mediator says it refused a message.
+    #[cfg(feature = "didcomm")]
     const PROBLEM_REPORT_TYPE: &str = "https://didcomm.org/report-problem/2.0/problem-report";
 
     /// Connecting to the mediator (resolve, authenticate, websocket).
@@ -662,9 +692,18 @@ mod mediated {
                 .profile_add(&profile, false)
                 .await
                 .map_err(|e| format!("messaging profile: {e}"))?;
-            match tokio::time::timeout(CONNECT_TIMEOUT, atm.profile_enable_websocket(&profile))
-                .await
-            {
+            // DIDComm frames are taken packed, so the envelope's sender
+            // binding can be checked before it is unpacked
+            // (`authcrypt_sender_kid`); TSP frames arrive packed either way.
+            let connect = async {
+                if self.kind == TransportKind::Didcomm {
+                    atm.profile_start_live_streaming(&profile, false, true)
+                        .await
+                } else {
+                    atm.profile_enable_websocket(&profile).await
+                }
+            };
+            match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(())) => Ok(profile),
                 Ok(Err(e)) => Err(format!(
                     "mediator {} did not accept this run's ephemeral DID — it must admit DIDs \
@@ -694,6 +733,11 @@ mod mediated {
         }
     }
 
+    /// A Trust Task id from the OS CSPRNG (UUID v4).
+    pub(crate) fn random_task_id() -> String {
+        format!("urn:uuid:{}", uuid::Uuid::new_v4())
+    }
+
     async fn close_session(shared: &TDKSharedState, session: Session) {
         let _ = session.atm.profile_remove(PROFILE_ALIAS).await;
         session.atm.graceful_shutdown().await;
@@ -708,7 +752,10 @@ mod mediated {
             self.kind
         }
 
-        async fn exchange(&self, request: TrustTask<Value>) -> Result<TrustTask<Value>, TrqlError> {
+        async fn exchange(
+            &self,
+            mut request: TrustTask<Value>,
+        ) -> Result<TrustTask<Value>, TrqlError> {
             // One exchange at a time: the session has one pickup stream, and
             // queries are sequential anyway.
             let mut state = self.state.lock().await;
@@ -737,6 +784,11 @@ mod mediated {
             let Some(session) = state.session.as_ref() else {
                 return Err(self.transport_error("no registry session"));
             };
+            // The client's id is not assumed unguessable (trql-client falls
+            // back to a clock-and-counter id in some builds). Every query goes
+            // out under a fresh random id, the reply must answer that id, and
+            // the client is handed back the correlation it expects.
+            let client_id = std::mem::replace(&mut request.id, random_task_id());
             let result = match self.kind {
                 #[cfg(feature = "didcomm")]
                 TransportKind::Didcomm => self.didcomm_exchange(session, request).await,
@@ -747,7 +799,10 @@ mod mediated {
             if let Err(e @ (TrqlError::Timeout { .. } | TrqlError::Transport { .. })) = &result {
                 state.failed = Some(format!("an earlier registry query failed: {e}"));
             }
-            result
+            result.map(|mut reply| {
+                reply.thread_id = Some(client_id);
+                reply
+            })
         }
     }
 
@@ -810,53 +865,110 @@ mod mediated {
                         waited_secs: self.reply_timeout.as_secs(),
                     });
                 }
-                let next = session
+                let packed = session
                     .atm
                     .message_pickup()
-                    .live_stream_next(&session.profile, Some(wait.min(POLL)), true)
+                    .live_stream_next_packed(&session.profile, Some(wait.min(POLL)), true)
                     .await
                     .map_err(|e| self.transport_error(format!("pickup: {e}")))?;
-                let Some((message, meta)) = next else {
+                let Some(packed) = packed else {
                     continue;
                 };
-                if message.typ == PROBLEM_REPORT_TYPE {
-                    return Err(self.transport_error(format!(
-                        "{} reported a problem: {}",
-                        message.from.as_deref().unwrap_or("the mediator"),
-                        problem_comment(&message.body)
-                    )));
-                }
-                if message.typ != DIDCOMM_ENVELOPE_TYPE {
-                    tracing::debug!(r#type = %message.typ, "ignoring a non-Trust-Task message");
-                    continue;
-                }
-                let document: TrustTask<Value> = match serde_json::from_value(message.body) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!("ignoring a malformed Trust Task envelope: {e}");
-                        continue;
+                match self.proven_didcomm(session, &packed).await {
+                    Ok(Proven::Reply(message)) => {
+                        let document: TrustTask<Value> = match serde_json::from_value(message.body)
+                        {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!("ignoring a malformed Trust Task envelope: {e}");
+                                continue;
+                            }
+                        };
+                        // The binding and the key agreement are checked; the
+                        // sender here is the proven registry key.
+                        match accept_reply(
+                            message.from.as_deref(),
+                            message.from.as_deref(),
+                            &self.registry_did,
+                            &document,
+                            &request_id,
+                        ) {
+                            Ok(()) => return Ok(document),
+                            Err(why) => tracing::warn!("ignoring a DIDComm reply: {why}"),
+                        }
                     }
-                };
-                let proven = meta
-                    .authenticated
-                    .then_some(meta.encrypted_from_kid.as_deref())
-                    .flatten()
-                    .filter(|_| !meta.anonymous_sender);
-                match accept_reply(
-                    proven,
-                    message.from.as_deref(),
-                    &self.registry_did,
-                    &document,
-                    &request_id,
-                ) {
-                    Ok(()) => return Ok(document),
-                    Err(why) => tracing::warn!("ignoring a DIDComm reply: {why}"),
+                    Ok(Proven::Refusal(detail)) => return Err(self.transport_error(detail)),
+                    Err(why) => tracing::warn!("ignoring a DIDComm message: {why}"),
                 }
             }
         }
+
+        /// Unpack `packed` only if its sender is proven to be the registry
+        /// (or, for a problem report, the registry's mediator), and classify
+        /// it. `Err`: not proven — ignore it; it must not end the query.
+        async fn proven_didcomm(&self, session: &Session, packed: &str) -> Result<Proven, String> {
+            let skid = authcrypt_sender_kid(packed)?;
+            let sender = did_of(&skid).to_string();
+            let from_registry = sender == self.registry_did;
+            if !from_registry && sender != self.mediator_did {
+                return Err(format!(
+                    "sent by {sender}, not the registry or its mediator"
+                ));
+            }
+            let (message, meta) = session
+                .atm
+                .unpack(packed)
+                .await
+                .map_err(|e| format!("did not unpack: {e}"))?;
+            if !meta.authenticated
+                || meta.anonymous_sender
+                || meta.encrypted_from_kid.as_deref() != Some(skid.as_str())
+            {
+                return Err(format!(
+                    "unpacked sender {:?} is not the bound key {skid}",
+                    meta.encrypted_from_kid
+                ));
+            }
+            if message.from.as_deref().map(did_of) != Some(sender.as_str()) {
+                return Err(format!(
+                    "`from` {:?} is not the authenticated sender {sender}",
+                    message.from
+                ));
+            }
+            // The registry does not sign its replies today; a signature by
+            // anyone but the sender, or one that did not verify, refuses it.
+            if !meta.unverified_signers.is_empty()
+                || meta.signers.iter().any(|kid| did_of(kid) != sender)
+            {
+                return Err(format!("signed by someone other than {sender}"));
+            }
+            if message.typ == PROBLEM_REPORT_TYPE {
+                return Ok(Proven::Refusal(format!(
+                    "{sender} reported a problem: {}",
+                    problem_comment(&message.body)
+                )));
+            }
+            if !from_registry {
+                return Err(format!("a {} from the mediator, not a reply", message.typ));
+            }
+            if message.typ != DIDCOMM_ENVELOPE_TYPE {
+                return Err(format!("not a Trust Task envelope ({})", message.typ));
+            }
+            Ok(Proven::Reply(Box::new(message)))
+        }
+    }
+
+    /// A DIDComm message whose sender was proven.
+    #[cfg(feature = "didcomm")]
+    enum Proven {
+        /// The registry's reply envelope.
+        Reply(Box<affinidi_tdk::didcomm::Message>),
+        /// A problem report from the registry or its mediator.
+        Refusal(String),
     }
 
     /// A problem report's human-readable `comment`, or the whole body.
+    #[cfg(feature = "didcomm")]
     fn problem_comment(body: &Value) -> String {
         body.get("comment")
             .and_then(Value::as_str)
@@ -916,8 +1028,7 @@ mod mediated {
         }
 
         /// The next TSP frame on the session, unpacked. `Ok(None)`: nothing
-        /// usable arrived this poll. A DIDComm problem report (the mediator
-        /// refusing something) fails.
+        /// usable arrived this poll.
         async fn next_tsp(
             &self,
             session: &Session,
@@ -949,13 +1060,9 @@ mod mediated {
                         }
                     }
                 }
-                Some(InboundFrame::DidComm(message, _)) if message.typ == PROBLEM_REPORT_TYPE => {
-                    Err(format!(
-                        "{} reported a problem: {}",
-                        message.from.as_deref().unwrap_or("the mediator"),
-                        problem_comment(&message.body)
-                    ))
-                }
+                // DIDComm frames on a TSP session (a mediator problem report,
+                // say) are not proven here, so they neither answer nor end the
+                // query: an unauthenticated "no" is ignored like any other.
                 _ => Ok(None),
             }
         }
@@ -1278,6 +1385,103 @@ mod tests {
     fn an_uncorrelated_reply_from_the_registry_is_refused() {
         let doc = reply_to("urn:uuid:other");
         assert!(accept_reply(Some(REGISTRY), None, REGISTRY, &doc, "urn:uuid:q").is_err());
+    }
+
+    // --- the authcrypt sender binding ---
+
+    fn jwe(header: serde_json::Value, extra: serde_json::Value) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut jwe = serde_json::json!({
+            "protected": URL_SAFE_NO_PAD.encode(header.to_string()),
+            "recipients": [{ "header": { "kid": "did:peer:2.Vx#key-2" }, "encrypted_key": "AA" }],
+            "iv": "AA", "ciphertext": "AA", "tag": "AA"
+        });
+        if let (Some(j), Some(e)) = (jwe.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                j.insert(k.clone(), v.clone());
+            }
+        }
+        jwe.to_string()
+    }
+
+    fn b64(s: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
+    }
+
+    const REG_KEY: &str = "did:webvh:QmRegistryScid:registry.example#key-2";
+    const MALLORY_KEY: &str = "did:peer:2.VzMallory#key-2";
+
+    #[test]
+    fn an_authcrypt_whose_apu_names_its_skid_is_bound() {
+        let packed = jwe(
+            serde_json::json!({ "alg": "ECDH-1PU+A256KW", "skid": REG_KEY, "apu": b64(REG_KEY) }),
+            serde_json::json!({}),
+        );
+        assert_eq!(authcrypt_sender_kid(&packed).unwrap(), REG_KEY);
+    }
+
+    #[test]
+    fn a_skid_the_key_agreement_does_not_name_is_refused() {
+        // Both directions of the mismatch: the key id looked up is not the
+        // one the key agreement was computed over.
+        for (skid, apu) in [(MALLORY_KEY, REG_KEY), (REG_KEY, MALLORY_KEY)] {
+            let packed = jwe(
+                serde_json::json!({ "alg": "ECDH-1PU+A256KW", "skid": skid, "apu": b64(apu) }),
+                serde_json::json!({}),
+            );
+            let e = authcrypt_sender_kid(&packed).unwrap_err();
+            assert!(e.contains("is not the key the key agreement names"), "{e}");
+        }
+    }
+
+    #[test]
+    fn anything_but_a_complete_authcrypt_header_is_refused() {
+        for header in [
+            serde_json::json!({ "alg": "ECDH-1PU+A256KW", "skid": REG_KEY }),
+            serde_json::json!({ "alg": "ECDH-1PU+A256KW", "apu": b64(REG_KEY) }),
+            serde_json::json!({ "alg": "ECDH-ES+A256KW", "skid": REG_KEY, "apu": b64(REG_KEY) }),
+            serde_json::json!({ "skid": REG_KEY, "apu": b64(REG_KEY) }),
+        ] {
+            assert!(
+                authcrypt_sender_kid(&jwe(header.clone(), serde_json::json!({}))).is_err(),
+                "{header}"
+            );
+        }
+        assert!(
+            authcrypt_sender_kid("{\"payload\":\"x\"}").is_err(),
+            "a JWS is not authcrypt"
+        );
+        assert!(authcrypt_sender_kid("not json").is_err());
+    }
+
+    #[test]
+    fn sender_members_outside_the_protected_header_are_refused() {
+        let good =
+            serde_json::json!({ "alg": "ECDH-1PU+A256KW", "skid": REG_KEY, "apu": b64(REG_KEY) });
+        let e = authcrypt_sender_kid(&jwe(
+            good.clone(),
+            serde_json::json!({ "unprotected": { "skid": MALLORY_KEY } }),
+        ))
+        .unwrap_err();
+        assert!(e.contains("outside the protected header"), "{e}");
+        let e = authcrypt_sender_kid(&jwe(
+            good,
+            serde_json::json!({ "recipients": [{ "header": { "kid": "x", "apu": b64(MALLORY_KEY) } }] }),
+        ))
+        .unwrap_err();
+        assert!(e.contains("outside the protected header"), "{e}");
+    }
+
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    #[test]
+    fn query_ids_are_random_uuid_v4() {
+        let a = mediated::random_task_id();
+        let b = mediated::random_task_id();
+        assert_ne!(a, b);
+        let uuid = uuid::Uuid::parse_str(a.strip_prefix("urn:uuid:").unwrap()).unwrap();
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
     }
 
     // --- the run identity ---
