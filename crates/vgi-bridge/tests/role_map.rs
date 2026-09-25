@@ -531,3 +531,85 @@ async fn forgejo_reports_its_ladder_and_a_changed_map_makes_repositories_stale()
         })
     );
 }
+
+/// Role-map reports taken off the inbox until it is quiet, and the count of
+/// everything else.
+async fn drain(w: &mut World) -> (Vec<Value>, usize) {
+    let (mut maps, mut other) = (Vec::new(), 0);
+    while let Ok(Some((_, doc))) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), w.inbox.recv()).await
+    {
+        if doc["payload"]["event"]["type"] == "roleMapReported" {
+            maps.push(doc);
+        } else {
+            other += 1;
+        }
+    }
+    (maps, other)
+}
+
+#[tokio::test]
+async fn a_link_that_comes_back_reports_the_role_map_once_per_namespace() {
+    use std::sync::atomic::Ordering;
+    let mut w = world(Options::default()).await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+
+    // The link drops: a result goes unsent, and nothing is flagged yet.
+    w.link_down.store(true, Ordering::Release);
+    mount_empty_repo(&w.server, "widgets").await;
+    w.send_job_0_2(json!({
+        "jobId": "job_down", "namespace": NS, "kind": "projectRoles",
+        "repo": "github.com/acme/widgets", "desiredRoles": [],
+    }))
+    .await;
+    // Give the job time to finish and its result to fail to send.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The link comes back by itself: the first send that succeeds (the
+    // outbox's retry) is the link-up.
+    w.link_down.store(false, Ordering::Release);
+    w.bridge.resend_unacknowledged(true).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), w.bridge.link_recovered())
+        .await
+        .expect("a send succeeding after failures raises a link-up");
+    w.bridge.link_up().await;
+    let (maps, _) = drain(&mut w).await;
+    assert_eq!(maps.len(), 1, "one report per namespace per link-up");
+    assert_eq!(maps[0]["payload"]["namespace"], NS);
+
+    // A link-up the transport signalled (a new mediator session) reports
+    // once, and its own sends do not count as a second one.
+    w.bridge.link_up().await;
+    let (maps, _) = drain(&mut w).await;
+    assert_eq!(maps.len(), 1);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            w.bridge.link_recovered()
+        )
+        .await
+        .is_err(),
+        "no second link-up"
+    );
+    // One outbox entry for the report, whatever was sent.
+    let reports = w
+        .bridge
+        .store()
+        .list::<OutboxEntry>(Table::Outbox)
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(vgi_bridge::rolemap::OUTBOX_PREFIX))
+        .count();
+    assert_eq!(reports, 1);
+}
+
+#[tokio::test]
+async fn a_namespace_the_bridge_starts_serving_is_reported() {
+    let mut w = world(Options::default()).await;
+    w.bridge.started_serving(NS).await;
+    let (maps, other) = drain(&mut w).await;
+    assert_eq!((maps.len(), other), (1, 0));
+    // A namespace that is not bound (or unknown) is not reported.
+    w.bridge.started_serving("ns_unknown").await;
+    w.quiet().await;
+}

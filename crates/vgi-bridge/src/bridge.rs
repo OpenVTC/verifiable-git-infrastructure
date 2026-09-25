@@ -102,6 +102,12 @@ pub struct Bridge {
     pub(crate) link: Arc<dyn VtcLink>,
     pub(crate) checker: DocChecker,
     ns_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The last send to the VTC failed: the link is down as far as the
+    /// bridge can tell. The next send that succeeds is a link-up.
+    link_down: std::sync::atomic::AtomicBool,
+    /// Raised by a send that succeeded after sends failed, for
+    /// [`Bridge::background`] to run [`Bridge::link_up`].
+    pub(crate) link_recovered: tokio::sync::Notify,
     #[cfg(feature = "forge-github")]
     pub(crate) checks: crate::checks::CheckRunner,
     #[cfg(feature = "forge-github")]
@@ -166,6 +172,8 @@ impl Bridge {
             link: parts.link,
             checker,
             ns_locks: Mutex::new(BTreeMap::new()),
+            link_down: std::sync::atomic::AtomicBool::new(false),
+            link_recovered: tokio::sync::Notify::new(),
             #[cfg(feature = "forge-github")]
             checks,
             #[cfg(feature = "forge-github")]
@@ -226,11 +234,11 @@ impl Bridge {
             }
         }
         crate::flows::resume_device_polls(self)?;
-        self.resend_unacknowledged(true).await;
-        // After resending, so the fresh report is sent once and is the last
-        // the VTC reads: it replaces, under the same outbox key, any report
-        // from the last run still unacknowledged.
-        self.report_role_maps().await;
+        // As at any link-up: everything unacknowledged, then a fresh
+        // role-map report per bound namespace (the configuration is the one
+        // thing a restart can change), replacing any report from the last
+        // run still unacknowledged under the same outbox key.
+        self.link_up().await;
         Ok(())
     }
 
@@ -354,7 +362,7 @@ impl Bridge {
     async fn send_error(&self, request: &TrustTask<Value>, payload: ErrorPayload) {
         match wire::signed_error(&self.identity, request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     tracing::warn!(error = %e, "could not send an error response");
                 }
             }
@@ -365,7 +373,7 @@ impl Bridge {
     async fn respond(&self, request: &TrustTask<Value>, payload: Value) {
         match wire::signed_response(&self.identity, request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     // The VTC repeats a job it got no answer to; the ledger
                     // answers the repeat.
                     tracing::warn!(error = %e, "could not send a job response");
@@ -828,20 +836,64 @@ impl Bridge {
                     (),
                 ))
             });
-        if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+        if let Err(e) = self.send_doc(&doc).await {
             tracing::warn!(key, error = %e, "send failed; the outbox will retry");
         }
+    }
+
+    /// Send `doc` to the VTC, noting whether the link works: a send that
+    /// succeeds after one failed is a link-up the transport did not signal
+    /// (a mediator or session that came back by itself), and raises
+    /// [`Bridge::link_up`] for the background loop.
+    async fn send_doc(&self, doc: &Value) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        match self.link.send(&self.cfg.vtc_did, doc).await {
+            Ok(()) => {
+                if self.link_down.swap(false, Ordering::AcqRel) {
+                    tracing::info!("the link to the VTC works again");
+                    self.link_recovered.notify_one();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.link_down.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// The link to the VTC is up — a new mediator session, or sends
+    /// succeeding again after they failed: send everything unacknowledged,
+    /// then report every bound namespace's role map afresh
+    /// (`git-ns/bridge/event` 0.3: the VTC's view must be no older than the
+    /// link it holds). One report per namespace per link-up: an
+    /// unacknowledged report is not resent first, since the fresh one
+    /// replaces it under the same outbox key; and a link-up the transport
+    /// signalled clears the down flag first, so the first successful send
+    /// does not count as a second one.
+    pub async fn link_up(&self) {
+        self.link_down
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.resend_matching(true, |key| !key.starts_with(crate::rolemap::OUTBOX_PREFIX))
+            .await;
+        self.report_role_maps().await;
     }
 
     /// Send every unacknowledged result and event that is due (all of them
     /// when `all`). Backs off per entry: the resend interval doubled per
     /// attempt, capped at an hour.
     pub async fn resend_unacknowledged(&self, all: bool) {
+        self.resend_matching(all, |_| true).await;
+    }
+
+    /// [`Self::resend_unacknowledged`], for the entries whose key `pick`
+    /// accepts.
+    async fn resend_matching(&self, all: bool, pick: impl Fn(&str) -> bool) {
         let Ok(entries) = self.store.list::<OutboxEntry>(Table::Outbox) else {
             return;
         };
         let now = now();
-        for (key, e) in entries {
+        for (key, e) in entries.into_iter().filter(|(k, _)| pick(k)) {
             let backoff = (self.cfg.resend_secs as i64)
                 .saturating_mul(1_i64 << e.attempts.min(6))
                 .min(3600);
@@ -928,6 +980,7 @@ impl Bridge {
                 _ = expiry_tick.tick() => crate::flows::expire(&self).await,
                 _ = sweep_tick.tick() => crate::jobs::sweep_without_webhooks(&self).await,
                 _ = maint_tick.tick() => self.maintenance().await,
+                _ = self.link_recovered.notified() => self.link_up().await,
                 _ = shutdown.changed() => return,
             }
         }

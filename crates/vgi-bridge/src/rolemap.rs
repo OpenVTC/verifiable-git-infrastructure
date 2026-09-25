@@ -16,9 +16,13 @@
 //!   under a map other than the one the bridge now applies to it, which the
 //!   VTC re-projects.
 //!
-//! It is sent for every bound namespace at start-up (the only time the
-//! configuration can change) and when a binding completes, under one outbox
-//! key per namespace so a newer report replaces an unacknowledged one. There
+//! It is sent for a namespace whenever the bridge starts serving it — at
+//! start-up (the only time the configuration, and so the map, can change)
+//! and when a binding completes ([`Bridge::started_serving`]) — and for every
+//! bound namespace whenever the link to the VTC comes up
+//! ([`Bridge::link_up`]: a new mediator session, or sends succeeding again
+//! after they failed). One outbox key per namespace, so a newer report
+//! replaces an unacknowledged one. There
 //! is still no entry for `git.ns.admin`: a namespace admin gets no forge
 //! role whatever the map says.
 
@@ -32,9 +36,12 @@ use crate::bridge::Bridge;
 use crate::jobs::Ctx;
 use crate::store::{NamespaceRecord, NamespaceState, RepoRecord, Table};
 
+/// The outbox key prefix of role-map reports.
+pub const OUTBOX_PREFIX: &str = "event:roleMap:";
+
 /// The outbox key of namespace `ns_id`'s role-map report.
 pub fn outbox_key(ns_id: &str) -> String {
-    format!("event:roleMap:{ns_id}")
+    format!("{OUTBOX_PREFIX}{ns_id}")
 }
 
 /// `map` as `forge` applies it in `ns`: each tier's role rounded onto the
@@ -132,7 +139,23 @@ impl Bridge {
         }
     }
 
-    /// Report the role map of every bound namespace (at start-up).
+    /// Namespace `ns_id` became this bridge's to serve — its binding
+    /// completed, or it was handed to this bridge: report its role map, so
+    /// the VTC does not go on assuming the default (or another bridge's).
+    /// A namespace the bridge serves from a restored store is covered by
+    /// the report [`Bridge::restore`] sends for every bound namespace.
+    pub async fn started_serving(&self, ns_id: &str) {
+        self.report_role_map(ns_id).await;
+    }
+
+    /// Resolves once a send has succeeded after sends failed — the link-up
+    /// [`Bridge::background`] answers with [`Bridge::link_up`]. For tests
+    /// and supervisors that run their own loop.
+    pub async fn link_recovered(&self) {
+        self.link_recovered.notified().await;
+    }
+
+    /// Report the role map of every bound namespace (at each link-up).
     pub async fn report_role_maps(&self) {
         let Ok(all) = self.store.list::<NamespaceRecord>(Table::Namespaces) else {
             return;

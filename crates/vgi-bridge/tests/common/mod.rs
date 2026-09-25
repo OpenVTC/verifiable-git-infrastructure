@@ -130,6 +130,25 @@ pub struct World {
     pub pending: std::collections::VecDeque<Value>,
     /// The start-up role-map reports [`World::settled`] acknowledged.
     pub startup_reports: Vec<Value>,
+    /// While set, every send to the VTC fails (the link is down).
+    pub link_down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A [`ChannelLink`] that can be cut: while `down` is set every send fails,
+/// as a lost mediator session does.
+pub struct CuttableLink {
+    pub inner: ChannelLink,
+    pub down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl vgi_bridge::transport::VtcLink for CuttableLink {
+    async fn send(&self, to: &str, doc: &Value) -> anyhow::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("not connected to the mediator");
+        }
+        self.inner.send(to, doc).await
+    }
 }
 
 pub struct Options {
@@ -387,6 +406,11 @@ pub async fn world(o: Options) -> World {
     };
     let adapters = vgi_bridge::build_adapters(&cfg, &store).await.unwrap();
     let (link, inbox) = ChannelLink::new();
+    let link_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let link = CuttableLink {
+        inner: link,
+        down: link_down.clone(),
+    };
     let verifier = Arc::new(FakeVerifier {
         trusted: o.trusted.clone(),
         seen: Default::default(),
@@ -416,6 +440,7 @@ pub async fn world(o: Options) -> World {
         verifier,
         pending: Default::default(),
         startup_reports: Vec::new(),
+        link_down,
     }
     .settled()
     .await
@@ -801,6 +826,7 @@ oauth_client_id = "cid"
         }),
         pending: Default::default(),
         startup_reports: Vec::new(),
+        link_down: Default::default(),
     }
     .settled()
     .await

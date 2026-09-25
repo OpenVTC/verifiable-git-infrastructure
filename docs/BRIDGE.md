@@ -612,8 +612,19 @@ repository's owner or maintainer gets that repository right's role.
 **When a change applies.** The bridge maps rights to roles when a
 `projectRoles` or `createRepo` job arrives; it keeps no desired rights of
 its own, so it cannot re-map a repository by itself. Instead it tells the
-VTC (`git-ns/bridge/event` 0.3, `roleMapReported`), at every start and
-right after a namespace's binding completes:
+VTC (`git-ns/bridge/event` 0.3, `roleMapReported`), one report per
+namespace:
+
+- whenever it **starts serving** a namespace: at every start (the only time
+  its configuration, and so its map, can change), and right after a
+  namespace's binding completes;
+- whenever its **link to the VTC comes up**: each new mediator session, and
+  the first send that succeeds after sends had failed (a session that came
+  back by itself). Unacknowledged results and events go out first; the
+  report is sent once per link-up, and a newer report replaces an
+  unacknowledged older one rather than queueing behind it.
+
+Each report carries:
 
 - `roleMap` — the map it applies in the namespace, **as the forge applies
   it**: each right's configured role rounded down onto the namespace's

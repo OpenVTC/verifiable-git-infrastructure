@@ -163,8 +163,9 @@ pub async fn run(cfg: BridgeConfig, key: seal::MasterKey) -> Result<()> {
                         link.set(Some(conn.clone())).await;
                         tracing::info!("connected to the mediator");
                         let started = std::time::Instant::now();
-                        // Anything queued while disconnected goes out now.
-                        bridge.resend_unacknowledged(true).await;
+                        // Anything queued while disconnected goes out now,
+                        // and the role maps are reported afresh.
+                        bridge.link_up().await;
                         loop {
                             tokio::select! {
                                 next = inbound.next() => match next {

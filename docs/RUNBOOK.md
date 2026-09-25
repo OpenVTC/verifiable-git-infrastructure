@@ -927,7 +927,9 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
 - **A role-map change reaches the forge by re-projection.** After you change
   `role_map` and restart the bridge, it reports its map to the VTC
   (`git-ns/bridge/event` 0.3) with the repositories projected under the old
-  one, and the VTC re-projects those by itself; the console shows the map
+  one — and again at every reconnection to the VTC and whenever it starts
+  serving a newly bound namespace, so the VTC's copy is never older than
+  its link — and the VTC re-projects those by itself; the console shows the map
   each right projects to. On a bridge set to `event_version = "0.2"`, or to
   force it anyway, re-project by hand:
   `cnm git reproject --resource github.com/acme` (a namespace) or
