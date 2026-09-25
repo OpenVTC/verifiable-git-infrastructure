@@ -404,7 +404,9 @@ pub(crate) fn check_check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_runs_on(label: &str) -> Result<()> {
+/// Check a runner label (`runs-on:`) before it goes into a workflow: one
+/// label of letters, digits, `-`, `_` or `.`, at most 100 bytes.
+pub fn check_runs_on(label: &str) -> Result<()> {
     let ok = !label.is_empty()
         && label.len() <= 100
         && label

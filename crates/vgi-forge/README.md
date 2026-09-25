@@ -35,7 +35,11 @@ Forgejo, …) where that is enforced.
 - **`EffectiveRights` / `RoleMap` / `collapse_to_ladder`** — the five git
   rights with implication (`own ⇒ maintain ⇒ commit`, `ns.admin ⇒ create +
   own`), and their projection onto a forge's roles. Roles round *down* onto a
-  forge's ladder: fewer levels means less access, never more.
+  forge's ladder: fewer levels means less access, never more. Implication
+  decides what a person may do, not their forge role: `ns.admin` never
+  projects (`EffectiveRights::forge_tier`), and `RoleMap` has no entry for
+  it. A `RoleMap` is always ordered (`own ≥ maintain ≥ commit`, `commit ≤
+  write`).
 - **Bootstrap plans, `ForgeEvent`, `Drift`** — check-then-apply steps with
   `run_plan` (which stops at the first failure, so protection is never enabled
   ahead of the workflow it requires), neutral webhook events, and drift

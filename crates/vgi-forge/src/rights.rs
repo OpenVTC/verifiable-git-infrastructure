@@ -76,12 +76,29 @@ impl fmt::Display for Right {
 /// `ns.admin ⇒ create` plus `own` on every repository in the namespace. The
 /// VTC evaluates this before projecting; it is repeated here so an adapter
 /// handed a partial set (say, `own` alone) still maps it correctly.
+///
+/// **Implication decides what a person may do, not which forge role they
+/// get.** A namespace admin gets no role on the forge (decided 2026-09-25):
+/// `git.ns.admin` is exercised through the VTC and the bridge, never as an
+/// organisation owner or a repository role. So the rights `ns.admin` implies
+/// are [held](EffectiveRights::holds) but never
+/// [projected](EffectiveRights::forge_tier); only a repository right granted
+/// in its own name (`own`, `maintain`, `commit.sign`) reaches a forge role.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct EffectiveRights(u8);
+pub struct EffectiveRights {
+    /// Every right held, directly or by implication.
+    held: u8,
+    /// The rights that may become a forge role: the closure of the
+    /// repository rights granted, without what `ns.admin` implies.
+    projectable: u8,
+}
 
 impl EffectiveRights {
     /// No rights at all.
-    pub const NONE: EffectiveRights = EffectiveRights(0);
+    pub const NONE: EffectiveRights = EffectiveRights {
+        held: 0,
+        projectable: 0,
+    };
 
     /// The closure of `granted` under implication.
     pub fn from_granted(granted: impl IntoIterator<Item = Right>) -> Self {
@@ -94,26 +111,37 @@ impl EffectiveRights {
 
     /// Add a right and everything it implies.
     pub fn insert(&mut self, right: Right) {
-        self.0 |= right.bit();
+        let closure = Self::closure(right);
+        self.held |= closure;
         match right {
-            Right::NsAdmin => {
-                self.insert(Right::RepoCreate);
-                self.insert(Right::RepoOwn);
+            // Namespace rights never project: `ns.admin`'s implied `own`
+            // lets its holder act through the VTC, not on the forge.
+            Right::NsAdmin | Right::RepoCreate => {}
+            Right::RepoOwn | Right::RepoMaintain | Right::CommitSign => {
+                self.projectable |= closure;
             }
-            Right::RepoOwn => self.insert(Right::RepoMaintain),
-            Right::RepoMaintain => self.insert(Right::CommitSign),
-            Right::RepoCreate | Right::CommitSign => {}
         }
+    }
+
+    /// `right` and everything it implies, as bits.
+    fn closure(right: Right) -> u8 {
+        right.bit()
+            | match right {
+                Right::NsAdmin => Self::closure(Right::RepoCreate) | Self::closure(Right::RepoOwn),
+                Right::RepoOwn => Self::closure(Right::RepoMaintain),
+                Right::RepoMaintain => Self::closure(Right::CommitSign),
+                Right::RepoCreate | Right::CommitSign => 0,
+            }
     }
 
     /// Whether `right` is held (directly or by implication).
     pub fn holds(self, right: Right) -> bool {
-        self.0 & right.bit() != 0
+        self.held & right.bit() != 0
     }
 
     /// Whether nothing is held.
     pub fn is_empty(self) -> bool {
-        self.0 == 0
+        self.held == 0
     }
 
     /// Held rights, broadest first.
@@ -121,12 +149,26 @@ impl EffectiveRights {
         Right::ALL.into_iter().filter(move |r| self.holds(*r))
     }
 
-    /// The repository-level tier that decides the forge role: own, then
-    /// maintain, then commit. `None` when none of those is held.
+    /// The repository-level tier held, by any route (including `ns.admin`'s
+    /// implied `own`): own, then maintain, then commit. `None` when none of
+    /// those is held. For authorisation; the forge role comes from
+    /// [`EffectiveRights::forge_tier`].
     pub fn repo_tier(self) -> Option<Right> {
+        Self::tier(self.held)
+    }
+
+    /// The repository-level tier that decides the forge role: own, then
+    /// maintain, then commit, from repository rights granted in their own
+    /// name. `ns.admin` alone gives `None` — a namespace admin gets no forge
+    /// role.
+    pub fn forge_tier(self) -> Option<Right> {
+        Self::tier(self.projectable)
+    }
+
+    fn tier(bits: u8) -> Option<Right> {
         [Right::RepoOwn, Right::RepoMaintain, Right::CommitSign]
             .into_iter()
-            .find(|r| self.holds(*r))
+            .find(|r| bits & r.bit() != 0)
     }
 }
 
@@ -185,11 +227,21 @@ impl fmt::Display for ForgeRole {
 /// Which forge role each repository tier asks for, before the forge's ladder
 /// is applied (§4.2's "GitHub projection (org)" column is the default).
 ///
-/// This is the community hook of §5.8 layer 3: a namespace may override the
-/// map (`maintain → admin` on Forgejo, or committers get `write` on a repo
-/// that opts in) without code.
+/// This is the community hook of §5.8 layer 3: a bridge, a namespace or a
+/// repository may override the map (`maintain → admin` on Forgejo instead of
+/// `write` plus the merge allow-list, or committers get `write` on a
+/// repository that opts in to branch-based contribution) without code.
+///
+/// **There is no entry for `git.ns.admin`, by design** (decided 2026-09-25):
+/// a namespace admin gets no forge role, so no map can give them one. An
+/// `nsAdmin` key is refused when a map is read.
+///
+/// A map is always ordered — `own ≥ maintain ≥ commit` — and a committer
+/// gets at most `write`: the check, not the forge role, decides whose
+/// commits land, and a committer with merge rights would be a maintainer.
+/// [`RoleMap::new`] and deserialisation both enforce this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "RawRoleMap")]
 #[non_exhaustive]
 pub struct RoleMap {
     /// Role for `git.repo.own`.
@@ -200,6 +252,22 @@ pub struct RoleMap {
     /// through fork PRs, and the required check — not a forge role — decides
     /// whether their commits land.
     pub commit: ForgeRole,
+}
+
+/// The unchecked wire form of [`RoleMap`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawRoleMap {
+    own: ForgeRole,
+    maintain: ForgeRole,
+    commit: ForgeRole,
+}
+
+impl TryFrom<RawRoleMap> for RoleMap {
+    type Error = String;
+    fn try_from(r: RawRoleMap) -> Result<Self, String> {
+        RoleMap::new(r.own, r.maintain, r.commit)
+    }
 }
 
 impl Default for RoleMap {
@@ -213,6 +281,36 @@ impl Default for RoleMap {
 }
 
 impl RoleMap {
+    /// The highest role a committer may be given.
+    pub const MAX_COMMIT: ForgeRole = ForgeRole::Write;
+
+    /// A map giving `own`, `maintain` and `commit` to the three tiers.
+    /// Refused unless `own ≥ maintain ≥ commit` and `commit ≤ write`.
+    pub fn new(own: ForgeRole, maintain: ForgeRole, commit: ForgeRole) -> Result<Self, String> {
+        if maintain > own {
+            return Err(format!(
+                "a maintainer (`{maintain}`) may not get more than an owner (`{own}`)"
+            ));
+        }
+        if commit > maintain {
+            return Err(format!(
+                "a committer (`{commit}`) may not get more than a maintainer (`{maintain}`)"
+            ));
+        }
+        if commit > Self::MAX_COMMIT {
+            return Err(format!(
+                "a committer may get at most `{}`, not `{commit}`: the check decides whose \
+                 commits land, and merging is a maintainer's",
+                Self::MAX_COMMIT
+            ));
+        }
+        Ok(RoleMap {
+            own,
+            maintain,
+            commit,
+        })
+    }
+
     /// The default map with committers given `write` — for a repository that
     /// opts in to branch-based contribution.
     pub fn with_committer_write() -> Self {
@@ -222,9 +320,12 @@ impl RoleMap {
         }
     }
 
-    /// The role the rights ask for, before any ladder is applied.
+    /// The role the rights ask for, before any ladder is applied. Only
+    /// repository rights granted in their own name count
+    /// ([`EffectiveRights::forge_tier`]): `ns.admin` alone asks for
+    /// [`ForgeRole::None`].
     pub fn requested(&self, rights: EffectiveRights) -> ForgeRole {
-        match rights.repo_tier() {
+        match rights.forge_tier() {
             Some(Right::RepoOwn) => self.own,
             Some(Right::RepoMaintain) => self.maintain,
             Some(Right::CommitSign) => self.commit,
@@ -260,6 +361,8 @@ mod tests {
 
         let admin = EffectiveRights::from_granted([Right::NsAdmin]);
         assert_eq!(admin.iter().count(), 5);
+        assert_eq!(admin.repo_tier(), Some(Right::RepoOwn));
+        assert_eq!(admin.forge_tier(), None, "ns.admin never projects");
 
         let commit = EffectiveRights::from_granted([Right::CommitSign]);
         assert_eq!(commit.iter().collect::<Vec<_>>(), vec![Right::CommitSign]);
@@ -284,7 +387,8 @@ mod tests {
     fn default_map_matches_the_org_projection() {
         let map = RoleMap::default();
         let r = |x| EffectiveRights::from_granted([x]);
-        assert_eq!(map.requested(r(Right::NsAdmin)), ForgeRole::Admin);
+        assert_eq!(map.requested(r(Right::NsAdmin)), ForgeRole::None);
+        assert_eq!(map.requested(r(Right::RepoCreate)), ForgeRole::None);
         assert_eq!(map.requested(r(Right::RepoOwn)), ForgeRole::Admin);
         assert_eq!(map.requested(r(Right::RepoMaintain)), ForgeRole::Maintain);
         assert_eq!(map.requested(r(Right::CommitSign)), ForgeRole::None);
@@ -293,6 +397,45 @@ mod tests {
             ForgeRole::Write
         );
         assert_eq!(map.requested(EffectiveRights::NONE), ForgeRole::None);
+    }
+
+    #[test]
+    fn a_namespace_admin_gets_no_forge_role_under_any_map() {
+        let admin = EffectiveRights::from_granted([Right::NsAdmin]);
+        let everything =
+            RoleMap::new(ForgeRole::Admin, ForgeRole::Admin, ForgeRole::Write).unwrap();
+        for map in [
+            RoleMap::default(),
+            RoleMap::with_committer_write(),
+            everything,
+        ] {
+            assert_eq!(map.requested(admin), ForgeRole::None);
+        }
+        // A repository right granted in its own name still projects, whatever
+        // the holder also has on the namespace.
+        let both = EffectiveRights::from_granted([Right::NsAdmin, Right::RepoMaintain]);
+        assert!(both.holds(Right::RepoOwn));
+        assert_eq!(RoleMap::default().requested(both), ForgeRole::Maintain);
+    }
+
+    #[test]
+    fn a_role_map_is_ordered_and_committers_stop_at_write() {
+        use ForgeRole::*;
+        assert!(RoleMap::new(Admin, Admin, None).is_ok());
+        assert!(RoleMap::new(Admin, Write, Write).is_ok());
+        assert!(RoleMap::new(Maintain, Admin, None).is_err());
+        assert!(RoleMap::new(Admin, Write, Maintain).is_err());
+        assert!(RoleMap::new(Admin, Admin, Admin).is_err());
+        let ok: RoleMap =
+            serde_json::from_str(r#"{"own":"admin","maintain":"admin","commit":"write"}"#).unwrap();
+        assert_eq!(ok.maintain, Admin);
+        for bad in [
+            r#"{"own":"write","maintain":"admin","commit":"none"}"#,
+            r#"{"own":"admin","maintain":"admin","commit":"admin"}"#,
+            r#"{"own":"admin","maintain":"maintain","commit":"none","nsAdmin":"admin"}"#,
+        ] {
+            assert!(serde_json::from_str::<RoleMap>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

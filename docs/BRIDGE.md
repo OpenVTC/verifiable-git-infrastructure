@@ -212,6 +212,24 @@ The bind (an org owner signing in through the OAuth app) adds the bot to a
 `vgi-bridge` team and creates the org webhook to
 `/forgejo/<host>/webhook`, signed with the webhook secret.
 
+**The runner label.** The workflow the bootstrap writes
+(`.forgejo/workflows/verify-trust.yml`) asks for `runs-on: docker` unless the
+`[[forgejo]]` entry names another label — whatever the instance's runners
+register:
+
+```toml
+[[forgejo]]
+base_url = "https://git.example.org/"
+# …
+runs_on = "ubuntu-24.04"   # default "docker"; letters, digits, `-`, `_`, `.`
+```
+
+The job image needs glibc 2.39+ (Ubuntu 24.04, Debian 13) for the
+verify-trust Linux binary. A bad label fails the start. A change applies to
+new bootstraps; a repository bootstrapped under the old label keeps it until
+its bootstrap runs again, which rewrites the protected workflow through the
+audited `refresh-managed-files` step (RUNBOOK §4a).
+
 **Token rotation**, when `rotate_token_days` is set and the password is
 stored, runs in two phases: mint a new token (verified to be the bot's), seal
 it, and only then delete the old one. A crash in between leaves an extra live
@@ -472,6 +490,70 @@ The fallback needs no new verify-trust release: every release that knows
 outside the repository's namespace is in the release after this change;
 pinning an older one loses only that defence in depth, since the value the
 workflows pass can only name the running repository's own owner.
+
+## 6c. Roles: the role map
+
+Each repository right becomes one forge role for a person with a linked
+account (design §4.2, §5.8 "community hooks"). The default is the design's:
+
+| Right | Default role | GitHub organisation | Forgejo | GitHub personal account |
+|---|---|---|---|---|
+| `git.repo.own` | `admin` | `admin` | `admin` collaborator | `write` (the only role) |
+| `git.repo.maintain` | `maintain` | `maintain` | `write` **and** a place on the default branch's merge allow-list | `write` |
+| `git.commit.sign` | `none` | none — fork pull requests | none | none |
+| `git.ns.admin` | **none, always** | — | — | — |
+
+A forge without a level rounds it **down**, never up. The map can be
+overridden, field by field, at four levels; the most specific wins:
+
+```toml
+# Every forge this bridge serves.
+[role_map]
+# own = "admin"
+# maintain = "maintain"
+# commit = "none"
+
+[[forgejo]]
+base_url = "https://codeberg.org/"
+# …
+# Every namespace on this instance: maintainers as repository admins
+# instead of `write` plus the merge allow-list.
+[forgejo.role_map]
+maintain = "admin"
+
+# One namespace (the owner's login, lowercase).
+[forgejo.namespaces.acme.role_map]
+maintain = "maintain"
+
+# One repository (its name, lowercase): committers push branches here.
+[forgejo.namespaces.acme.repos.widgets.role_map]
+commit = "write"
+```
+
+`[github.role_map]`, `[github.namespaces.<owner>.role_map]` and
+`[github.namespaces.<owner>.repos.<name>.role_map]` work the same way (the
+`[github.namespaces.<owner>]` table is the one that also holds
+`resign_dependabot`). Values are `none`, `read`, `triage`, `write`,
+`maintain`, `admin`. The start fails unless every map the layers can make is
+ordered — `own ≥ maintain ≥ commit` — with `commit` at most `write` (merging
+is a maintainer's; the check, not a role, decides whose commits land).
+
+**A namespace admin gets no forge role, and no configuration can give them
+one** (decided 2026-09-25). There is no key for `git.ns.admin` — `ns_admin`,
+`admin` or any other unknown key fails the start — and a job whose desired
+role carries `git.ns.admin` projects nothing (a role the bridge gave that
+account before is taken off). A namespace-level role job (organisation
+owners) is refused `notCapable`. `git.ns.admin` is exercised through the VTC
+and the bridge; who owns the organisation stays yours to manage by hand.
+Someone who is both a namespace admin and, in their own name, a
+repository's owner or maintainer gets that repository right's role.
+
+**When a change applies.** The bridge maps rights to roles when a
+`projectRoles` or `createRepo` job arrives. Roles already projected are not
+re-mapped on restart: a repository picks up a new map at its next role
+projection, which the VTC sends when that repository's rights or linked
+accounts change. Roles the bridge projected under the old map are the
+baseline drift is measured against until then, so they are not reported.
 
 ## 7. Operating it
 
