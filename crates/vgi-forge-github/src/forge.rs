@@ -684,88 +684,7 @@ impl GitHubForge {
         default_branch: Option<&str>,
         actions_id: Option<u64>,
     ) -> ProtectionState {
-        let mut p = ProtectionState::default();
-        p.present = true;
-        p.enforced = rs.enforcement == "active";
-
-        let refs = |key: &str| -> Vec<String> {
-            rs.conditions
-                .as_ref()
-                .and_then(|c| c.get("ref_name"))
-                .and_then(|r| r.get(key))
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let mut default_names = vec!["~DEFAULT_BRANCH".to_string(), "~ALL".to_string()];
-        if let Some(b) = default_branch {
-            default_names.push(format!("refs/heads/{b}"));
-        }
-        let (include, exclude) = (refs("include"), refs("exclude"));
-        // Any exclusion at all counts as not covering: `refs/heads/*` or a
-        // pattern matching the default branch excludes it as surely as its
-        // literal name, and the managed ruleset is created with none.
-        p.covers_default_branch = rs.target.as_deref().unwrap_or("branch") == "branch"
-            && include.iter().any(|r| default_names.contains(r))
-            && exclude.is_empty();
-
-        for rule in &rs.rules {
-            match rule.kind.as_str() {
-                "pull_request" => p.requires_pull_request = true,
-                "non_fast_forward" => p.blocks_force_push = true,
-                "deletion" => p.blocks_deletion = true,
-                "required_status_checks" => {
-                    let checks = rule
-                        .parameters
-                        .as_ref()
-                        .and_then(|v| v.get("required_status_checks"))
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    // Only a check pinned to the Actions App counts: an
-                    // unpinned one is satisfied by any status of that name,
-                    // which anyone with write access can post.
-                    p.required_checks.extend(checks.iter().filter_map(|c| {
-                        let pinned = actions_id.is_some()
-                            && c.get("integration_id").and_then(Value::as_u64) == actions_id;
-                        pinned
-                            .then(|| c.get("context").and_then(Value::as_str))
-                            .flatten()
-                            .map(str::to_string)
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        match &rs.bypass_actors {
-            Some(actors) => {
-                p.bypass_actors = actors
-                    .iter()
-                    .map(|a| {
-                        format!(
-                            "{}:{}:{}",
-                            a.actor_type,
-                            a.actor_id.map_or_else(|| "-".into(), |i| i.to_string()),
-                            a.bypass_mode.as_deref().unwrap_or("always")
-                        )
-                    })
-                    .collect()
-            }
-            // Not visible to us is not the same as none: fail closed.
-            None => p.bypass_actors = vec!["<bypass actors not visible to the bridge>".into()],
-        }
-        if let Some(mode) = rs.current_user_can_bypass.as_deref()
-            && mode != "never"
-        {
-            p.bypass_actors.push(format!("bridge-app:{mode}"));
-        }
-        p
+        protection_of(rs, default_branch, actions_id)
     }
 
     // ── bootstrap steps ──────────────────────────────────────────────────
@@ -1910,10 +1829,105 @@ impl ForgeHooks for GitHubForge {
     }
 }
 
+/// What a ruleset enforces, read from GitHub's own shape of it. A required
+/// check counts only when pinned to `actions_id` (the App the check must
+/// come from).
+fn protection_of(
+    rs: &RulesetJson,
+    default_branch: Option<&str>,
+    actions_id: Option<u64>,
+) -> ProtectionState {
+    let mut p = ProtectionState::default();
+    p.present = true;
+    p.enforced = rs.enforcement == "active";
+
+    let refs = |key: &str| -> Vec<String> {
+        rs.conditions
+            .as_ref()
+            .and_then(|c| c.get("ref_name"))
+            .and_then(|r| r.get(key))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut default_names = vec!["~DEFAULT_BRANCH".to_string(), "~ALL".to_string()];
+    if let Some(b) = default_branch {
+        default_names.push(format!("refs/heads/{b}"));
+    }
+    let (include, exclude) = (refs("include"), refs("exclude"));
+    // Any exclusion at all counts as not covering: `refs/heads/*` or a
+    // pattern matching the default branch excludes it as surely as its
+    // literal name, and the managed ruleset is created with none.
+    p.covers_default_branch = rs.target.as_deref().unwrap_or("branch") == "branch"
+        && include.iter().any(|r| default_names.contains(r))
+        && exclude.is_empty();
+
+    for rule in &rs.rules {
+        match rule.kind.as_str() {
+            "pull_request" => p.requires_pull_request = true,
+            "non_fast_forward" => p.blocks_force_push = true,
+            "deletion" => p.blocks_deletion = true,
+            "required_status_checks" => {
+                let checks = rule
+                    .parameters
+                    .as_ref()
+                    .and_then(|v| v.get("required_status_checks"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                // Only a check pinned to the Actions App counts: an
+                // unpinned one is satisfied by any status of that name,
+                // which anyone with write access can post.
+                p.required_checks.extend(checks.iter().filter_map(|c| {
+                    let pinned = actions_id.is_some()
+                        && c.get("integration_id").and_then(Value::as_u64) == actions_id;
+                    pinned
+                        .then(|| c.get("context").and_then(Value::as_str))
+                        .flatten()
+                        .map(str::to_string)
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    match &rs.bypass_actors {
+        Some(actors) => {
+            p.bypass_actors = actors
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}:{}:{}",
+                        a.actor_type,
+                        a.actor_id.map_or_else(|| "-".into(), |i| i.to_string()),
+                        a.bypass_mode.as_deref().unwrap_or("always")
+                    )
+                })
+                .collect()
+        }
+        // Not visible to us is not the same as none: fail closed.
+        None => p.bypass_actors = vec!["<bypass actors not visible to the bridge>".into()],
+    }
+    if let Some(mode) = rs.current_user_can_bypass.as_deref()
+        && mode != "never"
+    {
+        p.bypass_actors.push(format!("bridge-app:{mode}"));
+    }
+    p
+}
+
 /// The ruleset GitHub is asked for: default branch, PR required, the check
 /// required and pinned to the Actions App, no force-push, no deletion, and
 /// an empty bypass list.
-fn ruleset_body(spec: &ProtectionSpec, actions_id: Option<u64>) -> Value {
+///
+/// Public so a client acting as the repository's own admin (`vgi repo
+/// init`) asks GitHub for exactly the ruleset the bridge would.
+pub fn ruleset_body(spec: &ProtectionSpec, actions_id: Option<u64>) -> Value {
     let mut rules = Vec::new();
     if spec.block_deletion {
         rules.push(json!({ "type": "deletion" }));
@@ -1956,6 +1970,24 @@ fn ruleset_body(spec: &ProtectionSpec, actions_id: Option<u64>) -> Value {
         "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
         "rules": rules,
     })
+}
+
+/// Whether `ruleset` — GitHub's JSON for one repository ruleset, as `GET
+/// /repos/{owner}/{repo}/rulesets/{id}` returns it — already enforces `spec`
+/// on a repository whose default branch is `default_branch`, with the
+/// required check pinned to `actions_id`. The same test the adapter runs
+/// before it rewrites its managed ruleset, so a client that converges on it
+/// leaves a ruleset alone exactly when the bridge would.
+pub fn ruleset_satisfies(
+    ruleset: &Value,
+    default_branch: Option<&str>,
+    actions_id: Option<u64>,
+    spec: &ProtectionSpec,
+) -> Result<bool> {
+    let rs: RulesetJson = serde_json::from_value(ruleset.clone())
+        .map_err(|e| ForgeError::Protocol(format!("ruleset: {e}")))?;
+    let observed = protection_of(&rs, default_branch, actions_id);
+    Ok(satisfies(&observed, spec) && rules_match(&rs, spec))
 }
 
 fn check_variable_name(var: &str) -> Result<()> {

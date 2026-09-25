@@ -252,7 +252,11 @@ organisations on plans without org rulesets — a check pinned to the GitHub
 Actions App is forgeable by any writer (a workflow on another branch can post
 a passing "Verify commit trust" onto someone else's pull request). There the
 bridge posts the check itself (§9, "forged check runs"), once the App has the
-permissions and events above:
+permissions and events above. (A personal account the App is not installed
+on has no bridge at all: the account holder runs `vgi repo init`, which
+commits the in-repo workflow with the owner-review or solo guard, and there
+repository writers are trusted not to forge the check —
+[RUNBOOK.md §4](RUNBOOK.md#4-set-up-the-repository).)
 
 - **Only against the protected branch.** A check run attaches to a commit,
   not to a pull request, so a success on a head commit counts for every

@@ -207,6 +207,34 @@ like alongside it; they affect forge attribution, not verifiability.
 
 ## 4. Set up the repository
 
+**In a VTC-governed namespace without a bridge** (bound `--mode manual`, or a
+personal account the community's App is not on), `vgi repo init` does this
+section for you — the same plan the bridge runs, as you — and is what
+`cnm git create`'s manual steps name:
+
+```sh
+cargo install vgi-cli                  # the `vgi` command
+gh auth login                          # GitHub: vgi acts through your gh login
+vgi repo init --vtc <vtc-did> --resource github.com/alice/gadgets --dry-run
+vgi repo init --vtc <vtc-did> --resource github.com/alice/gadgets
+cnm git adopt github.com/alice/gadgets --owner <owner-did>   # it prints this line
+```
+
+It commits the workflow (DIDs as literals, `resource-format: qualified`) and the
+`web-flow` keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID` variables,
+and converges the "VGI commit trust" ruleset: pull request required, the check
+required and pinned to GitHub Actions, no force-push or deletion, no bypass.
+Name further owners with `--code-owner <login>`: with two or more (a personal
+repository's account holder counts), `.github/` changes need a code owner's
+review. On Forgejo set `FORGEJO_TOKEN` (`write:repository`, `read:user`); it
+does §4a. The registry DID comes from the VTC's `TrustRegistry` referral unless
+you pass `--registry`. Re-running changes nothing; `--dry-run` shows every
+change with its contents. It cannot adopt the repository itself — that is a
+Trust Task signed with a VTA session — so it prints the `cnm git adopt` command.
+In **bridge** mode skip it: adopting runs the bootstrap.
+
+Outside a VTC-governed namespace, or to see what it writes, set it up by hand:
+
 **Workflow** — `.github/workflows/verify-trust.yml`:
 
 ```yaml
@@ -1122,7 +1150,7 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 
 | Code | Cause | Fix |
 |---|---|---|
-| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand and adopt; manage organisation roles yourself |
+| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
 | step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |

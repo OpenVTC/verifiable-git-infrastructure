@@ -202,7 +202,7 @@ impl ForgejoConfig {
     pub fn status_context(&self, check: &str) -> String {
         self.status_check_context
             .clone()
-            .unwrap_or_else(|| format!("{check} / {check} (pull_request)"))
+            .unwrap_or_else(|| crate::plan::default_status_context(check))
     }
 }
 

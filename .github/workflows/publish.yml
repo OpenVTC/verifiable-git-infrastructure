@@ -120,12 +120,16 @@ jobs:
 
           # vgi-core has no internal deps; verify-trust, did-git-sign and
           # vgi-forge depend on it, and both forge adapters depend on
-          # vgi-forge. `cargo publish` waits for each crate to appear in the
-          # index before returning, so the next one resolves it. vgi-bridge
-          # is a service (`publish = false`) and ships only as a release
-          # artifact. Every crate listed has a Trusted Publishing config for
-          # this workflow on crates.io.
-          for crate in vgi-core verify-trust did-git-sign vgi-forge vgi-forge-github vgi-forge-forgejo; do
+          # vgi-forge. vgi-cli (the `vgi` command) depends on both adapters
+          # and verify-trust, so it goes last. `cargo publish` waits for each
+          # crate to appear in the index before returning, so the next one
+          # resolves it. vgi-bridge is a service (`publish = false`) and ships
+          # only as a release artifact. Every crate listed has a Trusted
+          # Publishing config for this workflow on crates.io — except that a
+          # crate's *first* version cannot be published this way (crates.io
+          # configures Trusted Publishing on an existing crate), so a new
+          # crate is published once by hand, then configured, then listed.
+          for crate in vgi-core verify-trust did-git-sign vgi-forge vgi-forge-github vgi-forge-forgejo vgi-cli; do
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')
             if [ -z "$version" ]; then

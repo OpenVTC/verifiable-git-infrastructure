@@ -52,6 +52,8 @@ pub use config::{
 };
 pub use forge::{
     BOT_TOKEN_SCOPES, ForgejoForge, MintedToken, RefreshReport, TOKEN_NAME_PREFIX, TokenRef,
+    managed_protection_rule, protection_body, protection_satisfies, settings_body,
+    settings_satisfied,
 };
 pub use secret::Secret;
 pub use version::{Features, Flavor, InstanceInfo};

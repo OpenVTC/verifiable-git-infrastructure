@@ -614,9 +614,10 @@ The fallback, not the recommendation. What changes:
     3. Run `cnm git adopt github.com/alice/gadgets --owner did:…` to tell the VTC the repository exists.
   ```
 
-  **Skip step 2**: there is no `vgi` command (see *Not implemented*, below),
-  and in bridge mode the adopt's bootstrap does what it describes. Create the
-  repository on GitHub (the account holder: `gh repo create alice/gadgets --public`),
+  **Skip step 2** in bridge mode: the adopt's bootstrap does what it
+  describes, with the bridge-posted guard (`vgi repo init` would write the
+  in-repo workflow, which the bootstrap then removes). Create the repository
+  on GitHub (the account holder: `gh repo create alice/gadgets --public`),
   then run step 3 — finishing one's own reservation is a normal-class action.
 - **The guard** is the **bridge-posted check** (personal accounts have no org
   rulesets), and the bridge becomes a merge dependency: while it is down,
@@ -673,14 +674,19 @@ cnm git namespace bind --forge github.com --owner acme      # --mode manual is t
 
 The namespace is bound at once and the binder is its admin. Then:
 
-- **Repositories:** `cnm git create` prints the steps (as in §9.1); do step 1
-  by hand, then set the repository up **by hand as in
-  [runbook §4](RUNBOOK.md#4-set-up-the-repository)**, then `cnm git adopt`.
-  Use `resource-format: qualified` in the workflow: the VTC publishes only the
-  qualified form (`github.com/acme/widgets`), never `acme/widgets`. Pass
-  the namespace as `fallback-resource` (`github.com/acme`, or
-  `github.com/${{ github.repository_owner }}`): namespace admins' implied
-  commit rights and namespace-wide grants are published there.
+- **Repositories:** `cnm git create` prints the steps (as in §9.1); do all
+  three. Step 2 is `vgi repo init` (`cargo install vgi-cli`), run by the
+  repository's admin through their own `gh` login (`FORGEJO_TOKEN` on
+  Forgejo): the bridge's bootstrap plan, as them — see
+  [runbook §4](RUNBOOK.md#4-set-up-the-repository). The workflow it writes
+  passes the namespace as `fallback-resource`, as the bridge's does. It
+  prints the step 3 `cnm git adopt` command. Setting a repository up by hand
+  instead, use `resource-format: qualified` in the workflow: the VTC
+  publishes only the qualified form (`github.com/acme/widgets`), never
+  `acme/widgets`. Pass the namespace as `fallback-resource`
+  (`github.com/acme`, or `github.com/${{ github.repository_owner }}`):
+  namespace admins' implied commit rights and namespace-wide grants are
+  published there.
 - **Roles, drift, the Dependabot re-sign, the bridge-posted check:** none.
   Forge roles are yours to keep in step with the rights; a drift revert is
   refused `notRevertible` ("manual mode").
@@ -695,10 +701,6 @@ The namespace is bound at once and the binder is its admin. Then:
 Checked against `main` of this repository, verifiable-trust-infrastructure
 and openvtc when this was written:
 
-- **`vgi repo init` does not exist.** The VTC's manual steps, and the
-  adapters' hints, name it; no crate here builds a `vgi` binary. Use
-  [runbook §4](RUNBOOK.md#4-set-up-the-repository) by hand, or, in bridge
-  mode, adopt and let the bootstrap do it.
 - **Namespace admins get no organisation role.** The bridge projects roles
   per repository only and refuses a namespace-level `projectRoles`
   (`notCapable`: "project git.ns.admin by hand"). Make namespace admins

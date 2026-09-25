@@ -29,6 +29,7 @@ day to day with the runbook's
 | [`vgi-forge-github`](crates/vgi-forge-github) | The GitHub adapter: one community's own GitHub App (manifest registration, scoped per-job installation tokens), namespace binding, device-flow account linking, repo creation and the commit-trust bootstrap, role projection, verified webhooks. |
 | [`vgi-forge-forgejo`](crates/vgi-forge-forgejo) | The Forgejo (and Gitea) adapter: a scoped bot user with token rotation, version-probed capabilities, OAuth2 + PKCE binding and account linking, repo creation and the commit-trust bootstrap (fast-forward-only merges, protected workflow paths), merge allow-list role projection, verified webhooks. |
 | [`vgi-bridge`](crates/vgi-bridge) | The per-community bridge service (not published; a container): its own DID, `git-ns/bridge/*` jobs from its one VTC over DIDComm, the adapters, a sealed redb store, and — where GitHub has no required workflow — the "Verify commit trust" check posted by the bridge itself. Operator guide: [`docs/BRIDGE.md`](docs/BRIDGE.md); end-to-end setup: [`docs/SETUP-GITHUB-VTC.md`](docs/SETUP-GITHUB-VTC.md). |
+| [`vgi-cli`](crates/vgi-cli) | The `vgi` command (`cargo install vgi-cli`). `vgi repo init --vtc <did> --resource <host>/<owner>/<repo>` turns commit trust on for one repository where no bridge acts — a manual-mode namespace, or a personal account without the App — running the adapters' own bootstrap plan as you, through `gh` on GitHub or `FORGEJO_TOKEN` on Forgejo, and prints the `cnm git adopt` command that finishes the job. |
 
 ## The CI check
 
