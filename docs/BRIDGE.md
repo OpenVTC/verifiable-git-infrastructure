@@ -66,9 +66,13 @@ limit is the one that answers.
 cp bridge.example.toml /etc/vgi-bridge/bridge.toml
 
 # 2. The master key and the bridge's identity. `init` writes the key file
-#    named by `master_key_file` (0600, never overwritten) and mints a
-#    did:key identity if the store has none. It prints the DID.
+#    named by `master_key_file` (0600, never overwritten) and, if the store
+#    has no identity, mints a did:peer whose document names `mediator_did`.
+#    It prints the DID.
 vgi-bridge --config /etc/vgi-bridge/bridge.toml init
+
+# 3. Back the identity up apart from the store (see §5).
+vgi-bridge --config /etc/vgi-bridge/bridge.toml identity export /secure/bridge-identity.json
 ```
 
 **A `did:webvh` identity instead** (recommended for production, the same way
@@ -85,10 +89,23 @@ Register the printed DID at the VTC as the bridge serving its namespaces:
 the VTC's `[git_ns] bridges` maps each forge host to it.
 
 The VTC reaches the bridge through a transport the bridge's DID document
-advertises (a `DIDCommMessaging` service naming the mediator). A `did:key`
-advertises none, so a VTC cannot send it jobs: use the `did:key` only where
-nothing does, and a `did:webvh` whose document carries that service for a
-real deployment (SETUP-GITHUB-VTC.md §2.2).
+advertises: it resolves the DID and needs a `DIDCommMessaging` service naming
+the mediator the bridge listens at. Both identities carry one:
+
+- **The `did:peer:2` `init` mints** encodes its keys *and* that service in
+  the identifier, so there is nothing to host. The flip side: the mediator is
+  part of the DID. Change `mediator_did` and the bridge refuses to start
+  rather than have the VTC deliver jobs where it no longer listens; mint a new
+  identity (`vgi-bridge identity mint --replace`) and register the new DID at
+  the VTC. `init` refuses a mediator whose own DID would make the `did:peer`
+  longer than the 1000 bytes DID resolvers accept.
+- **A `did:webvh`** publishes the service in its document (the VTA template
+  adds it), and can move mediators without changing DID.
+
+A store from an earlier release may hold a `did:key`, which advertises no
+service: no VTC can send it jobs (they fail `noMatchingProtocol`). `run` warns
+about it at start; mint a `did:peer` in its place (`identity mint --replace`)
+and register that.
 
 The admin commands (`init`, `identity`, `secret`) open the store directly,
 and redb allows one process at a time: stop the bridge first.
@@ -104,8 +121,8 @@ docker run -d --name vgi-bridge \
   -p 127.0.0.1:8080:8080 vgi-bridge
 ```
 
-Run `init` / `identity import` with the same volumes and `vgi-bridge init`
-as the command before the first `run`.
+Run `init` / `identity import` / `identity export` with the same volumes and
+`vgi-bridge init` as the command before the first `run`.
 
 ## 3. GitHub: register the App (manifest flow)
 
@@ -240,10 +257,21 @@ useless without the key, and the key must never sit in the same backup as
 the store. For a consistent copy, stop the bridge (or snapshot the volume)
 and copy the single file. After a restore the bridge re-sends every
 unacknowledged result and event; the VTC treats repeats as harmless, and
-repeats its own jobs, which the bridge answers from the ledger. Losing the
-store entirely means re-registering the GitHub App and re-binding the
-namespaces — and re-binding means unbinding first, which revokes every right
-in them ([RUNBOOK.md §8i](RUNBOOK.md#8i-the-bridge-backup-restore-restart)).
+repeats its own jobs, which the bridge answers from the ledger.
+
+**Back the identity up too, once, apart from both:** `vgi-bridge identity
+export <file>` writes its secrets bundle (0600, never over an existing file),
+and `identity import <file>` puts it into a fresh store. The VTC records each
+namespace's bridge by DID and accepts results and events only from it, the
+registry holds the bridge's `git.commit.sign` grant under it, and the
+Dependabot commits it re-signed name it — so a bridge that keeps its DID is
+still the one the VTC bound. (A VTA-provisioned `did:webvh` can instead be
+exported from the VTA again.)
+
+Losing the store entirely — even with the identity restored — still means
+re-registering the GitHub App and re-binding the namespaces, and re-binding
+means unbinding first, which revokes every right in them
+([RUNBOOK.md §8i](RUNBOOK.md#8i-the-bridge-backup-restore-restart)).
 
 ## 6. The check the bridge posts itself
 
@@ -377,7 +405,7 @@ is missing; it re-signs regardless, and the re-signed commits then fail as
 **What the bridge's DID must publish.** verify-trust resolves the DID in the
 trailer and accepts the signature only from an Ed25519 key its DID document
 lists as a verification method (`publicKeyMultibase`). The bridge signs with
-the same key that signs its Trust Task documents: a locally minted `did:key`
+the same key that signs its Trust Task documents: a locally minted `did:peer`
 always publishes it; for a VTA-provisioned `did:webvh`, the Ed25519 key in
 the imported bundle must be a verification method of the DID's document
 (VTA templates publish it). The commit signature's `git` namespace keeps it

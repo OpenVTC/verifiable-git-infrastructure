@@ -1083,6 +1083,9 @@ Everything is in `data_dir/state.redb`, sealed with the master key
   have no provenance record, so they are not re-signed until Dependabot
   recreates them; a Forgejo bot token rotated after the backup is not in the
   store (§8j).
+- **The identity** is worth keeping even when the store is not: `vgi-bridge
+  identity export` once (BRIDGE.md §5), `identity import` into a fresh store,
+  and the bridge keeps the DID the VTC recorded for its namespaces.
 - **Losing the store, or the key,** means registering a new GitHub App and
   binding again — and there is no re-attach. The VTC still holds the
   namespace as bound to that bridge, and binding it again needs
@@ -1174,7 +1177,7 @@ fix where one applies.
 | `git-ns/account/link-status:unknownLink` | the link attempt is unknown, or forgotten (after 7 days) | start again (`l`) |
 | `permissionDenied` | the signer lacks the right; or an elevated or destructive action from someone who is not a community administrator (`elevated_requires_admin`); or a bind or reseat without the community-administrator capability | a community administrator does it |
 | `malformedRequest` | a DID that is not DID-core (`did:<method>:<id>`, the id only letters, digits, `.` `-` `_` `:` and `%`-escapes — no fragment, spaces or shell characters); a resource that is not forge-qualified; an unknown right | fix the value; `cnm` refuses these before signing |
-| `unavailable` | the bridge did not answer an in-line job (bind, link), or refused it — the message carries its code, e.g. `noMatchingProtocol` (a `did:key` bridge, or no DIDComm service in its DID document); earlier records at the name still being withdrawn (§8h); **two governed repositories recorded at one name** | check the bridge and its DID document, retry; for two at one name, below |
+| `unavailable` | the bridge did not answer an in-line job (bind, link), or refused it — the message carries its code, e.g. `noMatchingProtocol` (no DIDComm service in the bridge's DID document: a `did:key` from an earlier release — `vgi-bridge identity mint --replace` — or a `did:webvh` whose template lacks it); earlier records at the name still being withdrawn (§8h); **two governed repositories recorded at one name** | check the bridge and its DID document, retry; for two at one name, below |
 
 *Two governed repositories at one name* is refused rather than guessed at
 (*N governed repositories are recorded at …; an administrator must resolve
