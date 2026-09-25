@@ -338,3 +338,196 @@ async fn forgejo_default_maintainers_get_write_and_the_allow_list() {
     assert_eq!(perms, ["write"]);
     assert_eq!(lists, [json!([BOT, "bob"])]);
 }
+
+// ── the role-map report (`git-ns/bridge/event` 0.3, `roleMapReported`) ──────
+
+use vgi_bridge::store::{OutboxEntry, RepoRecord, Table};
+use vgi_forge::{NamespaceKind, Resource};
+
+/// The next role-map report for namespace `NS`, as its event body.
+async fn report(w: &mut World) -> Value {
+    w.bridge.report_role_map(NS).await;
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(ev["payload"]["namespace"], NS);
+    // Fits the 0.3 payload type.
+    serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
+        .expect("a 0.3 payload");
+    ev["payload"]["event"].clone()
+}
+
+fn map(own: &str, maintain: &str, commit: &str) -> Value {
+    json!({ "own": own, "maintain": maintain, "commit": commit })
+}
+
+#[tokio::test]
+async fn a_github_organisation_with_the_default_map_reports_just_the_map() {
+    let mut w = world(Options::default()).await;
+    // Projected before the bridge kept the map: taken as the default, which
+    // is what applies, so not stale.
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    assert_eq!(
+        report(&mut w).await,
+        json!({ "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") })
+    );
+}
+
+#[tokio::test]
+async fn a_github_personal_account_reports_the_one_collaborator_level() {
+    let mut w = world(Options {
+        kind: NamespaceKind::User,
+        ..Options::default()
+    })
+    .await;
+    seed_repo(
+        w.bridge.store(),
+        &Resource::parse("github.com/alice/widgets").unwrap(),
+        812,
+    );
+    assert_eq!(
+        report(&mut w).await,
+        json!({ "type": "roleMapReported", "roleMap": map("write", "write", "none") })
+    );
+}
+
+#[tokio::test]
+async fn repository_overrides_are_listed_and_repositories_projected_under_another_map_are_stale() {
+    let mut w = world(Options {
+        github_extra: r#"
+[github.namespaces.acme.repos.widgets.role_map]
+commit = "write"
+
+[github.namespaces.acme.repos.same.role_map]
+commit = "none"
+"#
+        .into(),
+        ..Options::default()
+    })
+    .await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    seed_repo(w.bridge.store(), &repo("gadgets"), 813);
+    let ev = report(&mut w).await;
+    assert_eq!(ev["roleMap"], map("admin", "maintain", "none"));
+    // `same` overrides nothing in effect, so it is not listed.
+    assert_eq!(
+        ev["repos"],
+        json!([{ "resource": "github.com/acme/widgets", "roleMap": map("admin", "maintain", "write") }])
+    );
+    // `widgets` was projected under the default map (no record of one);
+    // `gadgets` still gets the default.
+    assert_eq!(ev["stale"], json!(["github.com/acme/widgets"]));
+
+    // A successful projection records the map it applied: no longer stale.
+    mount_empty_repo(&w.server, "widgets").await;
+    let result = project(
+        &mut w,
+        "widgets",
+        vec![role(DAVE, "dave", "git.commit.sign")],
+    )
+    .await;
+    assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
+    let rec: RepoRecord = w
+        .bridge
+        .store()
+        .get(Table::Repos, "github.com#812")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(rec.role_map).unwrap(),
+        map("admin", "maintain", "write")
+    );
+    assert!(report(&mut w).await.get("stale").is_none());
+}
+
+#[tokio::test]
+async fn a_newer_report_replaces_an_unacknowledged_one() {
+    let mut w = world(Options::default()).await;
+    let reports = |w: &World| {
+        w.bridge
+            .store()
+            .list::<OutboxEntry>(Table::Outbox)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e.payload["event"]["type"] == "roleMapReported")
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>()
+    };
+    report(&mut w).await;
+    report(&mut w).await;
+    assert_eq!(
+        reports(&w),
+        vec![vgi_bridge::rolemap::outbox_key(NS)],
+        "one per namespace"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_on_event_0_2_never_reports_its_role_map() {
+    let mut w = world(Options {
+        event_version: Some("0.2"),
+        ..Options::default()
+    })
+    .await;
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    w.bridge.report_role_maps().await;
+    w.quiet().await;
+    assert!(
+        w.bridge
+            .store()
+            .list::<OutboxEntry>(Table::Outbox)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_reports_its_role_map_at_start_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("bridge.redb");
+    // Start once to create the store, then again: every start reports.
+    for _ in 0..2 {
+        let w = world(Options {
+            store_path: Some(store_path.clone()),
+            seed_namespace: !store_path.exists(),
+            ..Options::default()
+        })
+        .await;
+        assert_eq!(w.startup_reports.len(), 1, "one bound namespace");
+        let doc = &w.startup_reports[0];
+        assert_eq!(doc["type"], EVENT);
+        assert_eq!(
+            doc["payload"]["event"]["roleMap"],
+            map("admin", "maintain", "none")
+        );
+        // Acknowledged, so nothing is left to resend.
+        assert!(
+            w.bridge
+                .store()
+                .list::<OutboxEntry>(Table::Outbox)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn forgejo_reports_its_ladder_and_a_changed_map_makes_repositories_stale() {
+    let w = forgejo_world("").await;
+    let doc = &w.startup_reports[0];
+    // The adapter's own `maintain` rung (`write` plus the default branch's
+    // merge allow-list) is reported as `maintain`, the level drift uses.
+    assert_eq!(
+        doc["payload"]["event"],
+        json!({ "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") })
+    );
+
+    let w = forgejo_world("[forgejo.role_map]\nmaintain = \"admin\"").await;
+    let doc = &w.startup_reports[0];
+    assert_eq!(
+        doc["payload"]["event"],
+        json!({
+            "type": "roleMapReported",
+            "roleMap": map("admin", "admin", "none"),
+            "stale": [format!("{FJ}/acme/widgets")],
+        })
+    );
+}

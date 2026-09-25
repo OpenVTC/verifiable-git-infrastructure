@@ -289,6 +289,8 @@ pub(crate) async fn bind_callback(
                 .unwrap_or_default();
             let ev = json!({ "type": "bindCompleted", "jobId": job_id, "ownerId": owner_id, "kind": kind });
             bridge.send_event(&namespace, ev, None).await?;
+            // The VTC holds the default map until it is told otherwise.
+            bridge.report_role_map(&namespace).await;
             let mut report = Report::default();
             if !binding.missing_permissions.is_empty() {
                 report.step(

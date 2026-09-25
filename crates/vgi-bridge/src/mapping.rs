@@ -355,7 +355,8 @@ pub fn event_payload(
 /// whole-segment containment (event 0.2: the VTC refuses such an event
 /// whole, so the bridge never sends one): the `resource` of any event, the
 /// `from` of any event, a `repoRenamed`'s `to`, and every drift item's
-/// `resource`. A `repoTransferred`'s `to` is exempt — a transfer leaves the
+/// `resource`, and a `roleMapReported`'s `repos[].resource` and `stale`
+/// entries. A `repoTransferred`'s `to` is exempt — a transfer leaves the
 /// namespace by definition. A resource that does not parse counts as
 /// outside, as does every resource when there is no `namespace` to hold it.
 pub fn outside_namespace(
@@ -367,6 +368,11 @@ pub fn outside_namespace(
     let mut members = vec![event.get("resource"), event.get("from")];
     if renamed {
         members.push(event.get("to"));
+    }
+    if event.get("type").and_then(Value::as_str) == Some("roleMapReported") {
+        let listed = |k: &str| event.get(k).and_then(Value::as_array).into_iter().flatten();
+        members.extend(listed("repos").map(|r| r.get("resource")));
+        members.extend(listed("stale").map(Some));
     }
     members.extend(drift.iter().map(|d| d.get("resource")));
     members.into_iter().flatten().find_map(|v| {
@@ -457,7 +463,17 @@ mod tests {
     fn every_resource_but_a_transfers_destination_lies_in_the_namespace() {
         let ns = Resource::parse("github.com/acme").unwrap();
         let out = |ev: Value, drift: &[Value]| outside_namespace(Some(&ns), &ev, drift);
+        let m = json!({"own":"admin","maintain":"maintain","commit":"none"});
         // Inside: nothing to refuse.
+        assert_eq!(
+            out(
+                json!({"type":"roleMapReported","roleMap":m,
+                       "repos":[{"resource":"github.com/acme/a","roleMap":m}],
+                       "stale":["github.com/acme/b"]}),
+                &[]
+            ),
+            None
+        );
         assert_eq!(
             out(
                 json!({"type":"repoRenamed","forgeId":"1","from":"github.com/acme/a","to":"github.com/acme/b"}),
@@ -505,6 +521,18 @@ mod tests {
                 json!({"type":"protectionChanged","forgeId":"1","resource":"github.com/acme/a","requiredCheck":true}),
                 vec![json!({"type":"protectionWeakened","resource":"github.com/other/a"})],
                 "github.com/other/a",
+            ),
+            (
+                json!({"type":"roleMapReported","roleMap":m,
+                       "repos":[{"resource":"github.com/acme-labs/a","roleMap":m}]}),
+                vec![],
+                "github.com/acme-labs/a",
+            ),
+            (
+                json!({"type":"roleMapReported","roleMap":m,
+                       "stale":["github.com/acme/a","codeberg.org/acme/b"]}),
+                vec![],
+                "codeberg.org/acme/b",
             ),
         ];
         for (ev, drift, bad) in cases {

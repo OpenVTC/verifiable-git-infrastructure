@@ -271,6 +271,12 @@ async fn apply_roles(
                 status,
                 (!failures.is_empty()).then(|| failures.join("; ")),
             );
+            // The map these roles were projected under, for the role-map
+            // report's `stale` — only once every role took: a partly failed
+            // projection leaves the repository stale, so it is re-projected.
+            let applied_map = failures
+                .is_empty()
+                .then(|| crate::rolemap::effective(ctx, &bridge.cfg.role_map(repo)));
             if let Some(id) = forge_id {
                 let _ = bridge.store.update::<RepoRecord, _>(
                     Table::Repos,
@@ -286,6 +292,9 @@ async fn apply_roles(
                             .collect();
                         rec.roles_known = true;
                         rec.owners = owners.clone();
+                        if applied_map.is_some() {
+                            rec.role_map = applied_map;
+                        }
                         Ok((Some(rec), ()))
                     },
                 );

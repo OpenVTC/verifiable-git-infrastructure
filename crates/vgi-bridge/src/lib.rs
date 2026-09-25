@@ -43,6 +43,7 @@ pub mod mapping;
 pub mod registry;
 #[cfg(feature = "forge-github")]
 pub mod resign;
+pub mod rolemap;
 pub mod seal;
 pub mod status;
 pub mod store;

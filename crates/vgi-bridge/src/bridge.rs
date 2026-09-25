@@ -202,7 +202,9 @@ impl Bridge {
     ///    convergent);
     /// 3. device-flow account links still inside their window are polled
     ///    again;
-    /// 4. unacknowledged results and events are sent again.
+    /// 4. unacknowledged results and events are sent again;
+    /// 5. every bound namespace's role map is reported (`crate::rolemap`),
+    ///    the configuration being the one thing a restart can change.
     pub async fn restore(self: &Arc<Self>) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
             if let Some(adapter) = self.adapters.for_resource(&ns.resource)
@@ -225,6 +227,10 @@ impl Bridge {
         }
         crate::flows::resume_device_polls(self)?;
         self.resend_unacknowledged(true).await;
+        // After resending, so the fresh report is sent once and is the last
+        // the VTC reads: it replaces, under the same outbox key, any report
+        // from the last run still unacknowledged.
+        self.report_role_maps().await;
         Ok(())
     }
 
@@ -723,6 +729,20 @@ impl Bridge {
         event_json: Value,
         drift: Option<Vec<Value>>,
     ) -> Result<()> {
+        self.send_event_keyed(namespace, event_json, drift, None)
+            .await
+    }
+
+    /// [`Self::send_event`] under outbox key `key`, replacing an entry
+    /// still there (a newer report supersedes an unacknowledged one), or
+    /// under a fresh key when `None`.
+    pub(crate) async fn send_event_keyed(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+        key: Option<String>,
+    ) -> Result<()> {
         // The repository an event is about, by forge id, for the status
         // report (`ext`).
         let repo = event_json
@@ -755,7 +775,7 @@ impl Bridge {
         let host = ns_resource.map(|r| r.host().to_string());
         let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
         let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
-        let key = format!("event:{}", wire::new_id());
+        let key = key.unwrap_or_else(|| format!("event:{}", wire::new_id()));
         let entry = OutboxEntry {
             kind: OutboxKind::Event,
             payload,
