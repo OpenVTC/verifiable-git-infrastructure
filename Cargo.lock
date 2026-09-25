@@ -6061,6 +6061,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vgi-cli"
+version = "0.4.14"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "verify-trust",
+ "vgi-forge",
+ "vgi-forge-forgejo",
+ "vgi-forge-github",
+ "wiremock",
+]
+
+[[package]]
 name = "vgi-core"
 version = "0.4.14"
 dependencies = [

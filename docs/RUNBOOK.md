@@ -207,6 +207,70 @@ like alongside it; they affect forge attribution, not verifiability.
 
 ## 4. Set up the repository
 
+**In a VTC-governed namespace without a bridge** (bound `--mode manual`, or a
+personal account the community's App is not on), `vgi repo init` does this
+section for you — the same plan the bridge runs, as you — and is what
+`cnm git create`'s manual steps name:
+
+```sh
+cargo install vgi-cli                  # the `vgi` command
+gh auth login                          # GitHub: vgi acts through your gh login
+vgi repo init --vtc <vtc-did> --resource github.com/alice/gadgets --dry-run
+vgi repo init --vtc <vtc-did> --resource github.com/alice/gadgets
+cnm git adopt github.com/alice/gadgets --owner <owner-did>   # it prints this line
+```
+
+It commits the workflow (DIDs as literals, `resource-format: qualified`, the
+namespace as `fallback-resource`, as the bridge writes it) and the `web-flow`
+keyring, removes stale `TRUST_REGISTRY_DID` / `VTC_DID` variables,
+and converges the "VGI commit trust" ruleset: pull request required, the check
+required and pinned to GitHub Actions, no force-push or deletion, no bypass.
+These are **per-repository guards**: it does not set the organisation's
+required workflow, which only the community's bridge does.
+
+The owners are you (on a personal repository, its account holder) plus each
+`--code-owner <login>`, each counted once. With two or more, `.github/`
+changes need a code owner's review. With one, only the check is required, and
+on an **organisation** repository that is refused unless you pass `--solo`:
+any other member with write access could edit the workflow in the very pull
+request it judges. Prefer `--code-owner`.
+
+On Forgejo set `FORGEJO_TOKEN` (`write:repository`, `read:user`); it does
+§4a. It sends the token only after `GET /api/v1/version`, asked without it,
+answers as Forgejo or Gitea, and only to the repository's own host
+(`--forgejo-url` may add a port or sub-path, not change the host). With
+`--forge auto` any host but `github.com` is taken for Forgejo; for GitHub
+Enterprise Server pass `--forge github`.
+
+The registry DID comes from the VTC's `TrustRegistry` referral unless you pass
+`--registry`; the report says which. The action commit (the
+`--verify-trust-version` tag, dereferenced) and, on Forgejo, the release's
+SHA-256 are what GitHub serves when you run it — trust on first use, labelled
+so in the report; pass `--verify-trust-action` / `--verify-trust-sha256` to
+pin values you checked. Re-running changes nothing; `--dry-run` shows every
+change with its contents. It cannot adopt the repository itself — that is a
+Trust Task signed with a VTA session — so it prints the `cnm git adopt` command.
+In **bridge** mode skip it: adopting runs the bootstrap.
+
+**Upgrading the check** (a new `--verify-trust-version`) once the repository
+is protected:
+
+- **GitHub:** the ruleset has no bypass, so the new workflow lands through a
+  pull request, like any change. `vgi repo init --dry-run
+  --verify-trust-version <tag>` prints the file to commit (each line after
+  its `      | ` margin); open the pull
+  request with it (a code owner reviews it where there are two owners), merge,
+  and a re-run of `vgi repo init` then reports nothing to change.
+- **Forgejo:** no one can push to the default branch and the workflow
+  directories are protected file patterns, so an admin lifts the protection
+  for the change — deletes the default branch's protection rule (or allows
+  pushes and clears its protected file patterns) — and re-runs
+  `vgi repo init --verify-trust-version <tag>`, which writes the new workflow
+  and puts the protection back. The branch is unprotected in between: do it
+  in one sitting. Where a bridge manages the repository, it does this instead.
+
+Outside a VTC-governed namespace, or to see what it writes, set it up by hand:
+
 **Workflow** — `.github/workflows/verify-trust.yml`:
 
 ```yaml
@@ -1122,7 +1186,7 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 
 | Code | Cause | Fix |
 |---|---|---|
-| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand and adopt; manage organisation roles yourself |
+| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
 | step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |

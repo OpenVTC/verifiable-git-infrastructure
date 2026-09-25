@@ -582,7 +582,7 @@ impl ForgejoForge {
         name: &str,
         branch: &str,
     ) -> Result<(Option<ProtectionJson>, Vec<String>)> {
-        let rules: Vec<ProtectionJson> = self
+        let mut rules: Vec<ProtectionJson> = self
             .api
             .json(
                 Method::GET,
@@ -592,19 +592,8 @@ impl ForgejoForge {
                 "branch protections",
             )
             .await?;
-        let folded = branch.to_lowercase();
-        let mut managed = None;
-        let mut shadowing = Vec::new();
-        for rule in rules {
-            match rule.name() {
-                Some(n) if n == branch => managed = Some(rule),
-                Some(n) if !is_glob(n) && n.to_lowercase() == folded => {
-                    shadowing.push(n.to_string())
-                }
-                _ => {}
-            }
-        }
-        Ok((managed, shadowing))
+        let (managed, shadowing) = select_rule(&rules, branch);
+        Ok((managed.map(|i| rules.swap_remove(i)), shadowing))
     }
 
     fn protection_state(
@@ -1124,26 +1113,7 @@ impl ForgejoForge {
             return Ok(StepOutcome::Unchanged);
         }
 
-        let has = |m| s.merge_methods.contains(&m);
-        let mut body = json!({});
-        if !s.merge_methods.is_empty() {
-            // Forgejo applies merge settings only alongside
-            // `has_pull_requests`.
-            body = json!({
-                "has_pull_requests": true,
-                "allow_merge_commits": has(MergeMethod::MergeCommit),
-                "allow_rebase": has(MergeMethod::Rebase),
-                "allow_rebase_explicit": has(MergeMethod::RebaseMerge),
-                "allow_squash_merge": has(MergeMethod::Squash),
-                "default_merge_style": merge_style(s.merge_methods[0]),
-            });
-            if r.allow_fast_forward_only_merge.is_some() {
-                body["allow_fast_forward_only_merge"] = json!(ff_wanted);
-            }
-        }
-        if s.enable_ci {
-            body["has_actions"] = json!(true);
-        }
+        let body = settings_request(&r, s);
         let after: RepoJson = self
             .api
             .json(
@@ -1206,48 +1176,14 @@ impl ForgejoForge {
         // enabled, even an admin cannot merge without a place on it (and an
         // admin can edit the rule anyway, so this grants nothing new).
         // Maintainers are added by `apply_roles`.
-        let mut allow: Vec<String> = existing
-            .as_ref()
-            .filter(|r| r.enable_merge_whitelist)
-            .map(|r| r.merge_whitelist_usernames.clone())
-            .unwrap_or_default();
-        for (account, perm) in self.collaborators(&token, owner, name).await? {
-            if perm == Perm::Admin && !contains_login(&allow, &account.login) {
-                allow.push(account.login);
-            }
-        }
-        let mut contexts = existing
-            .as_ref()
-            .map(|r| r.status_check_contexts.clone())
-            .unwrap_or_default();
-        if !contexts.contains(&spec.required_check) {
-            contexts.push(spec.required_check.clone());
-        }
-        let mut paths = existing
-            .as_ref()
-            .map(|r| patterns(&r.protected_file_patterns))
-            .unwrap_or_default();
-        for p in &spec.protected_paths {
-            let p = p.to_ascii_lowercase();
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-        let mut body = json!({
-            "enable_push": !spec.require_pull_request,
-            "enable_push_whitelist": false,
-            "push_whitelist_usernames": [],
-            "push_whitelist_teams": [],
-            "push_whitelist_deploy_keys": false,
-            "enable_merge_whitelist": true,
-            "merge_whitelist_usernames": allow,
-            "merge_whitelist_teams": [],
-            "enable_status_check": true,
-            "status_check_contexts": contexts,
-            "protected_file_patterns": paths.join(";"),
-            "unprotected_file_patterns": "",
-            "apply_to_admins": true,
-        });
+        let admins: Vec<String> = self
+            .collaborators(&token, owner, name)
+            .await?
+            .into_iter()
+            .filter(|(_, perm)| *perm == Perm::Admin)
+            .map(|(account, _)| account.login)
+            .collect();
+        let mut body = protection_request(existing.as_ref(), &admins, spec);
         let (method, url, outcome) = match &existing {
             Some(rule) => (
                 Method::PATCH,
@@ -2594,6 +2530,158 @@ fn merge_style(m: MergeMethod) -> &'static str {
         MergeMethod::Squash => "squash",
         _ => "merge",
     }
+}
+
+/// The managed rule among `rules` — the one named exactly `branch` — and
+/// the names of any other plain rules Forgejo may apply to the branch in its
+/// place (a case-insensitive name match; see `protection_rule`).
+fn select_rule(rules: &[ProtectionJson], branch: &str) -> (Option<usize>, Vec<String>) {
+    let folded = branch.to_lowercase();
+    let mut managed = None;
+    let mut shadowing = Vec::new();
+    for (i, rule) in rules.iter().enumerate() {
+        match rule.name() {
+            Some(n) if n == branch => managed = Some(i),
+            Some(n) if !is_glob(n) && n.to_lowercase() == folded => shadowing.push(n.to_string()),
+            _ => {}
+        }
+    }
+    (managed, shadowing)
+}
+
+/// The `PATCH /repos/{owner}/{repo}` body that makes the repository's merge
+/// and CI settings `s`.
+fn settings_request(r: &RepoJson, s: &RepoSettings) -> Value {
+    let has = |m| s.merge_methods.contains(&m);
+    let mut body = json!({});
+    if !s.merge_methods.is_empty() {
+        // Forgejo applies merge settings only alongside
+        // `has_pull_requests`.
+        body = json!({
+            "has_pull_requests": true,
+            "allow_merge_commits": has(MergeMethod::MergeCommit),
+            "allow_rebase": has(MergeMethod::Rebase),
+            "allow_rebase_explicit": has(MergeMethod::RebaseMerge),
+            "allow_squash_merge": has(MergeMethod::Squash),
+            "default_merge_style": merge_style(s.merge_methods[0]),
+        });
+        if r.allow_fast_forward_only_merge.is_some() {
+            body["allow_fast_forward_only_merge"] = json!(has(MergeMethod::FastForward));
+        }
+    }
+    if s.enable_ci {
+        body["has_actions"] = json!(true);
+    }
+    body
+}
+
+/// The branch-protection body for `spec`, keeping what an `existing` rule
+/// already has (its merge allow-list, contexts and protected paths) and
+/// seeding the allow-list with `admins`. A new rule also needs its
+/// `rule_name` / `branch_name`, which the caller adds.
+fn protection_request(
+    existing: Option<&ProtectionJson>,
+    admins: &[String],
+    spec: &ProtectionSpec,
+) -> Value {
+    let mut allow: Vec<String> = existing
+        .filter(|r| r.enable_merge_whitelist)
+        .map(|r| r.merge_whitelist_usernames.clone())
+        .unwrap_or_default();
+    for login in admins {
+        if !contains_login(&allow, login) {
+            allow.push(login.clone());
+        }
+    }
+    let mut contexts = existing
+        .map(|r| r.status_check_contexts.clone())
+        .unwrap_or_default();
+    if !contexts.contains(&spec.required_check) {
+        contexts.push(spec.required_check.clone());
+    }
+    let mut paths = existing
+        .map(|r| patterns(&r.protected_file_patterns))
+        .unwrap_or_default();
+    for p in &spec.protected_paths {
+        let p = p.to_ascii_lowercase();
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    json!({
+        "enable_push": !spec.require_pull_request,
+        "enable_push_whitelist": false,
+        "push_whitelist_usernames": [],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "enable_merge_whitelist": true,
+        "merge_whitelist_usernames": allow,
+        "merge_whitelist_teams": [],
+        "enable_status_check": true,
+        "status_check_contexts": contexts,
+        "protected_file_patterns": paths.join(";"),
+        "unprotected_file_patterns": "",
+        "apply_to_admins": true,
+    })
+}
+
+// ── the same shapes, for a client acting as the repository's admin ───────
+//
+// `vgi repo init` runs a bootstrap plan as the account holder, through their
+// own token, where no bridge exists. These let it ask Forgejo for exactly
+// what `run_step` asks for, and skip exactly what `run_step` would skip.
+
+fn parse<T: serde::de::DeserializeOwned>(what: &str, v: &Value) -> Result<T> {
+    serde_json::from_value(v.clone()).map_err(|e| ForgeError::Protocol(format!("{what}: {e}")))
+}
+
+/// From `GET /repos/{owner}/{repo}/branch_protections`: the managed rule for
+/// `branch`, and the names of rules that could shadow it (a plan must refuse
+/// to rely on the managed rule while any exist).
+pub fn managed_protection_rule(
+    rules: &Value,
+    branch: &str,
+) -> Result<(Option<Value>, Vec<String>)> {
+    let mut list: Vec<Value> = parse("branch protections", rules)?;
+    let typed = list
+        .iter()
+        .map(|v| parse::<ProtectionJson>("branch protection", v))
+        .collect::<Result<Vec<_>>>()?;
+    let (managed, shadowing) = select_rule(&typed, branch);
+    Ok((managed.map(|i| list.swap_remove(i)), shadowing))
+}
+
+/// Whether a rule (as Forgejo returns it) already is what the protection
+/// step would write for `spec`.
+pub fn protection_satisfies(rule: &Value, spec: &ProtectionSpec) -> Result<bool> {
+    Ok(satisfies_protection(
+        &parse("branch protection", rule)?,
+        spec,
+    ))
+}
+
+/// The protection body for `spec` over an `existing` rule, the allow-list
+/// seeded with `admins`. For a new rule, add `rule_name` and `branch_name`.
+pub fn protection_body(
+    existing: Option<&Value>,
+    admins: &[String],
+    spec: &ProtectionSpec,
+) -> Result<Value> {
+    let existing: Option<ProtectionJson> = existing
+        .map(|v| parse("branch protection", v))
+        .transpose()?;
+    Ok(protection_request(existing.as_ref(), admins, spec))
+}
+
+/// Whether a repository (as `GET /repos/{owner}/{repo}` returns it) already
+/// has the settings `s`.
+pub fn settings_satisfied(repo: &Value, s: &RepoSettings) -> Result<bool> {
+    Ok(satisfies_settings(&parse("repository", repo)?, s))
+}
+
+/// The `PATCH /repos/{owner}/{repo}` body for `s`.
+pub fn settings_body(repo: &Value, s: &RepoSettings) -> Result<Value> {
+    Ok(settings_request(&parse("repository", repo)?, s))
 }
 
 fn satisfies_settings(r: &RepoJson, s: &RepoSettings) -> bool {

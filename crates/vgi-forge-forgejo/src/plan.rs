@@ -36,6 +36,12 @@ pub const PROTECTED_PATHS: [&str; 4] = [
     KEYRING_PATH,
 ];
 
+/// The status context Forgejo reports for the plan's workflow: the workflow
+/// and its job are both named `check`, and the event is `pull_request`.
+pub fn default_status_context(check: &str) -> String {
+    format!("{check} / {check} (pull_request)")
+}
+
 /// How merge commits pass the check on this instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergePlan<'a> {
