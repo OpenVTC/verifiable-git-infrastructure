@@ -326,6 +326,27 @@ impl Bridge {
         let ty = verified.doc.type_uri.to_string();
         if wire::is_job_type(&ty) {
             self.on_job(verified).await;
+        } else if wire::is_other_job_version(&ty) {
+            self.send_error(
+                &verified.doc,
+                ErrorPayload::new(StandardCode::UnsupportedVersion)
+                    .with_message("this bridge takes git-ns/bridge/job 0.4 only"),
+            )
+            .await;
+        } else if ty == wire::DISCOVERY_TYPE {
+            let patterns: Vec<String> = verified
+                .doc
+                .payload
+                .get("patterns")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.respond(&verified.doc, wire::discovery_answer(&patterns))
+                .await;
         } else if ty == result::Response::TYPE_URI {
             self.on_result_ack(&verified);
         } else if wire::is_event_response_type(&ty) {
@@ -370,7 +391,7 @@ impl Bridge {
     }
 
     async fn on_job(self: &Arc<Self>, v: VerifiedDoc) {
-        let payload = match wire::parse_job(&v.type_uri(), &v.doc.payload) {
+        let payload = match wire::parse_job(&v.doc.payload) {
             Ok(p) => p,
             Err(e) => {
                 self.send_error(
@@ -579,12 +600,6 @@ impl Bridge {
                 if caps.account_link == vgi_forge::LinkMethod::None {
                     return Err(JobRefusal::not_capable("this forge has no account link"));
                 }
-            }
-            K::ProjectRoles if p.repo.is_none() => {
-                return Err(JobRefusal::not_capable(
-                    "namespace-level roles (organisation owners) are not projected by this \
-                     bridge; project git.ns.admin by hand",
-                ));
             }
             K::CreateRepo if !caps.bot_can_create_repos => {
                 return Err(JobRefusal::not_capable(

@@ -939,8 +939,8 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   repository read-only on GitHub and revokes every commit right on it. No
   task reverses it.
 - **Namespace admins get no forge role.** The bridge does not project
-  `git.ns.admin` — not as an organisation owner (it refuses a
-  namespace-level role projection, `notCapable`) and not as a repository
+  `git.ns.admin` — not as an organisation owner (`git-ns/bridge/job` 0.4 has
+  no namespace-level role projection) and not as a repository
   role (a desired role carrying `git.ns.admin` projects nothing), and no
   `role_map` can change that. Who owns the organisation is yours to manage.
   A namespace admin who should also hold a role on a repository needs that
@@ -984,7 +984,7 @@ namespace admin over it, answers each one.
 
 | Item | Means | Adopt | Revert |
 |---|---|---|---|
-| `roleAdded` | an account holds a role the rights do not give | records it as a right (below) | removes the direct role (`git-ns/bridge/job` 0.2 `removeAccounts`) |
+| `roleAdded` | an account holds a role the rights do not give | records it as a right (below) | removes the direct role (`git-ns/bridge/job` 0.4 `removeAccounts`) |
 | `roleChanged` | a role other than the projected one | if it raises a linked member: records the higher right | re-sends the complete desired roles |
 | `roleRemoved` | a projected role is gone | — | re-sends the complete desired roles |
 | `requiredCheckMissing` | the ruleset no longer requires the check | — | re-runs the `requiredCheck` bootstrap step |
@@ -1252,7 +1252,7 @@ fix where one applies.
 | `git-ns/repo/transfer:notOwner` / `selfTransfer` | you hold no ownership record to hand over / you named yourself | a namespace admin grants `own` instead |
 | `git-ns/drift/resolve:driftNotFound` | resolved already, or the forge changed since you read it | read it again with `git view` |
 | `git-ns/drift/resolve:notAdoptable` / `accountNotLinked` / `noMatchingRight` | the item records no right: a protection item; `write`, `triage` or `read`; an unlinked account; a role no higher than one held | revert it — or, to accept a lowering, revoke the right |
-| `git-ns/drift/resolve:notRevertible` | manual mode; or the account is a member's and the projection gives it a role there; or the bridge implements only job 0.1 | undo it on the forge; revoke the member's right; upgrade the bridge |
+| `git-ns/drift/resolve:notRevertible` | manual mode; or the account is a member's and the projection gives it a role there; or the bridge does not take job 0.4 | undo it on the forge; revoke the member's right; upgrade the bridge |
 | `git-ns/namespace/reseat:notHeadless` | a live admin remains | that admin grants `git.ns.admin` |
 | `git-ns/account/link:unsupportedForge` | no bridge-mode namespace on that forge | bind one in bridge mode |
 | `git-ns/account/link-status:unknownLink` | the link attempt is unknown, or forgotten (after 7 days) | start again (`l`) |
@@ -1270,7 +1270,8 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 
 | Code | Cause | Fix |
 |---|---|---|
-| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
+| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt |
+| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 only | upgrade the VTC |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
 | step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |

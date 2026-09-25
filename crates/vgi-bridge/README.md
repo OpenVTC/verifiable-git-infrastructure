@@ -15,8 +15,9 @@ the bridge carries it out and reports back.
   reaches it through — with every key sealed (AES-256-GCM under a
   mounted master key) in a redb store. It serves **one** VTC and refuses a
   document from any other DID, whatever its proof.
-- **Protocol.** `git-ns/bridge/job` (0.2, and 0.1 from a VTC that has not
-  moved) in; exactly one `git-ns/bridge/result`
+- **Protocol.** `git-ns/bridge/job` 0.4 in (older versions refused
+  `unsupportedVersion`; `trust-task-discovery/0.2` from the VTC is answered
+  with the 0.4 type URI); exactly one `git-ns/bridge/result`
   per job; `git-ns/bridge/event`s for what happens on the forge. The payload
   types are generated from the normative specifications
   (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed

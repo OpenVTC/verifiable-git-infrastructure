@@ -85,7 +85,7 @@ async fn project(w: &mut World, name: &str, roles: Vec<Value>) -> Value {
 }
 
 async fn project_on(w: &mut World, host: &str, name: &str, roles: Vec<Value>) -> Value {
-    w.send_job_0_2(json!({
+    w.send_job(json!({
         "jobId": format!("job_{name}"), "namespace": NS, "kind": "projectRoles",
         "repo": format!("{host}/acme/{name}"), "desiredRoles": roles,
     }))
