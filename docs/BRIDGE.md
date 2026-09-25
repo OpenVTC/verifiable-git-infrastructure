@@ -254,8 +254,19 @@ context; the bridge refuses to guess between two.
 keys it holds: every signing (`assertionMethod`) and key-agreement key the
 document lists, with the same public key, and nothing else. The private
 halves come from the VTA; one the VTA no longer releases but the document
-still lists stays in memory. The newest listed signing key the VTA releases
-signs.
+still lists stays in memory.
+
+**Which key signs.** A verifier (the VTC) may hold a cached copy of the
+bridge's DID document for up to its cache horizon, so a newly listed key is
+not known to all of them at once. The bridge records when it first saw each
+signing key listed; the record is mirrored to the VTA, so a restart or a new
+host keeps it. It keeps signing with the oldest listed key it may use until
+a newer one has been listed for `vta.signing_switch_after_secs` (default
+86400, the proposed 24-hour verifier cache cap; at least
+`did_cache_ttl_secs`), then switches to the newest. If the older key stops
+being listed first, the next key signs at once. A key the VTA no longer
+releases never signs. (When the VTA exposes key-role states with
+`activatesAt`, the bridge will switch at that time instead.)
 
 Every `key_refresh_secs` (default 60), or at once on `SIGHUP`, the bridge
 compares the key list and the document. It reads public halves only and
@@ -264,8 +275,9 @@ rotation that means:
 
 1. The VTA mints the successor keys: not listed yet, so not used.
 2. The document lists old and new (the overlap): the bridge holds all of
-   them, signs with the new key, and DIDComm reconnects with every listed
-   key-agreement key, so a job encrypted to either key opens.
+   them, and DIDComm reconnects with every listed key-agreement key, so a
+   job encrypted to either key opens. The old key keeps signing until the new
+   one has been listed for the horizon; then the new one signs.
 3. The document stops listing the old keys (the end of the overlap): the
    bridge drops them.
 

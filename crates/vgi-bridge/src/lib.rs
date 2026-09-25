@@ -170,15 +170,29 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
             zeroize::Zeroize::zeroize(&mut cred.private_key_multibase);
             let session = session?;
             let docs: Arc<dyn vta::DidDocuments> = Arc::new(vta::Resolver::new().await?);
-            let identity = vta::with_retry(budget, "fetching the bridge's keys", || {
-                session.load_identity(v.did.as_deref(), docs.as_ref(), None)
+            let did = vta::with_retry(budget, "reading the bridge's context", || {
+                session.context_did()
             })
-            .await?;
+            .await?
+            .context(
+                "the VTA context has no DID yet: provision one for the bridge (BRIDGE.md §2a)",
+            )?;
             // Nothing is sealed into the file in VTA mode: the key only
             // satisfies the store's shape and dies with the process.
             let store = Store::open(&cfg.store_path(), seal::MasterKey::generate()?)?;
-            vta::check_cache_binding(&store, &vta_did, &v.context, identity.did())?;
+            vta::check_cache_binding(&store, &vta_did, &v.context, &did)?;
+            // The state first: which signing key signs depends on when each
+            // was first listed, which the VTA keeps.
             let (store, mirror, remote) = vta::attach(&session, store, budget).await?;
+            let policy = vta::SigningPolicy::load(&store, v, chrono::Utc::now().timestamp())?;
+            let (identity, policy) = vta::with_retry(budget, "fetching the bridge's keys", || {
+                session.load_identity(v.did.as_deref(), docs.as_ref(), None, &policy)
+            })
+            .await?;
+            if identity.did() != did {
+                anyhow::bail!("the VTA context's DID changed while the bridge started");
+            }
+            policy.save(&store)?;
             tracing::info!(context = %v.context, "the bridge's state and secrets are in the VTA");
             let task = tokio::spawn(mirror.run(remote, store.clone(), stop_rx.clone()));
             (store, identity, Some((session, task, docs)))

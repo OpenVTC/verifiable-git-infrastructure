@@ -51,6 +51,9 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 # # asks it whether its keys were rotated (SIGHUP asks at once).
 # # start_timeout_secs = 300
 # # key_refresh_secs = 60
+# # How long a newly listed signing key must be in the DID document before
+# # the bridge signs with it (verifiers' cached copies must have it first).
+# # signing_switch_after_secs = 86400
 
 # How long a resolved DID document is trusted (the VTC's, the registry's,
 # commit signers'), in seconds; a failure is re-checked against a fresh one.

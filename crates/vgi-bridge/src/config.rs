@@ -151,6 +151,16 @@ pub struct VtaConfig {
     /// keys in service and drops the old ones.
     #[serde(default = "default_key_refresh")]
     pub key_refresh_secs: u64,
+    /// Seconds a newly listed signing key must have been in the bridge's
+    /// DID document before the bridge signs with it (every verifier's cached
+    /// copy has it by then). Default 86400, the proposed verifier cache cap;
+    /// at least `did_cache_ttl_secs`.
+    #[serde(default = "default_signing_switch_after")]
+    pub signing_switch_after_secs: u64,
+}
+
+fn default_signing_switch_after() -> u64 {
+    86_400
 }
 
 fn default_key_refresh() -> u64 {
@@ -742,6 +752,15 @@ impl BridgeConfig {
                      `master_key_env`"
                 );
             }
+            if v.signing_switch_after_secs < self.did_cache_ttl_secs {
+                bail!(
+                    "`vta.signing_switch_after_secs` ({}) must be at least `did_cache_ttl_secs` \
+                     ({}): a verifier's cached DID document must have the new key before the \
+                     bridge signs with it",
+                    v.signing_switch_after_secs,
+                    self.did_cache_ttl_secs
+                );
+            }
             if v.context.trim().is_empty() {
                 bail!("`vta.context` must name the bridge's context in the VTA");
             }
@@ -823,6 +842,15 @@ impl BridgeConfig {
     pub fn store_path(&self) -> PathBuf {
         self.data_dir.join("state.redb")
     }
+}
+
+/// The test config without a master key (VTA-mode tests elsewhere).
+#[cfg(test)]
+pub(crate) fn tests_example() -> String {
+    tests::EXAMPLE.replace(
+        "master_key_file = \"/run/secrets/vgi-bridge-master-key\"\n",
+        "",
+    )
 }
 
 #[cfg(test)]

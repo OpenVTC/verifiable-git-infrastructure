@@ -217,15 +217,17 @@ impl Session {
     /// the VTA or, for a key the VTA no longer releases but the document
     /// still lists (a rotation's overlap), from `held`. A key the document
     /// does not list is not held, whatever the VTA exports; a key it stops
-    /// listing is dropped. The newest listed signing key the VTA still
-    /// exports signs; with none, this fails. Fetched in one call and held in memory only. `want`: the DID
-    /// the config names, which the context's must be.
+    /// listing is dropped. Which listed key signs is `policy`'s
+    /// ([`SigningPolicy`]); the returned policy has this listing recorded.
+    /// Fetched in one call and held in memory only. `want`: the DID the
+    /// config names, which the context's must be.
     pub async fn load_identity(
         &self,
         want: Option<&str>,
         docs: &dyn DidDocuments,
         held: Option<&BridgeIdentity>,
-    ) -> Result<BridgeIdentity> {
+        policy: &SigningPolicy,
+    ) -> Result<(BridgeIdentity, SigningPolicy)> {
         let mut bundle = self
             .client
             .fetch_did_secrets_bundle(&self.context)
@@ -235,7 +237,7 @@ impl Session {
             check_did(&bundle.did, want)?;
             let created = key_ages(self, &bundle.did).await?;
             let doc = docs.current(&bundle.did).await?;
-            reconcile(&bundle, held, &doc, &created)
+            reconcile(&bundle, held, &doc, &created, policy)
         }
         .await;
         wipe(&mut bundle);
@@ -369,18 +371,32 @@ impl DidDocuments for Resolver {
 
 /// Check the VTA again and put the result in service
 /// ([`crate::Bridge::replace_identity`]): keys the document now lists are
-/// taken up, keys it stopped listing are dropped. `Ok(true)` if the keys in
-/// service changed.
+/// taken up, keys it stopped listing are dropped, and the signing key moves
+/// on when [`SigningPolicy`] says so. `Ok(true)` if the keys in service
+/// changed.
 pub async fn refresh_once(
     bridge: &crate::Bridge,
     session: &Session,
     cfg: &VtaConfig,
     docs: &dyn DidDocuments,
 ) -> Result<bool> {
+    refresh_once_at(bridge, session, cfg, docs, chrono::Utc::now().timestamp()).await
+}
+
+/// [`refresh_once`] as of `now` (Unix seconds).
+pub(crate) async fn refresh_once_at(
+    bridge: &crate::Bridge,
+    session: &Session,
+    cfg: &VtaConfig,
+    docs: &dyn DidDocuments,
+    now: i64,
+) -> Result<bool> {
     let held = bridge.identity();
-    let fresh = session
-        .load_identity(cfg.did.as_deref(), docs, Some(&held))
+    let policy = SigningPolicy::load(bridge.store(), cfg, now)?;
+    let (fresh, policy) = session
+        .load_identity(cfg.did.as_deref(), docs, Some(&held), &policy)
         .await?;
+    policy.save(bridge.store())?;
     let changed = bridge.replace_identity(fresh)?;
     if changed {
         let now = bridge.identity();
@@ -392,6 +408,108 @@ pub async fn refresh_once(
         );
     }
     Ok(changed)
+}
+
+/// Where the first-listed times are kept: the mirrored bookkeeping table,
+/// so a restart or a new host keeps them.
+pub const FIRST_LISTED_META: &str = "vta/signing-keys-first-listed";
+
+/// Which listed signing key signs.
+///
+/// A verifier (the VTC) may hold a copy of the bridge's DID document for up
+/// to its cache horizon, so a key newly listed there is not yet known to all
+/// of them. The bridge records the first time it sees each signing key
+/// listed, and keeps signing with the **oldest** listed key it may use until
+/// a newer one has been listed for `vta.signing_switch_after_secs` (default
+/// 24 h, the proposed verifier cache cap) — then with the newest such key. A
+/// key the document stops listing is simply gone, so the next one signs at
+/// once.
+///
+/// TODO(VTI #638): once the VTA exposes key-role states (the
+/// `vta/webvh/dids/keys/*` tasks with `rotation.activatesAt`), switch at
+/// `activatesAt` and drop this heuristic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningPolicy {
+    /// When each signing key was first seen listed (Unix seconds).
+    pub first_listed: BTreeMap<String, i64>,
+    /// Seconds a newer key must have been listed before it signs.
+    pub switch_after: i64,
+    /// Now (Unix seconds).
+    pub now: i64,
+}
+
+impl SigningPolicy {
+    /// With nothing recorded (setup's dry run).
+    pub fn fresh(cfg: &VtaConfig, now: i64) -> Self {
+        SigningPolicy {
+            first_listed: BTreeMap::new(),
+            switch_after: i64::try_from(cfg.signing_switch_after_secs).unwrap_or(i64::MAX),
+            now,
+        }
+    }
+
+    /// As recorded in `store` (mirrored from the VTA).
+    pub fn load(store: &crate::store::Store, cfg: &VtaConfig, now: i64) -> Result<Self> {
+        let mut p = Self::fresh(cfg, now);
+        if let Some(m) = store.get(crate::store::Table::Meta, FIRST_LISTED_META)? {
+            p.first_listed = m;
+        }
+        Ok(p)
+    }
+
+    /// Record in `store` (and so in the VTA), if it changed.
+    pub fn save(&self, store: &crate::store::Store) -> Result<()> {
+        let have: Option<BTreeMap<String, i64>> =
+            store.get(crate::store::Table::Meta, FIRST_LISTED_META)?;
+        if have.as_ref() != Some(&self.first_listed) {
+            store.put(
+                crate::store::Table::Meta,
+                FIRST_LISTED_META,
+                &self.first_listed,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record the signing keys listed now: new ones as first seen now,
+    /// unlisted ones forgotten (if one comes back, it is new again).
+    fn observe<'a>(&mut self, listed: impl Iterator<Item = &'a String>) {
+        let listed: std::collections::BTreeSet<&String> = listed.collect();
+        self.first_listed.retain(|k, _| listed.contains(k));
+        for k in listed {
+            self.first_listed.entry(k.clone()).or_insert(self.now);
+        }
+    }
+
+    /// Of `usable` (listed keys the bridge may sign with), the one that
+    /// signs: the newest that has been listed for the horizon, else the
+    /// oldest. `order` breaks ties (the VTA's creation, the key number).
+    fn choose<'a, T>(
+        &self,
+        usable: &'a [T],
+        id: impl Fn(&T) -> &str,
+        order: impl Fn(&T) -> (i64, i64),
+    ) -> Option<&'a T> {
+        let seen = |t: &T| self.first_listed.get(id(t)).copied().unwrap_or(self.now);
+        let key = |t: &&T| (seen(t), order(t));
+        usable
+            .iter()
+            .filter(|t| seen(t).saturating_add(self.switch_after) <= self.now)
+            .max_by_key(key)
+            .or_else(|| usable.iter().min_by_key(key))
+    }
+
+    /// Whether a listed key newer than `current` has now been listed for
+    /// the horizon: the signing key should move on, though nothing else
+    /// changed.
+    pub fn switch_due(&self, current: &str) -> bool {
+        let Some(mine) = self.first_listed.get(current) else {
+            return false;
+        };
+        self.first_listed.iter().any(|(k, t)| {
+            k != current && t > mine && t.saturating_add(self.switch_after) <= self.now
+        })
+    }
 }
 
 /// What a rotation changes, without exporting anything: the DID's keys as
@@ -480,7 +598,10 @@ pub async fn refresh_keys(
                 continue;
             }
         };
-        if !forced && now == last {
+        let due = SigningPolicy::load(bridge.store(), &cfg, chrono::Utc::now().timestamp())
+            .map(|p| p.switch_due(bridge.identity().signing_key_id()))
+            .unwrap_or(false);
+        if !forced && !due && now == last {
             continue;
         }
         match refresh_once(&bridge, &session, &cfg, docs.as_ref()).await {
@@ -592,7 +713,8 @@ fn reconcile(
     held: Option<&BridgeIdentity>,
     doc: &Value,
     created: &BTreeMap<String, i64>,
-) -> Result<BridgeIdentity> {
+    policy: &SigningPolicy,
+) -> Result<(BridgeIdentity, SigningPolicy)> {
     use affinidi_tdk::affinidi_crypto::KeyType;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
     let did = fetched.did.as_str();
@@ -648,10 +770,15 @@ fn reconcile(
     // on its way out (retired, or withdrawn), and is kept only so what was
     // encrypted or signed under it still resolves while the document lists
     // it.
-    let signing = signing_candidates
+    let mut policy = policy.clone();
+    policy.observe(listed.signing.keys());
+    let usable: Vec<&Secret> = signing_candidates
         .iter()
         .filter(|s| exported_ids.contains(&s.id))
-        .max_by_key(|s| age(s))
+        .copied()
+        .collect();
+    let signing = policy
+        .choose(&usable, |s| s.id.as_str(), |s| age(s))
         .map(|s| (*s).clone())
         .with_context(|| {
             format!(
@@ -665,7 +792,7 @@ fn reconcile(
              key for; DIDComm needs one"
         );
     }
-    BridgeIdentity::from_secrets(did, signing, keep)
+    Ok((BridgeIdentity::from_secrets(did, signing, keep)?, policy))
 }
 
 /// Overwrite a bundle's key material.
@@ -980,8 +1107,12 @@ pub async fn setup(
             return r;
         }
     }
-    match session.load_identity(cfg.did.as_deref(), docs, None).await {
-        Ok(id) => {
+    let policy = SigningPolicy::fresh(cfg, chrono::Utc::now().timestamp());
+    match session
+        .load_identity(cfg.did.as_deref(), docs, None, &policy)
+        .await
+    {
+        Ok((id, _)) => {
             r.did = id.did().to_string();
             r.ok(format!(
                 "the credential fetches the DID's keys, and its current document lists {} of \
@@ -1441,6 +1572,15 @@ mod tests {
 
     const MEDIATOR: &str = "did:web:mediator.acme-vtc.example";
 
+    /// A signing policy with nothing recorded, as of now, the default horizon.
+    fn policy() -> SigningPolicy {
+        SigningPolicy {
+            first_listed: BTreeMap::new(),
+            switch_after: 86_400,
+            now: chrono::Utc::now().timestamp(),
+        }
+    }
+
     fn fake() -> (Arc<FakeVta>, BridgeIdentity, Arc<super::testing::FakeDocs>) {
         let (id, bundle) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
         let docs = super::testing::FakeDocs::listing(id.did(), &[&bundle]);
@@ -1469,7 +1609,11 @@ mod tests {
     async fn the_identity_comes_from_the_context_and_signs_as_before() {
         let (vta, minted, docs) = fake();
         let s = vta.session();
-        let id = s.load_identity(None, docs.as_ref(), None).await.unwrap();
+        let id = s
+            .load_identity(None, docs.as_ref(), None, &policy())
+            .await
+            .unwrap()
+            .0;
         assert_eq!(id.did(), minted.did());
         assert_eq!(id.messaging_secrets().len(), 2);
         assert_eq!(
@@ -1478,14 +1622,19 @@ mod tests {
         );
         // The config naming another DID is refused.
         let err = s
-            .load_identity(Some("did:webvh:QmOther:x.example"), docs.as_ref(), None)
+            .load_identity(
+                Some("did:webvh:QmOther:x.example"),
+                docs.as_ref(),
+                None,
+                &policy(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("vta.did"), "{err}");
         // A document that lists none of the keys the VTA releases: refused.
         *docs.0.lock().unwrap() = json!({ "id": id.did() });
         let err = s
-            .load_identity(None, docs.as_ref(), None)
+            .load_identity(None, docs.as_ref(), None, &policy())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lists no signing"), "{err}");
@@ -1499,7 +1648,7 @@ mod tests {
         f.forbid_secrets = true;
         let err = Arc::new(f)
             .session()
-            .load_identity(None, docs.as_ref(), None)
+            .load_identity(None, docs.as_ref(), None, &policy())
             .await
             .unwrap_err();
         assert!(
@@ -1695,9 +1844,10 @@ version = "v0.5.0"
         ))
         .unwrap();
         let identity = session
-            .load_identity(None, docs.as_ref(), None)
+            .load_identity(None, docs.as_ref(), None, &policy())
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let old = identity.clone();
         let store = Store::in_memory(MasterKey::generate().unwrap()).unwrap();
         let (link, mut inbox) = ChannelLink::new();
@@ -1742,40 +1892,57 @@ version = "v0.5.0"
             inbox.try_recv().expect("the bridge answered").1
         };
 
+        const T0: i64 = 1_800_000_000;
+        const DAY: i64 = 86_400;
+        let refresh = |t: i64| {
+            let (bridge, session, cfg_vta, docs) = (&bridge, &session, &cfg_vta, docs.clone());
+            async move {
+                refresh_once_at(bridge, session, cfg_vta, docs.as_ref(), t)
+                    .await
+                    .unwrap()
+            }
+        };
         let a = answer(&bridge).await;
         published(&old)
             .verify_raw(&a)
             .await
             .expect("the key in service signs");
-        assert!(
-            !refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
-                .await
-                .unwrap()
-        );
+        assert!(!refresh(T0).await);
 
         // 1. The VTA mints the successor keys, not yet in the document: not
         //    held, not used.
         vta.rotate(&merged(&old_keys, &new_keys));
-        assert!(
-            !refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
-                .await
-                .unwrap()
-        );
+        assert!(!refresh(T0 + 10).await);
         assert_eq!(ids(&bridge), ["key-0", "key-1"]);
 
-        // 2. The document lists both (the overlap): all four held, the
-        //    newest signs.
+        // 2. The document lists both (the overlap): all four held — a job
+        //    encrypted to either key opens — but the old key keeps signing
+        //    until the new one has been listed for the verifiers' cache
+        //    horizon.
         docs.publish(DID, &[&old_keys, &new_keys]);
-        assert!(
-            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
-                .await
-                .unwrap()
-        );
+        assert!(refresh(T0 + 20).await);
         assert!(
             rotations.has_changed().unwrap(),
             "DIDComm reconnects with every listed key"
         );
         assert_eq!(ids(&bridge), ["key-0", "key-1", "key-2", "key-3"]);
+        assert!(bridge.identity().signing_key_id().ends_with("#key-0"));
+        let a = answer(&bridge).await;
+        published(&old)
+            .verify_raw(&a)
+            .await
+            .expect("the old key still signs inside the horizon");
+        assert!(
+            !refresh(T0 + 20 + DAY - 1).await,
+            "one second short: no switch"
+        );
+        assert!(bridge.identity().signing_key_id().ends_with("#key-0"));
+
+        // …and switches once the horizon has passed, though nothing else
+        // changed.
+        let policy = SigningPolicy::load(bridge.store(), &cfg_vta, T0 + 20 + DAY).unwrap();
+        assert!(policy.switch_due(bridge.identity().signing_key_id()));
+        assert!(refresh(T0 + 20 + DAY).await);
         let new = bridge.identity();
         assert!(
             new.signing_key_id().ends_with("#key-2"),
@@ -1786,24 +1953,27 @@ version = "v0.5.0"
         published(&new)
             .verify_raw(&a)
             .await
-            .expect("the newest key signs");
+            .expect("the new key signs after the horizon");
         assert!(published(&old).verify_raw(&a).await.is_err());
+        // The first-listed times are in the mirrored state (a new host keeps
+        // them).
+        let recorded: BTreeMap<String, i64> = bridge
+            .store()
+            .get(crate::store::Table::Meta, FIRST_LISTED_META)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded[&format!("{DID}#key-0")], T0);
+        assert_eq!(recorded[&format!("{DID}#key-2")], T0 + 20);
 
         // 3. The VTA stops releasing the old keys, but the document still
         //    lists them: the bridge keeps its copies.
         vta.rotate(&new_keys);
-        refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
-            .await
-            .unwrap();
+        refresh(T0 + DAY + 100).await;
         assert_eq!(ids(&bridge), ["key-0", "key-1", "key-2", "key-3"]);
 
         // 4. The document stops listing them (the end of the overlap): gone.
         docs.publish(DID, &[&new_keys]);
-        assert!(
-            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
-                .await
-                .unwrap()
-        );
+        assert!(refresh(T0 + DAY + 200).await);
         assert_eq!(ids(&bridge), ["key-2", "key-3"]);
         let a = answer(&bridge).await;
         published(&new)
@@ -1822,7 +1992,7 @@ version = "v0.5.0"
         let impostor = webvh_bundle_from(DID, 2);
         docs.publish(DID, &[&impostor]);
         assert!(
-            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+            refresh_once_at(&bridge, &session, &cfg_vta, docs.as_ref(), T0 + DAY + 300)
                 .await
                 .is_err()
         );
@@ -1830,7 +2000,7 @@ version = "v0.5.0"
         docs.publish(DID, &[&new_keys]);
         vta.rotate(&other);
         assert!(
-            refresh_once(&bridge, &session, &cfg_vta, docs.as_ref())
+            refresh_once_at(&bridge, &session, &cfg_vta, docs.as_ref(), T0 + DAY + 400)
                 .await
                 .is_err()
         );
@@ -1847,11 +2017,15 @@ version = "v0.5.0"
         let vta = Arc::new(FakeVta::new("vgi-bridge", &old_keys));
         let docs = FakeDocs::listing(DID, &[&old_keys]);
         let s = vta.session();
-        let held = s.load_identity(None, docs.as_ref(), None).await.unwrap();
+        let held = s
+            .load_identity(None, docs.as_ref(), None, &policy())
+            .await
+            .unwrap()
+            .0;
         // The VTA withdraws them (releases others the document does not list).
         vta.rotate(&webvh_bundle_from(DID, 4));
         let err = s
-            .load_identity(None, docs.as_ref(), Some(&held))
+            .load_identity(None, docs.as_ref(), Some(&held), &policy())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("withdrawn"), "{err}");
@@ -1869,5 +2043,73 @@ version = "v0.5.0"
         s.client().create_key(req).await.unwrap();
         let err = s.sealing_key(true).await.unwrap_err();
         assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    /// The signing choice on its own: the oldest listed key signs until a
+    /// newer one has been listed for the horizon; an unlisted key is gone at
+    /// once, so its successor signs immediately.
+    #[test]
+    fn the_signing_key_moves_on_at_the_horizon_or_when_the_old_one_is_unlisted() {
+        let mut p = SigningPolicy {
+            first_listed: BTreeMap::new(),
+            switch_after: 100,
+            now: 1_000,
+        };
+        let (old, new) = ("did:x#key-0".to_string(), "did:x#key-2".to_string());
+        p.observe([&old].into_iter());
+        let order = |_: &&String| (0, 0);
+        let pick = |p: &SigningPolicy, keys: &[&String]| {
+            p.choose(keys, |k| k.as_str(), order).map(|k| (*k).clone())
+        };
+        // The new key is listed at 1 050.
+        p.now = 1_050;
+        p.observe([&old, &new].into_iter());
+        assert_eq!(
+            pick(&p, &[&old, &new]),
+            Some(old.clone()),
+            "inside the horizon"
+        );
+        assert!(!p.switch_due(&old));
+        p.now = 1_149;
+        assert_eq!(pick(&p, &[&old, &new]), Some(old.clone()));
+        p.now = 1_150;
+        assert!(p.switch_due(&old));
+        assert_eq!(pick(&p, &[&old, &new]), Some(new.clone()), "at the horizon");
+
+        // The old key unlisted before the horizon: the new one at once.
+        let mut q = SigningPolicy {
+            first_listed: BTreeMap::new(),
+            switch_after: 100,
+            now: 1_000,
+        };
+        q.observe([&old].into_iter());
+        q.now = 1_010;
+        q.observe([&old, &new].into_iter());
+        q.now = 1_020;
+        q.observe([&new].into_iter());
+        assert!(
+            !q.first_listed.contains_key(&old),
+            "an unlisted key is forgotten"
+        );
+        assert_eq!(pick(&q, &[&new]), Some(new.clone()));
+    }
+
+    #[test]
+    fn the_switch_horizon_is_at_least_the_did_cache_lifetime() {
+        let base = crate::config::tests_example();
+        let with = |extra: &str| {
+            crate::config::BridgeConfig::parse(&format!(
+                "{base}\n[vta]\ncontext = \"b\"\ncredential_env = \"X\"\n{extra}"
+            ))
+        };
+        assert_eq!(
+            with("").unwrap().vta.unwrap().signing_switch_after_secs,
+            86_400
+        );
+        assert!(
+            with("signing_switch_after_secs = 30").is_err(),
+            "below the 60 s DID cache"
+        );
+        assert!(with("signing_switch_after_secs = 60").is_ok());
     }
 }
