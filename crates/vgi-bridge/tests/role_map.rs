@@ -367,7 +367,11 @@ async fn a_github_organisation_with_the_default_map_reports_just_the_map() {
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
     assert_eq!(
         report(&mut w).await,
-        json!({ "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") })
+        json!({
+            "type": "roleMapReported",
+            "roleMap": map("admin", "maintain", "none"),
+            "ladder": ["read", "triage", "write", "maintain", "admin"],
+        })
     );
 }
 
@@ -385,7 +389,7 @@ async fn a_github_personal_account_reports_the_one_collaborator_level() {
     );
     assert_eq!(
         report(&mut w).await,
-        json!({ "type": "roleMapReported", "roleMap": map("write", "write", "none") })
+        json!({ "type": "roleMapReported", "roleMap": map("write", "write", "none"), "ladder": ["write"] })
     );
 }
 
@@ -517,7 +521,11 @@ async fn forgejo_reports_its_ladder_and_a_changed_map_makes_repositories_stale()
     // merge allow-list) is reported as `maintain`, the level drift uses.
     assert_eq!(
         doc["payload"]["event"],
-        json!({ "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") })
+        json!({
+            "type": "roleMapReported",
+            "roleMap": map("admin", "maintain", "none"),
+            "ladder": ["read", "write", "maintain", "admin"],
+        })
     );
 
     let w = forgejo_world("[forgejo.role_map]\nmaintain = \"admin\"").await;
@@ -527,6 +535,7 @@ async fn forgejo_reports_its_ladder_and_a_changed_map_makes_repositories_stale()
         json!({
             "type": "roleMapReported",
             "roleMap": map("admin", "admin", "none"),
+            "ladder": ["read", "write", "maintain", "admin"],
             "stale": [format!("{FJ}/acme/widgets")],
         })
     );
@@ -612,4 +621,72 @@ async fn a_namespace_the_bridge_starts_serving_is_reported() {
     // A namespace that is not bound (or unknown) is not reported.
     w.bridge.started_serving("ns_unknown").await;
     w.quiet().await;
+}
+
+#[tokio::test]
+async fn a_resent_report_carries_the_map_applied_now_not_the_one_first_queued() {
+    use std::sync::atomic::Ordering;
+    let mut w = world(Options::default()).await;
+    // Queued while the link is down: no stale repository yet.
+    w.link_down.store(true, Ordering::Release);
+    w.bridge.report_role_map(NS).await;
+    let key = vgi_bridge::rolemap::outbox_key(NS);
+    let queued: OutboxEntry = w.bridge.store().get(Table::Outbox, &key).unwrap().unwrap();
+    assert!(queued.payload["event"].get("stale").is_none());
+    // Before the resend, a repository comes to be projected under another
+    // map than the one applied now.
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    w.bridge
+        .store()
+        .update::<RepoRecord, _>(Table::Repos, "github.com#812", |r| {
+            Ok((
+                r.map(|mut r| {
+                    r.role_map = serde_json::from_value(map("admin", "admin", "none")).ok();
+                    r
+                }),
+                (),
+            ))
+        })
+        .unwrap();
+    // The resend is built afresh: a later issuedAt carries the later map.
+    w.link_down.store(false, Ordering::Release);
+    w.bridge.resend_unacknowledged(true).await;
+    let (maps, _) = drain(&mut w).await;
+    let last = maps.last().expect("the report is sent again");
+    assert_eq!(
+        last["payload"]["event"]["stale"],
+        json!(["github.com/acme/widgets"])
+    );
+}
+
+#[tokio::test]
+async fn a_pending_report_is_dropped_once_the_vtc_takes_an_event_version_below_0_3() {
+    let mut w = world(Options {
+        event_version: Some("0.2"),
+        ..Options::default()
+    })
+    .await;
+    // A report queued under 0.3, before the version was lowered.
+    let key = vgi_bridge::rolemap::outbox_key(NS);
+    w.bridge
+        .store()
+        .put(
+            Table::Outbox,
+            &key,
+            &OutboxEntry::result(json!({
+                "namespace": NS,
+                "event": { "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") },
+            })),
+        )
+        .unwrap();
+    w.bridge.resend_unacknowledged(true).await;
+    w.quiet().await;
+    assert!(
+        w.bridge
+            .store()
+            .get::<OutboxEntry>(Table::Outbox, &key)
+            .unwrap()
+            .is_none(),
+        "dropped, not sent under 0.2"
+    );
 }

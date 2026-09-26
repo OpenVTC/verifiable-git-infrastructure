@@ -751,6 +751,31 @@ impl Bridge {
         drift: Option<Vec<Value>>,
         key: Option<String>,
     ) -> Result<()> {
+        let Some(payload) = self.event_outbox_payload(namespace, event_json, drift)? else {
+            return Ok(());
+        };
+        let key = key.unwrap_or_else(|| format!("event:{}", wire::new_id()));
+        let entry = OutboxEntry {
+            kind: OutboxKind::Event,
+            payload,
+            doc_ids: Vec::new(),
+            last_sent: 0,
+            attempts: 0,
+        };
+        self.store.put(Table::Outbox, &key, &entry)?;
+        self.send_outbox(&key).await;
+        Ok(())
+    }
+
+    /// The outbox payload of an event in `namespace`: the event, its drift
+    /// and the status report (`ext`). `None` for an event that names a
+    /// repository outside `namespace`, which is logged and never sent.
+    fn event_outbox_payload(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+    ) -> Result<Option<Value>> {
         // The repository an event is about, by forge id, for the status
         // report (`ext`).
         let repo = event_json
@@ -777,28 +802,65 @@ impl Bridge {
                 r#type = ty,
                 "not reporting an event that names a repository outside its namespace"
             );
-            return Ok(());
+            return Ok(None);
         }
         let payload = mapping::event_payload(namespace, event_json, drift)?;
         let host = ns_resource.map(|r| r.host().to_string());
         let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
-        let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
-        let key = key.unwrap_or_else(|| format!("event:{}", wire::new_id()));
-        let entry = OutboxEntry {
-            kind: OutboxKind::Event,
-            payload,
-            doc_ids: Vec::new(),
-            last_sent: 0,
-            attempts: 0,
+        Ok(Some(crate::status::attach::<event::Payload>(
+            serde_json::to_value(&payload)?,
+            ext,
+        )))
+    }
+
+    /// A role-map report's outbox entry `key`, built afresh for this send
+    /// (`git-ns/bridge/event` 0.3: the report with the latest `issuedAt`
+    /// wins, so a resend carries the map applied now, never the one first
+    /// queued). `false` when there is nothing to send: the VTC takes an event
+    /// version without `roleMapReported`, the namespace is no longer bound,
+    /// or its map rounds unordered. The entry is then dropped rather than
+    /// sent under an older version or with a map the bridge no longer
+    /// applies.
+    fn refresh_role_map_entry(&self, key: &str) -> bool {
+        let ns_id = &key[crate::rolemap::OUTBOX_PREFIX.len()..];
+        let fresh = if self.cfg.event_version.reports_role_map() {
+            self.store
+                .get::<NamespaceRecord>(Table::Namespaces, ns_id)
+                .ok()
+                .flatten()
+                .and_then(|ns| crate::rolemap::event(self, &ns))
+                .and_then(|ev| self.event_outbox_payload(ns_id, ev, None).ok().flatten())
+        } else {
+            None
         };
-        self.store.put(Table::Outbox, &key, &entry)?;
-        self.send_outbox(&key).await;
-        Ok(())
+        let Some(payload) = fresh else {
+            tracing::info!(
+                namespace = ns_id,
+                "dropping a pending role-map report: there is no report to send now"
+            );
+            let _ = self.store.delete(Table::Outbox, key);
+            return false;
+        };
+        self.store
+            .update::<OutboxEntry, _>(Table::Outbox, key, |e| {
+                Ok((
+                    e.map(|mut e| {
+                        e.payload = payload;
+                        e
+                    }),
+                    (),
+                ))
+            })
+            .is_ok()
     }
 
     /// Send (again) the outbox entry `key`, as a freshly issued and signed
-    /// document.
+    /// document. A role-map report is first rebuilt from the map applied now
+    /// (or dropped: [`Self::refresh_role_map_entry`]).
     pub(crate) async fn send_outbox(&self, key: &str) {
+        if key.starts_with(crate::rolemap::OUTBOX_PREFIX) && !self.refresh_role_map_entry(key) {
+            return;
+        }
         let Ok(Some(entry)) = self.store.get::<OutboxEntry>(Table::Outbox, key) else {
             return;
         };
