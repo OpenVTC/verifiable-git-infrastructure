@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.15"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.4.15", path = "crates/vgi-core" }
+vgi-core = { version = "0.5.0", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.4.15", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.5.0", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.4.15", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.4.15", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.4.15", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.5.0", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.5.0", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.5.0", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
