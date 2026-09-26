@@ -110,14 +110,14 @@ async fn a_0_2_job_removes_a_collaborator_added_on_github_by_id() {
         .await;
 
     let job = w
-        .send_job_0_2(revert_job(
+        .send_job(revert_job(
             "job_rv",
             "github.com/acme/widgets",
             json!([account("github.com", EVE, "eve-dev")]),
         ))
         .await;
     let resp = w.next().await;
-    assert_eq!(resp["type"], format!("{JOB_0_2}#response"));
+    assert_eq!(resp["type"], format!("{JOB}#response"));
     assert_eq!(resp["threadId"], job["id"]);
     assert_eq!(
         resp["payload"],
@@ -150,7 +150,7 @@ async fn removing_an_account_that_holds_no_role_is_already_converged() {
     let mut w = world(Options::default()).await;
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
     mount_github_roles(&w.server, "acme", vec![]).await;
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "job_nr",
         "github.com/acme/widgets",
         json!([account("github.com", EVE, "eve-dev")]),
@@ -170,7 +170,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
 
     // An account in both desiredRoles and removeAccounts (by forge and id;
     // the login differing changes nothing).
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "j_overlap",
         "github.com/acme/widgets",
         json!([account(gh, ALICE, "someone-else")]),
@@ -187,9 +187,8 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
         "{err}"
     );
 
-    // Namespace-level projectRoles (no `repo`): removeAccounts never
-    // touches the namespace itself.
-    w.send_job_0_2(json!({
+    // Namespace-level projectRoles (no `repo`): job 0.4 has none.
+    w.send_job(json!({
         "jobId": "j_ns", "namespace": NS, "kind": "projectRoles", "desiredRoles": [],
         "removeAccounts": [account(gh, EVE, "eve-dev")],
     }))
@@ -204,7 +203,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
     );
 
     // An account on another forge than the namespace's.
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "j_forge",
         "github.com/acme/widgets",
         json!([account("codeberg.org", EVE, "eve-dev")]),
@@ -213,7 +212,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
     assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
 
     // Another kind carrying it.
-    w.send_job_0_2(json!({
+    w.send_job(json!({
         "jobId": "j_kind", "namespace": NS, "kind": "inspect", "repo": "github.com/acme/widgets",
         "removeAccounts": [account(gh, EVE, "eve-dev")],
     }))
@@ -221,10 +220,10 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
     assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
 
     // Empty, or one account twice.
-    w.send_job_0_2(revert_job("j_empty", "github.com/acme/widgets", json!([])))
+    w.send_job(revert_job("j_empty", "github.com/acme/widgets", json!([])))
         .await;
     assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "j_twice",
         "github.com/acme/widgets",
         json!([account(gh, EVE, "eve-dev"), account(gh, EVE, "eve-renamed")]),
@@ -232,10 +231,10 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
     .await;
     assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
 
-    // A 0.1 job has no `removeAccounts` member at all.
+    // A 0.1 job is not taken at all: this bridge takes 0.4 only.
     let doc = w
         .doc(
-            JOB,
+            JOB_0_1,
             revert_job(
                 "j_v01",
                 "github.com/acme/widgets",
@@ -245,7 +244,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
         )
         .await;
     w.deliver(doc).await;
-    assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
+    assert_eq!(w.next().await["payload"]["code"], "unsupportedVersion");
 
     for j in [
         "j_overlap",
@@ -262,7 +261,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
 }
 
 #[tokio::test]
-async fn a_0_1_project_roles_job_is_still_taken_and_answered_as_0_1() {
+async fn a_project_roles_job_without_remove_accounts_leaves_unprojected_roles() {
     let mut w = world(Options::default()).await;
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
     mount_github_roles(
@@ -281,7 +280,7 @@ async fn a_0_1_project_roles_job_is_still_taken_and_answered_as_0_1() {
     assert_eq!(resp["payload"]["accepted"], true);
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
-    // 0.1 semantics unchanged: a role the bridge never projected stays.
+    // Without `removeAccounts`, a role the bridge never projected stays.
     assert!(deletes(&w.server).await.is_empty());
 }
 
@@ -297,7 +296,7 @@ async fn the_personal_accounts_owner_is_never_removed() {
     mount_github_roles(&w.server, "alice", vec![]).await;
     // Owner id 500 (the seeded namespace's), and Eve beside it: Eve holds
     // nothing, the owner is refused.
-    w.send_job_0_2(json!({
+    w.send_job(json!({
         "jobId": "job_own", "namespace": NS, "kind": "projectRoles",
         "repo": "github.com/alice/widgets", "desiredRoles": [],
         "removeAccounts": [account("github.com", 500, "alice"), account("github.com", EVE, "eve-dev")],
@@ -331,7 +330,7 @@ async fn the_bridges_own_github_app_is_never_removed() {
         .expect(0)
         .mount(&w.server)
         .await;
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "job_bot",
         "github.com/acme/widgets",
         json!([account("github.com", 777, "acme-vgi-bridge[bot]")]),
@@ -450,7 +449,7 @@ async fn writes(server: &MockServer) -> Vec<String> {
 }
 
 async fn run_revert(w: &mut World, job: &str, repo: &str, host: &str) -> Value {
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         job,
         repo,
         json!([account(host, EVE, "eve-dev")]),
@@ -614,14 +613,14 @@ async fn a_0_2_job_removes_a_collaborator_added_on_forgejo_by_id() {
         .expect(1)
         .mount(&w.server)
         .await;
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "job_fj",
         &format!("{FJ}/acme/widgets"),
         json!([account(FJ, EVE, "eve-dev")]),
     ))
     .await;
     let resp = w.next().await;
-    assert_eq!(resp["type"], format!("{JOB_0_2}#response"));
+    assert_eq!(resp["type"], format!("{JOB}#response"));
     assert_eq!(resp["payload"]["accepted"], true, "{resp}");
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
@@ -635,7 +634,7 @@ async fn a_0_2_job_removes_a_collaborator_added_on_forgejo_by_id() {
 #[tokio::test]
 async fn the_bridges_own_forgejo_bot_is_never_removed() {
     let mut w = forgejo_world().await;
-    w.send_job_0_2(revert_job(
+    w.send_job(revert_job(
         "job_fjbot",
         &format!("{FJ}/acme/widgets"),
         json!([account(FJ, BOT_ID, BOT)]),

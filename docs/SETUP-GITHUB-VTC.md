@@ -725,8 +725,9 @@ Checked against `main` of this repository, verifiable-trust-infrastructure
 and openvtc when this was written:
 
 - **Namespace admins get no organisation role.** The bridge projects roles
-  per repository only and refuses a namespace-level `projectRoles`
-  (`notCapable`: "project git.ns.admin by hand"). Make namespace admins
+  per repository only; `git-ns/bridge/job` 0.4 has no namespace-level
+  `projectRoles`, and a namespace admin with no right of their own on a
+  repository is sent as `git.ns.admin` and gets no role. Make namespace admins
   organisation owners (or not) yourself.
 - **Committers get no GitHub role.** `git.commit.sign` projects to no role
   (the default map; nothing in the bridge config changes it): committers

@@ -343,11 +343,13 @@ affinidi-messaging-test-mediator = { version = "0.10.2", features = ["tsp"] }
 # crate OpenVTC consumes — is unaffected. It closes as vta-sdk and
 # trql-client publish onto this line.
 #
-# 0.23 carries `git-ns/bridge/job` 0.4 (`projectRoles` requires `repo`) and
-# `git-ns/namespace/reseat` 0.3 generated, on top of everything the 0.22 line
-# already carried. It is its own node, so the split widens from two to three:
-# 0.21 through trql-client, 0.22 through vta-sdk 0.51 (and verify-trust,
-# which builds against it), 0.23 here.
+# 0.23 carries `git-ns/bridge/job` 0.4 generated (`specs::git_ns::bridge::
+# job::v0_4`; wire-identical to 0.3, so the swap from the generated 0.3
+# types this bridge previously read it with is source-only) and
+# `git-ns/namespace/reseat` 0.3, on top of everything the 0.22 line already
+# carried. It is its own node, so the split widens from two to three: 0.21
+# through trql-client, 0.22 through vta-sdk 0.51 (and verify-trust, which
+# builds against it), 0.23 here.
 trust-tasks-rs = { version = "0.23", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
