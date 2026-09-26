@@ -785,10 +785,10 @@ overridden, field by field, at four levels; the most specific wins:
 [[forgejo]]
 base_url = "https://codeberg.org/"
 # …
-# Every namespace on this instance: maintainers as repository admins
-# instead of `write` plus the merge allow-list.
+# Every namespace on this instance: maintainers as plain `write`,
+# without the merge allow-list.
 [forgejo.role_map]
-maintain = "admin"
+maintain = "write"
 
 # One namespace (the owner's login, lowercase).
 [forgejo.namespaces.acme.role_map]
@@ -805,7 +805,14 @@ commit = "write"
 `resign_dependabot`). Values are `none`, `read`, `triage`, `write`,
 `maintain`, `admin`. The start fails unless every map the layers can make is
 ordered — `own ≥ maintain ≥ commit` — with `commit` at most `write` (merging
-is a maintainer's; the check, not a role, decides whose commits land).
+is a maintainer's; the check, not a role, decides whose commits land), and
+**only `own` may map to `admin`**. `maintain` and `commit.sign` are rights a
+member may grant themselves, so a map that made either a forge admin would let
+them make themselves a repository administrator on their own authority; the
+start fails with an error naming the layer (`git-ns/bridge/job` 0.4 requires
+this). On a personal account `own` and `maintain` both become `write`, so
+there the forge cannot tell an owner from a maintainer: separation of duties
+is enforced at the VTC, not the forge.
 
 **A namespace admin gets no forge role, and no configuration can give them
 one** (decided 2026-09-25). There is no key for `git.ns.admin` — `ns_admin`,
@@ -814,14 +821,16 @@ role carries `git.ns.admin` projects nothing. Nothing here means *no
 direct role at all*: an account a job lists with no role has **any** direct
 collaborator role on that repository removed, one given by hand on the
 forge as much as one the bridge projected (only accounts a job does not
-list are left alone). A namespace-level role job (organisation owners) is
-refused `notCapable`.
+list are left alone). `git-ns/bridge/job` 0.4 has no namespace-level role
+job (organisation owners): one without `repo` is `malformedRequest`. The
+bridge takes 0.4 only — older versions are refused `unsupportedVersion` —
+and answers `trust-task-discovery/0.2` from its VTC with the 0.4 type URI,
+which is how a VTC learns it may send 0.4.
 
-This holds end to end only when the VTC sends `git.ns.admin` for a
-namespace admin. A VTC that folds `ns.admin` into `git.repo.own` by
-implication before sending — as VTC releases before the fix for this do —
-sends namespace admins as owners, and the bridge, which cannot tell them
-apart, projects them as owners. `git.ns.admin` is exercised through the VTC
+Job 0.4 has the VTC send `git.ns.admin` for a namespace admin with no right
+of their own on a repository, never the `git.repo.own` it implies; a VTC
+that sent earlier versions folded the two together, which is why this
+bridge takes 0.4 only. `git.ns.admin` is exercised through the VTC
 and the bridge; who owns the organisation stays yours to manage by hand.
 Someone who is both a namespace admin and, in their own name, a
 repository's owner or maintainer gets that repository right's role.

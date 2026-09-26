@@ -304,7 +304,9 @@ impl Default for ResignConfig {
 /// GitHub personal account has only `write`).
 ///
 /// Every map a layer can produce must be ordered (`own ≥ maintain ≥
-/// commit`) with `commit` at most `write`, or the start fails.
+/// commit`), give `admin` to nobody but `own` and keep `commit` at most
+/// `write`, or the start fails: `maintain` and `commit` are rights their
+/// holder may grant themselves, so neither may make them a forge admin.
 ///
 /// **There is deliberately no key for `git.ns.admin`**: a namespace admin
 /// gets no forge role (decided 2026-09-25), so none can be configured — an
@@ -343,9 +345,9 @@ impl RoleMapConfig {
             .fold(RoleMapConfig::default(), |acc, l| l.over(acc));
         let d = RoleMap::default();
         RoleMap::new(
-            merged.own.unwrap_or(d.own),
-            merged.maintain.unwrap_or(d.maintain),
-            merged.commit.unwrap_or(d.commit),
+            merged.own.unwrap_or(d.own()),
+            merged.maintain.unwrap_or(d.maintain()),
+            merged.commit.unwrap_or(d.commit()),
         )
         .map_err(|e| anyhow::anyhow!(e))
     }
@@ -1192,10 +1194,10 @@ oauth_client_id = "0b6e3a0c"
             EXAMPLE.replace("[[github]]", "[role_map]\ncommit = \"read\"\n\n[[github]]"),
             r#"
 [forgejo.role_map]
-maintain = "admin"
+maintain = "write"
 
 [forgejo.namespaces.acme.role_map]
-maintain = "write"
+maintain = "maintain"
 
 [forgejo.namespaces.acme.repos.widgets.role_map]
 commit = "write"
@@ -1205,16 +1207,16 @@ commit = "write"
         use ForgeRole::*;
         let got = |r| {
             let m = c.role_map(&res(r));
-            (m.own, m.maintain, m.commit)
+            (m.own(), m.maintain(), m.commit())
         };
         // Bridge-wide only.
         assert_eq!(got("github.com/acme/widgets"), (Admin, Maintain, Read));
         // Forge entry over the bridge.
-        assert_eq!(got("codeberg.org/other/widgets"), (Admin, Admin, Read));
+        assert_eq!(got("codeberg.org/other/widgets"), (Admin, Write, Read));
         // Namespace over the forge entry.
-        assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Write, Read));
+        assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Maintain, Read));
         // Repository over the namespace; names match case-insensitively.
-        assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Write, Write));
+        assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Maintain, Write));
         // The repositories with a layer of their own, for the report.
         assert_eq!(
             c.role_map_repos(&res("codeberg.org/acme")),
@@ -1235,19 +1237,47 @@ commit = "write"
             // Out of order, or a committer above `write`.
             "[role_map]\nown = \"write\"",
             "[role_map]\ncommit = \"maintain\"",
-            "[forgejo.role_map]\nmaintain = \"admin\"\ncommit = \"admin\"",
             // Checked through every layer, not only on its own.
-            "[forgejo.role_map]\nown = \"maintain\"\n\
-             [forgejo.namespaces.acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.role_map]\nown = \"write\"\n\
+             [forgejo.namespaces.acme.role_map]\nmaintain = \"maintain\"",
             "[forgejo.namespaces.acme.repos.w.role_map]\ncommit = \"triage\"\nmaintain = \"read\"",
             // Keys are lowercase.
-            "[forgejo.namespaces.Acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.namespaces.Acme.role_map]\nmaintain = \"write\"",
             "[forgejo.namespaces.acme.repos.W.role_map]\ncommit = \"write\"",
             "[role_map]\nmaintain = \"superuser\"",
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }
-        assert!(with("[role_map]\nmaintain = \"admin\"\ncommit = \"write\"").is_ok());
+        assert!(with("[role_map]\nmaintain = \"write\"\ncommit = \"write\"").is_ok());
+    }
+
+    #[test]
+    fn only_an_owner_may_map_to_admin_at_any_layer() {
+        let with = |extra: &str| BridgeConfig::parse(&format!("{EXAMPLE}\n{extra}"));
+        for (bad, layer) in [
+            ("[role_map]\nmaintain = \"admin\"", "`role_map`"),
+            (
+                "[role_map]\nmaintain = \"admin\"\ncommit = \"write\"",
+                "`role_map`",
+            ),
+            ("[forgejo.role_map]\nmaintain = \"admin\"", "forgejo"),
+            ("[forgejo.role_map]\ncommit = \"admin\"", "forgejo"),
+            (
+                "[forgejo.namespaces.acme.role_map]\nmaintain = \"admin\"",
+                "acme",
+            ),
+            (
+                "[forgejo.namespaces.acme.repos.w.role_map]\nmaintain = \"admin\"",
+                "acme",
+            ),
+        ] {
+            let err = format!("{:#}", with(bad).unwrap_err());
+            assert!(err.contains("only an owner"), "{bad}: {err}");
+            assert!(err.contains(layer), "{bad} names its layer: {err}");
+        }
+        // An owner at admin is the default, and a narrower owner is allowed.
+        assert!(with("[role_map]\nown = \"admin\"").is_ok());
+        assert!(with("[role_map]\nown = \"write\"\nmaintain = \"write\"").is_ok());
     }
 
     #[test]

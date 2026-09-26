@@ -85,7 +85,7 @@ async fn project(w: &mut World, name: &str, roles: Vec<Value>) -> Value {
 }
 
 async fn project_on(w: &mut World, host: &str, name: &str, roles: Vec<Value>) -> Value {
-    w.send_job_0_2(json!({
+    w.send_job(json!({
         "jobId": format!("job_{name}"), "namespace": NS, "kind": "projectRoles",
         "repo": format!("{host}/acme/{name}"), "desiredRoles": roles,
     }))
@@ -123,10 +123,10 @@ async fn namespace_and_repository_overrides_apply_and_still_give_an_admin_nothin
     let mut w = world(Options {
         github_extra: r#"
 [github.role_map]
-maintain = "write"
+maintain = "maintain"
 
 [github.namespaces.acme.role_map]
-maintain = "admin"
+maintain = "write"
 
 [github.namespaces.acme.repos.gadgets.role_map]
 commit = "write"
@@ -151,7 +151,7 @@ commit = "write"
     assert_eq!(
         puts(&w.server).await,
         vec![
-            ("bob".into(), "admin".into()),
+            ("bob".into(), "push".into()),
             ("dave".into(), "push".into()),
         ]
     );
@@ -286,23 +286,6 @@ async fn forgejo_writes(server: &MockServer) -> (Vec<String>, Vec<Value>) {
         .map(|r| body(r)["merge_whitelist_usernames"].clone())
         .collect();
     (perms, lists)
-}
-
-#[tokio::test]
-async fn forgejo_maintainers_as_admins_are_on_the_merge_allow_list() {
-    let mut w = forgejo_world("[forgejo.role_map]\nmaintain = \"admin\"").await;
-    mount_forgejo_bootstrapped(&w.server).await;
-    let result = project_on(
-        &mut w,
-        FJ,
-        "widgets",
-        vec![fj_role(BOB, "bob", "git.repo.maintain")],
-    )
-    .await;
-    assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
-    let (perms, lists) = forgejo_writes(&w.server).await;
-    assert_eq!(perms, ["admin"]);
-    assert_eq!(lists, [json!([BOT, "bob"])]);
 }
 
 #[tokio::test]
@@ -528,13 +511,13 @@ async fn forgejo_reports_its_ladder_and_a_changed_map_makes_repositories_stale()
         })
     );
 
-    let w = forgejo_world("[forgejo.role_map]\nmaintain = \"admin\"").await;
+    let w = forgejo_world("[forgejo.role_map]\nmaintain = \"write\"").await;
     let doc = &w.startup_reports[0];
     assert_eq!(
         doc["payload"]["event"],
         json!({
             "type": "roleMapReported",
-            "roleMap": map("admin", "admin", "none"),
+            "roleMap": map("admin", "write", "none"),
             "ladder": ["read", "write", "maintain", "admin"],
             "stale": [format!("{FJ}/acme/widgets")],
         })
@@ -566,7 +549,7 @@ async fn a_link_that_comes_back_reports_the_role_map_once_per_namespace() {
     // The link drops: a result goes unsent, and nothing is flagged yet.
     w.link_down.store(true, Ordering::Release);
     mount_empty_repo(&w.server, "widgets").await;
-    w.send_job_0_2(json!({
+    w.send_job(json!({
         "jobId": "job_down", "namespace": NS, "kind": "projectRoles",
         "repo": "github.com/acme/widgets", "desiredRoles": [],
     }))
@@ -641,7 +624,7 @@ async fn a_resent_report_carries_the_map_applied_now_not_the_one_first_queued() 
         .update::<RepoRecord, _>(Table::Repos, "github.com#812", |r| {
             Ok((
                 r.map(|mut r| {
-                    r.role_map = serde_json::from_value(map("admin", "admin", "none")).ok();
+                    r.role_map = serde_json::from_value(map("admin", "write", "none")).ok();
                     r
                 }),
                 (),
