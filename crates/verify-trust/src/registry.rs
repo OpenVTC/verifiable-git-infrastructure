@@ -67,7 +67,7 @@ use trql_client::{
     HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportChoice, TransportKind,
     TrqlClient, TrqlError, TrqlTransport,
 };
-use trust_tasks_trql::TrustTask;
+use trust_tasks_rs::TrustTask;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub use mediated::EphemeralIdentity;

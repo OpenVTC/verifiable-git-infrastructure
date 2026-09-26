@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.5.0", path = "crates/vgi-core" }
+vgi-core = { version = "0.5.1", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.5.0", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.5.1", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.5.0", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.5.0", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.5.0", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.5.1", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.5.1", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.5.1", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -84,33 +84,20 @@ verify-trust = { version = "0.5.0", path = "crates/verify-trust" }
 # strict form this note prefers. Taken together with the vta-sdk 0.39 -> 0.42
 # step below; the registry published 0.18 so this workspace could land the whole
 # frontier at once rather than leaving the split standing behind a fresh pin.
-trql-client = "0.19"
-# The Trust Task document type on the line trql-client 0.18 speaks, named only
-# because `TrqlTransport::exchange` takes and returns one: verify-trust
-# implements that trait for its mediator transports (DIDComm and TSP), which
-# check that every reply was authenticated as the registry's DID before
-# handing it back — trql-client's own mediator transports route by `threadId`
-# alone. This is **the same node** trql-client already resolves, not a new
-# line: `cargo tree -i trust-tasks-rs@0.21` still shows one 0.21 row, under
-# trql-client and verify-trust. What it does change is the note above that
-# "verify-trust passes no trust-tasks type across the trql-client boundary":
-# it now passes exactly this one, so when trql-client moves lines this alias
-# must move with it — a mismatch is a compile error at the `impl
-# TrqlTransport`, not a silent second copy. Renamed so it cannot be confused
-# with the bridge's `trust-tasks-rs` (the 0.23 line, in the bridge's section
-# below — vta-sdk 0.53 landed on it too, so it is no longer the odd one out).
-# Default features off: the document envelope is all it needs.
 #
-# **Stays on 0.21, deliberately.** The vta-sdk 0.53 step tried bumping this
-# alias to 0.23 alongside everything else and it does not compile:
-# `TrqlTransport::exchange` is trql-client 0.19's own trait, and trql-client
-# 0.19 still declares `trust-tasks-rs ^0.21` for itself — the version its
-# public API actually speaks — so an implementor naming a 0.23 `TrustTask` is a
-# different, non-unifying type (`E0053`, a mismatched `impl TrqlTransport`).
-# This has to track trql-client's internal requirement, not the workspace's
-# other trust-tasks lines. It moves only when trql-client itself moves off
-# `^0.21`.
-trust-tasks-trql = { package = "trust-tasks-rs", version = "0.21.21", default-features = false }
+# 0.19 -> 0.20 is the step that retires the split for good. The registry
+# published trql-client 0.20.0 declaring `trust-tasks-rs ^0.23.0` — the same
+# line vta-sdk 0.53 resolves and the same line the bridge's own
+# `trust-tasks-rs` requirement (below) already pins — so `cargo tree -i
+# trust-tasks-rs` is one node across the *entire* workspace now, not two. The
+# `trust-tasks-trql` alias this note used to carry (a separate `package =
+# "trust-tasks-rs"` pin held at 0.21.21 because trql-client 0.19's own
+# `TrqlTransport` trait spoke a 0.21 `TrustTask`) is retired along with it:
+# verify-trust names the workspace's single `trust-tasks-rs` directly now.
+# There is no source change in trql-client between 0.19.0 and 0.20.0 — the
+# Rust it ships is byte-identical; only its own `trust-tasks-rs` requirement
+# moved — so this was a manifest-only step for this workspace.
+trql-client = "0.20"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -247,8 +234,11 @@ trust-tasks-trql = { package = "trust-tasks-rs", version = "0.21.21", default-fe
 # and, unlike every step before it, this is also the step that lands
 # `trust-tasks-rs` on 0.23: the bridge's own `trust-tasks-rs` requirement
 # (below) was already there, so this closes that gap down to the one residual
-# node the `trust-tasks-trql` note above describes (trql-client 0.19 itself
+# node the `trust-tasks-trql` note above described (trql-client 0.19 itself
 # still speaking `^0.21`). `trust-tasks-proof` is a single 0.23.0 node now.
+# That residual closed for good in the 0.5.1 release: trql-client 0.20
+# declares `trust-tasks-rs ^0.23.0` too, so the `trust-tasks-trql` alias is
+# gone and `cargo tree -i trust-tasks-rs` is one node, full stop.
 vta-sdk = { version = "0.53", default-features = false }
 affinidi-tdk = "0.18"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
@@ -379,15 +369,15 @@ affinidi-messaging-test-mediator = { version = "0.11.1", features = ["tsp"] }
 # `git-ns/namespace/reseat` 0.3, on top of everything the 0.22 line already
 # carried.
 #
-# The vta-sdk 0.53 step (above) landed vta-sdk on this same 0.23 line, so
-# `cargo tree -i trust-tasks-rs` is down to two nodes rather than three: this
-# one (and vta-sdk, and verify-trust, which builds against it) at 0.23, and a
-# second at 0.21 through trql-client alone (see the `trust-tasks-trql` note
-# above for why that one does not close here). The bridge is `publish =
-# false` and passes no trust-tasks type across the trql-client boundary (it
-# signs and verifies with trust-tasks-proof on the same 0.23 line), and
-# did-git-sign — the crate OpenVTC consumes — has no trql-client edge at all,
-# so the residual split is bounded exactly as before, just narrower.
+# The vta-sdk 0.53 step (above) landed vta-sdk on this same 0.23 line, and the
+# 0.5.1 release's trql-client 0.20 bump (above) closed the one residual node
+# that split had left: trql-client 0.20 declares `trust-tasks-rs ^0.23.0`
+# too, so `cargo tree -i trust-tasks-rs` is a single node — this one, vta-sdk,
+# verify-trust and trql-client all resolve it — rather than the two the
+# `trust-tasks-trql` alias used to bound. That alias is gone; verify-trust
+# names this same `trust-tasks-rs` directly now. The bridge is `publish =
+# false`, and signs and verifies with trust-tasks-proof on the same 0.23
+# line.
 trust-tasks-rs = { version = "0.23", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver

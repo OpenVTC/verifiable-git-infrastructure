@@ -33,9 +33,12 @@ tsp = ["affinidi-tdk/tsp"]
 [dependencies]
 vgi-core = { workspace = true }
 trql-client = { workspace = true }
-# `TrustTask`, for the mediator transports' `TrqlTransport` impls. The line
-# trql-client resolves; see the workspace manifest.
-trust-tasks-trql = { workspace = true }
+# `TrustTask`, for the mediator transports' `TrqlTransport` impls. Since
+# trql-client 0.20 this is the same node trql-client, vta-sdk and the bridge
+# all resolve — see the workspace manifest's `trql-client` note — so this
+# names the workspace's single `trust-tasks-rs` directly rather than a
+# separate `trust-tasks-trql` alias.
+trust-tasks-rs = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
