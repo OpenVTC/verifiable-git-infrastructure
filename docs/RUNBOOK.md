@@ -1147,8 +1147,25 @@ records and moves nothing on GitHub.
 
 ### 8i. The bridge: backup, restore, restart
 
-Everything is in `data_dir/state.redb`, sealed with the master key
-(BRIDGE.md §5).
+**A bridge in VTA mode** (BRIDGE.md §2a) keeps its DID, keys, secrets and
+state in its trust context of the VTC's VTA. There is nothing on its host to
+back up, and a lost host is recovered by:
+
+1. revoking the old host's context credential in the VTA, and issuing a new
+   one (an admin scoped to the bridge's context only);
+2. putting it on the new host (`credential_file`, owner-only) with the same
+   config and an **empty** data directory;
+3. `vgi-bridge vta setup`, then starting the bridge.
+
+It comes back as the same DID with its namespaces, managed repositories,
+required-workflow pin and App credentials: no rebind, no unbind, no rights
+change, no App re-registration. What it loses: jobs in flight (the VTC sends
+unfinished ones again), unacknowledged results (the VTC repeats their jobs),
+binds and account links waiting for a person (start them again), and the
+provenance of Dependabot branches pushed to while the VTA was unreachable.
+
+The rest of this section is the self-contained mode. Everything is in
+`data_dir/state.redb`, sealed with the master key (BRIDGE.md §5).
 
 - **Back up** the file and the key **separately**. For a consistent copy,
   stop the bridge (or snapshot the volume) and copy the one file.
@@ -1169,12 +1186,14 @@ Everything is in `data_dir/state.redb`, sealed with the master key
 - **The identity** is worth keeping even when the store is not: `vgi-bridge
   identity export` once (BRIDGE.md §5), `identity import` into a fresh store,
   and the bridge keeps the DID the VTC recorded for its namespaces.
-- **Losing the store, or the key,** means registering a new GitHub App and
+- **Losing the store, or the key,** of a self-contained bridge means
+  registering a new GitHub App and
   binding again — and there is no re-attach. The VTC still holds the
   namespace as bound to that bridge, and binding it again needs
   `cnm git namespace unbind` first, which **revokes every right in the
   namespace** and detaches every repository; everything is then granted and
-  adopted afresh. Back the store up.
+  adopted afresh. Back the store up — or move the bridge to VTA mode, which
+  does not have this limit.
 
 The VTC's own backup (VTI `docs/03-vtc/backup-restore.md`) carries the
 git-namespace records; its bridge-job queue and the registry-projection mirror
@@ -1272,9 +1291,12 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 
 | Code | Cause | Fix |
 |---|---|---|
-| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt |
+| `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
 | `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 only | upgrade the VTC |
-| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
+| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
+| VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
+| bridge `/healthz` 503, log "another bridge … is writing the same VTA context" | two hosts (or a stolen credential) on one bridge context; the bridge stopped writing its state and holds its results | §8i; BRIDGE.md §2a |
+| bridge `/healthz` 503 "state not reaching the VTA: N change(s) waiting" | every write to the VTA has failed for five minutes: the VTA unreachable, or its app-state lease kept by another writer (logs: "another writer holds the bridge's app-state lease") | bring the VTA back; if the lease is the cause, find the other writer on the context and stop it (revoke the credential if it is not yours) |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
 | step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |
 | step `notFound` | the repository is gone, or outside the installation's repository selection | an inspection that finds nothing detaches it; install the App on *All repositories* |

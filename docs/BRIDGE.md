@@ -28,8 +28,8 @@ the bridge itself.
 | The **VTC's DID** and **mediator DID** | the bridge accepts jobs only from that DID, over DIDComm through that mediator |
 | The **Trust Registry's DID** | written into every bootstrapped repository, and used by the check the bridge posts itself |
 | A **public HTTPS URL** behind a TLS-terminating proxy | the forges send App-setup and OAuth redirects and signed webhooks to it |
-| A **master key** (32 bytes, base64) | seals every secret in the store; from a file, or an environment variable that the bridge clears once read |
-| A writable **data directory** | one redb file, `state.redb` |
+| A **master key** (32 bytes, base64) — *or*, in VTA mode (§2a), a **context credential** for the bridge's trust context in the VTC's VTA | seals every secret in the store; from a file, or an environment variable that the bridge clears once read. In VTA mode there is no master key: secrets and state live in the VTA |
+| A writable **data directory** | one redb file, `state.redb` (in VTA mode a cache the bridge rebuilds from the VTA) |
 | `git` on the path (the container has it) | the bridge-posted check fetches commit objects — never runs anything from them |
 
 ### Network
@@ -60,6 +60,18 @@ own body limit at or above `max_body_bytes` (default 2 MiB), so the bridge's
 limit is the one that answers.
 
 ## 2. First start
+
+Two ways to run a bridge:
+
+- **VTA mode (recommended; §2a).** Like every companion service around a
+  VTC, the bridge's DID, keys, secrets and state live in its own trust context
+  of the VTC's VTA; the host holds only a context-scoped credential. A lost
+  host costs nothing: issue a new credential, start the bridge.
+- **Self-contained** (below): a sealed store and a locally held identity
+  (`did:peer`, or an imported bundle). For development and testing, or where
+  there is no VTA.
+
+### Self-contained
 
 ```sh
 # 1. Config: start from crates/vgi-bridge/bridge.example.toml.
@@ -136,6 +148,176 @@ docker run -d --name vgi-bridge \
 Run `init` / `identity import` / `identity export` with the same volumes and
 `vgi-bridge init` as the command before the first `run`.
 
+## 2a. VTA mode
+
+The bridge works off the VTC's VTA (design §5.7). What lives where:
+
+| What | Where |
+|---|---|
+| The bridge's DID (`did:webvh`) and its keys (Ed25519 signing, X25519 key agreement) | the context, in the VTA; fetched into memory at start-up, never written to disk or logs |
+| The GitHub App's credentials, webhook secrets, Forgejo tokens | the context's `vta/app-state`, namespace `vgi-bridge`, **sealed** under a key only the context's admins can export (`vgi-bridge/app-state-seal`, created by `vta setup`) — app-state is not a secret store, so the bridge never puts a secret there in the clear |
+| Namespaces (binding, installation, capabilities, managed repositories, the required-workflow pin), repository records, the Dependabot provenance ledger, bookkeeping | the context's `vta/app-state`, one record each |
+| The job ledger, the outbox, pending binds and links, webhook delivery ids | the local store only (a lost host loses them: the VTC repeats unfinished jobs, every job is convergent, and a person restarts a bind or link) |
+| The credential | this host, and nothing else |
+
+Every signature the bridge makes is its own: it signs its Trust Task
+documents, results and Dependabot re-signs with its own Ed25519 key, never as
+the VTC.
+
+**1. The context and the DID.** In the VTA, create a context for the bridge
+(`vgi-bridge`, say) and provision a `did:webvh` into it from a DID template
+with an Ed25519 signing key (`#key-0`), an X25519 key-agreement key (`#key-1`)
+and a `DIDCommMessaging` service naming `mediator_did`.
+
+**2. The credential.** Issue a `did:key` credential that is an **admin
+scoped to that context only** — exporting the context's keys needs the VTA's
+`key-export` capability, which only `admin` carries — and hand it to the
+bridge host as a file (owner-only, JSON: `did`, `privateKeyMultibase`,
+`vtaDid`, `vtaUrl`):
+
+```sh
+pnm auth-credential create --role admin --contexts vgi-bridge --recipient req.json
+# (or `pnm acl create --did <did:key> --role admin --contexts vgi-bridge`)
+# open the sealed bundle into the credential JSON:
+pnm bootstrap open --bundle bundle.armor --expect-digest <digest> --out /run/secrets/vgi-bridge-vta-credential
+chmod 600 /run/secrets/vgi-bridge-vta-credential
+```
+
+A context-scoped admin reaches that context (and any context below it) and
+nothing else: every key, sign and app-state operation checks the key's or
+record's own context, so the credential can read neither the VTC's keys nor
+any other context's. It can administer its own context (create keys and ACL
+entries in it), which is why it is issued to the bridge host alone.
+
+**3. The config.** Add a `[vta]` section and remove `master_key_file` /
+`master_key_env` (the bridge refuses both together):
+
+```toml
+[vta]
+context = "vgi-bridge"
+credential_file = "/run/secrets/vgi-bridge-vta-credential"
+# The VTA is reached over DIDComm, through the bridge's `mediator_did`
+# unless this names another:
+# mediator_did = "did:web:mediator.acme-vtc.example"
+```
+
+The bridge talks to the VTA over DIDComm only: the VTA releases a private
+key only over a channel confidential end to end, never over REST, where the
+key would exist wherever TLS terminates.
+
+**4. Check it.** `vta setup` verifies the context has a DID with both keys,
+the credential can fetch them and read, write and delete app-state, creates
+the sealing key, warns if the credential reaches any other context, and
+prints the DID to register at the VTC:
+
+```sh
+vgi-bridge --config /etc/vgi-bridge/bridge.toml vta setup
+```
+
+Then `run` as usual, with an **empty** `data_dir` the first time (a store left
+by a self-contained bridge is refused: the state of VTA mode comes from the
+VTA). `secret set` / `secret list` work on the context's app-state in VTA mode
+(restart the bridge after a `secret set`); `identity import`, `export` and
+`mint` are refused — the identity is the context's.
+
+**Start-up and an unreachable VTA.** The bridge cannot run without its keys:
+start-up retries an unreachable VTA with capped backoff for
+`start_timeout_secs` (default 300), and gives up at once on a refusal (a
+revoked credential) or on state it will not run on (rolled back, replayed —
+below): retrying would read the same state again. While running, state changes reach the VTA from a
+background task a moment after they happen, retried with backoff; a result
+or event goes to the VTC only once the state it reports is in the VTA (it is
+held in the outbox until then), a Forgejo bot token is retired only once its
+successor is in the VTA, and the App registration page says so if the App's
+credentials could not be written yet. If changes wait five minutes with
+every write failing — the VTA unreachable, or its app-state lease kept by
+another writer — `/healthz` answers 503 with how many are waiting, so
+results held behind them do not go unnoticed.
+
+**One writer at a time.** Writers of the context's app-state (the running
+bridge, `secret set`, `vta setup`) take a lease record first. It lasts two
+minutes unless renewed, judged by the **VTA's** time of the write, not the
+holder's claim: a writer with a wrong clock, or one that claims the lease
+for longer, holds it for at most two minutes past its last write. Every
+app-state request is given up after 20 seconds, well inside the half-lease
+the bridge keeps in hand before each write.
+
+**A second writer.** Every write is conditional on the version this host
+last saw. If another bridge — or anyone holding the credential — writes the
+same context, the bridge stops writing its state (fail closed), holds its
+results, logs why, and `/healthz` answers 503. Stop the other writer (revoke
+the credential if it is not yours) and restart this bridge.
+
+**The VTA is the authority on a restart.** A host that comes back on an old
+data directory does not bring back what another host changed meanwhile:
+
+- a record it had mirrored that the VTA deleted (the recovery host) is
+  dropped from its cache, not written back. While the VTA's change feed
+  still reaches back to the start it carries every deletion, so a mirrored
+  record the VTA has **no record of at all** was lost, not deleted: a
+  rollback, which stops the start even when the counter has moved past the
+  restore point since. Only once the VTA has reaped old deletions (and
+  answers with a snapshot) is a missing record taken for deleted;
+- only records it never managed to mirror are written;
+- a record the VTA holds at an *older* version than this host wrote (a
+  rolled-back or replayed store) stops the start, and so does a VTA whose
+  counter is behind the last version this host wrote (restored from a
+  snapshot taken before some of its records existed: those are missing,
+  not deleted).
+
+**One writer at a time.** The running bridge, `secret set` and `vta setup`
+take a short lease (`lease/writer` in app-state, 2 minutes, renewed while
+held) before writing, so each secret is sealed once to the version it lands
+at and is never left in the VTA in a form that does not open. `secret set`
+while the bridge runs waits its turn.
+
+Each secret is sealed to its own record version, so a ciphertext put back
+later does not open (the start is refused, naming the secret). The sealing
+key must be the only active key labelled `vgi-bridge/app-state-seal` in the
+context; the bridge refuses to guess between two.
+
+**Key rotation.** The bridge's **current DID document** decides which of its
+keys it holds: every signing (`assertionMethod`) and key-agreement key the
+document lists, with the same public key, and nothing else. The private
+halves come from the VTA; one the VTA no longer releases but the document
+still lists stays in memory.
+
+**Which key signs.** A verifier (the VTC) may hold a cached copy of the
+bridge's DID document for up to its cache horizon, so a newly listed key is
+not known to all of them at once. The bridge records when it first saw each
+signing key listed; the record is mirrored to the VTA, so a restart or a new
+host keeps it. It keeps signing with the oldest listed key it may use until
+a newer one has been listed for `vta.signing_switch_after_secs` (default
+86400, the proposed 24-hour verifier cache cap; at least
+`did_cache_ttl_secs`), then switches to the newest. If the older key stops
+being listed first, the next key signs at once. A key the VTA no longer
+releases never signs. (When the VTA exposes key-role states with
+`activatesAt`, the bridge will switch at that time instead.)
+
+Every `key_refresh_secs` (default 60), or at once on `SIGHUP`, the bridge
+compares the key list and the document. It reads public halves only and
+exports the secrets again only when something changed. Through a planned
+rotation that means:
+
+1. The VTA mints the successor keys: not listed yet, so not used.
+2. The document lists old and new (the overlap): the bridge holds all of
+   them, and DIDComm reconnects with every listed key-agreement key, so a
+   job encrypted to either key opens. The old key keeps signing until the new
+   one has been listed for the horizon; then the new one signs.
+3. The document stops listing the old keys (the end of the overlap): the
+   bridge drops them.
+
+No grace timer is involved; the overlap is the document's. A key whose id
+the document lists with another public key is not used, and a rotation that
+names another DID is refused (the VTC knows the bridge by its DID).
+
+**Recovering a lost host:** issue a new context credential (and revoke the
+old one), put it on the new host, and start the bridge on an empty data
+directory. It fetches its DID and keys, pulls its namespaces, repositories,
+pin and App credentials back from the VTA, and serves the same namespaces
+under the same DID — no rebind, no App re-registration, no org owner proving
+control again. What a lost host does lose is listed in the table above.
+
 ## 3. GitHub: register the App (manifest flow)
 
 One App per community, registered by the bridge itself so nobody copies a
@@ -159,7 +341,8 @@ key by hand.
    adapter in service. It refuses an App registered under another account,
    a public App, or one with any permission beyond the reviewed set. If the
    exchange fails (GitHub unavailable, say), open the same link again: it is
-   spent only once the App is registered.
+   spent only once the App is registered. In VTA mode the credentials go to
+   the context's app-state (sealed), not to the local store.
 4. **Enable Device Flow** on the App's settings page (the manifest format
    cannot): *Settings → Developer settings → GitHub Apps → the App → Enable
    Device Flow*. Members link their accounts with it.
@@ -271,6 +454,10 @@ protected workflow paths keep a pull request from rewriting its own check.
 
 ## 5. What the bridge keeps, and backups
 
+**In VTA mode** (§2a) there is nothing on the host to back up: the VTA holds
+the bridge's identity, secrets and state, and is backed up with the VTC's
+ecosystem. The rest of this section is the self-contained mode.
+
 Everything is in `data_dir/state.redb`:
 
 | What | Why it must survive |
@@ -301,7 +488,8 @@ exported from the VTA again.)
 Losing the store entirely — even with the identity restored — still means
 re-registering the GitHub App and re-binding the namespaces, and re-binding
 means unbinding first, which revokes every right in them
-([RUNBOOK.md §8i](RUNBOOK.md#8i-the-bridge-backup-restore-restart)).
+([RUNBOOK.md §8i](RUNBOOK.md#8i-the-bridge-backup-restore-restart)). VTA mode
+does not have this limit.
 
 ## 6. The check the bridge posts itself
 
@@ -629,7 +817,16 @@ baseline drift is measured against until then, so they are not reported.
 
 - **Logs** go to standard error (`RUST_LOG=info` by default). They never
   contain secrets.
-- **`/healthz`** answers `ok` while the HTTP server runs.
+- **`/healthz`** answers `ok` while the HTTP server runs, and 503 in VTA mode
+  once another writer was found on the bridge's context, or once changes
+  have waited five minutes with every write to the VTA failing (§2a).
+- **DID documents are cached** for `did_cache_ttl_secs` (default 60, at most
+  3600): the VTC's (job proofs), the registry's (and its endpoint) and commit
+  signers' (the bridge-posted check). That bounds how long a key its owner
+  rotated out is still accepted. A job proof, or a commit whose key the cached
+  document does not publish, is checked once more against a fresh resolution
+  before it is refused — so a rotated-in key is not refused for the cache's
+  lifetime — and refused (closed) if it still fails.
 - The DIDComm link reconnects on its own with capped backoff; results and
   events queued meanwhile go out when it is back.
 - A job that fails half-way reports `partial` with each step's outcome; every

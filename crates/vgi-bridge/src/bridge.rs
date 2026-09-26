@@ -96,7 +96,13 @@ impl BridgeParts {
 /// The bridge.
 pub struct Bridge {
     pub(crate) cfg: BridgeConfig,
-    pub(crate) identity: BridgeIdentity,
+    /// The bridge's DID: fixed for the process (a key rotation keeps it).
+    did: String,
+    /// Its keys, replaced when the VTA rotates them ([`Bridge::replace_identity`]).
+    identity: std::sync::RwLock<BridgeIdentity>,
+    /// Bumped on every rotation, so the DIDComm link reconnects with the
+    /// new key-agreement key.
+    rotation: tokio::sync::watch::Sender<u64>,
     pub(crate) store: Store,
     pub(crate) adapters: Adapters,
     pub(crate) link: Arc<dyn VtcLink>,
@@ -111,12 +117,16 @@ pub struct Bridge {
 impl std::fmt::Debug for Bridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bridge")
-            .field("did", &self.identity.did())
+            .field("did", &self.did)
             .field("vtc", &self.cfg.vtc_did)
             .field("adapters", &self.adapters)
             .finish_non_exhaustive()
     }
 }
+
+/// How long a result or event waits for the VTA mirror before it is held
+/// for the next resend.
+const OUTBOX_FLUSH: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Unix seconds now.
 pub(crate) fn now() -> i64 {
@@ -160,7 +170,9 @@ impl Bridge {
         let resign = crate::resign::ResignRunner::new(parts.config.checks.concurrency);
         Arc::new(Bridge {
             cfg: parts.config,
-            identity: parts.identity,
+            did: parts.identity.did().to_string(),
+            identity: std::sync::RwLock::new(parts.identity),
+            rotation: tokio::sync::watch::channel(0).0,
             store: parts.store,
             adapters: parts.adapters,
             link: parts.link,
@@ -175,7 +187,41 @@ impl Bridge {
 
     /// The bridge's DID.
     pub fn did(&self) -> &str {
-        self.identity.did()
+        &self.did
+    }
+
+    /// The bridge's current keys.
+    pub fn identity(&self) -> BridgeIdentity {
+        self.identity.read().expect("lock").clone()
+    }
+
+    /// Put rotated keys in service: from now on every document and re-sign
+    /// is signed with `new`, and the DIDComm link reconnects with its
+    /// key-agreement key. The old keys are dropped. `Ok(false)`: the keys are
+    /// the ones already in service. Refused for another DID — a rotation
+    /// keeps the DID, and the VTC knows the bridge by it.
+    pub fn replace_identity(&self, new: BridgeIdentity) -> Result<bool> {
+        if new.did() != self.did {
+            anyhow::bail!(
+                "the VTA now names the DID `{}` for this bridge, not `{}`: refusing to switch DIDs \
+                 at run time (the VTC knows the bridge by its DID); restart after fixing the context",
+                new.did(),
+                self.did
+            );
+        }
+        let mut current = self.identity.write().expect("lock");
+        if current.same_keys(&new) {
+            return Ok(false);
+        }
+        *current = new;
+        drop(current);
+        self.rotation.send_modify(|g| *g += 1);
+        Ok(true)
+    }
+
+    /// Changes on every key rotation.
+    pub fn rotations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rotation.subscribe()
     }
 
     /// The configuration.
@@ -367,7 +413,7 @@ impl Bridge {
     }
 
     async fn send_error(&self, request: &TrustTask<Value>, payload: ErrorPayload) {
-        match wire::signed_error(&self.identity, request, payload).await {
+        match wire::signed_error(&self.identity(), request, payload).await {
             Ok(doc) => {
                 if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
                     tracing::warn!(error = %e, "could not send an error response");
@@ -378,7 +424,7 @@ impl Bridge {
     }
 
     async fn respond(&self, request: &TrustTask<Value>, payload: Value) {
-        match wire::signed_response(&self.identity, request, payload).await {
+        match wire::signed_response(&self.identity(), request, payload).await {
             Ok(doc) => {
                 if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
                     // The VTC repeats a job it got no answer to; the ledger
@@ -789,12 +835,23 @@ impl Bridge {
         let Ok(Some(entry)) = self.store.get::<OutboxEntry>(Table::Outbox, key) else {
             return;
         };
+        // VTA mode: what a result or event reports (a binding, a managed
+        // repository) must be in the VTA before the VTC hears of it, or a
+        // host lost in between would come back without it. Held here, the
+        // entry goes out on a later resend.
+        if !self.store.flush(OUTBOX_FLUSH).await {
+            tracing::warn!(
+                key,
+                "holding a result or event until the bridge's state is written to the VTA"
+            );
+            return;
+        }
         let type_uri = match entry.kind {
             OutboxKind::Result => result::Payload::TYPE_URI,
             _ => wire::event_type_uri(self.cfg.event_version),
         };
         let (id, doc) = match wire::signed_request(
-            &self.identity,
+            &self.identity(),
             &self.cfg.vtc_did,
             type_uri,
             entry.payload.clone(),

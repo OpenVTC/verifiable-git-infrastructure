@@ -609,7 +609,9 @@ async fn a_push_delivered_after_the_pull_request_resumes_the_re_sign() {
     assert_eq!(remote.branch_head(), remote.head());
 
     dependabot_pushes(&w, &remote).await;
-    for _ in 0..200 {
+    // Up to a minute: the re-sign fetches, rewrites and pushes, which a
+    // loaded machine can take well past ten seconds.
+    for _ in 0..1200 {
         if remote.branch_head() != remote.head() {
             break;
         }
