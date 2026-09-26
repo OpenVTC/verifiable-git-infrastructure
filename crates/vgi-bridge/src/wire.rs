@@ -40,26 +40,58 @@ use crate::identity::BridgeIdentity;
 
 /// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
 pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
-/// `git-ns/bridge/event` 0.2, the type every event is built as. 0.1 is
-/// wire-identical (0.2 changes only what the VTC does with a transfer, a
-/// reused name, and a resource outside the namespace), so an event for a
-/// VTC configured for 0.1 is the same payload under the 0.1 type URI: see
-/// [`event_type_uri`].
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event;
-/// `git-ns/bridge/job` 0.1, still accepted from a VTC that has not moved.
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_1 as job_v0_1;
-/// `git-ns/bridge/job` 0.2, the version the bridge runs every job as. A 0.1
-/// job is a valid 0.2 job with the same meaning (0.2 only adds
-/// `removeAccounts`), so it is read with [`job_v0_1`] and carried as this
-/// type from then on: see [`parse_job`].
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_2 as job;
+/// `git-ns/bridge/event` 0.2, still sent to a VTC configured for it.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event_v0_2;
+/// `git-ns/bridge/event` 0.3, the type every event is built as. 0.1 and 0.2
+/// are wire-identical for every forge event (0.2 changes only what the VTC
+/// does with a transfer, a reused name, and a resource outside the
+/// namespace; 0.3 only adds `roleMapReported`), so an event for a VTC
+/// configured for either is the same payload under the older type URI: see
+/// [`event_type_uri`]. `roleMapReported` is never sent under them.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_3 as event;
+/// The payload types of `git-ns/bridge/job` 0.4, the only version this
+/// bridge takes. It adds rules the schema does not state, checked in
+/// [`check_kind_members`]: a namespace admin with no right of their own on
+/// a repository is listed at `git.ns.admin` and gets no role; there is no
+/// namespace-level `projectRoles`; each account appears once.
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_4 as job;
 pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
 
+/// `git-ns/bridge/job/0.4`'s type URI.
+pub const JOB_TYPE: &str = <job::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `trust-task-discovery/0.2`, which a VTC asks before it sends 0.4 jobs
+/// (`git-ns/bridge/job` 0.4 forbids sending 0.4 to a bridge that has not
+/// shown it takes it).
+pub const DISCOVERY_TYPE: &str = "https://trusttasks.org/spec/trust-task-discovery/0.2";
+
 /// Whether `type_uri` (bare) is a job this bridge takes: `git-ns/bridge/job`
-/// 0.1 or 0.2.
+/// 0.4 only.
 pub fn is_job_type(type_uri: &str) -> bool {
-    use trust_tasks_rs::Payload as _;
-    type_uri == job::Payload::TYPE_URI || type_uri == job_v0_1::Payload::TYPE_URI
+    type_uri == JOB_TYPE
+}
+
+/// Whether `type_uri` (bare) is another version of `git-ns/bridge/job`,
+/// which this bridge refuses with `unsupportedVersion`: before 0.4 a
+/// namespace admin was sent as an owner, and nothing here reads that.
+pub fn is_other_job_version(type_uri: &str) -> bool {
+    type_uri != JOB_TYPE && type_uri.starts_with("https://trusttasks.org/spec/git-ns/bridge/job/")
+}
+
+/// The `trust-task-discovery` answer: the job type this bridge takes, if
+/// any of `patterns` (SPEC §10.2 grammar; empty means `*`) selects its
+/// slug.
+pub fn discovery_answer(patterns: &[String]) -> Value {
+    const SLUG: &str = "git-ns/bridge/job";
+    let selects = |p: &str| {
+        p == "*"
+            || p == SLUG
+            || p.strip_suffix("/*")
+                .is_some_and(|prefix| SLUG.starts_with(&format!("{prefix}/")))
+    };
+    let listed = patterns.is_empty() || patterns.iter().any(|p| selects(p));
+    let types: Vec<&str> = if listed { vec![JOB_TYPE] } else { Vec::new() };
+    serde_json::json!({ "supportedTypes": types })
 }
 
 /// The type URI an event is sent under, for the version the VTC takes.
@@ -68,33 +100,24 @@ pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
     use trust_tasks_rs::Payload as _;
     match version {
         EventVersion::V0_1 => event_v0_1::Payload::TYPE_URI,
+        EventVersion::V0_2 => event_v0_2::Payload::TYPE_URI,
         _ => event::Payload::TYPE_URI,
     }
 }
 
 /// Whether `type_uri` (bare) is the VTC's acknowledgement of an event, of
-/// either version (a VTC acknowledges an event in the version it was sent,
+/// any version (a VTC acknowledges an event in the version it was sent,
 /// and the configured version may have changed since).
 pub fn is_event_response_type(type_uri: &str) -> bool {
     use trust_tasks_rs::Payload as _;
-    type_uri == event::Response::TYPE_URI || type_uri == event_v0_1::Response::TYPE_URI
+    type_uri == event::Response::TYPE_URI
+        || type_uri == event_v0_2::Response::TYPE_URI
+        || type_uri == event_v0_1::Response::TYPE_URI
 }
 
-/// Parse a job payload by the version its document declares. A 0.1 payload
-/// is parsed against the 0.1 type — so a 0.1 document carrying
-/// `removeAccounts`, a member 0.1 does not have, is refused rather than
-/// read as 0.2 — and then carried as 0.2, which is wire-identical for
-/// every member 0.1 has.
-pub fn parse_job(type_uri: &str, payload: &Value) -> std::result::Result<job::Payload, String> {
-    use trust_tasks_rs::Payload as _;
-    if type_uri == job_v0_1::Payload::TYPE_URI {
-        let p: job_v0_1::Payload =
-            serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))?;
-        let v = serde_json::to_value(&p).map_err(|e| format!("job payload: {e}"))?;
-        serde_json::from_value(v).map_err(|e| format!("job payload (as 0.2): {e}"))
-    } else {
-        serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))
-    }
+/// Parse a `git-ns/bridge/job` 0.4 payload.
+pub fn parse_job(payload: &Value) -> std::result::Result<job::Payload, String> {
+    serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))
 }
 
 /// The DIDComm message type that carries a Trust Task document as its body
@@ -116,6 +139,90 @@ impl ProofCheck for trust_tasks_proof::affinidi::Verifier {
     }
 }
 
+/// Drops a DID's cached document, so the next resolution fetches it again.
+#[async_trait]
+pub trait Evict: Send + Sync {
+    /// Forget `did`'s cached document.
+    async fn evict(&self, did: &str);
+}
+
+#[async_trait]
+impl Evict for affinidi_tdk::did_resolver::DIDCacheClient {
+    async fn evict(&self, did: &str) {
+        let _ = self.remove(did).await;
+    }
+}
+
+/// A [`ProofCheck`] that tries a failed proof once more against a fresh
+/// resolution of the issuer's DID: a document cached from before the
+/// issuer rotated its key would otherwise refuse the new key until it
+/// expired. Fails closed after the second try, and a document that verified
+/// is never re-checked — a key rotated *out* is trusted at most for the
+/// cache's lifetime.
+pub struct ReResolving {
+    inner: Arc<dyn ProofCheck>,
+    cache: Arc<dyn Evict>,
+    /// When each DID was last resolved again: at most once per
+    /// [`RE_RESOLVE_EVERY`], so a stream of bad proofs cannot make the bridge
+    /// hammer (or be steered into flooding) the DID's host.
+    last: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+/// The least time between two fresh resolutions of one DID on a failure.
+pub const RE_RESOLVE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl ReResolving {
+    /// Over `inner`, evicting from `cache`.
+    pub fn new(inner: Arc<dyn ProofCheck>, cache: Arc<dyn Evict>) -> Self {
+        ReResolving {
+            inner,
+            cache,
+            last: Default::default(),
+        }
+    }
+
+    /// Whether `did` may be resolved again now (and note that it is).
+    fn may_re_resolve(&self, did: &str) -> bool {
+        let mut last = self.last.lock().expect("lock");
+        let now = std::time::Instant::now();
+        if last
+            .get(did)
+            .is_some_and(|t| now.duration_since(*t) < RE_RESOLVE_EVERY)
+        {
+            return false;
+        }
+        if last.len() > 1024 {
+            last.retain(|_, t| now.duration_since(*t) < RE_RESOLVE_EVERY);
+        }
+        last.insert(did.to_string(), now);
+        true
+    }
+}
+
+#[async_trait]
+impl ProofCheck for ReResolving {
+    async fn verify_raw(&self, doc: &Value) -> Result<(), VerificationError> {
+        match self.inner.verify_raw(doc).await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                let Some(issuer) = doc.get("issuer").and_then(Value::as_str) else {
+                    return Err(first);
+                };
+                // Only a network-resolved DID can have changed.
+                if issuer.starts_with("did:key:")
+                    || issuer.starts_with("did:peer:")
+                    || !self.may_re_resolve(issuer)
+                {
+                    return Err(first);
+                }
+                tracing::info!(%issuer, "a proof failed against the cached DID document; resolving it again");
+                self.cache.evict(issuer).await;
+                self.inner.verify_raw(doc).await
+            }
+        }
+    }
+}
+
 /// A document that passed steps 1–6: from the VTC, to this bridge, fresh,
 /// and signed. Only [`DocChecker::check`] makes one.
 #[derive(Debug, Clone)]
@@ -125,7 +232,7 @@ pub struct VerifiedDoc {
 }
 
 impl VerifiedDoc {
-    /// The bare type URI (`…/git-ns/bridge/job/0.1`, `…#response`).
+    /// The bare type URI (`…/git-ns/bridge/job/0.4`, `…#response`).
     pub fn type_uri(&self) -> String {
         self.doc.type_uri.to_string()
     }
@@ -353,8 +460,9 @@ pub fn check_kind_members(p: &job::Payload) -> std::result::Result<(), String> {
     };
     // (repo, spec, desiredRoles, steps, target, subject): (allowed, required)
     let rules: [(bool, bool); 6] = match p.kind {
+        // 0.4: no namespace-level `projectRoles`.
         K::ProjectRoles => [
-            (true, false),
+            (true, true),
             (false, false),
             (true, true),
             (false, false),
@@ -431,16 +539,20 @@ pub fn check_kind_members(p: &job::Payload) -> std::result::Result<(), String> {
     }
     if let Some(roles) = &p.desired_roles {
         let mut seen = std::collections::BTreeSet::new();
-        if !roles.iter().all(|r| seen.insert(r.account.id.to_string())) {
+        if !roles
+            .iter()
+            .all(|r| seen.insert((r.account.forge.to_string(), r.account.id.to_string())))
+        {
             return Err("`desiredRoles` names one account twice".into());
         }
     }
     check_remove_accounts(p)
 }
 
-/// `removeAccounts` (job 0.2): `projectRoles` on a repository only, at
-/// least one account, none twice, and none also in `desiredRoles` — an
-/// account is matched by `forge` and `id`, never by its display `login`.
+/// `removeAccounts`: `projectRoles` only, at least one account, none twice,
+/// and none also in `desiredRoles` except at `git.ns.admin` (job 0.4: that
+/// entry asks for no role, as the removal does) — an account is matched by
+/// `forge` and `id`, never by its display `login`.
 /// Whether each account is on the namespace's forge is checked once the
 /// namespace is known (the bridge's admission).
 fn check_remove_accounts(p: &job::Payload) -> std::result::Result<(), String> {
@@ -449,13 +561,6 @@ fn check_remove_accounts(p: &job::Payload) -> std::result::Result<(), String> {
     };
     if p.kind != job::PayloadKind::ProjectRoles {
         return Err(format!("`{}` does not use `removeAccounts`", p.kind));
-    }
-    if p.repo.is_none() {
-        return Err(
-            "`removeAccounts` takes roles off a repository and needs `repo`: a namespace's \
-             owners change only through `desiredRoles`"
-                .into(),
-        );
     }
     if remove.is_empty() {
         return Err("`removeAccounts` must name at least one account".into());
@@ -469,7 +574,7 @@ fn check_remove_accounts(p: &job::Payload) -> std::result::Result<(), String> {
         .desired_roles
         .iter()
         .flatten()
-        .find(|r| seen.contains(&key(&r.account)))
+        .find(|r| seen.contains(&key(&r.account)) && r.right != job::Right::GitNsAdmin)
     {
         return Err(format!(
             "account {} on `{}` is in both `desiredRoles` and `removeAccounts`",
@@ -499,10 +604,87 @@ pub fn is_type<P: trust_tasks_rs::Payload>(v: &VerifiedDoc) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Fails until the cache is evicted once — a document cached from
+    /// before the issuer rotated its key.
+    struct Stale {
+        evicted: std::sync::atomic::AtomicBool,
+        checks: std::sync::atomic::AtomicU32,
+        fresh_passes: bool,
+    }
+
+    #[async_trait]
+    impl ProofCheck for Stale {
+        async fn verify_raw(&self, _doc: &Value) -> Result<(), VerificationError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.checks.fetch_add(1, SeqCst);
+            if self.evicted.load(SeqCst) && self.fresh_passes {
+                Ok(())
+            } else {
+                Err(VerificationError::UnsupportedCryptosuite("stale".into()))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Evict for Stale {
+        async fn evict(&self, _did: &str) {
+            self.evicted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_proof_is_checked_once_more_against_a_fresh_document() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let doc = serde_json::json!({ "issuer": "did:webvh:QmVtc:acme-vtc.example" });
+        for fresh_passes in [true, false] {
+            let s = Arc::new(Stale {
+                evicted: false.into(),
+                checks: 0.into(),
+                fresh_passes,
+            });
+            let r = ReResolving::new(s.clone(), s.clone());
+            assert_eq!(r.verify_raw(&doc).await.is_ok(), fresh_passes);
+            assert_eq!(
+                s.checks.load(SeqCst),
+                2,
+                "once more, never again (fails closed)"
+            );
+            assert!(s.evicted.load(SeqCst));
+        }
+        // Once per DID per interval: a second failure soon after is refused
+        // without resolving again.
+        let s = Arc::new(Stale {
+            evicted: false.into(),
+            checks: 0.into(),
+            fresh_passes: false,
+        });
+        let r = ReResolving::new(s.clone(), s.clone());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert_eq!(
+            s.checks.load(SeqCst),
+            3,
+            "the second failure is not re-resolved"
+        );
+        // A did:key cannot have changed: no second try.
+        let s = Arc::new(Stale {
+            evicted: false.into(),
+            checks: 0.into(),
+            fresh_passes: true,
+        });
+        let r = ReResolving::new(s.clone(), s.clone());
+        assert!(
+            r.verify_raw(&serde_json::json!({ "issuer": "did:key:z6Mk" }))
+                .await
+                .is_err()
+        );
+        assert_eq!(s.checks.load(SeqCst), 1);
+    }
+
     use super::*;
     use serde_json::json;
     use trust_tasks_proof::affinidi::Verifier;
-    use trust_tasks_rs::Payload as _;
 
     fn checker(vtc: &BridgeIdentity, bridge: &str) -> DocChecker {
         DocChecker::new(vtc.did(), bridge, 300, Arc::new(Verifier::for_did_key()))
@@ -511,7 +693,7 @@ mod tests {
     async fn job_doc(vtc: &BridgeIdentity, bridge: &str, payload: Value) -> Value {
         let doc = json!({
             "id": new_id(),
-            "type": job::Payload::TYPE_URI,
+            "type": JOB_TYPE,
             "issuer": vtc.did(),
             "recipient": bridge,
             "issuedAt": Utc::now().to_rfc3339(),
@@ -534,7 +716,7 @@ mod tests {
             .check(&raw, Some(vtc.did()))
             .await
             .unwrap();
-        assert!(is_type::<job::Payload>(&v));
+        assert!(is_job_type(&v.type_uri()));
         let p: job::Payload = serde_json::from_value(v.doc.payload).unwrap();
         check_kind_members(&p).unwrap();
     }
@@ -576,7 +758,7 @@ mod tests {
 
         // Claiming the VTC as issuer but signed by someone else.
         let mut forged = json!({
-            "id": new_id(), "type": job::Payload::TYPE_URI, "issuer": other.did(),
+            "id": new_id(), "type": JOB_TYPE, "issuer": other.did(),
             "recipient": bridge.did(), "issuedAt": Utc::now().to_rfc3339(), "payload": payload,
         });
         forged = other.sign(&forged).await.unwrap();
@@ -603,7 +785,7 @@ mod tests {
         let auth = vtc
             .sign_with_purpose(
                 &json!({
-                    "id": new_id(), "type": job::Payload::TYPE_URI, "issuer": vtc.did(),
+                    "id": new_id(), "type": JOB_TYPE, "issuer": vtc.did(),
                     "recipient": bridge.did(), "issuedAt": Utc::now().to_rfc3339(),
                     "payload": {"jobId": "j", "namespace": "n", "kind": "inspect"},
                 }),
@@ -622,7 +804,7 @@ mod tests {
 
         // Stale.
         let old = json!({
-            "id": new_id(), "type": job::Payload::TYPE_URI, "issuer": vtc.did(),
+            "id": new_id(), "type": JOB_TYPE, "issuer": vtc.did(),
             "recipient": bridge.did(), "issuedAt": "2020-01-01T00:00:00Z",
             "payload": {"jobId": "j", "namespace": "n", "kind": "inspect"},
         });
@@ -636,8 +818,12 @@ mod tests {
         let ok = [
             json!({"jobId":"j","namespace":"n","kind":"archive","repo":"github.com/a/b"}),
             json!({"jobId":"j","namespace":"n","kind":"inspect"}),
-            json!({"jobId":"j","namespace":"n","kind":"projectRoles","desiredRoles":[]}),
+            json!({"jobId":"j","namespace":"n","kind":"projectRoles","repo":"github.com/a/b","desiredRoles":[]}),
             json!({"jobId":"j","namespace":"n","kind":"beginBind","target":{"forge":"github.com","owner":"acme"}}),
+            // An account listed at `git.ns.admin` (no role) may also be removed.
+            json!({"jobId":"j","namespace":"n","kind":"projectRoles","repo":"github.com/a/b",
+                "desiredRoles":[{"subject":"did:key:z6MkAdmin","account":{"forge":"github.com","id":"7","login":"a"},"right":"git.ns.admin"}],
+                "removeAccounts":[{"forge":"github.com","id":"7","login":"a"}]}),
         ];
         for v in ok {
             check_kind_members(&parse(v.clone())).unwrap_or_else(|e| panic!("{v}: {e}"));
@@ -647,6 +833,16 @@ mod tests {
             json!({"jobId":"j","namespace":"n","kind":"inspect","subject":"did:key:z6Mk"}),
             json!({"jobId":"j","namespace":"n","kind":"createRepo","repo":"github.com/a/b"}),
             json!({"jobId":"j","namespace":"n","kind":"beginAccountLink"}),
+            // 0.4: there is no namespace-level `projectRoles`.
+            json!({"jobId":"j","namespace":"n","kind":"projectRoles","desiredRoles":[]}),
+            // One account, twice.
+            json!({"jobId":"j","namespace":"n","kind":"projectRoles","repo":"github.com/a/b","desiredRoles":[
+                {"subject":"did:key:z6MkOne","account":{"forge":"github.com","id":"7","login":"a"},"right":"git.repo.own"},
+                {"subject":"did:key:z6MkTwo","account":{"forge":"github.com","id":"7","login":"b"},"right":"git.ns.admin"}]}),
+            // An account listed at a right that maps to a role is not also removed.
+            json!({"jobId":"j","namespace":"n","kind":"projectRoles","repo":"github.com/a/b",
+                "desiredRoles":[{"subject":"did:key:z6MkOwner","account":{"forge":"github.com","id":"7","login":"a"},"right":"git.repo.own"}],
+                "removeAccounts":[{"forge":"github.com","id":"7","login":"a"}]}),
         ];
         for v in bad {
             assert!(check_kind_members(&parse(v.clone())).is_err(), "{v}");
@@ -658,6 +854,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_job_0_4_is_taken() {
+        assert!(is_job_type(JOB_TYPE));
+        for v in ["0.1", "0.2", "0.3"] {
+            let t = format!("https://trusttasks.org/spec/git-ns/bridge/job/{v}");
+            assert!(!is_job_type(&t));
+            assert!(is_other_job_version(&t));
+        }
+        assert!(!is_other_job_version(JOB_TYPE));
+    }
+
+    #[test]
+    fn discovery_lists_job_0_4_for_a_pattern_that_selects_it() {
+        for p in [
+            vec![],
+            vec!["*".to_string()],
+            vec!["git-ns/*".into()],
+            vec!["git-ns/bridge/job".into()],
+        ] {
+            assert_eq!(
+                discovery_answer(&p)["supportedTypes"],
+                json!([JOB_TYPE]),
+                "{p:?}"
+            );
+        }
+        for p in [
+            vec!["acl/*".to_string()],
+            vec!["git-ns/bridge".into()],
+            vec!["git-ns/bridge/job/0.4".into()],
+        ] {
+            assert_eq!(discovery_answer(&p)["supportedTypes"], json!([]), "{p:?}");
+        }
     }
 
     #[test]

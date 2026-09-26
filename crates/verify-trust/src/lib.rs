@@ -860,6 +860,21 @@ fn load_exempt_keyring(args: &VerifyTrustArgs) -> Result<Option<ExemptKeyring>> 
 /// on an internal host is not an identity this verifier can be asked to trust,
 /// and `max_signers` bounds the count rather than the reach.
 pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::TDK> {
+    build_resolver_with_cache_ttl(resolve_agent_names, DEFAULT_DID_CACHE_TTL_SECS).await
+}
+
+/// How long a resolved DID document is trusted before it is resolved again,
+/// by default (the resolver's own default, stated so it cannot drift).
+pub const DEFAULT_DID_CACHE_TTL_SECS: u32 = 300;
+
+/// [`build_resolver`] with an explicit cache lifetime for resolved DID
+/// documents: how long a key the signer has since rotated out can still be
+/// trusted, and a key it rotated in can go unseen — a long-running service
+/// states it rather than inherit it.
+pub async fn build_resolver_with_cache_ttl(
+    resolve_agent_names: bool,
+    cache_ttl_secs: u32,
+) -> Result<affinidi_tdk::TDK> {
     use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy;
     use affinidi_tdk::TDK;
     use affinidi_tdk::common::config::TDKConfig;
@@ -873,6 +888,7 @@ pub async fn build_resolver(resolve_agent_names: bool) -> Result<affinidi_tdk::T
             .with_load_environment(false)
             .with_did_resolver_config(
                 DIDCacheConfigBuilder::default()
+                    .with_cache_ttl(cache_ttl_secs)
                     .with_host_policy(HostPolicy::PublicOnly)
                     .with_resolve_shortcuts(resolve_agent_names)
                     .build(),

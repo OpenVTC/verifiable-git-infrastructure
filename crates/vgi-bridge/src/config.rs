@@ -8,7 +8,8 @@
 //!
 //! Environment overrides (applied after the file):
 //! `VGI_BRIDGE_LISTEN`, `VGI_BRIDGE_DATA_DIR`, `VGI_BRIDGE_PUBLIC_URL`,
-//! `VGI_BRIDGE_MASTER_KEY_FILE`.
+//! `VGI_BRIDGE_MASTER_KEY_FILE`, `VGI_BRIDGE_VTA_CREDENTIAL_FILE` (with a
+//! `[vta]` section).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,11 +29,14 @@ pub struct BridgeConfig {
     /// The one VTC this bridge serves. Jobs signed by any other DID are
     /// refused (spec: `permissionDenied`), whatever their proof.
     pub vtc_did: String,
-    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.2"`
-    /// (the default), or `"0.1"` for a VTC that does not understand 0.2 yet.
-    /// The two are wire-identical; what differs is what the VTC does with
-    /// a transfer (0.2 detaches the repository and never moves its rights).
-    /// The bridge's own handling is the same either way.
+    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.3"`
+    /// (the default), or `"0.2"` / `"0.1"` for a VTC that does not
+    /// understand the newer one yet. All three are wire-identical for every
+    /// forge event; 0.2 changes what the VTC does with a transfer (it
+    /// detaches the repository and never moves its rights), and 0.3 adds
+    /// `roleMapReported`, the role map the bridge projects rights with —
+    /// which is never sent under 0.1 or 0.2, so such a VTC keeps assuming
+    /// the default map. The bridge's own handling is the same either way.
     #[serde(default)]
     pub event_version: EventVersion,
     /// The community's Trust Registry, for the bootstrap plan and the
@@ -57,6 +61,12 @@ pub struct BridgeConfig {
     /// file.
     #[serde(default)]
     pub master_key_env: Option<String>,
+    /// VTA mode: the bridge's identity, secrets and state live in its own
+    /// trust context of the VTC's VTA, and this host holds only a
+    /// context-scoped credential. No master key is needed then. `None`: the
+    /// self-contained mode (sealed store, local identity).
+    #[serde(default)]
+    pub vta: Option<VtaConfig>,
     /// Oldest `issuedAt` a job is accepted with, in seconds (plus a minute of
     /// clock skew). A stale job replayed after later ones would push the
     /// forge back to an old desired state.
@@ -72,6 +82,14 @@ pub struct BridgeConfig {
     /// seconds.
     #[serde(default = "default_resend")]
     pub resend_secs: u64,
+    /// How long a resolved DID document is trusted before it is resolved
+    /// again, in seconds (10–3600): the VTC's (job proofs), the registry's,
+    /// and commit signers' (the bridge-posted check). It bounds how long a
+    /// key its owner rotated out can still be accepted. A proof or commit
+    /// that fails against a cached document is checked once more against a
+    /// fresh resolution before it is refused.
+    #[serde(default = "default_did_cache_ttl")]
+    pub did_cache_ttl_secs: u64,
     /// How long a bind or link waits for the person, in seconds.
     #[serde(default = "default_flow_ttl")]
     pub flow_ttl_secs: u64,
@@ -89,7 +107,11 @@ pub struct BridgeConfig {
     /// repository can override it (see [`RoleMapConfig`]).
     #[serde(default)]
     pub role_map: RoleMapConfig,
-    /// GitHub (github.com or GHES), one App each.
+    /// GitHub (github.com or GHES): one private App per organisation (or
+    /// account), keyed by `(host, app_owner)`. GitHub installs a private App
+    /// only on the account that owns it, so a community binding several
+    /// organisations on one host registers one App for each; the VTC still
+    /// maps the host to this one bridge.
     #[serde(default)]
     pub github: Vec<GitHubForgeConfig>,
     /// Forgejo instances, one bot each.
@@ -97,17 +119,87 @@ pub struct BridgeConfig {
     pub forgejo: Vec<ForgejoForgeConfig>,
 }
 
+/// VTA mode (design §5.7, "The bridge works off the VTC's VTA"): where the
+/// bridge's trust context is and how it authenticates to it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct VtaConfig {
+    /// The context's id in the VTA (`vgi-bridge`).
+    pub context: String,
+    /// File holding the context credential bundle the VTA issued (JSON:
+    /// `did`, `privateKeyMultibase`, `vtaDid`, optional `vtaUrl`; or the
+    /// same base64-encoded). Owner-only.
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    /// Environment variable holding the bundle, when there is no file. The
+    /// bridge clears it once read.
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    /// The mediator the VTA is reached through, over DIDComm. Default: the
+    /// bridge's own `mediator_did`. Always DIDComm: the VTA releases a
+    /// private key only over a channel confidential end to end (never over
+    /// REST, where the key would exist wherever TLS terminates).
+    #[serde(default)]
+    pub mediator_did: Option<String>,
+    /// The VTA's REST URL, when the bundle carries none: used only as the
+    /// DIDComm client's fallback for unauthenticated calls.
+    #[serde(default)]
+    pub url: Option<Url>,
+    /// The bridge's DID. `None`: the context's DID.
+    #[serde(default)]
+    pub did: Option<String>,
+    /// Seconds start-up keeps retrying an unreachable VTA before it gives
+    /// up (the bridge cannot run without its keys).
+    #[serde(default = "default_vta_start_timeout")]
+    pub start_timeout_secs: u64,
+    /// How often the bridge asks the VTA whether its keys were rotated, in
+    /// seconds (at least 30; SIGHUP asks at once). A rotation puts the new
+    /// keys in service and drops the old ones.
+    #[serde(default = "default_key_refresh")]
+    pub key_refresh_secs: u64,
+    /// Seconds a newly listed signing key must have been in the bridge's
+    /// DID document before the bridge signs with it (every verifier's cached
+    /// copy has it by then). Default 86400, the proposed verifier cache cap;
+    /// at least `did_cache_ttl_secs`.
+    #[serde(default = "default_signing_switch_after")]
+    pub signing_switch_after_secs: u64,
+}
+
+fn default_signing_switch_after() -> u64 {
+    86_400
+}
+
+fn default_key_refresh() -> u64 {
+    60
+}
+
+fn default_vta_start_timeout() -> u64 {
+    300
+}
+
 /// A `git-ns/bridge/event` version the bridge can send.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[non_exhaustive]
 pub enum EventVersion {
     /// `git-ns/bridge/event` 0.1, for a VTC that has not moved to 0.2.
     #[serde(rename = "0.1")]
     V0_1,
-    /// `git-ns/bridge/event` 0.2.
-    #[default]
+    /// `git-ns/bridge/event` 0.2, for a VTC that has not moved to 0.3: no
+    /// role-map report.
     #[serde(rename = "0.2")]
     V0_2,
+    /// `git-ns/bridge/event` 0.3: adds `roleMapReported`.
+    #[default]
+    #[serde(rename = "0.3")]
+    V0_3,
+}
+
+impl EventVersion {
+    /// Whether the VTC takes `roleMapReported` (event 0.3 and later).
+    pub fn reports_role_map(self) -> bool {
+        self >= EventVersion::V0_3
+    }
 }
 
 /// Inputs to every bootstrap plan.
@@ -215,7 +307,9 @@ impl Default for ResignConfig {
 /// GitHub personal account has only `write`).
 ///
 /// Every map a layer can produce must be ordered (`own ≥ maintain ≥
-/// commit`) with `commit` at most `write`, or the start fails.
+/// commit`), give `admin` to nobody but `own` and keep `commit` at most
+/// `write`, or the start fails: `maintain` and `commit` are rights their
+/// holder may grant themselves, so neither may make them a forge admin.
 ///
 /// **There is deliberately no key for `git.ns.admin`**: a namespace admin
 /// gets no forge role (decided 2026-09-25), so none can be configured — an
@@ -254,9 +348,9 @@ impl RoleMapConfig {
             .fold(RoleMapConfig::default(), |acc, l| l.over(acc));
         let d = RoleMap::default();
         RoleMap::new(
-            merged.own.unwrap_or(d.own),
-            merged.maintain.unwrap_or(d.maintain),
-            merged.commit.unwrap_or(d.commit),
+            merged.own.unwrap_or(d.own()),
+            merged.maintain.unwrap_or(d.maintain()),
+            merged.commit.unwrap_or(d.commit()),
         )
         .map_err(|e| anyhow::anyhow!(e))
     }
@@ -313,7 +407,8 @@ pub struct ForgejoNamespaceConfig {
     pub repos: BTreeMap<String, RepoConfig>,
 }
 
-/// One GitHub the bridge serves as one App.
+/// One GitHub App the bridge holds: its host, and the organisation (or
+/// account) that owns it and whose namespaces it serves.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -321,7 +416,9 @@ pub struct GitHubForgeConfig {
     /// `github.com` or the GHES host.
     #[serde(default = "default_github_host")]
     pub host: String,
-    /// The App's name for the manifest (`acme-vgi-bridge`).
+    /// The App's name for the manifest (`acme-vgi-bridge`). GitHub App names
+    /// are unique per GitHub instance, so every entry on a host names its
+    /// own.
     pub app_name: String,
     /// The organisation (or, with `app_owner_is_user`, the personal account)
     /// the App is registered under and owned by. The manifest exchange
@@ -429,6 +526,9 @@ fn default_sweep() -> u64 {
 fn default_resend() -> u64 {
     60
 }
+fn default_did_cache_ttl() -> u64 {
+    60
+}
 fn default_flow_ttl() -> u64 {
     900
 }
@@ -469,7 +569,23 @@ fn default_committer_email() -> String {
     "vgi-bridge@noreply.invalid".into()
 }
 
+/// A GitHub login is letters, digits and single hyphens: what is safe in a
+/// route segment and a secret's name.
+fn url_segment_ok(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !login.starts_with('-')
+}
+
 impl GitHubForgeConfig {
+    /// The owner as the bridge keys the App by (logins are case-insensitive).
+    pub fn owner_key(&self) -> String {
+        self.app_owner.to_ascii_lowercase()
+    }
+
     /// Whether the Dependabot re-sign is on for the namespace owned by
     /// `owner` (on unless `[github.namespaces.<owner>]` turns it off).
     pub fn resign_dependabot(&self, owner: &str) -> bool {
@@ -483,6 +599,20 @@ impl GitHubForgeConfig {
 type NsLayers<'a> = (Option<RoleMapConfig>, &'a BTreeMap<String, RepoConfig>);
 
 impl BridgeConfig {
+    /// The `[[github]]` entry that serves `owner`'s namespaces on `host`: the
+    /// App `owner` owns, and no other. GitHub installs a private App only on
+    /// its owner, so an owner without an entry of its own has no App here.
+    pub fn github_for(&self, host: &str, owner: &str) -> Option<&GitHubForgeConfig> {
+        self.github
+            .iter()
+            .find(|g| g.host == host && g.app_owner.eq_ignore_ascii_case(owner))
+    }
+
+    /// Every `[[github]]` entry on `host`.
+    pub fn github_on(&self, host: &str) -> impl Iterator<Item = &GitHubForgeConfig> {
+        self.github.iter().filter(move |g| g.host == host)
+    }
+
     /// The role map for `repo` (`host/owner/name`): its repository's,
     /// namespace's, forge entry's and the bridge's overrides over the
     /// default. A resource on a host this bridge has no entry for gets the
@@ -492,7 +622,7 @@ impl BridgeConfig {
         let owner = repo.owner().to_ascii_lowercase();
         let name = repo.repo_name().map(str::to_ascii_lowercase);
         let (forge, ns): (Option<RoleMapConfig>, Option<NsLayers<'_>>) =
-            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+            if let Some(g) = self.github_for(host, &owner) {
                 (
                     g.role_map,
                     g.namespaces.get(&owner).map(|n| (n.role_map, &n.repos)),
@@ -518,6 +648,32 @@ impl BridgeConfig {
         // loaded config; the default is the safe answer if it ever did.
         RoleMapConfig::resolve(&[Some(self.role_map), forge, ns_layer, repo_layer])
             .unwrap_or_default()
+    }
+
+    /// The repositories with a `role_map` layer of their own in the
+    /// namespace `ns` (`host/owner`), as resources (the config keys them by
+    /// lowercase name). Empty on a host this bridge has no entry for.
+    pub fn role_map_repos(&self, ns: &Resource) -> Vec<Resource> {
+        let host = ns.host();
+        let owner = ns.owner().to_ascii_lowercase();
+        let repos: Option<&BTreeMap<String, RepoConfig>> =
+            if let Some(g) = self.github_for(host, &owner) {
+                g.namespaces.get(&owner).map(|n| &n.repos)
+            } else if let Some(f) = self
+                .forgejo
+                .iter()
+                .find(|f| f.host().is_ok_and(|h| h == host))
+            {
+                f.namespaces.get(&owner).map(|n| &n.repos)
+            } else {
+                None
+            };
+        repos
+            .into_iter()
+            .flatten()
+            .filter(|(_, r)| r.role_map.is_some())
+            .filter_map(|(name, _)| ns.namespace().join(name).ok())
+            .collect()
     }
 
     /// Check every role map the layers can produce, and the keys.
@@ -551,7 +707,7 @@ impl BridgeConfig {
         };
         for g in &self.github {
             check(
-                format!("github ({})", g.host),
+                format!("github ({}, {})", g.host, g.app_owner),
                 g.role_map,
                 g.namespaces
                     .iter()
@@ -599,7 +755,8 @@ fn yes() -> bool {
 impl BridgeConfig {
     /// Parse `text` and check it.
     pub fn parse(text: &str) -> Result<Self> {
-        let cfg: BridgeConfig = toml::from_str(text).context("parsing the bridge config")?;
+        let mut cfg: BridgeConfig = toml::from_str(text).context("parsing the bridge config")?;
+        cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -611,8 +768,18 @@ impl BridgeConfig {
         let mut cfg: BridgeConfig =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.apply_env()?;
+        cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Defaults that depend on other settings.
+    fn fill_defaults(&mut self) {
+        if let Some(v) = self.vta.as_mut()
+            && v.mediator_did.is_none()
+        {
+            v.mediator_did = Some(self.mediator_did.clone());
+        }
     }
 
     fn apply_env(&mut self) -> Result<()> {
@@ -627,6 +794,11 @@ impl BridgeConfig {
         }
         if let Ok(v) = std::env::var("VGI_BRIDGE_MASTER_KEY_FILE") {
             self.master_key_file = Some(v.into());
+        }
+        if let Ok(v) = std::env::var("VGI_BRIDGE_VTA_CREDENTIAL_FILE")
+            && let Some(vta) = self.vta.as_mut()
+        {
+            vta.credential_file = Some(v.into());
         }
         Ok(())
     }
@@ -654,6 +826,46 @@ impl BridgeConfig {
                  webhooks to it); got `{s}`"
             ),
         }
+        if let Some(v) = &self.vta {
+            if self.master_key_file.is_some() || self.master_key_env.is_some() {
+                bail!(
+                    "`[vta]` and a master key are both set: in VTA mode nothing is sealed into the \
+                     local store (secrets live in the VTA), so remove `master_key_file` / \
+                     `master_key_env`"
+                );
+            }
+            if v.signing_switch_after_secs < self.did_cache_ttl_secs {
+                bail!(
+                    "`vta.signing_switch_after_secs` ({}) must be at least `did_cache_ttl_secs` \
+                     ({}): a verifier's cached DID document must have the new key before the \
+                     bridge signs with it",
+                    v.signing_switch_after_secs,
+                    self.did_cache_ttl_secs
+                );
+            }
+            if v.context.trim().is_empty() {
+                bail!("`vta.context` must name the bridge's context in the VTA");
+            }
+            if v.credential_file.is_none() && v.credential_env.is_none() {
+                bail!("`[vta]` needs `credential_file` or `credential_env`");
+            }
+            for (what, did) in [("vta.mediator_did", &v.mediator_did), ("vta.did", &v.did)] {
+                if let Some(did) = did
+                    && (!did.starts_with("did:") || did.chars().any(char::is_whitespace))
+                {
+                    bail!("`{what}` must be a DID, got `{did}`");
+                }
+            }
+            if let Some(u) = &v.url
+                && u.scheme() != "https"
+                && !matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            {
+                bail!("`vta.url` must be https (the credential handshake travels over it)");
+            }
+        }
+        if !(10..=3600).contains(&self.did_cache_ttl_secs) {
+            bail!("`did_cache_ttl_secs` must be between 10 and 3600");
+        }
         if self.max_body_bytes < 64 * 1024 {
             bail!("`max_body_bytes` below 64 KiB would refuse ordinary webhooks");
         }
@@ -679,20 +891,41 @@ impl BridgeConfig {
                  bridge's DID in their `Signed-by-DID:` trailer"
             );
         }
-        let mut hosts = std::collections::BTreeSet::new();
+        let mut apps = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
         for g in &self.github {
-            Resource::namespace_of(&g.host, "x")
-                .map_err(|e| anyhow::anyhow!("github host `{}`: {e}", g.host))?;
-            if !hosts.insert(g.host.clone()) {
-                bail!("forge host `{}` is configured twice", g.host);
+            Resource::namespace_of(&g.host, &g.app_owner).map_err(|e| {
+                anyhow::anyhow!("github `{}` / app_owner `{}`: {e}", g.host, g.app_owner)
+            })?;
+            if !apps.insert((g.host.clone(), g.owner_key())) {
+                bail!(
+                    "two `[[github]]` entries for `{}` on `{}`: one App per organisation (or \
+                     account), each its own entry",
+                    g.app_owner,
+                    g.host
+                );
+            }
+            if !names.insert((g.host.clone(), g.app_name.to_ascii_lowercase())) {
+                bail!(
+                    "two `[[github]]` entries on `{}` name the App `{}`: GitHub App names are unique \
+                     per instance, so give each organisation's App its own `app_name`",
+                    g.host,
+                    g.app_name
+                );
+            }
+            if !url_segment_ok(&g.app_owner) {
+                bail!("`app_owner` `{}` is not a GitHub login", g.app_owner);
             }
             if g.dependabot_login.is_empty() || g.dependabot_id == 0 {
                 bail!("`dependabot_login` and `dependabot_id` must be set");
             }
         }
+        let github_hosts: std::collections::BTreeSet<&str> =
+            self.github.iter().map(|g| g.host.as_str()).collect();
+        let mut hosts = std::collections::BTreeSet::new();
         for f in &self.forgejo {
             let host = f.host()?;
-            if !hosts.insert(host.clone()) {
+            if github_hosts.contains(host.as_str()) || !hosts.insert(host.clone()) {
                 bail!("forge host `{host}` is configured twice");
             }
             if let Some(label) = &f.runs_on {
@@ -722,6 +955,15 @@ impl BridgeConfig {
     pub fn store_path(&self) -> PathBuf {
         self.data_dir.join("state.redb")
     }
+}
+
+/// The test config without a master key (VTA-mode tests elsewhere).
+#[cfg(test)]
+pub(crate) fn tests_example() -> String {
+    tests::EXAMPLE.replace(
+        "master_key_file = \"/run/secrets/vgi-bridge-master-key\"\n",
+        "",
+    )
 }
 
 #[cfg(test)]
@@ -762,7 +1004,7 @@ oauth_client_id = "0b6e3a0c"
             "https://bridge.acme.example/github/github.com/webhook"
         );
         assert_eq!(c.checks.max_commits, 250);
-        assert_eq!(c.event_version, EventVersion::V0_2, "0.2 unless set");
+        assert_eq!(c.event_version, EventVersion::V0_3, "0.3 unless set");
     }
 
     #[test]
@@ -813,7 +1055,7 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn the_event_version_is_0_1_or_0_2() {
+    fn the_event_version_is_0_1_0_2_or_0_3() {
         let with = |v: &str| {
             BridgeConfig::parse(&EXAMPLE.replacen(
                 "public_url",
@@ -823,7 +1065,10 @@ oauth_client_id = "0b6e3a0c"
         };
         assert_eq!(with("0.1").unwrap().event_version, EventVersion::V0_1);
         assert_eq!(with("0.2").unwrap().event_version, EventVersion::V0_2);
-        for bad in ["0.3", "1.0", "", "v0.2"] {
+        assert_eq!(with("0.3").unwrap().event_version, EventVersion::V0_3);
+        assert!(!EventVersion::V0_2.reports_role_map());
+        assert!(EventVersion::V0_3.reports_role_map());
+        for bad in ["0.4", "1.0", "", "v0.2"] {
             assert!(with(bad).is_err(), "`{bad}` is refused");
         }
     }
@@ -838,6 +1083,90 @@ oauth_client_id = "0b6e3a0c"
         );
         let c = BridgeConfig::parse(&no_keyring).unwrap();
         assert!(c.github[0].platform_keyring_file.is_none());
+    }
+
+    #[test]
+    fn vta_mode_parses_and_refuses_a_master_key_beside_it() {
+        let base = EXAMPLE.replace(
+            "master_key_file = \"/run/secrets/vgi-bridge-master-key\"\n",
+            "",
+        );
+        let with = |vta: &str| BridgeConfig::parse(&format!("{base}\n[vta]\n{vta}"));
+        let c = with("context = \"vgi-bridge\"\ncredential_file = \"/run/secrets/c\"").unwrap();
+        let v = c.vta.clone().unwrap();
+        assert_eq!(v.context, "vgi-bridge");
+        assert_eq!(v.key_refresh_secs, 60);
+        assert_eq!(c.did_cache_ttl_secs, 60);
+        assert_eq!(
+            v.mediator_did.as_deref(),
+            Some("did:web:mediator.acme.example"),
+            "the VTA is reached over DIDComm, through the bridge's mediator by default"
+        );
+        assert!(
+            with("context = \"vgi-bridge\"").is_err(),
+            "a credential source is required"
+        );
+        assert!(with("context = \"\"\ncredential_env = \"X\"").is_err());
+        assert!(
+            with("context = \"b\"\ncredential_env = \"X\"\nurl = \"http://vta.example\"").is_err(),
+            "cleartext only to loopback"
+        );
+        assert!(
+            with("context = \"b\"\ncredential_env = \"X\"\nmediator_did = \"mediator\"").is_err()
+        );
+        let err = BridgeConfig::parse(&format!(
+            "{EXAMPLE}\n[vta]\ncontext = \"b\"\ncredential_env = \"X\""
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("master key"), "{err}");
+        assert!(BridgeConfig::parse(&format!("did_cache_ttl_secs = 5\n{EXAMPLE}")).is_err());
+    }
+
+    #[test]
+    fn several_apps_on_one_host_are_keyed_by_owner() {
+        let second = |owner: &str, name: &str| {
+            format!("{EXAMPLE}\n[[github]]\napp_name = \"{name}\"\napp_owner = \"{owner}\"\n")
+        };
+        let c = BridgeConfig::parse(&second("globex", "globex-vgi-bridge")).unwrap();
+        assert_eq!(
+            c.github_for("github.com", "ACME").unwrap().app_owner,
+            "acme"
+        );
+        assert_eq!(
+            c.github_for("github.com", "globex").unwrap().app_name,
+            "globex-vgi-bridge"
+        );
+        assert!(
+            c.github_for("github.com", "initech").is_none(),
+            "no fallback with several"
+        );
+        assert!(c.github_for("ghe.example", "acme").is_none());
+        // One App per organisation, and GitHub App names are unique.
+        assert!(BridgeConfig::parse(&second("Acme", "other-name")).is_err());
+        assert!(BridgeConfig::parse(&second("globex", "ACME-vgi-bridge")).is_err());
+        assert!(BridgeConfig::parse(&second("glo/bex", "x")).is_err());
+        // A lone App serves only its own owner.
+        let one = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert!(one.github_for("github.com", "initech").is_none());
+    }
+
+    #[test]
+    fn role_map_repos_are_the_owners_own() {
+        // Two Apps on github.com, one configured repository map under the
+        // second: only that organisation's report lists it.
+        let text = format!(
+            "{EXAMPLE}\n[[github]]\napp_name = \"globex-vgi-bridge\"\napp_owner = \"globex\"\n\n\
+             [github.namespaces.globex.repos.w.role_map]\ncommit = \"write\"\n"
+        );
+        let c = BridgeConfig::parse(&text).unwrap();
+        let listed = |ns: &str| -> Vec<String> {
+            c.role_map_repos(&res(ns))
+                .into_iter()
+                .map(|r| r.to_string())
+                .collect()
+        };
+        assert_eq!(listed("github.com/globex"), vec!["github.com/globex/w"]);
+        assert!(listed("github.com/acme").is_empty());
     }
 
     #[test]
@@ -914,10 +1243,10 @@ oauth_client_id = "0b6e3a0c"
             EXAMPLE.replace("[[github]]", "[role_map]\ncommit = \"read\"\n\n[[github]]"),
             r#"
 [forgejo.role_map]
-maintain = "admin"
+maintain = "write"
 
 [forgejo.namespaces.acme.role_map]
-maintain = "write"
+maintain = "maintain"
 
 [forgejo.namespaces.acme.repos.widgets.role_map]
 commit = "write"
@@ -927,16 +1256,23 @@ commit = "write"
         use ForgeRole::*;
         let got = |r| {
             let m = c.role_map(&res(r));
-            (m.own, m.maintain, m.commit)
+            (m.own(), m.maintain(), m.commit())
         };
         // Bridge-wide only.
         assert_eq!(got("github.com/acme/widgets"), (Admin, Maintain, Read));
         // Forge entry over the bridge.
-        assert_eq!(got("codeberg.org/other/widgets"), (Admin, Admin, Read));
+        assert_eq!(got("codeberg.org/other/widgets"), (Admin, Write, Read));
         // Namespace over the forge entry.
-        assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Write, Read));
+        assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Maintain, Read));
         // Repository over the namespace; names match case-insensitively.
-        assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Write, Write));
+        assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Maintain, Write));
+        // The repositories with a layer of their own, for the report.
+        assert_eq!(
+            c.role_map_repos(&res("codeberg.org/acme")),
+            vec![res("codeberg.org/acme/widgets")]
+        );
+        assert!(c.role_map_repos(&res("codeberg.org/other")).is_empty());
+        assert!(c.role_map_repos(&res("github.com/acme")).is_empty());
     }
 
     #[test]
@@ -950,19 +1286,47 @@ commit = "write"
             // Out of order, or a committer above `write`.
             "[role_map]\nown = \"write\"",
             "[role_map]\ncommit = \"maintain\"",
-            "[forgejo.role_map]\nmaintain = \"admin\"\ncommit = \"admin\"",
             // Checked through every layer, not only on its own.
-            "[forgejo.role_map]\nown = \"maintain\"\n\
-             [forgejo.namespaces.acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.role_map]\nown = \"write\"\n\
+             [forgejo.namespaces.acme.role_map]\nmaintain = \"maintain\"",
             "[forgejo.namespaces.acme.repos.w.role_map]\ncommit = \"triage\"\nmaintain = \"read\"",
             // Keys are lowercase.
-            "[forgejo.namespaces.Acme.role_map]\nmaintain = \"admin\"",
+            "[forgejo.namespaces.Acme.role_map]\nmaintain = \"write\"",
             "[forgejo.namespaces.acme.repos.W.role_map]\ncommit = \"write\"",
             "[role_map]\nmaintain = \"superuser\"",
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }
-        assert!(with("[role_map]\nmaintain = \"admin\"\ncommit = \"write\"").is_ok());
+        assert!(with("[role_map]\nmaintain = \"write\"\ncommit = \"write\"").is_ok());
+    }
+
+    #[test]
+    fn only_an_owner_may_map_to_admin_at_any_layer() {
+        let with = |extra: &str| BridgeConfig::parse(&format!("{EXAMPLE}\n{extra}"));
+        for (bad, layer) in [
+            ("[role_map]\nmaintain = \"admin\"", "`role_map`"),
+            (
+                "[role_map]\nmaintain = \"admin\"\ncommit = \"write\"",
+                "`role_map`",
+            ),
+            ("[forgejo.role_map]\nmaintain = \"admin\"", "forgejo"),
+            ("[forgejo.role_map]\ncommit = \"admin\"", "forgejo"),
+            (
+                "[forgejo.namespaces.acme.role_map]\nmaintain = \"admin\"",
+                "acme",
+            ),
+            (
+                "[forgejo.namespaces.acme.repos.w.role_map]\nmaintain = \"admin\"",
+                "acme",
+            ),
+        ] {
+            let err = format!("{:#}", with(bad).unwrap_err());
+            assert!(err.contains("only an owner"), "{bad}: {err}");
+            assert!(err.contains(layer), "{bad} names its layer: {err}");
+        }
+        // An owner at admin is the default, and a narrower owner is allowed.
+        assert!(with("[role_map]\nown = \"admin\"").is_ok());
+        assert!(with("[role_map]\nown = \"write\"\nmaintain = \"write\"").is_ok());
     }
 
     #[test]

@@ -366,3 +366,41 @@ fn assert_no_nulls(v: &Value) {
         _ => {}
     }
 }
+
+#[tokio::test]
+async fn discovery_lists_job_0_4_and_older_job_versions_are_refused() {
+    let mut w = world(Options::default()).await;
+    let ask = w
+        .doc(
+            "https://trusttasks.org/spec/trust-task-discovery/0.2",
+            json!({ "patterns": ["git-ns/bridge/job"] }),
+            None,
+        )
+        .await;
+    w.deliver(ask.clone()).await;
+    let answer = w.next().await;
+    assert_eq!(
+        answer["type"],
+        "https://trusttasks.org/spec/trust-task-discovery/0.2#response"
+    );
+    assert_eq!(answer["threadId"], ask["id"]);
+    assert_eq!(answer["payload"]["supportedTypes"], json!([JOB]));
+
+    for old in [
+        JOB_0_1,
+        JOB_0_2,
+        "https://trusttasks.org/spec/git-ns/bridge/job/0.3",
+    ] {
+        let doc = w.doc(old, inspect_job("job_old"), None).await;
+        w.deliver(doc).await;
+        let err = w.next().await;
+        assert_eq!(err["payload"]["code"], "unsupportedVersion", "{old}: {err}");
+    }
+    assert!(
+        w.bridge
+            .store()
+            .get::<JobRecord>(Table::Jobs, "job_old")
+            .unwrap()
+            .is_none()
+    );
+}

@@ -27,6 +27,10 @@ fn seed_labs(w: &World) {
     rec.required_workflow = Some(false);
     rec.bridge_checks = Some(true);
     w.bridge.store().put(Table::Namespaces, LABS, &rec).unwrap();
+    // Handed to its App, as a restart would (when acme-labs has one).
+    if let Some(a) = w.bridge.adapters().for_resource(&rec.resource) {
+        a.restore(&rec).unwrap();
+    }
 }
 
 fn ns(w: &World, id: &str) -> NamespaceRecord {
@@ -63,16 +67,21 @@ fn open_events(w: &World) -> usize {
         .count()
 }
 
-/// A managed repository transferred to another namespace this same bridge
-/// serves: reported to its old namespace as `repoTransferred`, and to the
-/// new one as `repoCreatedUnmanaged` — its record, its place in the managed
-/// set and its Dependabot provenance never follow it. Same handling on
-/// either event version; only the type differs.
+/// A managed repository transferred to another organisation this same
+/// bridge serves (through that organisation's own App): the old
+/// organisation's App reports it to its namespace as `repoTransferred`, and
+/// the new one's App reports it to its namespace as `repoCreatedUnmanaged` —
+/// each App speaks for its own organisation only, and the record, the place
+/// in the managed set and the Dependabot provenance never follow it. Same
+/// handling on either event version; only the type differs.
 async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty: &str) {
-    let mut w = world(Options {
-        event_version: version,
-        ..Options::default()
-    })
+    let mut w = world(
+        Options {
+            event_version: version,
+            ..Options::default()
+        }
+        .with_org("acme-labs", 3004),
+    )
     .await;
     seed_labs(&w);
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
@@ -98,6 +107,17 @@ async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty:
         json!({ "type": "repoTransferred", "forgeId": "812",
                 "from": "github.com/acme/widgets", "to": "github.com/acme-labs/widgets" })
     );
+    // acme's App says nothing for acme-labs: its own App does.
+    w.quiet().await;
+    let s = post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "t-1-labs",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
     let arrived = w.next_of(ty).await;
     assert_eq!(arrived["payload"]["namespace"], LABS);
     assert_eq!(
@@ -135,6 +155,15 @@ async fn a_transfer_between_served_namespaces(version: Option<&'static str>, ty:
     assert_eq!(s, StatusCode::ACCEPTED);
     let again = w.next_of(ty).await;
     assert_eq!(again["payload"]["event"]["type"], "repoTransferred");
+    let s = post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "t-2-labs",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
     let again = w.next_of(ty).await;
     assert_eq!(again["payload"]["event"]["type"], "repoCreatedUnmanaged");
     assert!(record(&w, 812).is_none());
@@ -148,6 +177,159 @@ async fn a_transfer_into_another_served_namespace_detaches_and_carries_nothing()
 #[tokio::test]
 async fn under_0_1_a_transfer_is_handled_the_same_and_typed_0_1() {
     a_transfer_between_served_namespaces(Some("0.1"), EVENT_0_1).await;
+}
+
+/// Two events, in either order, keyed by namespace.
+async fn two_events(w: &mut World) -> std::collections::BTreeMap<String, Value> {
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let ev = w.next_of(EVENT).await;
+        out.insert(
+            ev["payload"]["namespace"].as_str().unwrap().to_string(),
+            ev["payload"]["event"].clone(),
+        );
+    }
+    out
+}
+
+/// A world with acme's `widgets` (812) managed, and acme-labs served by its
+/// own App.
+async fn two_org_world() -> World {
+    let w = world(Options::default().with_org("acme-labs", 3004)).await;
+    seed_labs(&w);
+    seed_repo(w.bridge.store(), &repo("widgets"), 812);
+    w
+}
+
+/// Probe (re-review of #90): only the NEW owner's App reports the transfer
+/// (the old owner's delivery never comes, or comes later). The new side
+/// reports it unmanaged; the old side is detached and told only once GitHub
+/// itself confirms the move — never on the other organisation's word.
+#[tokio::test]
+async fn a_transfer_only_the_new_owner_reports_is_confirmed_before_the_old_side_detaches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let mut w = two_org_world().await;
+    mount_any_token(&w.server).await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/812"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": 812, "full_name": "acme-labs/widgets" })),
+        )
+        .mount(&w.server)
+        .await;
+    let s = post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "n-1",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let evs = two_events(&mut w).await;
+    assert_eq!(
+        evs[NS],
+        json!({ "type": "repoTransferred", "forgeId": "812",
+                "from": "github.com/acme/widgets", "to": "github.com/acme-labs/widgets" })
+    );
+    assert_eq!(
+        evs[LABS],
+        json!({ "type": "repoCreatedUnmanaged", "forgeId": "812",
+                "resource": "github.com/acme-labs/widgets" })
+    );
+    assert!(
+        record(&w, 812).is_none(),
+        "the old side's record is detached"
+    );
+    assert!(!ns(&w, NS).managed.contains(&812));
+
+    // The old owner's delivery arrives late: nothing of it is left to
+    // detach; nothing breaks.
+    post_webhook(
+        &w,
+        "repository",
+        "o-1",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    let late = w.next_of(EVENT).await;
+    assert_eq!(late["payload"]["event"]["type"], "repoTransferred");
+    assert!(record(&w, 812).is_none());
+}
+
+/// The same transfer, the old owner's App first (the existing path) — the
+/// new owner's delivery after it has nothing to confirm.
+#[tokio::test]
+async fn a_transfer_the_old_owner_reports_first_needs_no_confirmation() {
+    let mut w = two_org_world().await;
+    post_webhook(
+        &w,
+        "repository",
+        "o-1",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    let out = w.next_of(EVENT).await;
+    assert_eq!(out["payload"]["namespace"], NS);
+    assert_eq!(out["payload"]["event"]["type"], "repoTransferred");
+    assert!(record(&w, 812).is_none());
+    post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "n-1",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    let arrived = w.next_of(EVENT).await;
+    assert_eq!(arrived["payload"]["namespace"], LABS);
+    assert_eq!(arrived["payload"]["event"]["type"], "repoCreatedUnmanaged");
+    w.quiet().await;
+    assert!(
+        !w.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == "/repositories/812"),
+        "nothing to confirm"
+    );
+}
+
+/// The new owner's App claims a repository GitHub says is still the old
+/// owner's: the old side is left alone.
+#[tokio::test]
+async fn an_unconfirmed_transfer_leaves_the_other_organisation_alone() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let mut w = two_org_world().await;
+    mount_any_token(&w.server).await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/812"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": 812, "full_name": "acme/widgets" })),
+        )
+        .mount(&w.server)
+        .await;
+    post_webhook_as(
+        &w,
+        "acme-labs",
+        "repository",
+        "n-1",
+        &transferred(812, "acme-labs/widgets"),
+    )
+    .await;
+    let ev = w.next_of(EVENT).await;
+    assert_eq!(
+        ev["payload"]["namespace"], LABS,
+        "only its own namespace hears of it"
+    );
+    w.quiet().await;
+    assert!(record(&w, 812).is_some(), "acme's record is untouched");
+    assert!(ns(&w, NS).managed.contains(&812));
 }
 
 #[tokio::test]
@@ -294,7 +476,7 @@ async fn under_0_1_events_are_typed_0_1_and_either_acknowledgement_clears_them()
 }
 
 #[tokio::test]
-async fn by_default_events_are_typed_0_2() {
+async fn by_default_events_are_typed_0_3() {
     let mut w = world(Options::default()).await;
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
     mount_inspect(&w.server).await;
@@ -305,7 +487,7 @@ async fn by_default_events_are_typed_0_2() {
     .await;
     let ev = w.next_of(EVENT).await;
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.2 payload");
+        .expect("a 0.3 payload");
     // A VTC that answers in 0.1 (the configured version changed while this
     // was out) still clears it.
     let ack = w

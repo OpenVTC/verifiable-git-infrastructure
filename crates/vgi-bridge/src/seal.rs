@@ -154,8 +154,9 @@ fn aad(name: &str) -> Vec<u8> {
     a
 }
 
+/// Refuse a key or credential file others can read.
 #[cfg(unix)]
-fn check_owner_only(path: &Path) -> Result<()> {
+pub fn check_owner_only(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path)
         .with_context(|| format!("reading {}", path.display()))?
@@ -163,7 +164,7 @@ fn check_owner_only(path: &Path) -> Result<()> {
         .mode();
     if mode & 0o077 != 0 {
         bail!(
-            "{} is readable by others (mode {:o}); `chmod 600` it — it opens every sealed secret",
+            "{} is readable by others (mode {:o}); `chmod 600` it — it holds key material",
             path.display(),
             mode & 0o777
         );
@@ -171,8 +172,9 @@ fn check_owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a key or credential file others can read (a no-op off Unix).
 #[cfg(not(unix))]
-fn check_owner_only(_path: &Path) -> Result<()> {
+pub fn check_owner_only(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -432,8 +432,9 @@ fn github_ctx(bridge: &Bridge, repo: &Resource) -> Option<Ctx> {
     Some(ctx)
 }
 
-fn github_config<'a>(bridge: &'a Bridge, host: &str) -> Option<&'a GitHubForgeConfig> {
-    bridge.cfg.github.iter().find(|g| g.host == host)
+/// The `[[github]]` entry (the App) serving `r`'s owner.
+fn github_config<'a>(bridge: &'a Bridge, r: &Resource) -> Option<&'a GitHubForgeConfig> {
+    bridge.cfg.github_for(r.host(), r.owner())
 }
 
 /// Whether `pr` was opened by Dependabot, by login and id.
@@ -453,7 +454,7 @@ fn eligibility(
     pr: &PullRequestInfo,
     protected: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
-    let gh = github_config(bridge, repo.host()).ok_or("no GitHub is configured for this host")?;
+    let gh = github_config(bridge, repo).ok_or("no GitHub is configured for this host")?;
     if !ctx.adapter.forge().capabilities(&ctx.namespace).automation {
         return Err("the namespace is in manual mode".into());
     }
@@ -503,7 +504,7 @@ pub(crate) fn check_hint(
     pr: &PullRequestInfo,
     protected: &str,
 ) -> Option<String> {
-    let gh = github_config(bridge, trigger.repo.host())?;
+    let gh = github_config(bridge, &trigger.repo)?;
     if !opened_by_dependabot(gh, pr) {
         return None;
     }
@@ -538,7 +539,7 @@ pub(crate) fn check_hint(
              runs again on the re-signed head — unless they change `{WORKFLOWS}/`, which the \
              bridge never re-signs. If the re-signed commits fail too, the VTC has not granted \
              the bridge `git.commit.sign` on this namespace.",
-            bridge.identity.did()
+            bridge.did()
         ),
         Err(why) if why.contains(WORKFLOWS) => format!(
             "\n\n**Dependabot.** This pull request changes `{WORKFLOWS}/`, and the bridge never \
@@ -646,7 +647,7 @@ pub(crate) fn on_pull_request_triggers(bridge: &Arc<Bridge>, triggers: &[CheckTr
         let CheckTriggerKind::PullRequest { number } = t.kind else {
             continue;
         };
-        let Some(gh) = github_config(bridge, t.repo.host()) else {
+        let Some(gh) = github_config(bridge, &t.repo) else {
             continue;
         };
         let head = t.head_ref.as_deref().unwrap_or_default();
@@ -698,7 +699,7 @@ pub async fn run(
     if pr.open
         && pr.head_repo_id == Some(repo_id)
         && check_branch_name(&pr.head_ref).is_ok()
-        && let Some(gh) = github_config(bridge, repo.host())
+        && let Some(gh) = github_config(bridge, repo)
         && opened_by_dependabot(gh, &pr)
     {
         // So that a push delivered after this one can resume the re-sign.
@@ -777,7 +778,7 @@ pub async fn run(
         });
     }
 
-    let signing = bridge.identity.git_signing_key()?;
+    let signing = bridge.identity().git_signing_key()?;
     if fetched
         .commits
         .iter()
@@ -785,7 +786,7 @@ pub async fn run(
     {
         return skip("already re-signed by the bridge".into());
     }
-    let gh = github_config(bridge, repo.host()).context("GitHub config")?;
+    let gh = github_config(bridge, repo).context("GitHub config")?;
     let keyring = ExemptKeyring::load(&keyring)?;
     let author_email = format!(
         "{}+{}@users.noreply.{}",
@@ -1107,7 +1108,7 @@ pub(crate) async fn warn_if_ungranted(bridge: &Bridge, ns_id: &str) {
     if ns.state != NamespaceState::Bound {
         return;
     }
-    let Some(gh) = github_config(bridge, ns.resource.host()) else {
+    let Some(gh) = github_config(bridge, &ns.resource) else {
         return;
     };
     if !gh.resign_dependabot(ns.resource.owner()) {
@@ -1116,11 +1117,11 @@ pub(crate) async fn warn_if_ungranted(bridge: &Bridge, ns_id: &str) {
     match bridge
         .checks
         .verifier
-        .commit_sign_granted(bridge.identity.did(), ns.resource.as_str())
+        .commit_sign_granted(bridge.did(), ns.resource.as_str())
         .await
     {
         Ok(Some(false)) => tracing::warn!(
-            namespace = %ns_id, resource = %ns.resource, did = %bridge.identity.did(),
+            namespace = %ns_id, resource = %ns.resource, did = %bridge.did(),
             "the registry does not grant this bridge's DID git.commit.sign on the namespace: \
              Dependabot pull requests it re-signs will fail the check until the VTC grants it"
         ),

@@ -113,12 +113,24 @@ impl BridgeParts {
 /// The bridge.
 pub struct Bridge {
     pub(crate) cfg: BridgeConfig,
-    pub(crate) identity: BridgeIdentity,
+    /// The bridge's DID: fixed for the process (a key rotation keeps it).
+    did: String,
+    /// Its keys, replaced when the VTA rotates them ([`Bridge::replace_identity`]).
+    identity: std::sync::RwLock<BridgeIdentity>,
+    /// Bumped on every rotation, so the DIDComm link reconnects with the
+    /// new key-agreement key.
+    rotation: tokio::sync::watch::Sender<u64>,
     pub(crate) store: Store,
     pub(crate) adapters: Adapters,
     pub(crate) link: Arc<dyn VtcLink>,
     pub(crate) checker: DocChecker,
     ns_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The last send to the VTC failed: the link is down as far as the
+    /// bridge can tell. The next send that succeeds is a link-up.
+    link_down: std::sync::atomic::AtomicBool,
+    /// Raised by a send that succeeded after sends failed, for
+    /// [`Bridge::background`] to run [`Bridge::link_up`].
+    pub(crate) link_recovered: tokio::sync::Notify,
     #[cfg(feature = "forge-github")]
     pub(crate) checks: crate::checks::CheckRunner,
     #[cfg(feature = "forge-github")]
@@ -130,12 +142,16 @@ pub struct Bridge {
 impl std::fmt::Debug for Bridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bridge")
-            .field("did", &self.identity.did())
+            .field("did", &self.did)
             .field("vtc", &self.cfg.vtc_did)
             .field("adapters", &self.adapters)
             .finish_non_exhaustive()
     }
 }
+
+/// How long a result or event waits for the VTA mirror before it is held
+/// for the next resend.
+const OUTBOX_FLUSH: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Unix seconds now.
 pub(crate) fn now() -> i64 {
@@ -179,12 +195,16 @@ impl Bridge {
         let resign = crate::resign::ResignRunner::new(parts.config.checks.concurrency);
         Arc::new(Bridge {
             cfg: parts.config,
-            identity: parts.identity,
+            did: parts.identity.did().to_string(),
+            identity: std::sync::RwLock::new(parts.identity),
+            rotation: tokio::sync::watch::channel(0).0,
             store: parts.store,
             adapters: parts.adapters,
             link: parts.link,
             checker,
             ns_locks: Mutex::new(BTreeMap::new()),
+            link_down: std::sync::atomic::AtomicBool::new(false),
+            link_recovered: tokio::sync::Notify::new(),
             #[cfg(feature = "forge-github")]
             checks,
             #[cfg(feature = "forge-github")]
@@ -196,7 +216,41 @@ impl Bridge {
 
     /// The bridge's DID.
     pub fn did(&self) -> &str {
-        self.identity.did()
+        &self.did
+    }
+
+    /// The bridge's current keys.
+    pub fn identity(&self) -> BridgeIdentity {
+        self.identity.read().expect("lock").clone()
+    }
+
+    /// Put rotated keys in service: from now on every document and re-sign
+    /// is signed with `new`, and the DIDComm link reconnects with its
+    /// key-agreement key. The old keys are dropped. `Ok(false)`: the keys are
+    /// the ones already in service. Refused for another DID — a rotation
+    /// keeps the DID, and the VTC knows the bridge by it.
+    pub fn replace_identity(&self, new: BridgeIdentity) -> Result<bool> {
+        if new.did() != self.did {
+            anyhow::bail!(
+                "the VTA now names the DID `{}` for this bridge, not `{}`: refusing to switch DIDs \
+                 at run time (the VTC knows the bridge by its DID); restart after fixing the context",
+                new.did(),
+                self.did
+            );
+        }
+        let mut current = self.identity.write().expect("lock");
+        if current.same_keys(&new) {
+            return Ok(false);
+        }
+        *current = new;
+        drop(current);
+        self.rotation.send_modify(|g| *g += 1);
+        Ok(true)
+    }
+
+    /// Changes on every key rotation.
+    pub fn rotations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rotation.subscribe()
     }
 
     /// Registry answers in flight (tests drive a channel against them).
@@ -230,7 +284,9 @@ impl Bridge {
     ///    convergent);
     /// 3. device-flow account links still inside their window are polled
     ///    again;
-    /// 4. unacknowledged results and events are sent again.
+    /// 4. unacknowledged results and events are sent again;
+    /// 5. every bound namespace's role map is reported (`crate::rolemap`),
+    ///    the configuration being the one thing a restart can change.
     pub async fn restore(self: &Arc<Self>) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
             if let Some(adapter) = self.adapters.for_resource(&ns.resource)
@@ -252,7 +308,11 @@ impl Bridge {
             }
         }
         crate::flows::resume_device_polls(self)?;
-        self.resend_unacknowledged(true).await;
+        // As at any link-up: everything unacknowledged, then a fresh
+        // role-map report per bound namespace (the configuration is the one
+        // thing a restart can change), replacing any report from the last
+        // run still unacknowledged under the same outbox key.
+        self.link_up().await;
         Ok(())
     }
 
@@ -311,14 +371,18 @@ impl Bridge {
         let _ = ns_id;
     }
 
-    /// Put an adapter's namespaces back after it came into service later
-    /// than start-up (a GitHub App registered at run time).
-    pub(crate) fn restore_host(&self, host: &str) -> Result<()> {
-        let Some(adapter) = self.adapters.get(host) else {
-            return Ok(());
-        };
+    /// Put a GitHub App's namespaces back after it came into service later
+    /// than start-up (registered at run time): those on `host` whose owner
+    /// it serves.
+    pub(crate) fn restore_app(&self, host: &str, owner: &str) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
-            if ns.resource.host() == host {
+            if ns.resource.host() == host
+                && self
+                    .cfg
+                    .github_for(host, ns.resource.owner())
+                    .is_some_and(|g| g.app_owner.eq_ignore_ascii_case(owner))
+                && let Some(adapter) = self.adapters.for_resource(&ns.resource)
+            {
                 adapter.restore(&ns)?;
             }
         }
@@ -360,6 +424,27 @@ impl Bridge {
         let ty = verified.doc.type_uri.to_string();
         if wire::is_job_type(&ty) {
             self.on_job(verified).await;
+        } else if wire::is_other_job_version(&ty) {
+            self.send_error(
+                &verified.doc,
+                ErrorPayload::new(StandardCode::UnsupportedVersion)
+                    .with_message("this bridge takes git-ns/bridge/job 0.4 only"),
+            )
+            .await;
+        } else if ty == wire::DISCOVERY_TYPE {
+            let patterns: Vec<String> = verified
+                .doc
+                .payload
+                .get("patterns")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.respond(&verified.doc, wire::discovery_answer(&patterns))
+                .await;
         } else if ty == result::Response::TYPE_URI {
             self.on_result_ack(&verified);
         } else if wire::is_event_response_type(&ty) {
@@ -380,9 +465,9 @@ impl Bridge {
     }
 
     async fn send_error(&self, request: &TrustTask<Value>, payload: ErrorPayload) {
-        match wire::signed_error(&self.identity, request, payload).await {
+        match wire::signed_error(&self.identity(), request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     tracing::warn!(error = %e, "could not send an error response");
                 }
             }
@@ -391,9 +476,9 @@ impl Bridge {
     }
 
     async fn respond(&self, request: &TrustTask<Value>, payload: Value) {
-        match wire::signed_response(&self.identity, request, payload).await {
+        match wire::signed_response(&self.identity(), request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     // The VTC repeats a job it got no answer to; the ledger
                     // answers the repeat.
                     tracing::warn!(error = %e, "could not send a job response");
@@ -404,7 +489,7 @@ impl Bridge {
     }
 
     async fn on_job(self: &Arc<Self>, v: VerifiedDoc) {
-        let payload = match wire::parse_job(&v.type_uri(), &v.doc.payload) {
+        let payload = match wire::parse_job(&v.doc.payload) {
             Ok(p) => p,
             Err(e) => {
                 self.send_error(
@@ -614,12 +699,6 @@ impl Bridge {
                     return Err(JobRefusal::not_capable("this forge has no account link"));
                 }
             }
-            K::ProjectRoles if p.repo.is_none() => {
-                return Err(JobRefusal::not_capable(
-                    "namespace-level roles (organisation owners) are not projected by this \
-                     bridge; project git.ns.admin by hand",
-                ));
-            }
             K::CreateRepo if !caps.bot_can_create_repos => {
                 return Err(JobRefusal::not_capable(
                     "the bridge cannot create repositories in this namespace (a personal \
@@ -757,6 +836,45 @@ impl Bridge {
         event_json: Value,
         drift: Option<Vec<Value>>,
     ) -> Result<()> {
+        self.send_event_keyed(namespace, event_json, drift, None)
+            .await
+    }
+
+    /// [`Self::send_event`] under outbox key `key`, replacing an entry
+    /// still there (a newer report supersedes an unacknowledged one), or
+    /// under a fresh key when `None`.
+    pub(crate) async fn send_event_keyed(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+        key: Option<String>,
+    ) -> Result<()> {
+        let Some(payload) = self.event_outbox_payload(namespace, event_json, drift)? else {
+            return Ok(());
+        };
+        let key = key.unwrap_or_else(|| format!("event:{}", wire::new_id()));
+        let entry = OutboxEntry {
+            kind: OutboxKind::Event,
+            payload,
+            doc_ids: Vec::new(),
+            last_sent: 0,
+            attempts: 0,
+        };
+        self.store.put(Table::Outbox, &key, &entry)?;
+        self.send_outbox(&key).await;
+        Ok(())
+    }
+
+    /// The outbox payload of an event in `namespace`: the event, its drift
+    /// and the status report (`ext`). `None` for an event that names a
+    /// repository outside `namespace`, which is logged and never sent.
+    fn event_outbox_payload(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+    ) -> Result<Option<Value>> {
         // The repository an event is about, by forge id, for the status
         // report (`ext`).
         let repo = event_json
@@ -783,37 +901,85 @@ impl Bridge {
                 r#type = ty,
                 "not reporting an event that names a repository outside its namespace"
             );
-            return Ok(());
+            return Ok(None);
         }
         let payload = mapping::event_payload(namespace, event_json, drift)?;
         let host = ns_resource.map(|r| r.host().to_string());
         let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
-        let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
-        let key = format!("event:{}", wire::new_id());
-        let entry = OutboxEntry {
-            kind: OutboxKind::Event,
-            payload,
-            doc_ids: Vec::new(),
-            last_sent: 0,
-            attempts: 0,
+        Ok(Some(crate::status::attach::<event::Payload>(
+            serde_json::to_value(&payload)?,
+            ext,
+        )))
+    }
+
+    /// A role-map report's outbox entry `key`, built afresh for this send
+    /// (`git-ns/bridge/event` 0.3: the report with the latest `issuedAt`
+    /// wins, so a resend carries the map applied now, never the one first
+    /// queued). `false` when there is nothing to send: the VTC takes an event
+    /// version without `roleMapReported`, the namespace is no longer bound,
+    /// or its map rounds unordered. The entry is then dropped rather than
+    /// sent under an older version or with a map the bridge no longer
+    /// applies.
+    fn refresh_role_map_entry(&self, key: &str) -> bool {
+        let ns_id = &key[crate::rolemap::OUTBOX_PREFIX.len()..];
+        let fresh = if self.cfg.event_version.reports_role_map() {
+            self.store
+                .get::<NamespaceRecord>(Table::Namespaces, ns_id)
+                .ok()
+                .flatten()
+                .and_then(|ns| crate::rolemap::event(self, &ns))
+                .and_then(|ev| self.event_outbox_payload(ns_id, ev, None).ok().flatten())
+        } else {
+            None
         };
-        self.store.put(Table::Outbox, &key, &entry)?;
-        self.send_outbox(&key).await;
-        Ok(())
+        let Some(payload) = fresh else {
+            tracing::info!(
+                namespace = ns_id,
+                "dropping a pending role-map report: there is no report to send now"
+            );
+            let _ = self.store.delete(Table::Outbox, key);
+            return false;
+        };
+        self.store
+            .update::<OutboxEntry, _>(Table::Outbox, key, |e| {
+                Ok((
+                    e.map(|mut e| {
+                        e.payload = payload;
+                        e
+                    }),
+                    (),
+                ))
+            })
+            .is_ok()
     }
 
     /// Send (again) the outbox entry `key`, as a freshly issued and signed
-    /// document.
+    /// document. A role-map report is first rebuilt from the map applied now
+    /// (or dropped: [`Self::refresh_role_map_entry`]).
     pub(crate) async fn send_outbox(&self, key: &str) {
+        if key.starts_with(crate::rolemap::OUTBOX_PREFIX) && !self.refresh_role_map_entry(key) {
+            return;
+        }
         let Ok(Some(entry)) = self.store.get::<OutboxEntry>(Table::Outbox, key) else {
             return;
         };
+        // VTA mode: what a result or event reports (a binding, a managed
+        // repository) must be in the VTA before the VTC hears of it, or a
+        // host lost in between would come back without it. Held here, the
+        // entry goes out on a later resend.
+        if !self.store.flush(OUTBOX_FLUSH).await {
+            tracing::warn!(
+                key,
+                "holding a result or event until the bridge's state is written to the VTA"
+            );
+            return;
+        }
         let type_uri = match entry.kind {
             OutboxKind::Result => result::Payload::TYPE_URI,
             _ => wire::event_type_uri(self.cfg.event_version),
         };
         let (id, doc) = match wire::signed_request(
-            &self.identity,
+            &self.identity(),
             &self.cfg.vtc_did,
             type_uri,
             entry.payload.clone(),
@@ -842,20 +1008,64 @@ impl Bridge {
                     (),
                 ))
             });
-        if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+        if let Err(e) = self.send_doc(&doc).await {
             tracing::warn!(key, error = %e, "send failed; the outbox will retry");
         }
+    }
+
+    /// Send `doc` to the VTC, noting whether the link works: a send that
+    /// succeeds after one failed is a link-up the transport did not signal
+    /// (a mediator or session that came back by itself), and raises
+    /// [`Bridge::link_up`] for the background loop.
+    async fn send_doc(&self, doc: &Value) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        match self.link.send(&self.cfg.vtc_did, doc).await {
+            Ok(()) => {
+                if self.link_down.swap(false, Ordering::AcqRel) {
+                    tracing::info!("the link to the VTC works again");
+                    self.link_recovered.notify_one();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.link_down.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// The link to the VTC is up — a new mediator session, or sends
+    /// succeeding again after they failed: send everything unacknowledged,
+    /// then report every bound namespace's role map afresh
+    /// (`git-ns/bridge/event` 0.3: the VTC's view must be no older than the
+    /// link it holds). One report per namespace per link-up: an
+    /// unacknowledged report is not resent first, since the fresh one
+    /// replaces it under the same outbox key; and a link-up the transport
+    /// signalled clears the down flag first, so the first successful send
+    /// does not count as a second one.
+    pub async fn link_up(&self) {
+        self.link_down
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.resend_matching(true, |key| !key.starts_with(crate::rolemap::OUTBOX_PREFIX))
+            .await;
+        self.report_role_maps().await;
     }
 
     /// Send every unacknowledged result and event that is due (all of them
     /// when `all`). Backs off per entry: the resend interval doubled per
     /// attempt, capped at an hour.
     pub async fn resend_unacknowledged(&self, all: bool) {
+        self.resend_matching(all, |_| true).await;
+    }
+
+    /// [`Self::resend_unacknowledged`], for the entries whose key `pick`
+    /// accepts.
+    async fn resend_matching(&self, all: bool, pick: impl Fn(&str) -> bool) {
         let Ok(entries) = self.store.list::<OutboxEntry>(Table::Outbox) else {
             return;
         };
         let now = now();
-        for (key, e) in entries {
+        for (key, e) in entries.into_iter().filter(|(k, _)| pick(k)) {
             let backoff = (self.cfg.resend_secs as i64)
                 .saturating_mul(1_i64 << e.attempts.min(6))
                 .min(3600);
@@ -942,6 +1152,7 @@ impl Bridge {
                 _ = expiry_tick.tick() => crate::flows::expire(&self).await,
                 _ = sweep_tick.tick() => crate::jobs::sweep_without_webhooks(&self).await,
                 _ = maint_tick.tick() => self.maintenance().await,
+                _ = self.link_recovered.notified() => self.link_up().await,
                 _ = shutdown.changed() => return,
             }
         }

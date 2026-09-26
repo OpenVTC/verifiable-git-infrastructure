@@ -70,12 +70,15 @@ Standing up the VTA, the registry and the VTC is documented in
 
 A personal account works, with less (§9.1).
 
-**One GitHub App per GitHub host, per bridge, and it is private.** The manifest
-registers the App as not public, so GitHub lets only the account that owns it
-install it. On github.com a bridge therefore serves exactly one namespace: the
-`app_owner` in its config. A second organisation needs a second bridge (and a
-second entry in the VTC's `[git_ns] bridges` cannot name the same host twice
-either — the map is keyed by host).
+**One private GitHub App per organisation, all in one bridge.** The manifest
+registers each App as not public, so GitHub lets only the account that owns
+it install it. A community binding several organisations on github.com gives
+the bridge one `[[github]]` entry per organisation (`app_owner`, and an
+`app_name` of its own — GitHub App names are unique) and registers one App
+for each, one click per organisation (§3.1). The bridge picks the App from
+the namespace's owner, and each App has its own key, webhook secret and
+routes (`/github/github.com/<owner>/…`). The VTC's `[git_ns] bridges` still
+names one bridge for the host: nothing changes on the VTC's side.
 
 ---
 
@@ -150,7 +153,7 @@ public_url         = "https://bridge.acme-vtc.example/"      # must be https
 listen             = "0.0.0.0:8080"
 data_dir           = "/var/lib/vgi-bridge"
 master_key_file    = "/run/secrets/vgi-bridge-master-key"
-# event_version = "0.2"   # the default; see step 3.3
+# event_version = "0.3"   # the default; see step 3.3
 
 [verify_trust]
 # What the bootstrap writes into workflows. The action must be pinned to a
@@ -164,6 +167,13 @@ host         = "github.com"
 app_name     = "acme-vgi-bridge"
 app_owner    = "acme"                                        # the organisation
 platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
+
+# Another organisation of the same community: its own App, same bridge.
+# [[github]]
+# host         = "github.com"
+# app_name     = "acme-labs-vgi-bridge"                       # unique on GitHub
+# app_owner    = "acme-labs"
+# platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 ```
 
 Get the commit for the tag with
@@ -182,6 +192,13 @@ in [BRIDGE.md](BRIDGE.md) §6–6a. Leave `bridge_checks` on: without it, an
 organisation without org rulesets falls back to a check any writer can forge.
 
 ### 2.2 Master key and identity
+
+**Recommended: VTA mode.** Give the bridge its own trust context in the VTC's
+VTA and a context-scoped credential instead of a master key and a local
+identity — the steps are BRIDGE.md §2a (context and `did:webvh`, credential,
+`[vta]` config, `vgi-bridge vta setup`). A lost bridge host is then recovered
+by issuing a new credential. The rest of this section is the self-contained
+mode.
 
 The master key seals every secret the bridge stores. It is 32 bytes, base64,
 in a file only its owner can read (the bridge refuses a file readable by group
@@ -248,7 +265,7 @@ paths in BRIDGE.md §1 and keeping `/healthz` internal.
 
 ### 2.4 Tell the VTC which bridge serves github.com
 
-Put the DID from `identity show` into the VTC's `[git_ns] bridges` under
+Put the DID from `identity show` (VTA mode: from `vta setup`) into the VTC's `[git_ns] bridges` under
 `"github.com"` (step 1) and restart the VTC.
 
 **Success looks like:** `curl http://127.0.0.1:8080/healthz` answers `ok`;
@@ -264,15 +281,16 @@ The bridge registers its own App, so no one copies a private key by hand.
 1. Find the warning in the bridge's log:
 
    ```
-   the GitHub App is not registered yet; an admin of `acme` opens
-   https://bridge.acme-vtc.example/github/github.com/register?state=… to register it
+   the GitHub App for `acme` is not registered yet; an admin of `acme` opens
+   https://bridge.acme-vtc.example/github/github.com/acme/register?state=… to register it
    ```
 
    The URL is valid for 24 hours; the bridge logs one at start for as long as
-   no App is registered.
+   no App is registered. With several `[[github]]` entries there is one URL
+   per organisation: each organisation's owner registers its own App.
 2. **An owner of the organisation** opens it. The page posts the manifest to
    GitHub; they review and create the App.
-3. GitHub redirects to `/github/github.com/registered`. The bridge exchanges
+3. GitHub redirects to `/github/github.com/<owner>/registered`. The bridge exchanges
    the code for the App's id, private key and webhook secret, seals them, and
    puts the adapter in service. It refuses an App registered under another
    account, a public one, or one with any permission beyond the reviewed set.
@@ -296,11 +314,12 @@ device code.
 
 ### 3.3 The event version
 
-The bridge sends `git-ns/bridge/event` **0.2**, which the VTC on `main`
-serves. Leave `event_version` unset. Only a VTC older than that needs
-`event_version = "0.1"` (it would otherwise refuse every event as an
-unsupported type); what the two versions do differently with transfers is in
-BRIDGE.md §7.
+The bridge sends `git-ns/bridge/event` **0.3**, which adds the bridge's role
+map to what the VTC is told (BRIDGE.md §6c). Leave `event_version` unset
+once your VTC serves 0.3. A VTC that serves only 0.2 needs
+`event_version = "0.2"`, and one older than that `"0.1"` (it would otherwise
+refuse every event as an unsupported type); what the versions do
+differently is in BRIDGE.md §7.
 
 **Success looks like:** the bridge's log says the adapter for `github.com` is
 in service; the App appears under the organisation's *Settings → Developer
@@ -334,7 +353,7 @@ hands you the `cnm` command.
 organisation. Choose **All repositories**: the bridge must see every
 repository the community creates or adopts, and one outside the
 installation's selection is `notFound` to it. GitHub redirects to
-`/github/github.com/setup`, which completes the bind. The link lives 15
+`/github/github.com/<owner>/setup`, which completes the bind. The link lives 15
 minutes on the bridge's side (`flow_ttl_secs`); an abandoned pending
 namespace is discarded by the VTC after 24 hours, and you bind again.
 
@@ -717,8 +736,9 @@ Checked against `main` of this repository, verifiable-trust-infrastructure
 and openvtc when this was written:
 
 - **Namespace admins get no organisation role.** The bridge projects roles
-  per repository only and refuses a namespace-level `projectRoles`
-  (`notCapable`: "project git.ns.admin by hand"). Make namespace admins
+  per repository only; `git-ns/bridge/job` 0.4 has no namespace-level
+  `projectRoles`, and a namespace admin with no right of their own on a
+  repository is sent as `git.ns.admin` and gets no role. Make namespace admins
   organisation owners (or not) yourself.
 - **Committers get no GitHub role.** `git.commit.sign` projects to no role
   (the default map; nothing in the bridge config changes it): committers

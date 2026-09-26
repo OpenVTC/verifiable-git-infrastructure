@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-core"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4095bae8f56ae80b0b2ca5a29aced5948f2693fa77a8c372696b85d542666681"
+checksum = "38543d1988321594efcaf14e57c00cea20295df68b0231957c25c4f80c5606ce"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -298,9 +298,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-delivery"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07e75a6211b5785a61c6903178eed47bd50370275a4a7b8cc310cb2012768e05"
+checksum = "32e014fd6825b755a4b0e89035152188c001331f87454c1bab8f94ac2a040406"
 dependencies = [
  "affinidi-messaging-core",
  "async-trait",
@@ -393,8 +393,8 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "trust-tasks-proof",
- "trust-tasks-rs 0.22.5",
+ "trust-tasks-proof 0.22.4",
+ "trust-tasks-rs 0.22.7",
  "url",
  "uuid",
 ]
@@ -486,8 +486,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tracing",
- "trust-tasks-proof",
- "trust-tasks-rs 0.22.5",
+ "trust-tasks-proof 0.22.4",
+ "trust-tasks-rs 0.22.7",
  "uuid",
 ]
 
@@ -6546,7 +6546,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs 0.22.5",
+ "trust-tasks-rs 0.22.7",
+]
+
+[[package]]
+name = "trust-tasks-proof"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c93f86fdcfffef174380586175a4d0ccf3498954039017e9071f6071f72f57d5"
+dependencies = [
+ "affinidi-crypto",
+ "affinidi-data-integrity",
+ "affinidi-did-common",
+ "affinidi-did-resolver-cache-sdk",
+ "affinidi-encoding",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "trust-tasks-rs 0.23.0",
 ]
 
 [[package]]
@@ -6566,13 +6584,28 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.22.5"
+version = "0.22.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e00bd0bec42faa300c230582380cb332b791274f7d9320a4eeca9e0584113a"
+checksum = "1d7ba07576152893f350eec73a5421c2b89a3248536e78eae8987bb1070e1921"
 dependencies = [
  "async-trait",
  "chrono",
  "jsonschema",
+ "regress",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror",
+]
+
+[[package]]
+name = "trust-tasks-rs"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c62c76306e33b5f6fafb59013b8d30aeecb281b05292bdb075fabd2d423ad81f"
+dependencies = [
+ "async-trait",
+ "chrono",
  "regress",
  "serde",
  "serde_json",
@@ -6817,6 +6850,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vgi-bridge"
 version = "0.4.15"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-messaging-core",
  "affinidi-messaging-delivery",
  "affinidi-messaging-didcomm",
@@ -6834,6 +6868,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "multibase",
  "pgp",
  "rand 0.8.8",
  "redb",
@@ -6847,8 +6882,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-proof",
- "trust-tasks-rs 0.22.5",
+ "trust-tasks-proof 0.23.0",
+ "trust-tasks-rs 0.23.0",
  "url",
  "uuid",
  "verify-trust",
@@ -6989,7 +7024,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.22.5",
+ "trust-tasks-rs 0.22.7",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",

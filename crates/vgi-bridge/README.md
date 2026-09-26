@@ -10,13 +10,19 @@ the bridge carries it out and reports back.
      ◀── git-ns/bridge/result, /event ────            ◀── webhooks, OAuth redirects (HTTPS)
 ```
 
-- **Identity.** Its own DID — a VTA-provisioned `did:webvh` (imported) or a
-  locally minted `did:peer:2` whose identifier names the mediator the VTC
-  reaches it through — with every key sealed (AES-256-GCM under a
+- **Identity.** Its own DID. In **VTA mode** (recommended), the `did:webvh`
+  of its own trust context in the VTC's VTA: the host holds only a
+  context-scoped credential, the keys are fetched into memory at start-up
+  (and replaced when the VTA rotates them), and the App keys, tokens and the
+  bridge's state live in the context's app-state (secrets sealed) — a lost
+  host is recovered by issuing a new credential. Self-contained, an imported
+  bundle or a locally minted `did:peer:2` whose identifier names the mediator
+  the VTC reaches it through, with every key sealed (AES-256-GCM under a
   mounted master key) in a redb store. It serves **one** VTC and refuses a
   document from any other DID, whatever its proof.
-- **Protocol.** `git-ns/bridge/job` (0.2, and 0.1 from a VTC that has not
-  moved) in; exactly one `git-ns/bridge/result`
+- **Protocol.** `git-ns/bridge/job` 0.4 in (older versions refused
+  `unsupportedVersion`; `trust-task-discovery/0.2` from the VTC is answered
+  with the 0.4 type URI); exactly one `git-ns/bridge/result`
   per job; `git-ns/bridge/event`s for what happens on the forge. The payload
   types are generated from the normative specifications
   (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed

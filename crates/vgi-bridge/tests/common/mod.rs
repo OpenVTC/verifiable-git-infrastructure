@@ -45,14 +45,19 @@ pub const NS: &str = "ns_acme";
 pub const KEYRING: &str =
     "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nweb-flow\n-----END PGP PUBLIC KEY BLOCK-----\n";
 
-pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
+/// `git-ns/bridge/job` 0.4, the only version the bridge takes.
+pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
+/// `git-ns/bridge/job` 0.1, which the bridge refuses.
+pub const JOB_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
 pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";
-/// `git-ns/bridge/event` 0.2, what the bridge sends unless configured
+/// `git-ns/bridge/event` 0.3, what the bridge sends unless configured
 /// otherwise.
-pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
+pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.3";
+/// `git-ns/bridge/event` 0.2, for a VTC configured `event_version = "0.2"`.
+pub const EVENT_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
 /// `git-ns/bridge/event` 0.1, for a VTC configured `event_version = "0.1"`.
 pub const EVENT_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
-/// `git-ns/bridge/job` 0.2: `projectRoles` may carry `removeAccounts`.
+/// `git-ns/bridge/job` 0.2, which the bridge refuses.
 pub const JOB_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.2";
 
 /// One App key per test binary.
@@ -123,6 +128,32 @@ pub struct World {
     pub inbox: UnboundedReceiver<(String, Value)>,
     pub dir: tempfile::TempDir,
     pub verifier: Arc<FakeVerifier>,
+    /// Documents already taken off `inbox` (by [`World::settle`]) and not
+    /// yet read by [`World::next`].
+    pub pending: std::collections::VecDeque<Value>,
+    /// The start-up role-map reports [`World::settled`] acknowledged.
+    pub startup_reports: Vec<Value>,
+    /// While set, every send to the VTC fails (the link is down).
+    pub link_down: Arc<std::sync::atomic::AtomicBool>,
+    /// VTA mode: stops the mirror task when dropped.
+    pub _mirror_stop: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// A [`ChannelLink`] that can be cut: while `down` is set every send fails,
+/// as a lost mediator session does.
+pub struct CuttableLink {
+    pub inner: ChannelLink,
+    pub down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl vgi_bridge::transport::VtcLink for CuttableLink {
+    async fn send(&self, to: &str, doc: &Value) -> anyhow::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("not connected to the mediator");
+        }
+        self.inner.send(to, doc).await
+    }
 }
 
 pub struct Options {
@@ -148,6 +179,26 @@ pub struct Options {
     pub github_extra: String,
     /// `event_version`, when set.
     pub event_version: Option<&'static str>,
+    /// VTA mode: the store is a cache of this app-state (seeds go through
+    /// it, and the mirror task runs).
+    pub vta: Option<Arc<vgi_bridge::appstate::MemoryAppState>>,
+    /// More GitHub Apps on github.com, sealed before start: `(owner, App id,
+    /// webhook secret)`. Each needs its `[[github]]` entry (`github_extra`,
+    /// where `{MOCK}` is the mock server's URL).
+    pub extra_apps: Vec<(&'static str, u64, &'static str)>,
+}
+
+impl Options {
+    /// With a second organisation `owner` on github.com: its own App (id
+    /// `app_id`, the shared webhook secret) and `[[github]]` entry.
+    pub fn with_org(mut self, owner: &'static str, app_id: u64) -> Self {
+        self.github_extra.push_str(&format!(
+            "\n[[github]]\napp_name = \"{owner}-vgi-bridge\"\napp_owner = \"{owner}\"\n\
+             api_base = \"{{MOCK}}\"\nweb_base = \"{{WEB}}\"\n"
+        ));
+        self.extra_apps.push((owner, app_id, WEBHOOK_SECRET));
+        self
+    }
 }
 
 impl Default for Options {
@@ -169,6 +220,8 @@ impl Default for Options {
             keyring: true,
             github_extra: String::new(),
             event_version: None,
+            vta: None,
+            extra_apps: Vec::new(),
         }
     }
 }
@@ -196,8 +249,9 @@ action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@012
 version = "v0.5.0"
 
 [[github]]
-app_name = "acme-vgi-bridge"
-app_owner = "acme"
+app_name = "{owner}-vgi-bridge"
+app_owner = "{owner}"
+{user}
 {keyring}
 bridge_checks = {checks}
 api_base = "{uri}"
@@ -205,12 +259,21 @@ web_base = "{web}"
 {extra}
 "#,
         vtc = vtc,
+        owner = owner_of(o.kind),
+        user = if o.kind == NamespaceKind::User {
+            "app_owner_is_user = true"
+        } else {
+            ""
+        },
         keyring = keyring,
         checks = o.bridge_checks,
         uri = server.uri(),
         web = o.web_base.clone().unwrap_or_else(|| server.uri()),
         max_body = o.max_body,
-        extra = o.github_extra,
+        extra = o
+            .github_extra
+            .replace("{MOCK}", &server.uri())
+            .replace("{WEB}", &o.web_base.clone().unwrap_or_else(|| server.uri())),
         event_version = o
             .event_version
             .map(|v| format!("event_version = \"{v}\""))
@@ -219,18 +282,33 @@ web_base = "{web}"
     .unwrap()
 }
 
-pub fn seed_app(store: &Store) {
+/// The account the test's App belongs to: the namespace's owner.
+pub fn owner_of(kind: NamespaceKind) -> &'static str {
+    match kind {
+        NamespaceKind::User => "alice",
+        _ => "acme",
+    }
+}
+
+/// Seal the test's registered App (owned by `owner`).
+pub fn seed_app(store: &Store, owner: &str) {
+    seed_app_for(store, owner, APP_ID, WEBHOOK_SECRET);
+}
+
+/// Seal a registered App for `owner` on github.com.
+pub fn seed_app_for(store: &Store, owner: &str, app_id: u64, webhook_secret: &str) {
     let app = StoredApp {
-        app_id: APP_ID,
-        slug: "acme-vgi-bridge".into(),
+        app_id,
+        owner: owner.into(),
+        slug: format!("{owner}-vgi-bridge"),
         client_id: "Iv1.testclient".into(),
         client_secret: "client-secret".into(),
-        webhook_secret: WEBHOOK_SECRET.into(),
+        webhook_secret: webhook_secret.into(),
         pem: app_pem().into(),
     };
     store
         .put_secret(
-            &github_app_secret("github.com"),
+            &github_app_secret("github.com", owner),
             &serde_json::to_vec(&app).unwrap(),
         )
         .unwrap();
@@ -365,13 +443,34 @@ pub async fn world(o: Options) -> World {
         Some(p) => Store::open(p, key).unwrap(),
         None => Store::in_memory(key).unwrap(),
     };
+    let mut mirror_stop = None;
+    let store = match &o.vta {
+        Some(remote) => {
+            let m = vgi_bridge::appstate::Mirror::new(MasterKey::from_bytes([11u8; 32]));
+            let store = store.with_mirror(m.clone());
+            m.pull(remote.as_ref(), &store).await.unwrap();
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let remote: Arc<dyn vgi_bridge::appstate::AppState> = remote.clone();
+            tokio::spawn(m.run(remote, store.clone(), rx));
+            mirror_stop = Some(tx);
+            store
+        }
+        None => store,
+    };
     if o.seed_app {
-        seed_app(&store);
+        seed_app(&store, owner_of(o.kind));
+    }
+    for (owner, id, secret) in &o.extra_apps {
+        seed_app_for(&store, owner, *id, secret);
     }
     if o.seed_namespace {
         seed_namespace(&store, o.kind, o.required_workflow);
     }
+    // VTA mode: the identity comes from the VTA, never from the store.
     let identity = match BridgeIdentity::load(&store).unwrap() {
+        _ if o.vta.is_some() => {
+            BridgeIdentity::from_seed(&o.bridge_seed.unwrap_or([9u8; 32])).unwrap()
+        }
         Some(id) => id,
         None => {
             let seed = o.bridge_seed.unwrap_or([9u8; 32]);
@@ -380,6 +479,11 @@ pub async fn world(o: Options) -> World {
     };
     let adapters = vgi_bridge::build_adapters(&cfg, &store).await.unwrap();
     let (link, inbox) = ChannelLink::new();
+    let link_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let link = CuttableLink {
+        inner: link,
+        down: link_down.clone(),
+    };
     let verifier = Arc::new(FakeVerifier {
         trusted: o.trusted.clone(),
         seen: Default::default(),
@@ -407,7 +511,13 @@ pub async fn world(o: Options) -> World {
         inbox,
         dir,
         verifier,
+        pending: Default::default(),
+        startup_reports: Vec::new(),
+        link_down,
+        _mirror_stop: mirror_stop,
     }
+    .settled()
+    .await
 }
 
 impl World {
@@ -434,13 +544,6 @@ impl World {
         doc
     }
 
-    /// Send a `git-ns/bridge/job` 0.2 job; returns the job document.
-    pub async fn send_job_0_2(&self, payload: Value) -> Value {
-        let doc = self.doc(JOB_0_2, payload, None).await;
-        self.deliver(doc.clone()).await;
-        doc
-    }
-
     pub async fn deliver(&self, doc: Value) {
         self.bridge
             .handle_inbound(InboundDoc {
@@ -453,6 +556,9 @@ impl World {
     /// The next document the bridge sent, checked as the VTC checks it:
     /// addressed to the VTC, from the bridge, with a proof that verifies.
     pub async fn next(&mut self) -> Value {
+        if let Some(doc) = self.pending.pop_front() {
+            return doc;
+        }
         let (to, doc) = tokio::time::timeout(Duration::from_secs(20), self.inbox.recv())
             .await
             .expect("the bridge sent nothing in time")
@@ -481,6 +587,10 @@ impl World {
     /// Nothing more arrives within a short while.
     pub async fn quiet(&mut self) {
         assert!(
+            self.pending.is_empty(),
+            "the bridge sent something unexpected"
+        );
+        assert!(
             tokio::time::timeout(Duration::from_millis(300), self.inbox.recv())
                 .await
                 .is_err(),
@@ -503,6 +613,23 @@ impl World {
 }
 
 impl World {
+    /// Take the start-up role-map reports (`roleMapReported`, sent by
+    /// `restore` for every bound namespace) off the inbox and acknowledge
+    /// them as the VTC does, so a test sees only what it caused. Anything
+    /// else `restore` sent (an unacknowledged document resent) is kept for
+    /// [`World::next`], in order.
+    pub async fn settled(mut self) -> Self {
+        while let Ok((_, doc)) = self.inbox.try_recv() {
+            if doc["payload"]["event"]["type"] == "roleMapReported" {
+                self.ack_event(&doc).await;
+                self.startup_reports.push(doc);
+            } else {
+                self.pending.push_back(doc);
+            }
+        }
+        self
+    }
+
     /// Acknowledge an event as the VTC does.
     pub async fn ack_event(&self, event_doc: &Value) {
         let ack = self
@@ -540,7 +667,9 @@ pub async fn wait_for_request(
 /// Wait until delivery `id` on github.com is recorded as handled — every
 /// check it called for has ended (posted or deliberately skipped).
 pub async fn wait_delivery(w: &World, id: &str) {
-    for _ in 0..400 {
+    // A minute: a check fetches from a local git remote and verifies, which
+    // a loaded machine can take well past the ten seconds this once was.
+    for _ in 0..2400 {
         if w.bridge
             .store()
             .get::<i64>(Table::Deliveries, &format!("github.com#{id}"))
@@ -578,11 +707,24 @@ pub async fn completed_checks(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-/// Deliver a signed GitHub webhook to the bridge's router.
+/// Deliver a signed GitHub webhook to the bridge's router, on the test App's
+/// route.
 pub async fn post_webhook(w: &World, event: &str, delivery: &str, body: &Value) -> StatusCode {
+    let owner = w.bridge.config().github[0].owner_key();
+    post_webhook_as(w, &owner, event, delivery, body).await
+}
+
+/// Deliver a signed GitHub webhook on `owner`'s App route.
+pub async fn post_webhook_as(
+    w: &World,
+    owner: &str,
+    event: &str,
+    delivery: &str,
+    body: &Value,
+) -> StatusCode {
     let bytes = serde_json::to_vec(body).unwrap();
     let sig = sign_body(&Secret::new(WEBHOOK_SECRET), &bytes);
-    let req = Request::post("/github/github.com/webhook")
+    let req = Request::post(format!("/github/github.com/{owner}/webhook"))
         .header("x-github-event", event)
         .header("x-github-delivery", delivery)
         .header("x-hub-signature-256", sig)
@@ -764,5 +906,11 @@ oauth_client_id = "cid"
             trusted: vec![],
             seen: Default::default(),
         }),
+        pending: Default::default(),
+        startup_reports: Vec::new(),
+        link_down: Default::default(),
+        _mirror_stop: None,
     }
+    .settled()
+    .await
 }

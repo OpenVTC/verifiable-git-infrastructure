@@ -128,10 +128,9 @@ pub(crate) fn repo_record_by_resource(bridge: &Bridge, r: &Resource) -> Option<R
 /// because the adapter converges every listed account to exactly its
 /// desired role. (Only unlisted accounts are left alone, `Unlisted::Keep`.)
 ///
-/// This only takes effect end to end when the VTC sends `git.ns.admin` for
-/// a namespace admin. A VTC that folds `ns.admin` into `git.repo.own` (by
-/// implication) before sending makes the entry indistinguishable from an
-/// owner's, and it projects as one.
+/// `git-ns/bridge/job` 0.4 has the VTC send `git.ns.admin` for a namespace
+/// admin with no right of their own on the repository, never the `own` it
+/// implies; that is the only version this bridge takes.
 fn desired_roles(
     bridge: &Bridge,
     ctx: &Ctx,
@@ -198,7 +197,7 @@ impl Removals {
 /// Converge roles on `repo` to `desired`: people not listed lose a role the
 /// bridge projected before; roles it never projected are left and reported
 /// as drift (spec: *desiredRoles*) — except the accounts in `removals`,
-/// whose direct role goes whatever it is and whoever gave it (job 0.2
+/// whose direct role goes whatever it is and whoever gave it (job 0.4
 /// `removeAccounts`).
 #[allow(clippy::too_many_arguments)]
 async fn apply_roles(
@@ -227,8 +226,9 @@ async fn apply_roles(
     for account in &removals.remove {
         let account = account.clone();
         match want.iter_mut().find(|w| w.account.id == account.id) {
-            // Only a formerly projected role can be here: `desiredRoles`
-            // and `removeAccounts` never overlap (checked at admission).
+            // A formerly projected role, or an account `desiredRoles` lists
+            // at `git.ns.admin` (no role already): the only overlap job 0.4
+            // allows (checked at admission).
             Some(w) => w.role = ForgeRole::None,
             None => want.push(RoleAssignment::new(account, ForgeRole::None)),
         }
@@ -271,6 +271,16 @@ async fn apply_roles(
                 status,
                 (!failures.is_empty()).then(|| failures.join("; ")),
             );
+            // The map these roles were projected under, for the role-map
+            // report's `stale` — only once every role took: a partly failed
+            // projection leaves the repository stale, so it is re-projected.
+            // A map that rounds unordered is not recorded either (it is
+            // logged, and never reported).
+            let applied_map = if failures.is_empty() {
+                crate::rolemap::effective(ctx, &bridge.cfg.role_map(repo))
+            } else {
+                None
+            };
             if let Some(id) = forge_id {
                 let _ = bridge.store.update::<RepoRecord, _>(
                     Table::Repos,
@@ -286,6 +296,9 @@ async fn apply_roles(
                             .collect();
                         rec.roles_known = true;
                         rec.owners = owners.clone();
+                        if applied_map.is_some() {
+                            rec.role_map = applied_map;
+                        }
                         Ok((Some(rec), ()))
                     },
                 );
@@ -300,7 +313,7 @@ async fn apply_roles(
 
 /// Access the accounts `removeAccounts` named still have to `repo` once
 /// their direct role is gone — through a team, as an organisation owner or
-/// member — one line each, for the failed `roles` step (job 0.2: the bridge
+/// member — one line each, for the failed `roles` step (job 0.4: the bridge
 /// reports it and never changes the team or the organisation). An account
 /// whose removal itself failed is already reported.
 async fn remaining_access(
@@ -575,7 +588,7 @@ async fn run_bootstrap(
     report: &mut Report,
 ) -> bool {
     let forge = ctx.adapter.forge();
-    let Some(vgi) = bridge.adapters.vgi(ctx.host()) else {
+    let Some(vgi) = bridge.adapters.vgi_for(&ctx.ns.resource) else {
         report.fail_with("forgeError", "no bootstrap configuration for this forge");
         return false;
     };
@@ -765,10 +778,12 @@ fn projection(
         p.roles = r.roles.clone();
         p.owners = r.owners.clone();
         p.archived = r.archived;
-        p.required_check = r
-            .required_check
-            .clone()
-            .or_else(|| bridge.adapters.vgi(ctx.host()).map(|v| v.required_check));
+        p.required_check = r.required_check.clone().or_else(|| {
+            bridge
+                .adapters
+                .vgi_for(&ctx.ns.resource)
+                .map(|v| v.required_check)
+        });
     }
     p
 }

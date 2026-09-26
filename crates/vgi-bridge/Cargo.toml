@@ -61,7 +61,9 @@ affinidi-messaging-sdk = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-messaging-delivery = { workspace = true }
 affinidi-messaging-core = { workspace = true }
-vta-sdk = { workspace = true, features = ["didcomm"] }
+# VTA mode (`crate::vta`): the client, the session transports and
+# `connect_auto`.
+vta-sdk = { workspace = true, features = ["didcomm", "client", "session"] }
 ed25519-dalek = { workspace = true }
 
 axum = { workspace = true }
@@ -83,6 +85,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
+# VTA mode reads the keys the bridge's DID document lists.
+multibase = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 
@@ -99,3 +103,9 @@ tower = { workspace = true }
 affinidi-messaging-test-mediator = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+# A scripted VTA behind the SDK's loopback transport, for the VTA-mode tests.
+vta-sdk = { workspace = true, features = ["test-loopback"] }
+# A fixed verification-method resolver for the key-rotation test (a
+# did:webvh resolved without the network). Already in the graph through
+# trust-tasks-proof.
+affinidi-data-integrity = "0.7.11"

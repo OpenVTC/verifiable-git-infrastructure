@@ -27,7 +27,7 @@ async fn post_webhook(
 ) -> StatusCode {
     let bytes = serde_json::to_vec(body).unwrap();
     let sig = sign_body(&Secret::new(secret), &bytes);
-    let req = Request::post("/github/github.com/webhook")
+    let req = Request::post("/github/github.com/acme/webhook")
         .header("x-github-event", event)
         .header("x-github-delivery", delivery)
         .header("x-hub-signature-256", sig)
@@ -258,10 +258,13 @@ fn state_of(url: &str) -> String {
 
 #[tokio::test]
 async fn a_bind_completes_through_the_setup_callback_once() {
-    let mut w = world(Options {
-        web_base: Some("https://github.example".into()),
-        ..Options::default()
-    })
+    let mut w = world(
+        Options {
+            web_base: Some("https://github.example".into()),
+            ..Options::default()
+        }
+        .with_org("newco", 3003),
+    )
     .await;
     let s = &w.server;
     mount_any_token(s).await;
@@ -294,7 +297,7 @@ async fn a_bind_completes_through_the_setup_callback_once() {
     assert_eq!(resp["payload"]["accepted"], true);
     let url = resp["payload"]["next"]["url"].as_str().unwrap().to_string();
     assert!(
-        url.contains("/apps/acme-vgi-bridge/installations/new"),
+        url.contains("/apps/newco-vgi-bridge/installations/new"),
         "{url}"
     );
     assert!(resp["payload"]["next"]["expiresAt"].is_string());
@@ -304,7 +307,9 @@ async fn a_bind_completes_through_the_setup_callback_once() {
 
     let (status, _) = get(
         &w,
-        &format!("/github/github.com/setup?installation_id=77&setup_action=install&state={state}"),
+        &format!(
+            "/github/github.com/newco/setup?installation_id=77&setup_action=install&state={state}"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -317,8 +322,9 @@ async fn a_bind_completes_through_the_setup_callback_once() {
     // lacks (the check's events), org rulesets on the plan.
     let ns_report = ev["payload"]["ext"]["org.openvtc.git-ns"]["namespace"].clone();
     assert_eq!(ns_report["installationId"], "77", "{ev}");
-    assert_eq!(ns_report["appName"], "acme-vgi-bridge");
-    assert_eq!(ns_report["appSlug"], "acme-vgi-bridge");
+    // newco's own App, not acme's.
+    assert_eq!(ns_report["appName"], "newco-vgi-bridge");
+    assert_eq!(ns_report["appSlug"], "newco-vgi-bridge");
     assert_eq!(ns_report["appRegistration"], "registered");
     assert_eq!(ns_report["orgRulesets"], true);
     assert_eq!(ns_report["requiredWorkflow"], true);
@@ -334,6 +340,16 @@ async fn a_bind_completes_through_the_setup_callback_once() {
             .get("repo")
             .is_none(),
         "no repository to report on"
+    );
+    // Then the role map: until it arrives the VTC holds the map as unknown,
+    // and assumes none.
+    let map = w.next().await;
+    assert_eq!(map["type"], EVENT);
+    assert_eq!(
+        map["payload"]["event"],
+        json!({ "type": "roleMapReported",
+                "roleMap": { "own": "admin", "maintain": "maintain", "commit": "none" },
+                "ladder": ["read", "triage", "write", "maintain", "admin"] })
     );
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded");
@@ -360,7 +376,9 @@ async fn a_bind_completes_through_the_setup_callback_once() {
     // The state is single use.
     let (status, _) = get(
         &w,
-        &format!("/github/github.com/setup?installation_id=77&setup_action=install&state={state}"),
+        &format!(
+            "/github/github.com/newco/setup?installation_id=77&setup_action=install&state={state}"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -369,10 +387,13 @@ async fn a_bind_completes_through_the_setup_callback_once() {
 
 #[tokio::test]
 async fn a_bind_nobody_completes_ends_expired() {
-    let mut w = world(Options {
-        web_base: Some("https://github.example".into()),
-        ..Options::default()
-    })
+    let mut w = world(
+        Options {
+            web_base: Some("https://github.example".into()),
+            ..Options::default()
+        }
+        .with_org("newco", 3003),
+    )
     .await;
     w.send_job(json!({
         "jobId": "job_e", "namespace": "ns_new", "kind": "beginBind",
@@ -491,7 +512,11 @@ async fn an_installation_that_accepts_the_new_permissions_turns_the_bridge_check
         false,
         Some(false),
     );
-    let adapter = w.bridge.adapters().get("github.com").unwrap();
+    let adapter = w
+        .bridge
+        .adapters()
+        .get_github("github.com", "acme")
+        .unwrap();
     let rec: NamespaceRecord = w
         .bridge
         .store()
@@ -555,7 +580,12 @@ async fn a_failed_app_registration_can_be_retried_from_the_same_link() {
         ..Options::default()
     })
     .await;
-    assert!(w.bridge.adapters().get("github.com").is_none());
+    assert!(
+        w.bridge
+            .adapters()
+            .get_github("github.com", "acme")
+            .is_none()
+    );
     let urls = vgi_bridge::flows::offer_registrations(&w.bridge).unwrap();
     let state = state_of(&urls[0]);
     Mock::given(method("POST"))
@@ -578,18 +608,26 @@ async fn a_failed_app_registration_can_be_retried_from_the_same_link() {
         })))
         .mount(&w.server)
         .await;
-    let uri = format!("/github/github.com/registered?code=abc123&state={state}");
+    let uri = format!("/github/github.com/acme/registered?code=abc123&state={state}");
     let (status, _) = get(&w, &uri).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
         "GitHub failed the exchange"
     );
-    assert!(w.bridge.adapters().get("github.com").is_none());
+    assert!(
+        w.bridge
+            .adapters()
+            .get_github("github.com", "acme")
+            .is_none()
+    );
     let (status, page) = get(&w, &uri).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(
-        w.bridge.adapters().get("github.com").is_some(),
+        w.bridge
+            .adapters()
+            .get_github("github.com", "acme")
+            .is_some(),
         "in service"
     );
     let (status, _) = get(&w, &uri).await;
@@ -646,7 +684,11 @@ async fn a_restart_restores_pins_managed_sets_and_unfinished_jobs() {
         ..Options::default()
     })
     .await;
-    let adapter = w.bridge.adapters().get("github.com").unwrap();
+    let adapter = w
+        .bridge
+        .adapters()
+        .get_github("github.com", "acme")
+        .unwrap();
     let g = adapter.github().unwrap();
     assert_eq!(
         g.managed_repositories(&acme()),

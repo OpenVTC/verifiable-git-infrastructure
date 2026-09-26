@@ -129,10 +129,16 @@ pub struct VerifyTrustVerifier {
     /// Per GitHub host, the configured `web-flow` keyring, where one is.
     keyrings: BTreeMap<String, PathBuf>,
     tdk: OnceCell<Arc<affinidi_tdk::TDK>>,
-    /// The discovered binding. Dropped whenever the registry could not be
-    /// consulted, so the next check discovers it again (a registry that
-    /// moved is found without a restart).
-    registry_route: tokio::sync::Mutex<Option<trql_client::TransportChoice>>,
+    /// How long a resolved DID document (and the binding read from the
+    /// registry's) is kept.
+    ttl: std::time::Duration,
+    /// The discovered binding, and when. Dropped whenever the registry could
+    /// not be consulted and once it is older than `ttl`, so the next check
+    /// discovers it again (a registry that moved is found without a
+    /// restart).
+    registry_route: tokio::sync::Mutex<Option<(trql_client::TransportChoice, std::time::Instant)>>,
+    /// Signer DIDs resolved again after an unknown key, and when.
+    re_resolved: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// A fixed HTTPS endpoint (tests; a registry that publishes none).
     registry_override: Option<String>,
     /// `[verify_trust] transport`, for the bridge's own queries.
@@ -156,7 +162,9 @@ impl VerifyTrustVerifier {
                 .filter_map(|g| g.platform_keyring_file.clone().map(|k| (g.host.clone(), k)))
                 .collect(),
             tdk: OnceCell::new(),
+            ttl: std::time::Duration::from_secs(cfg.did_cache_ttl_secs),
             registry_route: tokio::sync::Mutex::new(None),
+            re_resolved: Default::default(),
             registry_override: None,
             transport: bridge_transport(cfg.verify_trust.transport),
             channel: None,
@@ -174,7 +182,8 @@ impl VerifyTrustVerifier {
     /// document (tests: a registry whose document is not resolvable here).
     #[doc(hidden)]
     pub fn with_route(self, route: trql_client::TransportChoice) -> Self {
-        *self.registry_route.try_lock().expect("not yet shared") = Some(route);
+        *self.registry_route.try_lock().expect("not yet shared") =
+            Some((route, std::time::Instant::now()));
         self
     }
 
@@ -199,8 +208,8 @@ impl VerifyTrustVerifier {
         }
         let mut cached = self.registry_route.lock().await;
         let route = match cached.as_ref() {
-            Some(r) => r.clone(),
-            None => {
+            Some((r, at)) if at.elapsed() < self.ttl => r.clone(),
+            _ => {
                 let r = verify_trust::registry::discover_registry_route(
                     tdk,
                     &self.registry_did,
@@ -209,7 +218,7 @@ impl VerifyTrustVerifier {
                 )
                 .await?;
                 tracing::info!(binding = %r.kind, "querying the Trust Registry");
-                *cached = Some(r.clone());
+                *cached = Some((r.clone(), std::time::Instant::now()));
                 r
             }
         };
@@ -222,6 +231,17 @@ impl VerifyTrustVerifier {
             ),
             (kind, _) => bail!("the bridge cannot query the registry over {kind}"),
         }
+    }
+
+    async fn resolver(&self) -> Result<&Arc<affinidi_tdk::TDK>> {
+        let ttl = u32::try_from(self.ttl.as_secs()).unwrap_or(u32::MAX);
+        self.tdk
+            .get_or_try_init(|| async {
+                verify_trust::build_resolver_with_cache_ttl(false, ttl)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
     }
 
     async fn forget_endpoint(&self) {
@@ -250,12 +270,75 @@ impl CommitVerifier for VerifyTrustVerifier {
         fallback: &str,
     ) -> Result<Vec<CommitLine>> {
         let claimed = verify_trust::claimed_signer_dids(range, self.max_signers)?;
-        let tdk = self
-            .tdk
-            .get_or_try_init(|| async { verify_trust::build_resolver(false).await.map(Arc::new) })
+        let tdk = self.resolver().await?;
+        let lines = self
+            .verify_once(tdk, range, resource, fallback, &claimed)
             .await?;
+        // A signer that rotated its key since its document was cached shows
+        // up as an unknown key (or an unresolved DID): resolve those DIDs
+        // afresh and check once more before failing the commits (closed).
+        let stale: Vec<String> = lines
+            .1
+            .iter()
+            .filter_map(|s| match s {
+                verify_trust::CommitStatus::UnknownKey { did, .. }
+                | verify_trust::CommitStatus::UnresolvedSigner { did, .. } => Some(did.clone()),
+                _ => None,
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(lines.0);
+        }
+        // At most once per DID per interval (a signer DID is attacker-chosen
+        // on a fork PR: it must not steer the bridge into re-fetching at will).
+        let stale: Vec<String> = {
+            let mut last = self.re_resolved.lock().await;
+            let now = std::time::Instant::now();
+            last.retain(|_, t| now.duration_since(*t) < crate::wire::RE_RESOLVE_EVERY);
+            stale
+                .into_iter()
+                .filter(|d| last.insert(d.clone(), now).is_none())
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(lines.0);
+        }
+        for did in &stale {
+            let _ = tdk.did_resolver().remove(did).await;
+        }
+        tracing::info!(signers = ?stale, "re-resolving signer DIDs after an unknown key");
+        Ok(self
+            .verify_once(tdk, range, resource, fallback, &claimed)
+            .await?
+            .0)
+    }
+
+    async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
+        use trql_client::TrqpQuery;
+        let tdk = self.resolver().await?;
         let registry = self.registry(tdk).await?;
-        let signers = verify_trust::resolve_signer_keys(tdk, &claimed).await?;
+        let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
+        match registry.client().authorization(query).await {
+            Ok(r) => Ok(Some(r.authorized)),
+            // The registry answered and refused the tuple: a denial.
+            Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl VerifyTrustVerifier {
+    /// One verification of `range`: the lines, and each commit's status.
+    async fn verify_once(
+        &self,
+        tdk: &affinidi_tdk::TDK,
+        range: &[RangeCommit],
+        resource: &str,
+        fallback: &str,
+        claimed: &[String],
+    ) -> Result<(Vec<CommitLine>, Vec<verify_trust::CommitStatus>)> {
+        let registry = self.registry(tdk).await?;
+        let signers = verify_trust::resolve_signer_keys(tdk, claimed).await?;
         let host = resource.split('/').next().unwrap_or_default();
         let exempt = match self.keyrings.get(host) {
             Some(p) => Some(verify_trust::pgp_exempt::ExemptKeyring::load(p)?),
@@ -299,7 +382,8 @@ impl CommitVerifier for VerifyTrustVerifier {
         }) {
             self.forget_endpoint().await;
         }
-        Ok(report
+        let statuses = report.commits.iter().map(|c| c.status.clone()).collect();
+        let lines = report
             .commits
             .into_iter()
             .map(|c| {
@@ -309,23 +393,8 @@ impl CommitVerifier for VerifyTrustVerifier {
                     .unwrap_or_else(|| format!("{:?}", c.status));
                 CommitLine::new(c.sha, c.status.passes(), verdict)
             })
-            .collect())
-    }
-
-    async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
-        use trql_client::TrqpQuery;
-        let tdk = self
-            .tdk
-            .get_or_try_init(|| async { verify_trust::build_resolver(false).await.map(Arc::new) })
-            .await?;
-        let registry = self.registry(tdk).await?;
-        let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
-        match registry.client().authorization(query).await {
-            Ok(r) => Ok(Some(r.authorized)),
-            // The registry answered and refused the tuple: a denial.
-            Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
-            Err(e) => Err(e.into()),
-        }
+            .collect();
+        Ok((lines, statuses))
     }
 }
 
@@ -972,7 +1041,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
 
     let check_name = bridge
         .adapters
-        .vgi(ctx.ns.resource.host())
+        .vgi_for(&ctx.ns.resource)
         .map(|v| v.required_check)
         .unwrap_or_else(|| vgi_forge::DEFAULT_REQUIRED_CHECK.into());
     let _permit = bridge.checks.permits.acquire().await?;

@@ -924,9 +924,23 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   the merge allow-list); on a personal account both become `write`, the only
   collaborator role there. Committers get no role (fork pull requests). The
   bridge's `role_map` changes this per bridge, forge, namespace or
-  repository — maintainers as `admin`, committers `write` on a repository
-  that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). A member
+  repository — maintainers as `write`, committers `write` on a repository
+  that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). Only
+  `own` may map to `admin`: a map giving it to `maintain` or `commit` fails
+  the start. A member
   with no linked GitHub account gets no role until they link (openvtc `l`).
+- **A role-map change reaches the forge by re-projection.** After you change
+  `role_map` and restart the bridge, it reports its map to the VTC
+  (`git-ns/bridge/event` 0.3) with the repositories projected under the old
+  one — and again at every reconnection to the VTC and whenever it starts
+  serving a newly bound namespace, so the VTC's copy is never older than
+  its link — and the VTC re-projects those by itself; the console shows the map
+  each right projects to. On a bridge set to `event_version = "0.2"`, or to
+  force it anyway, re-project by hand:
+  `cnm git reproject --resource github.com/acme` (a namespace) or
+  `--resource github.com/acme/widgets` (one repository), or **Re-project
+  roles** on the console's Repos page. A community administrator or a
+  namespace admin may; no right changes.
 - **A repository keeps an owner.** Revoking the last one is
   `git-ns:lastOwner`; grant the replacement first. Only an owner record
   **without an expiry** counts for this, so an expiring grant cannot be the
@@ -942,8 +956,8 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   repository read-only on GitHub and revokes every commit right on it. No
   task reverses it.
 - **Namespace admins get no forge role.** The bridge does not project
-  `git.ns.admin` — not as an organisation owner (it refuses a
-  namespace-level role projection, `notCapable`) and not as a repository
+  `git.ns.admin` — not as an organisation owner (`git-ns/bridge/job` 0.4 has
+  no namespace-level role projection) and not as a repository
   role (a desired role carrying `git.ns.admin` projects nothing), and no
   `role_map` can change that. Who owns the organisation is yours to manage.
   A namespace admin who should also hold a role on a repository needs that
@@ -987,7 +1001,7 @@ namespace admin over it, answers each one.
 
 | Item | Means | Adopt | Revert |
 |---|---|---|---|
-| `roleAdded` | an account holds a role the rights do not give | records it as a right (below) | removes the direct role (`git-ns/bridge/job` 0.2 `removeAccounts`) |
+| `roleAdded` | an account holds a role the rights do not give | records it as a right (below) | removes the direct role (`git-ns/bridge/job` 0.4 `removeAccounts`) |
 | `roleChanged` | a role other than the projected one | if it raises a linked member: records the higher right | re-sends the complete desired roles |
 | `roleRemoved` | a projected role is gone | — | re-sends the complete desired roles |
 | `requiredCheckMissing` | the ruleset no longer requires the check | — | re-runs the `requiredCheck` bootstrap step |
@@ -1148,8 +1162,25 @@ records and moves nothing on GitHub.
 
 ### 8i. The bridge: backup, restore, restart
 
-Everything is in `data_dir/state.redb`, sealed with the master key
-(BRIDGE.md §5).
+**A bridge in VTA mode** (BRIDGE.md §2a) keeps its DID, keys, secrets and
+state in its trust context of the VTC's VTA. There is nothing on its host to
+back up, and a lost host is recovered by:
+
+1. revoking the old host's context credential in the VTA, and issuing a new
+   one (an admin scoped to the bridge's context only);
+2. putting it on the new host (`credential_file`, owner-only) with the same
+   config and an **empty** data directory;
+3. `vgi-bridge vta setup`, then starting the bridge.
+
+It comes back as the same DID with its namespaces, managed repositories,
+required-workflow pin and App credentials: no rebind, no unbind, no rights
+change, no App re-registration. What it loses: jobs in flight (the VTC sends
+unfinished ones again), unacknowledged results (the VTC repeats their jobs),
+binds and account links waiting for a person (start them again), and the
+provenance of Dependabot branches pushed to while the VTA was unreachable.
+
+The rest of this section is the self-contained mode. Everything is in
+`data_dir/state.redb`, sealed with the master key (BRIDGE.md §5).
 
 - **Back up** the file and the key **separately**. For a consistent copy,
   stop the bridge (or snapshot the volume) and copy the one file.
@@ -1170,12 +1201,14 @@ Everything is in `data_dir/state.redb`, sealed with the master key
 - **The identity** is worth keeping even when the store is not: `vgi-bridge
   identity export` once (BRIDGE.md §5), `identity import` into a fresh store,
   and the bridge keeps the DID the VTC recorded for its namespaces.
-- **Losing the store, or the key,** means registering a new GitHub App and
+- **Losing the store, or the key,** of a self-contained bridge means
+  registering a new GitHub App and
   binding again — and there is no re-attach. The VTC still holds the
   namespace as bound to that bridge, and binding it again needs
   `cnm git namespace unbind` first, which **revokes every right in the
   namespace** and detaches every repository; everything is then granted and
-  adopted afresh. Back the store up.
+  adopted afresh. Back the store up — or move the bridge to VTA mode, which
+  does not have this limit.
 
 The VTC's own backup (VTI `docs/03-vtc/backup-restore.md`) carries the
 git-namespace records; its bridge-job queue and the registry-projection mirror
@@ -1255,7 +1288,7 @@ fix where one applies.
 | `git-ns/repo/transfer:notOwner` / `selfTransfer` | you hold no ownership record to hand over / you named yourself | a namespace admin grants `own` instead |
 | `git-ns/drift/resolve:driftNotFound` | resolved already, or the forge changed since you read it | read it again with `git view` |
 | `git-ns/drift/resolve:notAdoptable` / `accountNotLinked` / `noMatchingRight` | the item records no right: a protection item; `write`, `triage` or `read`; an unlinked account; a role no higher than one held | revert it — or, to accept a lowering, revoke the right |
-| `git-ns/drift/resolve:notRevertible` | manual mode; or the account is a member's and the projection gives it a role there; or the bridge implements only job 0.1 | undo it on the forge; revoke the member's right; upgrade the bridge |
+| `git-ns/drift/resolve:notRevertible` | manual mode; or the account is a member's and the projection gives it a role there; or the bridge does not take job 0.4 | undo it on the forge; revoke the member's right; upgrade the bridge |
 | `git-ns/namespace/reseat:notHeadless` | a live admin remains | that admin grants `git.ns.admin` |
 | `git-ns/account/link:unsupportedForge` | no bridge-mode namespace on that forge | bind one in bridge mode |
 | `git-ns/account/link-status:unknownLink` | the link attempt is unknown, or forgotten (after 7 days) | start again (`l`) |
@@ -1274,7 +1307,12 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 | Code | Cause | Fix |
 |---|---|---|
 | `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
-| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind | §8i |
+| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 only | upgrade the VTC |
+| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
+| VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
+| bind fails `notCapable` ("not bound") for an organisation on a host with several Apps | no `[[github]]` entry (and registered App) for that organisation: add one and register its App (BRIDGE.md §3) | — |
+| bridge `/healthz` 503, log "another bridge … is writing the same VTA context" | two hosts (or a stolen credential) on one bridge context; the bridge stopped writing its state and holds its results | §8i; BRIDGE.md §2a |
+| bridge `/healthz` 503 "state not reaching the VTA: N change(s) waiting" | every write to the VTA has failed for five minutes: the VTA unreachable, or its app-state lease kept by another writer (logs: "another writer holds the bridge's app-state lease") | bring the VTA back; if the lease is the cause, find the other writer on the context and stop it (revoke the credential if it is not yours) |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |
 | step `forbidden` | the App lacks a permission or was uninstalled; a Forgejo token revoked | §8f; reinstall; §8j |
 | step `notFound` | the repository is gone, or outside the installation's repository selection | an inspection that finds nothing detaches it; install the App on *All repositories* |
@@ -1282,6 +1320,6 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 | step `rateLimited` | the forge's rate limit | the job is retried |
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
-| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.2 | update the VTC, or `event_version = "0.1"` meanwhile (BRIDGE.md §7) |
+| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default) | update the VTC, or `event_version = "0.2"` (or `"0.1"` for a VTC older than 0.2) meanwhile; the VTC is then not told the role map (BRIDGE.md §7) |
 
 [vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure

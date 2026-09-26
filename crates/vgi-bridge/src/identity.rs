@@ -18,7 +18,12 @@
 //! - **`did:key`**: still loaded from a store that holds one (earlier
 //!   releases minted it), but a VTC cannot send it jobs; `run` says so.
 //!
-//! Either way the private keys are held only in the sealed store, and the
+//! In VTA mode ([`crate::vta`]) the identity is the `did:webvh` of the
+//! bridge's own context in the VTC's VTA: its keys are fetched into memory at
+//! start-up and never stored here, and a rotation in the VTA replaces them at
+//! run time ([`crate::Bridge::replace_identity`]).
+//!
+//! Otherwise the private keys are held only in the sealed store, and the
 //! same keys serve DIDComm (authcrypt) and the Data Integrity proofs on every
 //! Trust Task document the bridge sends.
 
@@ -258,6 +263,55 @@ impl BridgeIdentity {
         &self.did
     }
 
+    /// An identity from secrets already checked against the DID's current
+    /// document (VTA mode, [`crate::vta`]): `signing` signs, every secret
+    /// goes to DIDComm (all the key-agreement keys the document lists, so a
+    /// message encrypted to any of them — during a rotation's overlap —
+    /// still opens).
+    pub fn from_secrets(did: &str, signing: Secret, secrets: Vec<Secret>) -> Result<Self> {
+        for s in &secrets {
+            if !s.id.starts_with(&format!("{did}#")) {
+                bail!("key `{}` does not belong to `{did}`", s.id);
+            }
+        }
+        if signing.get_key_type() != KeyType::Ed25519 || !secrets.iter().any(|s| s.id == signing.id)
+        {
+            bail!(
+                "the signing key `{}` is not an Ed25519 key of the set",
+                signing.id
+            );
+        }
+        Ok(BridgeIdentity {
+            did: did.to_string(),
+            signing,
+            secrets,
+        })
+    }
+
+    /// The verification method that signs.
+    pub fn signing_key_id(&self) -> &str {
+        &self.signing.id
+    }
+
+    /// Every secret held.
+    pub(crate) fn secrets(&self) -> &[Secret] {
+        &self.secrets
+    }
+
+    /// Whether `other` holds the same keys (ids and public halves).
+    pub fn same_keys(&self, other: &BridgeIdentity) -> bool {
+        let keys = |i: &BridgeIdentity| {
+            let mut v: Vec<(String, Vec<u8>)> = i
+                .secrets
+                .iter()
+                .map(|s| (s.id.clone(), s.get_public_bytes().to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+        self.did == other.did && self.signing.id == other.signing.id && keys(self) == keys(other)
+    }
+
     /// Every secret DIDComm needs (signing and key agreement).
     pub fn messaging_secrets(&self) -> Vec<Secret> {
         self.secrets.clone()
@@ -265,10 +319,21 @@ impl BridgeIdentity {
 
     /// Sign a Trust Task document (`eddsa-jcs-2022`, `assertionMethod`).
     /// `doc.issuer` must already be this DID.
+    ///
+    /// `assertionMethod` is passed explicitly rather than left to
+    /// `SignOptions`' default: trust-tasks-proof 0.23 changed that default
+    /// to `authentication` (SPEC's own examples use it), but this bridge
+    /// and the VTC-side checks it faces (`wire::DocChecker::check`) still
+    /// require `assertionMethod` on both sides of the wire — see the
+    /// `proofPurpose` follow-up in #91.
     pub async fn sign(&self, doc: &Value) -> Result<Value> {
-        sign_trust_task(doc, &self.signing, SignOptions::new())
-            .await
-            .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
+        sign_trust_task(
+            doc,
+            &self.signing,
+            SignOptions::new().with_proof_purpose("assertionMethod"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
     }
 }
 
