@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 use crate::seal::MasterKey;
 
 /// One logical collection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Table {
     /// [`JobRecord`] by `jobId`.
@@ -67,10 +67,15 @@ pub enum Table {
     /// [`BranchLedger`] by `<host>#<repository id>#<branch>`: the Dependabot
     /// re-sign's provenance ledger.
     Branches,
+    /// VTA mode, this host only: the version each app-state record was at
+    /// when this host last wrote or read it (`u64` by remote key). What
+    /// tells a record this host mirrored (and another host has since
+    /// deleted) from one it never did.
+    Mirror,
 }
 
 impl Table {
-    const ALL: [Table; 9] = [
+    const ALL: [Table; 10] = [
         Table::Jobs,
         Table::Namespaces,
         Table::Repos,
@@ -80,10 +85,12 @@ impl Table {
         Table::Secrets,
         Table::Meta,
         Table::Branches,
+        Table::Mirror,
     ];
 
-    fn def(self) -> TableDefinition<'static, &'static str, &'static [u8]> {
-        TableDefinition::new(match self {
+    /// The table's name (redb's, and the VTA mirror's key segment).
+    pub fn name(self) -> &'static str {
+        match self {
             Table::Jobs => "jobs",
             Table::Namespaces => "namespaces",
             Table::Repos => "repos",
@@ -93,7 +100,17 @@ impl Table {
             Table::Secrets => "secrets",
             Table::Meta => "meta",
             Table::Branches => "branches",
-        })
+            Table::Mirror => "mirror",
+        }
+    }
+
+    /// The table named `name`.
+    pub fn from_name(name: &str) -> Option<Table> {
+        Table::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    fn def(self) -> TableDefinition<'static, &'static str, &'static [u8]> {
+        TableDefinition::new(self.name())
     }
 }
 
@@ -541,10 +558,16 @@ pub enum OutboxKind {
 }
 
 /// The store.
+///
+/// In VTA mode ([`Store::with_mirror`]) it is a cache of the state held in
+/// the VTA's app-state ([`crate::appstate`]): writes to the mirrored tables
+/// are marked for the mirror task, and secrets are held in memory and in the
+/// VTA only — never sealed into the file.
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
     key: Arc<MasterKey>,
+    mirror: Option<Arc<crate::appstate::Mirror>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -581,7 +604,89 @@ impl Store {
         Ok(Store {
             db: Arc::new(db),
             key: Arc::new(key),
+            mirror: None,
         })
+    }
+
+    /// This store as the local cache of VTA mode: mirrored writes are marked
+    /// on `mirror`, and secrets live in it (memory) rather than in the file.
+    pub fn with_mirror(mut self, mirror: Arc<crate::appstate::Mirror>) -> Self {
+        self.mirror = Some(mirror);
+        self
+    }
+
+    /// The VTA mirror, in VTA mode.
+    pub fn mirror(&self) -> Option<&Arc<crate::appstate::Mirror>> {
+        self.mirror.as_ref()
+    }
+
+    /// Wait until every change is in the VTA (at most `timeout`). Always
+    /// `true` outside VTA mode, where the file is the durable copy.
+    pub async fn flush(&self, timeout: std::time::Duration) -> bool {
+        match &self.mirror {
+            Some(m) => m.flush(timeout).await,
+            None => true,
+        }
+    }
+
+    fn touched(&self, table: Table, key: &str) {
+        if let Some(m) = &self.mirror
+            && crate::appstate::record_is_mirrored(table, key)
+        {
+            m.mark(crate::appstate::Dirty::Record(table, key.to_string()));
+        }
+    }
+
+    /// Write a record pulled from the VTA, without marking it for the
+    /// mirror.
+    pub(crate) fn put_cached<T: Serialize>(
+        &self,
+        table: Table,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(value)?;
+        let w = self.db.begin_write()?;
+        w.open_table(table.def())?.insert(key, bytes.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Delete a record without marking it for the mirror (what the VTA
+    /// already dropped).
+    pub(crate) fn delete_cached(&self, table: Table, key: &str) -> Result<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(table.def())?.remove(key)?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// One record as JSON.
+    pub(crate) fn get_raw(&self, table: Table, key: &str) -> Result<Option<Value>> {
+        self.get(table, key)
+    }
+
+    /// Every key in a table.
+    pub(crate) fn keys(&self, table: Table) -> Result<Vec<String>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(table.def())?;
+        let mut out = Vec::new();
+        for row in t.iter()? {
+            out.push(row?.0.value().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Whether the file holds any record of `table`.
+    pub fn is_empty(&self, table: Table) -> Result<bool> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(table.def())?;
+        Ok(t.iter()?.next().is_none())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_secret_rows(&self) -> Result<Vec<String>> {
+        self.keys(Table::Secrets)
     }
 
     /// Read one record.
@@ -603,6 +708,7 @@ impl Store {
         let w = self.db.begin_write()?;
         w.open_table(table.def())?.insert(key, bytes.as_slice())?;
         w.commit()?;
+        self.touched(table, key);
         Ok(())
     }
 
@@ -618,6 +724,7 @@ impl Store {
             t.insert(key, bytes.as_slice())?;
         }
         w.commit()?;
+        self.touched(table, key);
         Ok(true)
     }
 
@@ -652,6 +759,7 @@ impl Store {
             out
         };
         w.commit()?;
+        self.touched(table, key);
         Ok(out)
     }
 
@@ -692,6 +800,9 @@ impl Store {
         let w = self.db.begin_write()?;
         let existed = w.open_table(table.def())?.remove(key)?.is_some();
         w.commit()?;
+        if existed {
+            self.touched(table, key);
+        }
         Ok(existed)
     }
 
@@ -712,6 +823,16 @@ impl Store {
 
     /// Seal `value` under `name` and store it.
     pub fn put_secret(&self, name: &str, value: &[u8]) -> Result<()> {
+        if let Some(m) = &self.mirror {
+            m.secrets
+                .lock()
+                .expect("lock")
+                .insert(name.to_string(), Zeroizing::new(value.to_vec()));
+            if crate::appstate::secret_is_mirrored(name) {
+                m.mark(crate::appstate::Dirty::Secret(name.to_string()));
+            }
+            return Ok(());
+        }
         let sealed = self.key.seal(name, value)?;
         let w = self.db.begin_write()?;
         w.open_table(Table::Secrets.def())?
@@ -722,6 +843,9 @@ impl Store {
 
     /// Open the secret `name`, if stored.
     pub fn get_secret(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        if let Some(m) = &self.mirror {
+            return Ok(m.secrets.lock().expect("lock").get(name).cloned());
+        }
         let r = self.db.begin_read()?;
         let t = r.open_table(Table::Secrets.def())?;
         match t.get(name)? {
@@ -743,11 +867,21 @@ impl Store {
 
     /// Remove the secret `name`.
     pub fn delete_secret(&self, name: &str) -> Result<()> {
+        if let Some(m) = &self.mirror {
+            let existed = m.secrets.lock().expect("lock").remove(name).is_some();
+            if existed && crate::appstate::secret_is_mirrored(name) {
+                m.mark(crate::appstate::Dirty::Secret(name.to_string()));
+            }
+            return Ok(());
+        }
         self.delete(Table::Secrets, name).map(|_| ())
     }
 
     /// Names of the stored secrets (never their values).
     pub fn secret_names(&self) -> Result<Vec<String>> {
+        if let Some(m) = &self.mirror {
+            return Ok(m.secrets.lock().expect("lock").keys().cloned().collect());
+        }
         let r = self.db.begin_read()?;
         let t = r.open_table(Table::Secrets.def())?;
         let mut out = Vec::new();

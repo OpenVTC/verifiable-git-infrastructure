@@ -183,6 +183,13 @@ organisation without org rulesets falls back to a check any writer can forge.
 
 ### 2.2 Master key and identity
 
+**Recommended: VTA mode.** Give the bridge its own trust context in the VTC's
+VTA and a context-scoped credential instead of a master key and a local
+identity — the steps are BRIDGE.md §2a (context and `did:webvh`, credential,
+`[vta]` config, `vgi-bridge vta setup`). A lost bridge host is then recovered
+by issuing a new credential. The rest of this section is the self-contained
+mode.
+
 The master key seals every secret the bridge stores. It is 32 bytes, base64,
 in a file only its owner can read (the bridge refuses a file readable by group
 or others):
@@ -248,7 +255,7 @@ paths in BRIDGE.md §1 and keeping `/healthz` internal.
 
 ### 2.4 Tell the VTC which bridge serves github.com
 
-Put the DID from `identity show` into the VTC's `[git_ns] bridges` under
+Put the DID from `identity show` (VTA mode: from `vta setup`) into the VTC's `[git_ns] bridges` under
 `"github.com"` (step 1) and restart the VTC.
 
 **Success looks like:** `curl http://127.0.0.1:8080/healthz` answers `ok`;

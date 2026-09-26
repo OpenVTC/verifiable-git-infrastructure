@@ -658,6 +658,16 @@ pub(crate) async fn manifest_callback(
     let json = zeroize::Zeroizing::new(serde_json::to_vec(&stored)?);
     bridge.store.put_secret(&secret_name, &json)?;
     drop(stored);
+    // VTA mode: the App's key exists nowhere else (GitHub shows it once), so
+    // say whether it reached the VTA before the admin walks away.
+    let persisted = bridge.store.flush(std::time::Duration::from_secs(30)).await;
+    if !persisted {
+        tracing::error!(
+            %host,
+            "the App's credentials are not in the VTA yet (it is unreachable); the bridge keeps \
+             trying — do not stop it until this log says the state was written"
+        );
+    }
     let forge = crate::registry::build_github(&bridge.store, &g)?
         .context("the App was sealed but does not load")?;
     let keyring = match &g.platform_keyring_file {
@@ -680,9 +690,15 @@ pub(crate) async fn manifest_callback(
         })
         .map(|u| u.to_string())
         .unwrap_or_default();
+    let warning = if persisted {
+        ""
+    } else {
+        " Note: the bridge could not write the App's credentials to its VTA yet and keeps trying; \
+         its operator should not stop it until its log says the state was written."
+    };
     Ok(format!(
         "The App `{}` is registered. One more step: tick \"Enable Device Flow\" on its settings \
-         page ({settings}) so members can link their accounts.",
+         page ({settings}) so members can link their accounts.{warning}",
         creds.slug
     ))
 }
@@ -751,6 +767,12 @@ pub(crate) async fn rotate_forgejo_tokens(bridge: &Bridge) {
                     continue;
                 }
                 let _ = bridge.store.put(Table::Meta, &key, &now());
+                // VTA mode: the old token is retired only once the new one is
+                // in the VTA — a host lost before that restarts with the old.
+                if !bridge.store.flush(std::time::Duration::from_secs(30)).await {
+                    tracing::warn!(%host, token = %minted.token.name, "the new bot token is not in the VTA yet; the old one is kept alive (delete it by hand later)");
+                    continue;
+                }
                 match &minted.previous {
                     Some(old) => {
                         if let Err(e) = forgejo.retire_token(old).await {

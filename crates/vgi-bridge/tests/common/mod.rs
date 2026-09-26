@@ -132,6 +132,8 @@ pub struct World {
     pub startup_reports: Vec<Value>,
     /// While set, every send to the VTC fails (the link is down).
     pub link_down: Arc<std::sync::atomic::AtomicBool>,
+    /// VTA mode: stops the mirror task when dropped.
+    pub _mirror_stop: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// A [`ChannelLink`] that can be cut: while `down` is set every send fails,
@@ -174,6 +176,9 @@ pub struct Options {
     pub github_extra: String,
     /// `event_version`, when set.
     pub event_version: Option<&'static str>,
+    /// VTA mode: the store is a cache of this app-state (seeds go through
+    /// it, and the mirror task runs).
+    pub vta: Option<Arc<vgi_bridge::appstate::MemoryAppState>>,
 }
 
 impl Default for Options {
@@ -195,6 +200,7 @@ impl Default for Options {
             keyring: true,
             github_extra: String::new(),
             event_version: None,
+            vta: None,
         }
     }
 }
@@ -391,13 +397,31 @@ pub async fn world(o: Options) -> World {
         Some(p) => Store::open(p, key).unwrap(),
         None => Store::in_memory(key).unwrap(),
     };
+    let mut mirror_stop = None;
+    let store = match &o.vta {
+        Some(remote) => {
+            let m = vgi_bridge::appstate::Mirror::new(MasterKey::from_bytes([11u8; 32]));
+            let store = store.with_mirror(m.clone());
+            m.pull(remote.as_ref(), &store).await.unwrap();
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let remote: Arc<dyn vgi_bridge::appstate::AppState> = remote.clone();
+            tokio::spawn(m.run(remote, store.clone(), rx));
+            mirror_stop = Some(tx);
+            store
+        }
+        None => store,
+    };
     if o.seed_app {
         seed_app(&store);
     }
     if o.seed_namespace {
         seed_namespace(&store, o.kind, o.required_workflow);
     }
+    // VTA mode: the identity comes from the VTA, never from the store.
     let identity = match BridgeIdentity::load(&store).unwrap() {
+        _ if o.vta.is_some() => {
+            BridgeIdentity::from_seed(&o.bridge_seed.unwrap_or([9u8; 32])).unwrap()
+        }
         Some(id) => id,
         None => {
             let seed = o.bridge_seed.unwrap_or([9u8; 32]);
@@ -441,6 +465,7 @@ pub async fn world(o: Options) -> World {
         pending: Default::default(),
         startup_reports: Vec::new(),
         link_down,
+        _mirror_stop: mirror_stop,
     }
     .settled()
     .await
@@ -600,7 +625,9 @@ pub async fn wait_for_request(
 /// Wait until delivery `id` on github.com is recorded as handled — every
 /// check it called for has ended (posted or deliberately skipped).
 pub async fn wait_delivery(w: &World, id: &str) {
-    for _ in 0..400 {
+    // A minute: a check fetches from a local git remote and verifies, which
+    // a loaded machine can take well past the ten seconds this once was.
+    for _ in 0..2400 {
         if w.bridge
             .store()
             .get::<i64>(Table::Deliveries, &format!("github.com#{id}"))
@@ -827,6 +854,7 @@ oauth_client_id = "cid"
         pending: Default::default(),
         startup_reports: Vec::new(),
         link_down: Default::default(),
+        _mirror_stop: None,
     }
     .settled()
     .await

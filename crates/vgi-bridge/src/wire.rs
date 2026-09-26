@@ -122,6 +122,90 @@ impl ProofCheck for trust_tasks_proof::affinidi::Verifier {
     }
 }
 
+/// Drops a DID's cached document, so the next resolution fetches it again.
+#[async_trait]
+pub trait Evict: Send + Sync {
+    /// Forget `did`'s cached document.
+    async fn evict(&self, did: &str);
+}
+
+#[async_trait]
+impl Evict for affinidi_tdk::did_resolver::DIDCacheClient {
+    async fn evict(&self, did: &str) {
+        let _ = self.remove(did).await;
+    }
+}
+
+/// A [`ProofCheck`] that tries a failed proof once more against a fresh
+/// resolution of the issuer's DID: a document cached from before the
+/// issuer rotated its key would otherwise refuse the new key until it
+/// expired. Fails closed after the second try, and a document that verified
+/// is never re-checked — a key rotated *out* is trusted at most for the
+/// cache's lifetime.
+pub struct ReResolving {
+    inner: Arc<dyn ProofCheck>,
+    cache: Arc<dyn Evict>,
+    /// When each DID was last resolved again: at most once per
+    /// [`RE_RESOLVE_EVERY`], so a stream of bad proofs cannot make the bridge
+    /// hammer (or be steered into flooding) the DID's host.
+    last: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+/// The least time between two fresh resolutions of one DID on a failure.
+pub const RE_RESOLVE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl ReResolving {
+    /// Over `inner`, evicting from `cache`.
+    pub fn new(inner: Arc<dyn ProofCheck>, cache: Arc<dyn Evict>) -> Self {
+        ReResolving {
+            inner,
+            cache,
+            last: Default::default(),
+        }
+    }
+
+    /// Whether `did` may be resolved again now (and note that it is).
+    fn may_re_resolve(&self, did: &str) -> bool {
+        let mut last = self.last.lock().expect("lock");
+        let now = std::time::Instant::now();
+        if last
+            .get(did)
+            .is_some_and(|t| now.duration_since(*t) < RE_RESOLVE_EVERY)
+        {
+            return false;
+        }
+        if last.len() > 1024 {
+            last.retain(|_, t| now.duration_since(*t) < RE_RESOLVE_EVERY);
+        }
+        last.insert(did.to_string(), now);
+        true
+    }
+}
+
+#[async_trait]
+impl ProofCheck for ReResolving {
+    async fn verify_raw(&self, doc: &Value) -> Result<(), VerificationError> {
+        match self.inner.verify_raw(doc).await {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                let Some(issuer) = doc.get("issuer").and_then(Value::as_str) else {
+                    return Err(first);
+                };
+                // Only a network-resolved DID can have changed.
+                if issuer.starts_with("did:key:")
+                    || issuer.starts_with("did:peer:")
+                    || !self.may_re_resolve(issuer)
+                {
+                    return Err(first);
+                }
+                tracing::info!(%issuer, "a proof failed against the cached DID document; resolving it again");
+                self.cache.evict(issuer).await;
+                self.inner.verify_raw(doc).await
+            }
+        }
+    }
+}
+
 /// A document that passed steps 1–6: from the VTC, to this bridge, fresh,
 /// and signed. Only [`DocChecker::check`] makes one.
 #[derive(Debug, Clone)]
@@ -505,6 +589,84 @@ pub fn is_type<P: trust_tasks_rs::Payload>(v: &VerifiedDoc) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Fails until the cache is evicted once — a document cached from
+    /// before the issuer rotated its key.
+    struct Stale {
+        evicted: std::sync::atomic::AtomicBool,
+        checks: std::sync::atomic::AtomicU32,
+        fresh_passes: bool,
+    }
+
+    #[async_trait]
+    impl ProofCheck for Stale {
+        async fn verify_raw(&self, _doc: &Value) -> Result<(), VerificationError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.checks.fetch_add(1, SeqCst);
+            if self.evicted.load(SeqCst) && self.fresh_passes {
+                Ok(())
+            } else {
+                Err(VerificationError::UnsupportedCryptosuite("stale".into()))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Evict for Stale {
+        async fn evict(&self, _did: &str) {
+            self.evicted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_proof_is_checked_once_more_against_a_fresh_document() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let doc = serde_json::json!({ "issuer": "did:webvh:QmVtc:acme-vtc.example" });
+        for fresh_passes in [true, false] {
+            let s = Arc::new(Stale {
+                evicted: false.into(),
+                checks: 0.into(),
+                fresh_passes,
+            });
+            let r = ReResolving::new(s.clone(), s.clone());
+            assert_eq!(r.verify_raw(&doc).await.is_ok(), fresh_passes);
+            assert_eq!(
+                s.checks.load(SeqCst),
+                2,
+                "once more, never again (fails closed)"
+            );
+            assert!(s.evicted.load(SeqCst));
+        }
+        // Once per DID per interval: a second failure soon after is refused
+        // without resolving again.
+        let s = Arc::new(Stale {
+            evicted: false.into(),
+            checks: 0.into(),
+            fresh_passes: false,
+        });
+        let r = ReResolving::new(s.clone(), s.clone());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert!(r.verify_raw(&doc).await.is_err());
+        assert_eq!(
+            s.checks.load(SeqCst),
+            3,
+            "the second failure is not re-resolved"
+        );
+        // A did:key cannot have changed: no second try.
+        let s = Arc::new(Stale {
+            evicted: false.into(),
+            checks: 0.into(),
+            fresh_passes: true,
+        });
+        let r = ReResolving::new(s.clone(), s.clone());
+        assert!(
+            r.verify_raw(&serde_json::json!({ "issuer": "did:key:z6Mk" }))
+                .await
+                .is_err()
+        );
+        assert_eq!(s.checks.load(SeqCst), 1);
+    }
+
     use super::*;
     use serde_json::json;
     use trust_tasks_proof::affinidi::Verifier;
