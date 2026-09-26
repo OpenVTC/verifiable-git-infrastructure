@@ -6815,6 +6815,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vgi-bridge"
 version = "0.4.15"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-messaging-core",
  "affinidi-messaging-delivery",
  "affinidi-tdk",
@@ -6829,6 +6830,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "multibase",
  "pgp",
  "rand 0.8.8",
  "redb",

@@ -121,10 +121,16 @@ pub struct VerifyTrustVerifier {
     /// Per GitHub host, the configured `web-flow` keyring, where one is.
     keyrings: BTreeMap<String, PathBuf>,
     tdk: OnceCell<Arc<affinidi_tdk::TDK>>,
-    /// The discovered endpoint. Dropped whenever the registry could not be
-    /// consulted, so the next check discovers it again (a registry that
-    /// moved is found without a restart).
-    registry_url: tokio::sync::Mutex<Option<String>>,
+    /// How long a resolved DID document (and the endpoint read from the
+    /// registry's) is kept.
+    ttl: std::time::Duration,
+    /// The discovered endpoint, and when. Dropped whenever the registry
+    /// could not be consulted and once it is older than `ttl`, so the next
+    /// check discovers it again (a registry that moved is found without a
+    /// restart).
+    registry_url: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Signer DIDs resolved again after an unknown key, and when.
+    re_resolved: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// A fixed endpoint (tests; a registry that publishes none).
     registry_override: Option<String>,
 }
@@ -144,7 +150,9 @@ impl VerifyTrustVerifier {
                 .filter_map(|g| g.platform_keyring_file.clone().map(|k| (g.host.clone(), k)))
                 .collect(),
             tdk: OnceCell::new(),
+            ttl: std::time::Duration::from_secs(cfg.did_cache_ttl_secs),
             registry_url: tokio::sync::Mutex::new(None),
+            re_resolved: Default::default(),
             registry_override: None,
         }
     }
@@ -160,12 +168,25 @@ impl VerifyTrustVerifier {
             return Ok(u.clone());
         }
         let mut cached = self.registry_url.lock().await;
-        if let Some(u) = cached.as_ref() {
+        if let Some((u, at)) = cached.as_ref()
+            && at.elapsed() < self.ttl
+        {
             return Ok(u.clone());
         }
         let u = verify_trust::resolve_registry_endpoint(tdk, &self.registry_did).await?;
-        *cached = Some(u.clone());
+        *cached = Some((u.clone(), std::time::Instant::now()));
         Ok(u)
+    }
+
+    async fn resolver(&self) -> Result<&Arc<affinidi_tdk::TDK>> {
+        let ttl = u32::try_from(self.ttl.as_secs()).unwrap_or(u32::MAX);
+        self.tdk
+            .get_or_try_init(|| async {
+                verify_trust::build_resolver_with_cache_ttl(false, ttl)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
     }
 
     async fn forget_endpoint(&self) {
@@ -182,12 +203,77 @@ impl CommitVerifier for VerifyTrustVerifier {
         fallback: &str,
     ) -> Result<Vec<CommitLine>> {
         let claimed = verify_trust::claimed_signer_dids(range, self.max_signers)?;
-        let tdk = self
-            .tdk
-            .get_or_try_init(|| async { verify_trust::build_resolver(false).await.map(Arc::new) })
+        let tdk = self.resolver().await?;
+        let lines = self
+            .verify_once(tdk, range, resource, fallback, &claimed)
             .await?;
+        // A signer that rotated its key since its document was cached shows
+        // up as an unknown key (or an unresolved DID): resolve those DIDs
+        // afresh and check once more before failing the commits (closed).
+        let stale: Vec<String> = lines
+            .1
+            .iter()
+            .filter_map(|s| match s {
+                verify_trust::CommitStatus::UnknownKey { did, .. }
+                | verify_trust::CommitStatus::UnresolvedSigner { did, .. } => Some(did.clone()),
+                _ => None,
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(lines.0);
+        }
+        // At most once per DID per interval (a signer DID is attacker-chosen
+        // on a fork PR: it must not steer the bridge into re-fetching at will).
+        let stale: Vec<String> = {
+            let mut last = self.re_resolved.lock().await;
+            let now = std::time::Instant::now();
+            last.retain(|_, t| now.duration_since(*t) < crate::wire::RE_RESOLVE_EVERY);
+            stale
+                .into_iter()
+                .filter(|d| last.insert(d.clone(), now).is_none())
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(lines.0);
+        }
+        for did in &stale {
+            let _ = tdk.did_resolver().remove(did).await;
+        }
+        tracing::info!(signers = ?stale, "re-resolving signer DIDs after an unknown key");
+        Ok(self
+            .verify_once(tdk, range, resource, fallback, &claimed)
+            .await?
+            .0)
+    }
+
+    async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
+        use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqpQuery};
+        let tdk = self.resolver().await?;
+        let url = self.endpoint(tdk).await?;
+        let transport = HttpsTransport::new(HttpsTransportConfig::new(&url))?;
+        let client = TrqlClient::new(Arc::new(transport), &self.registry_did);
+        let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
+        match client.authorization(query).await {
+            Ok(r) => Ok(Some(r.authorized)),
+            // The registry answered and refused the tuple: a denial.
+            Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl VerifyTrustVerifier {
+    /// One verification of `range`: the lines, and each commit's status.
+    async fn verify_once(
+        &self,
+        tdk: &affinidi_tdk::TDK,
+        range: &[RangeCommit],
+        resource: &str,
+        fallback: &str,
+        claimed: &[String],
+    ) -> Result<(Vec<CommitLine>, Vec<verify_trust::CommitStatus>)> {
         let registry_url = self.endpoint(tdk).await?;
-        let signers = verify_trust::resolve_signer_keys(tdk, &claimed).await?;
+        let signers = verify_trust::resolve_signer_keys(tdk, claimed).await?;
         let host = resource.split('/').next().unwrap_or_default();
         let exempt = match self.keyrings.get(host) {
             Some(p) => Some(verify_trust::pgp_exempt::ExemptKeyring::load(p)?),
@@ -226,7 +312,8 @@ impl CommitVerifier for VerifyTrustVerifier {
         }) {
             self.forget_endpoint().await;
         }
-        Ok(report
+        let statuses = report.commits.iter().map(|c| c.status.clone()).collect();
+        let lines = report
             .commits
             .into_iter()
             .map(|c| {
@@ -236,25 +323,8 @@ impl CommitVerifier for VerifyTrustVerifier {
                     .unwrap_or_else(|| format!("{:?}", c.status));
                 CommitLine::new(c.sha, c.status.passes(), verdict)
             })
-            .collect())
-    }
-
-    async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
-        use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqpQuery};
-        let tdk = self
-            .tdk
-            .get_or_try_init(|| async { verify_trust::build_resolver(false).await.map(Arc::new) })
-            .await?;
-        let url = self.endpoint(tdk).await?;
-        let transport = HttpsTransport::new(HttpsTransportConfig::new(&url))?;
-        let client = TrqlClient::new(Arc::new(transport), &self.registry_did);
-        let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
-        match client.authorization(query).await {
-            Ok(r) => Ok(Some(r.authorized)),
-            // The registry answered and refused the tuple: a denial.
-            Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
-            Err(e) => Err(e.into()),
-        }
+            .collect();
+        Ok((lines, statuses))
     }
 }
 

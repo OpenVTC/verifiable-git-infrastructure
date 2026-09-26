@@ -1,8 +1,9 @@
 # VGI bridge configuration — one community, one bridge (design §5.7).
 #
 # Nothing secret belongs in this file: keys, tokens and passwords live in the
-# sealed store (`vgi-bridge secret set …`, the GitHub manifest flow). Unknown
-# keys are refused at start-up.
+# sealed store — or, in VTA mode (the `[vta]` section below), in the bridge's
+# trust context of the VTC's VTA (`vgi-bridge secret set …`, the GitHub
+# manifest flow). Unknown keys are refused at start-up.
 
 # The one VTC this bridge serves. Jobs signed by any other DID are refused.
 vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
@@ -24,9 +25,39 @@ data_dir = "/var/lib/vgi-bridge"
 
 # The master key that seals every secret: a mounted, owner-only file
 # (a Kubernetes/Docker secret). Back it up apart from the data directory.
+# Not used (and refused) in VTA mode.
 master_key_file = "/run/secrets/vgi-bridge-master-key"
 # …or an environment variable instead:
 # master_key_env = "VGI_BRIDGE_MASTER_KEY"
+
+# VTA mode (recommended; BRIDGE.md §2): the bridge's DID, keys, secrets and
+# state live in its own trust context of the VTC's VTA, and this host holds
+# only a context-scoped credential. Losing the host then loses nothing: issue
+# a new credential and start the bridge on an empty data directory. Remove
+# `master_key_file` / `master_key_env` when you turn it on.
+# [vta]
+# context = "vgi-bridge"
+# # The credential bundle the VTA issued (JSON; owner-only file).
+# credential_file = "/run/secrets/vgi-bridge-vta-credential"
+# # …or an environment variable (cleared once read):
+# # credential_env = "VGI_BRIDGE_VTA_CREDENTIAL"
+# # The bridge reaches the VTA over DIDComm, always (the VTA releases keys
+# # only end to end); through this mediator, by default the bridge's own.
+# # mediator_did = "did:web:mediator.acme-vtc.example"
+# # url = "https://vta.acme-vtc.example"
+# # The bridge's DID; default: the context's DID.
+# # did = "did:webvh:…"
+# # How long start-up waits for an unreachable VTA, and how often the bridge
+# # asks it whether its keys were rotated (SIGHUP asks at once).
+# # start_timeout_secs = 300
+# # key_refresh_secs = 60
+# # How long a newly listed signing key must be in the DID document before
+# # the bridge signs with it (verifiers' cached copies must have it first).
+# # signing_switch_after_secs = 86400
+
+# How long a resolved DID document is trusted (the VTC's, the registry's,
+# commit signers'), in seconds; a failure is re-checked against a fresh one.
+# did_cache_ttl_secs = 60
 
 # Oldest job accepted, in seconds (plus a minute of clock skew).
 # max_job_age_secs = 300

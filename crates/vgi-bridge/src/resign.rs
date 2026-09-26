@@ -538,7 +538,7 @@ pub(crate) fn check_hint(
              runs again on the re-signed head — unless they change `{WORKFLOWS}/`, which the \
              bridge never re-signs. If the re-signed commits fail too, the VTC has not granted \
              the bridge `git.commit.sign` on this namespace.",
-            bridge.identity.did()
+            bridge.did()
         ),
         Err(why) if why.contains(WORKFLOWS) => format!(
             "\n\n**Dependabot.** This pull request changes `{WORKFLOWS}/`, and the bridge never \
@@ -777,7 +777,7 @@ pub async fn run(
         });
     }
 
-    let signing = bridge.identity.git_signing_key()?;
+    let signing = bridge.identity().git_signing_key()?;
     if fetched
         .commits
         .iter()
@@ -1116,11 +1116,11 @@ pub(crate) async fn warn_if_ungranted(bridge: &Bridge, ns_id: &str) {
     match bridge
         .checks
         .verifier
-        .commit_sign_granted(bridge.identity.did(), ns.resource.as_str())
+        .commit_sign_granted(bridge.did(), ns.resource.as_str())
         .await
     {
         Ok(Some(false)) => tracing::warn!(
-            namespace = %ns_id, resource = %ns.resource, did = %bridge.identity.did(),
+            namespace = %ns_id, resource = %ns.resource, did = %bridge.did(),
             "the registry does not grant this bridge's DID git.commit.sign on the namespace: \
              Dependabot pull requests it re-signs will fail the check until the VTC grants it"
         ),
