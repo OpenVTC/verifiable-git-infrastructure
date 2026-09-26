@@ -319,10 +319,21 @@ impl BridgeIdentity {
 
     /// Sign a Trust Task document (`eddsa-jcs-2022`, `assertionMethod`).
     /// `doc.issuer` must already be this DID.
+    ///
+    /// `assertionMethod` is passed explicitly rather than left to
+    /// `SignOptions`' default: trust-tasks-proof 0.23 changed that default
+    /// to `authentication` (SPEC's own examples use it), but this bridge
+    /// and the VTC-side checks it faces (`wire::DocChecker::check`) still
+    /// require `assertionMethod` on both sides of the wire — see the
+    /// `proofPurpose` follow-up in #91.
     pub async fn sign(&self, doc: &Value) -> Result<Value> {
-        sign_trust_task(doc, &self.signing, SignOptions::new())
-            .await
-            .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
+        sign_trust_task(
+            doc,
+            &self.signing,
+            SignOptions::new().with_proof_purpose("assertionMethod"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
     }
 }
 
