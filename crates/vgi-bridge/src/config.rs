@@ -1121,6 +1121,25 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
+    fn role_map_repos_are_the_owners_own() {
+        // Two Apps on github.com, one configured repository map under the
+        // second: only that organisation's report lists it.
+        let text = format!(
+            "{EXAMPLE}\n[[github]]\napp_name = \"globex-vgi-bridge\"\napp_owner = \"globex\"\n\n\
+             [github.namespaces.globex.repos.w.role_map]\ncommit = \"write\"\n"
+        );
+        let c = BridgeConfig::parse(&text).unwrap();
+        let listed = |ns: &str| -> Vec<String> {
+            c.role_map_repos(&res(ns))
+                .into_iter()
+                .map(|r| r.to_string())
+                .collect()
+        };
+        assert_eq!(listed("github.com/globex"), vec!["github.com/globex/w"]);
+        assert!(listed("github.com/acme").is_empty());
+    }
+
+    #[test]
     fn the_shipped_example_parses() {
         let c = BridgeConfig::parse(include_str!("../bridge.example.toml")).unwrap();
         assert_eq!(c.github.len(), 1);
