@@ -47,22 +47,15 @@ pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
 /// [`event_type_uri`].
 pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event;
 /// The payload types of `git-ns/bridge/job` 0.4, the only version this
-/// bridge takes. 0.4's payload has 0.3's shape — it adds rules the schema
-/// does not state, checked in [`check_kind_members`] — so it is read with
-/// the generated 0.3 types until a `trust-tasks-rs` release carries 0.4's.
-///
-/// TODO(trust-tasks release carrying trust-tasks #635): use the generated
-/// `job::v0_4` here, and its `TYPE_URI` in place of the hand-written
-/// [`JOB_TYPE`].
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_3 as job;
+/// bridge takes. It adds rules the schema does not state, checked in
+/// [`check_kind_members`]: a namespace admin with no right of their own on
+/// a repository is listed at `git.ns.admin` and gets no role; there is no
+/// namespace-level `projectRoles`; each account appears once.
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_4 as job;
 pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
 
-/// `git-ns/bridge/job/0.4`. A namespace admin with no right of their own on
-/// a repository is listed at `git.ns.admin` and gets no role; there is no
-/// namespace-level `projectRoles`; each account appears once. Written by
-/// hand until the trust-tasks release that generates `job::v0_4` (TODO,
-/// with trust-tasks #635).
-pub const JOB_TYPE: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
+/// `git-ns/bridge/job/0.4`'s type URI.
+pub const JOB_TYPE: &str = <job::Payload as trust_tasks_rs::Payload>::TYPE_URI;
 
 /// `trust-task-discovery/0.2`, which a VTC asks before it sends 0.4 jobs
 /// (`git-ns/bridge/job` 0.4 forbids sending 0.4 to a bridge that has not

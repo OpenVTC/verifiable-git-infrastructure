@@ -332,29 +332,29 @@ affinidi-messaging-test-mediator = { version = "0.10.2", features = ["tsp"] }
 # it reaches verify-trust, vgi-core or did-git-sign.
 #
 # The git-ns/bridge/{job,result,event} payload types are generated from the
-# normative specifications and published in trust-tasks-rs 0.22 (`specs::
-# git_ns`), so the bridge takes that line. The rest of this workspace is still
-# on 0.21 through trql-client and vta-sdk, so `cargo tree -i trust-tasks-rs`
-# shows two nodes — a *known*, bounded split, the weaker form the trql-client
-# note above describes: the bridge is `publish = false`, passes no trust-tasks
-# type across the vta-sdk or trql-client boundary (it signs and verifies with
-# trust-tasks-proof on the 0.22 line), and did-git-sign — the crate OpenVTC
-# consumes — is unaffected. It closes when vta-sdk and trql-client move to 0.22.
+# normative specifications and published in trust-tasks-rs (`specs::
+# git_ns`), so the bridge takes that line. The rest of this workspace's
+# published-crate dependencies (vta-sdk 0.51, and trql-client below them) are
+# still on 0.22 and 0.21 respectively, so `cargo tree -i trust-tasks-rs` shows
+# three nodes — a *known*, bounded split, the weaker form the trql-client
+# note above describes: the bridge is `publish = false`, passes no
+# trust-tasks type across the vta-sdk or trql-client boundary (it signs and
+# verifies with trust-tasks-proof on the same line), and did-git-sign — the
+# crate OpenVTC consumes — is unaffected. It closes as vta-sdk and
+# trql-client publish onto this line.
 #
-# 0.22.5 is the floor because it carries `git-ns/bridge/event` 0.2 (a
-# transfer detaches; every resource lies inside the event's namespace), on
-# top of 0.22.4's `git-ns/bridge/job` 0.2 (`removeAccounts`, what a
-# `git-ns/drift/resolve` revert of `roleAdded` sends). It moves within the
-# 0.22 line, so the split stays exactly two nodes: vta-sdk 0.51 already
-# resolves 0.22 here, and the 0.21 node that remains comes only through
-# trql-client 0.18 (and the affinidi-tdk 0.16 it pulls).
-trust-tasks-rs = { version = "0.22.5", default-features = false, features = ["git-ns"] }
+# 0.23 carries `git-ns/bridge/job` 0.4 generated (`specs::git_ns::bridge::
+# job::v0_4`; wire-identical to 0.3, so the swap from the generated 0.3
+# types this bridge previously read it with is source-only) and
+# `git-ns/namespace/reseat` 0.3, on top of everything the 0.22 line already
+# carried. It is its own node, so the split widens from two to three: 0.21
+# through trql-client, 0.22 through vta-sdk 0.51 (and verify-trust, which
+# builds against it), 0.23 here.
+trust-tasks-rs = { version = "0.23", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
-# dependencies are the versions the TDK already builds here. There is no
-# 0.22.5 of it on crates.io: 0.22.4 takes `trust-tasks-rs` on the 0.22 line
-# and resolves the same 0.22.5 node.
-trust-tasks-proof = "0.22.4"
+# dependencies are the versions the TDK already builds here.
+trust-tasks-proof = "0.23.0"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each
