@@ -40,6 +40,19 @@
 //! report nobody authenticated — is ignored, and a query that never gets a
 //! proven answer times out as `registryUnavailable`, never as a pass.
 //!
+//! # Querying as a caller's own DID
+//!
+//! A caller that already holds a stable DID and a live mediator session —
+//! the bridge — queries through [`Registry::over_channel`] instead, so its
+//! queries go out as its own DID on the socket it already has (the mediator
+//! permits one websocket per DID). The channel receives replies already
+//! unpacked, so it cannot re-check the envelope header above; it relies on
+//! the messaging SDK's own binding of the authcrypt sender to the key used
+//! (affinidi-messaging-sdk 0.27.2 / affinidi-messaging-didcomm 0.15.9 and
+//! later, which this crate requires). verify-trust still gives every channel
+//! query a fresh random id, requires the reply to answer it, and latches the
+//! first transport failure for the rest of the check.
+//!
 //! Over HTTPS the answer carries no signature, as before: trust rests on
 //! reaching the endpoint the registry's DID document names (or the explicit
 //! `--registry-url` override).
@@ -225,6 +238,113 @@ pub fn select_route(
     }
 }
 
+/// A channel to the registry owned by the caller, for [`Registry::over_channel`].
+///
+/// The bridge implements this over its existing mediator session, so its
+/// queries go out as its own DID on the socket it already holds.
+///
+/// # Security
+///
+/// **Implementing this trait is security-critical.** verify-trust does not
+/// see the transport envelope on this path, so it cannot check who sent a
+/// reply: the channel is the only thing standing between a forged answer and
+/// an authorization verdict. An implementation **MUST** return from
+/// [`exchange`](Self::exchange) only a reply whose *transport-verified*
+/// sender is the registry DID it was sent to — authenticated by the
+/// registry's own key (for DIDComm, authcrypt whose sender the key agreement
+/// actually used, never a sender merely claimed in a header or the body) —
+/// and **MUST** drop anything else (unauthenticated, anoncrypt, another
+/// sender) rather than return it. A channel that
+/// cannot prove the sender must not be used with [`Registry::over_channel`].
+#[async_trait::async_trait]
+pub trait RegistryChannel: Send + Sync {
+    /// The binding this channel speaks.
+    fn kind(&self) -> TransportKind;
+
+    /// The DID queries are sent as. Stamped as the documents' `issuer`, which
+    /// the registry checks against the transport-authenticated sender.
+    fn sender_did(&self) -> &str;
+
+    /// Send the Trust Task `request` document to `recipient` and return the
+    /// reply document.
+    ///
+    /// **Contract:** return only a reply that the transport authenticated as
+    /// sent by `recipient` — a verified sender whose key the key agreement
+    /// actually used — and whose `threadId` is the request's `id`. Everything
+    /// above this (the tuple echo, the verdict) assumes it. The wait must be
+    /// finite: a registry that never answers is a [`TrqlError::Timeout`].
+    async fn exchange(&self, recipient: &str, request: Value) -> Result<Value, TrqlError>;
+}
+
+/// [`TrqlTransport`] over a [`RegistryChannel`], in JSON so the channel's
+/// owner needs no `trust-tasks-rs` of this line.
+///
+/// Every query goes out under a fresh random id (whatever the client chose),
+/// a reply must carry that id as its thread, and the first transport failure
+/// or timeout is latched: later queries in the same check fail at once with
+/// it rather than each waiting out their own timeout.
+struct ChannelTransport {
+    channel: Arc<dyn RegistryChannel>,
+    failed: std::sync::Mutex<Option<String>>,
+}
+
+impl ChannelTransport {
+    fn new(channel: Arc<dyn RegistryChannel>) -> Self {
+        Self {
+            channel,
+            failed: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn latched(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.failed.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[async_trait::async_trait]
+impl TrqlTransport for ChannelTransport {
+    fn kind(&self) -> TransportKind {
+        self.channel.kind()
+    }
+
+    async fn exchange(&self, mut request: TrustTask<Value>) -> Result<TrustTask<Value>, TrqlError> {
+        let kind = self.channel.kind();
+        if let Some(why) = self.latched().clone() {
+            return Err(TrqlError::Transport { kind, detail: why });
+        }
+        let recipient = request.recipient.clone().ok_or_else(|| {
+            TrqlError::Config("request document has no recipient to route to".to_string())
+        })?;
+        let client_id = std::mem::replace(&mut request.id, random_task_id());
+        let sent_id = request.id.clone();
+        let body = serde_json::to_value(&request)
+            .map_err(|e| TrqlError::Contract(format!("request did not serialize: {e}")))?;
+        let reply = match self.channel.exchange(&recipient, body).await {
+            Ok(reply) => reply,
+            Err(e @ (TrqlError::Timeout { .. } | TrqlError::Transport { .. })) => {
+                *self.latched() = Some(format!("an earlier registry query failed: {e}"));
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut reply: TrustTask<Value> = serde_json::from_value(reply)
+            .map_err(|e| TrqlError::Contract(format!("reply is not a Trust Task document: {e}")))?;
+        if reply.thread_id.as_deref() != Some(sent_id.as_str()) {
+            return Err(TrqlError::Contract(format!(
+                "reply threadId {:?} does not answer request {sent_id}",
+                reply.thread_id
+            )));
+        }
+        reply.thread_id = Some(client_id);
+        Ok(reply)
+    }
+}
+
+/// A Trust Task id from the OS CSPRNG (UUID v4).
+pub(crate) fn random_task_id() -> String {
+    format!("urn:uuid:{}", uuid::Uuid::new_v4())
+}
+
 /// How verify-trust queries the registry for one run: the client, and the
 /// session behind it when there is one.
 pub struct Registry {
@@ -252,6 +372,28 @@ impl Registry {
             #[cfg(any(feature = "didcomm", feature = "tsp"))]
             session: None,
         })
+    }
+
+    /// Query through a channel the caller owns (the bridge's session), as the
+    /// channel's DID ([`RegistryChannel::sender_did`] is stamped as each
+    /// document's `issuer`).
+    ///
+    /// # Security
+    ///
+    /// The verdict is only as trustworthy as `channel`: this constructor
+    /// cannot check that replies came from `registry_did`. The channel
+    /// **MUST** meet [`RegistryChannel`]'s security contract — deliver only
+    /// replies whose transport-verified sender is `registry_did`.
+    pub fn over_channel(channel: Arc<dyn RegistryChannel>, registry_did: &str) -> Self {
+        let kind = channel.kind();
+        let sender = channel.sender_did().to_string();
+        Self {
+            client: TrqlClient::new(Arc::new(ChannelTransport::new(channel)), registry_did)
+                .with_client_did(sender),
+            kind,
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            session: None,
+        }
     }
 
     /// Query over an arbitrary transport — tests only. A real transport must
@@ -731,11 +873,6 @@ mod mediated {
                 close_session(&self.shared, session).await;
             }
         }
-    }
-
-    /// A Trust Task id from the OS CSPRNG (UUID v4).
-    pub(crate) fn random_task_id() -> String {
-        format!("urn:uuid:{}", uuid::Uuid::new_v4())
     }
 
     async fn close_session(shared: &TDKSharedState, session: Session) {
@@ -1477,11 +1614,136 @@ mod tests {
     #[cfg(any(feature = "didcomm", feature = "tsp"))]
     #[test]
     fn query_ids_are_random_uuid_v4() {
-        let a = mediated::random_task_id();
-        let b = mediated::random_task_id();
+        let a = random_task_id();
+        let b = random_task_id();
         assert_ne!(a, b);
         let uuid = uuid::Uuid::parse_str(a.strip_prefix("urn:uuid:").unwrap()).unwrap();
         assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+    }
+
+    // --- a caller-owned channel ---
+
+    /// A channel that answers with `reply(request)`, counting calls.
+    struct Scripted<F: Fn(&Value) -> Result<Value, TrqlError> + Send + Sync> {
+        reply: F,
+        calls: std::sync::atomic::AtomicUsize,
+        ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl<F: Fn(&Value) -> Result<Value, TrqlError> + Send + Sync> RegistryChannel for Scripted<F> {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Didcomm
+        }
+        fn sender_did(&self) -> &str {
+            "did:webvh:QmBridge:bridge.example"
+        }
+        async fn exchange(&self, recipient: &str, request: Value) -> Result<Value, TrqlError> {
+            assert_eq!(recipient, REGISTRY);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ids
+                .lock()
+                .unwrap()
+                .push(request["id"].as_str().unwrap().to_string());
+            (self.reply)(&request)
+        }
+    }
+
+    fn scripted<F: Fn(&Value) -> Result<Value, TrqlError> + Send + Sync>(f: F) -> Arc<Scripted<F>> {
+        Arc::new(Scripted {
+            reply: f,
+            calls: Default::default(),
+            ids: Default::default(),
+        })
+    }
+
+    fn authorized(request: &Value, thread: &Value) -> Value {
+        let p = &request["payload"];
+        serde_json::json!({
+            "id": "urn:uuid:reply",
+            "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+            "threadId": thread,
+            "payload": {
+                "entity_id": p["entity_id"], "authority_id": p["authority_id"],
+                "action": p["action"], "resource": p["resource"],
+                "authorized": true, "time_evaluated": "2026-09-25T00:00:00Z"
+            }
+        })
+    }
+
+    fn channel_query() -> trql_client::TrqpQuery {
+        trql_client::TrqpQuery::new("did:example:e", "did:example:a", "git.commit.sign", "r")
+    }
+
+    #[tokio::test]
+    async fn a_channel_query_goes_out_as_the_channel_owner_under_a_random_id() {
+        let channel = scripted(|req| {
+            assert_eq!(req["issuer"], "did:webvh:QmBridge:bridge.example");
+            Ok(authorized(req, &req["id"]))
+        });
+        let registry = Registry::over_channel(channel.clone(), REGISTRY);
+        assert!(
+            registry
+                .client()
+                .authorization(channel_query())
+                .await
+                .unwrap()
+                .authorized
+        );
+        assert!(
+            registry
+                .client()
+                .authorization(channel_query())
+                .await
+                .unwrap()
+                .authorized
+        );
+        let ids = channel.ids.lock().unwrap().clone();
+        assert_ne!(ids[0], ids[1]);
+        for id in ids {
+            let uuid = uuid::Uuid::parse_str(id.strip_prefix("urn:uuid:").unwrap()).unwrap();
+            assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_reply_to_another_thread_is_refused() {
+        let channel = scripted(|req| Ok(authorized(req, &serde_json::json!("urn:uuid:other"))));
+        let registry = Registry::over_channel(channel, REGISTRY);
+        let e = registry
+            .client()
+            .authorization(channel_query())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, TrqlError::Contract(_)), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_channel_failure_is_latched_for_the_rest_of_the_check() {
+        let channel = scripted(|_| {
+            Err(TrqlError::Timeout {
+                kind: TransportKind::Didcomm,
+                waited_secs: 30,
+            })
+        });
+        let registry = Registry::over_channel(channel.clone(), REGISTRY);
+        let first = registry
+            .client()
+            .authorization(channel_query())
+            .await
+            .unwrap_err();
+        assert!(matches!(first, TrqlError::Timeout { .. }), "{first}");
+        let second = registry
+            .client()
+            .authorization(channel_query())
+            .await
+            .unwrap_err();
+        assert!(matches!(second, TrqlError::Transport { .. }), "{second}");
+        assert_eq!(
+            channel.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second query is not sent"
+        );
     }
 
     // --- the run identity ---

@@ -615,6 +615,29 @@ impl GitHubForge {
 
     // ── reads ────────────────────────────────────────────────────────────
 
+    /// Where repository `id` is now, as namespace `ns`'s installation sees it
+    /// (`GET /repositories/{id}` with that installation's token): `None` if
+    /// it cannot see it. What a transfer into `ns` is confirmed by — GitHub's
+    /// word, not a webhook's.
+    pub async fn repository_by_id(&self, ns: &Resource, id: u64) -> Result<Option<Resource>> {
+        let namespace = self.namespace(ns)?;
+        let token = self
+            .installation_token(&namespace, None, PERMS_METADATA)
+            .await?;
+        let url = self.api.url(&["repositories", &id.to_string()]);
+        let r: Option<RepoJson> = self
+            .api
+            .get_opt(url, Auth::Bearer(&token), "repository")
+            .await?;
+        match r {
+            Some(r) if r.id == id => Ok(Some(Resource::parse_owner_repo(&format!(
+                "{}/{}",
+                self.config.host, r.full_name
+            ))?)),
+            _ => Ok(None),
+        }
+    }
+
     fn repo_state(&self, r: &RepoJson) -> Result<RepoState> {
         let resource =
             Resource::parse_owner_repo(&format!("{}/{}", self.config.host, r.full_name))?;

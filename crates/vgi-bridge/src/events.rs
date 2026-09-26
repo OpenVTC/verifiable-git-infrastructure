@@ -28,23 +28,138 @@ use crate::store::{BranchLedger, NamespaceRecord, NamespaceState, RepoRecord, Ta
 /// (spec).
 const NAMESPACE_REPOS: [&str; 1] = [".vgi"];
 
-/// Handle a webhook for `host`. Returns the status to answer the forge
-/// with.
+/// The adapter a delivery is for: the GitHub App the route names
+/// (`/github/<host>/<owner>/webhook`), or the Forgejo host's. Its own
+/// webhook secret must verify the delivery.
+fn webhook_adapter(
+    bridge: &Bridge,
+    host: &str,
+    owner: Option<&str>,
+) -> Option<crate::registry::Adapter> {
+    match owner {
+        Some(o) => bridge.adapters.get_github(host, o),
+        None => bridge.adapters.get(host),
+    }
+}
+
+/// Whose deliveries these are. A GitHub App's webhook secret is set by the
+/// organisation that owns the App, so a delivery it verifies speaks for that
+/// organisation **only**: every namespace, repository and installation it
+/// may touch is its owner's. A Forgejo bot's covers its host.
+#[derive(Debug, Clone)]
+pub(crate) struct Scope {
+    host: String,
+    /// The GitHub App's owner (lowercase); `None` for Forgejo.
+    owner: Option<String>,
+}
+
+impl Scope {
+    /// Whether `r` lies in this scope.
+    pub(crate) fn covers(&self, r: &Resource) -> bool {
+        r.host() == self.host
+            && self
+                .owner
+                .as_ref()
+                .is_none_or(|o| r.owner().eq_ignore_ascii_case(o))
+    }
+
+    /// Whether a delivery about repository `repo` (forge id `id`) may be
+    /// acted on: `repo` is in scope, and the repository the bridge records
+    /// under that id (if any) is too — a delivery cannot name another
+    /// owner's repository by its id. With `need_record`, the id must be one
+    /// the bridge manages.
+    pub(crate) fn admits_repo(
+        &self,
+        bridge: &Bridge,
+        repo: &Resource,
+        id: u64,
+        need_record: bool,
+    ) -> bool {
+        if !self.covers(repo) {
+            return false;
+        }
+        match repo_record(bridge, &self.host, id) {
+            Some(rec) => {
+                self.covers(&rec.resource)
+                    && namespace_record(bridge, &rec.namespace)
+                        .is_some_and(|n| self.covers(&n.resource))
+            }
+            None => !need_record,
+        }
+    }
+
+    /// Whether every resource an event names lies in scope. A transfer may
+    /// name the other side's owner (it moved in or out), but one of its
+    /// sides must be this owner's.
+    fn admits(&self, kind: &ForgeEventKind) -> bool {
+        match kind {
+            ForgeEventKind::RepoCreated { repo, .. }
+            | ForgeEventKind::RepoDeleted { repo, .. }
+            | ForgeEventKind::RepoArchived { repo, .. }
+            | ForgeEventKind::RepoVisibilityChanged { repo, .. }
+            | ForgeEventKind::CollaboratorChanged { repo, .. } => self.covers(repo),
+            ForgeEventKind::RepoRenamed { from, to, .. } => self.covers(from) && self.covers(to),
+            ForgeEventKind::RepoTransferred {
+                from_namespace, to, ..
+            } => self.covers(to) || from_namespace.as_ref().is_some_and(|f| self.covers(f)),
+            ForgeEventKind::OrgMembershipChanged { namespace, .. }
+            | ForgeEventKind::TeamMembershipChanged { namespace, .. }
+            | ForgeEventKind::InstallationChanged { namespace, .. } => self.covers(namespace),
+            ForgeEventKind::ProtectionChanged {
+                repo, namespace, ..
+            } => self.covers(namespace) && repo.as_ref().is_none_or(|r| self.covers(r)),
+            _ => false,
+        }
+    }
+}
+
+fn repo_record(bridge: &Bridge, host: &str, id: u64) -> Option<RepoRecord> {
+    bridge
+        .store
+        .get::<RepoRecord>(Table::Repos, &repo_key(host, id))
+        .ok()
+        .flatten()
+}
+
+fn namespace_record(bridge: &Bridge, id: &str) -> Option<NamespaceRecord> {
+    bridge
+        .store
+        .get::<NamespaceRecord>(Table::Namespaces, id)
+        .ok()
+        .flatten()
+}
+
+/// Handle a webhook for `host` (and, on GitHub, the App `owner` owns).
+/// Returns the status to answer the forge with.
 pub(crate) async fn on_webhook(
     bridge: &Arc<Bridge>,
     host: &str,
+    owner: Option<&str>,
     headers: &HeaderMap,
     body: &[u8],
 ) -> StatusCode {
-    let Some(adapter) = bridge.adapters.get(host) else {
+    let Some(adapter) = webhook_adapter(bridge, host, owner) else {
         return StatusCode::NOT_FOUND;
+    };
+    let scope = Scope {
+        host: host.to_string(),
+        owner: owner.map(str::to_ascii_lowercase),
     };
 
     #[cfg(feature = "forge-github")]
     if let Some(g) = adapter.github() {
         // A push: the Dependabot re-sign's provenance ledger.
         match g.parse_push(headers, body) {
-            Ok(Some(push)) => return crate::resign::on_push(bridge, host, push),
+            Ok(Some(push)) => {
+                // The provenance ledger the re-sign trusts: only for a
+                // repository this owner's namespace manages.
+                if !scope.admits_repo(bridge, &push.repo, push.repo_id, true) {
+                    tracing::warn!(%host, owner = ?scope.owner, repo = %push.repo, id = push.repo_id,
+                        "dropping a push for a repository outside the App's organisation");
+                    return StatusCode::NO_CONTENT;
+                }
+                return crate::resign::on_push(bridge, host, push);
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(%host, error = %e, "refused a webhook");
@@ -52,7 +167,16 @@ pub(crate) async fn on_webhook(
             }
         }
         match g.parse_check_trigger(headers, body) {
-            Ok(triggers) if !triggers.is_empty() => {
+            Ok(mut triggers) if !triggers.is_empty() => {
+                let before = triggers.len();
+                triggers.retain(|t| scope.admits_repo(bridge, &t.repo, t.repo_id, false));
+                if triggers.len() != before {
+                    tracing::warn!(%host, owner = ?scope.owner,
+                        "dropping check triggers for repositories outside the App's organisation");
+                }
+                if triggers.is_empty() {
+                    return StatusCode::NO_CONTENT;
+                }
                 let key = triggers[0]
                     .delivery_id
                     .as_deref()
@@ -92,6 +216,11 @@ pub(crate) async fn on_webhook(
             return StatusCode::UNAUTHORIZED;
         }
     };
+    if !scope.admits(&event.kind) {
+        tracing::warn!(%host, owner = ?scope.owner, event = ?event.kind,
+            "dropping an event that names a namespace or repository outside the App's organisation");
+        return StatusCode::NO_CONTENT;
+    }
     if seen(bridge, host, event.delivery_id.as_deref()) {
         return StatusCode::OK;
     }
@@ -105,7 +234,7 @@ pub(crate) async fn on_webhook(
     };
     let me = Arc::clone(bridge);
     // Answer the forge now; the inspection that follows may take a while.
-    tokio::spawn(async move { handle(&me, event.kind).await });
+    tokio::spawn(async move { handle(&me, &scope, event.kind).await });
     StatusCode::ACCEPTED
 }
 
@@ -123,23 +252,94 @@ fn seen(bridge: &Bridge, host: &str, delivery: Option<&str>) -> bool {
         .unwrap_or(true)
 }
 
-/// The bound namespace containing `r`.
-fn namespace_for(bridge: &Bridge, r: &Resource) -> Option<NamespaceRecord> {
+/// The bound namespace containing `r`, if it lies in `scope`.
+fn namespace_in(bridge: &Bridge, scope: &Scope, r: &Resource) -> Option<NamespaceRecord> {
+    if !scope.covers(r) {
+        return None;
+    }
     bridge
         .store
         .list::<NamespaceRecord>(Table::Namespaces)
         .ok()?
         .into_iter()
         .map(|(_, n)| n)
-        .find(|n| n.state == NamespaceState::Bound && n.resource.contains(r))
+        .find(|n| {
+            n.state == NamespaceState::Bound && n.resource.contains(r) && scope.covers(&n.resource)
+        })
 }
 
-fn repo_by_id(bridge: &Bridge, host: &str, id: u64) -> Option<RepoRecord> {
+/// The repository the bridge records under forge id `id` in namespace
+/// `ns` — never one of another namespace, whatever id a delivery names.
+fn repo_in(bridge: &Bridge, ns: &NamespaceRecord, id: u64) -> Option<RepoRecord> {
+    repo_record(bridge, ns.resource.host(), id).filter(|r| r.namespace == ns.id)
+}
+
+/// Whether some other namespace than `ns` records or manages forge id `id`.
+fn claimed_elsewhere(bridge: &Bridge, ns: &NamespaceRecord, id: u64) -> bool {
+    let host = ns.resource.host();
+    if repo_record(bridge, host, id).is_some_and(|r| r.namespace != ns.id) {
+        return true;
+    }
     bridge
         .store
-        .get::<RepoRecord>(Table::Repos, &repo_key(host, id))
-        .ok()
-        .flatten()
+        .list::<NamespaceRecord>(Table::Namespaces)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|(_, n)| n.id != ns.id && n.resource.host() == host && n.managed.contains(&id))
+}
+
+/// [`detach`] forge id `id` from `ns` — refused (and logged) when another
+/// namespace records or manages it: a delivery for one namespace never
+/// detaches another's repository.
+fn detach_from(bridge: &Bridge, ns: &NamespaceRecord, id: u64) -> bool {
+    if claimed_elsewhere(bridge, ns, id) {
+        tracing::warn!(namespace = %ns.id, forge_id = id,
+            "not detaching a repository another namespace governs");
+        return false;
+    }
+    detach(bridge, ns.resource.host(), id);
+    true
+}
+
+/// A repository came into namespace `to_ns` that another organisation's
+/// namespace still records (that organisation's App sent no transfer, or
+/// has not yet). One organisation's webhook never changes another's
+/// state on its own word: the move is confirmed with GitHub first — where
+/// `to_ns`'s installation sees repository `forge_id` now — and only then is
+/// the old side detached and told (`repoTransferred`).
+async fn confirm_transfer_in(bridge: &Bridge, to_ns: &NamespaceRecord, forge_id: u64) {
+    let Some(rec) = repo_record(bridge, to_ns.resource.host(), forge_id) else {
+        return;
+    };
+    if rec.namespace == to_ns.id {
+        return;
+    }
+    let Some(old_ns) = namespace_record(bridge, &rec.namespace) else {
+        return;
+    };
+    #[cfg(feature = "forge-github")]
+    {
+        let Some(g) = bridge
+            .adapters
+            .for_resource(&to_ns.resource)
+            .and_then(|a| a.github().cloned())
+        else {
+            return;
+        };
+        match g.repository_by_id(&to_ns.resource, forge_id).await {
+            Ok(Some(now)) if to_ns.resource.contains(&now) && !old_ns.resource.contains(&now) => {
+                tracing::info!(from = %rec.resource, to = %now,
+                    "GitHub confirms a repository moved to another organisation; detaching it there");
+                transferred_out(bridge, &old_ns, &rec.resource, &now, forge_id).await;
+            }
+            Ok(other) => tracing::warn!(forge_id, now = ?other,
+                "a transfer in that GitHub does not confirm; the other organisation's record is left alone"),
+            Err(e) => tracing::warn!(forge_id, error = %e,
+                "could not confirm a transfer with GitHub; the other organisation's record is left alone"),
+        }
+    }
+    #[cfg(not(feature = "forge-github"))]
+    let _ = old_ns;
 }
 
 /// Stop governing repository `forge_id` on `host`: its record, its place in
@@ -171,7 +371,10 @@ pub(crate) fn detach(bridge: &Bridge, host: &str, forge_id: u64) {
         #[cfg(feature = "forge-github")]
         if let (Ok(Some(m)), Some(g)) = (
             managed,
-            bridge.adapters.get(host).and_then(|a| a.github().cloned()),
+            bridge
+                .adapters
+                .for_resource(&ns.resource)
+                .and_then(|a| a.github().cloned()),
         ) {
             g.set_managed_repositories(&ns.resource, m);
         }
@@ -216,7 +419,8 @@ pub(crate) fn detach_reused_name(
 
 /// Report `resource` (forge id `forge_id`) to namespace `ns` as a repository
 /// the VTC did not create or adopt — unless it is the bridge's own
-/// namespace-level repository, or one it manages. A repository this
+/// namespace-level repository, or one `ns` manages (another organisation's
+/// record of it does not stop the report). A repository this
 /// namespace records at the same name under another forge id is detached
 /// first (name reuse).
 pub(crate) async fn report_unmanaged(
@@ -226,7 +430,7 @@ pub(crate) async fn report_unmanaged(
     forge_id: u64,
 ) {
     if NAMESPACE_REPOS.contains(&resource.repo_name().unwrap_or_default())
-        || repo_by_id(bridge, resource.host(), forge_id).is_some()
+        || repo_in(bridge, ns, forge_id).is_some()
     {
         return;
     }
@@ -246,13 +450,22 @@ pub(crate) async fn transferred_out(
     to: &Resource,
     forge_id: u64,
 ) {
-    detach(bridge, to.host(), forge_id);
+    if !detach_from(bridge, from_ns, forge_id) {
+        return;
+    }
     if NAMESPACE_REPOS.contains(&from.repo_name().unwrap_or_default()) {
         return;
     }
     let ev = json!({ "type": "repoTransferred", "forgeId": forge_id.to_string(), "from": from.as_str(), "to": to.as_str() });
     report(bridge, &from_ns.id, ev).await;
-    if let Some(to_ns) = namespace_for(bridge, to)
+    // The receiving side, only when it is this same owner's (a jobs-path
+    // transfer between its own namespaces); another owner's App reports its
+    // own side.
+    let same_owner = Scope {
+        host: from_ns.resource.host().to_string(),
+        owner: Some(from_ns.resource.owner().to_ascii_lowercase()),
+    };
+    if let Some(to_ns) = namespace_in(bridge, &same_owner, to)
         && to_ns.id != from_ns.id
     {
         report_unmanaged(bridge, &to_ns, to, forge_id).await;
@@ -276,16 +489,14 @@ async fn report(bridge: &Bridge, ns: &str, ev: serde_json::Value) {
     }
 }
 
-async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
+async fn handle(bridge: &Arc<Bridge>, scope: &Scope, kind: ForgeEventKind) {
     match kind {
         ForgeEventKind::RepoCreated { repo, forge_id } => {
-            let Some(ns) = namespace_for(bridge, &repo) else {
+            let Some(ns) = namespace_in(bridge, scope, &repo) else {
                 return;
             };
             let name = repo.repo_name().unwrap_or_default();
-            if NAMESPACE_REPOS.contains(&name)
-                || repo_by_id(bridge, repo.host(), forge_id).is_some()
-            {
+            if NAMESPACE_REPOS.contains(&name) || repo_in(bridge, &ns, forge_id).is_some() {
                 // The bridge's own (it creates, then records) or part of the
                 // binding.
                 return;
@@ -299,18 +510,20 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             report_unmanaged(bridge, &ns, &repo, forge_id).await;
         }
         ForgeEventKind::RepoDeleted { repo, forge_id } => {
-            let Some(ns) = namespace_for(bridge, &repo) else {
+            let Some(ns) = namespace_in(bridge, scope, &repo) else {
                 return;
             };
             if NAMESPACE_REPOS.contains(&repo.repo_name().unwrap_or_default()) {
                 return;
             }
-            detach(bridge, repo.host(), forge_id);
+            if !detach_from(bridge, &ns, forge_id) {
+                return;
+            }
             let ev = json!({ "type": "repoDeleted", "forgeId": forge_id.to_string(), "resource": repo.as_str() });
             report(bridge, &ns.id, ev).await;
         }
         ForgeEventKind::RepoRenamed { forge_id, from, to } => {
-            let Some(ns) = namespace_for(bridge, &to) else {
+            let Some(ns) = namespace_in(bridge, scope, &to) else {
                 return;
             };
             // A rename stays with its owner. One whose `from` lies outside
@@ -322,14 +535,21 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             }
             // Renamed onto a name the namespace still records for another
             // repository: that one is gone, and nothing of it passes on.
+            if claimed_elsewhere(bridge, &ns, forge_id) {
+                tracing::warn!(%from, %to, "ignoring a rename of a repository another namespace governs");
+                return;
+            }
             detach_reused_name(bridge, &ns.id, &to, forge_id);
+            let ns_id = ns.id.clone();
             let _ = bridge.store.update::<RepoRecord, _>(
                 Table::Repos,
                 &repo_key(to.host(), forge_id),
                 |r| {
                     Ok((
                         r.map(|mut r| {
-                            r.resource = to.clone();
+                            if r.namespace == ns_id {
+                                r.resource = to.clone();
+                            }
                             r
                         }),
                         (),
@@ -344,13 +564,20 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             from_namespace,
             to,
         } => {
-            let rec = repo_by_id(bridge, to.host(), forge_id);
+            // Only this owner's record of the repository counts, and only a
+            // `from` in this owner's scope.
+            let rec = repo_record(bridge, to.host(), forge_id).filter(|r| {
+                scope.covers(&r.resource)
+                    && namespace_record(bridge, &r.namespace)
+                        .is_some_and(|n| scope.covers(&n.resource))
+            });
             let from = rec.as_ref().map(|r| r.resource.clone()).or_else(|| {
                 from_namespace
                     .as_ref()
+                    .filter(|n| scope.covers(n))
                     .and_then(|n| n.join(to.repo_name().unwrap_or_default()).ok())
             });
-            let from_ns = from.as_ref().and_then(|f| namespace_for(bridge, f));
+            let from_ns = from.as_ref().and_then(|f| namespace_in(bridge, scope, f));
             match (from_ns, from) {
                 // Out of a namespace this bridge serves — to another owner,
                 // and so out of the namespace, wherever `to` is (a namespace
@@ -365,8 +592,12 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
                 // this namespace it is a repository the VTC did not create
                 // or adopt, reported as such — never as `repoTransferred`,
                 // whose `from` would lie outside it.
+                // Another organisation's namespace may still record it
+                // (its App's delivery has not come, or will not): confirmed
+                // with GitHub before that side is detached.
                 _ => {
-                    if let Some(t) = namespace_for(bridge, &to) {
+                    if let Some(t) = namespace_in(bridge, scope, &to) {
+                        confirm_transfer_in(bridge, &t, forge_id).await;
                         report_unmanaged(bridge, &t, &to, forge_id).await;
                     }
                 }
@@ -378,7 +609,7 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             account,
             ..
         } => {
-            let Some(ns) = namespace_for(bridge, &repo) else {
+            let Some(ns) = namespace_in(bridge, scope, &repo) else {
                 return;
             };
             let Ok(ctx) = Ctx::load(bridge, &ns.id) else {
@@ -408,14 +639,14 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             }
             report(bridge, &ns.id, ev).await;
             // Then the complete drift for the repository.
-            if repo_by_id(bridge, repo.host(), forge_id).is_some() {
+            if repo_in(bridge, &ns, forge_id).is_some() {
                 inspect_in(bridge, &ns, &repo).await;
             }
         }
         ForgeEventKind::ProtectionChanged {
             repo: Some(repo), ..
         } => {
-            if let Some(ns) = namespace_for(bridge, &repo) {
+            if let Some(ns) = namespace_in(bridge, scope, &repo) {
                 inspect_in(bridge, &ns, &repo).await;
             }
         }
@@ -426,7 +657,7 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
         } => {
             // An owner-level rule (the org required workflow): every managed
             // repository may be affected.
-            if let Some(ns) = namespace_for(bridge, &namespace)
+            if let Some(ns) = namespace_in(bridge, scope, &namespace)
                 && let Ok(ctx) = Ctx::load(bridge, &ns.id)
             {
                 let lock = bridge.ns_lock(&ns.id);
@@ -436,11 +667,23 @@ async fn handle(bridge: &Arc<Bridge>, kind: ForgeEventKind) {
             }
         }
         ForgeEventKind::InstallationChanged {
-            namespace, change, ..
+            namespace,
+            installation_id,
+            change,
         } => {
-            let Some(ns) = namespace_for(bridge, &namespace) else {
+            let Some(ns) = namespace_in(bridge, scope, &namespace) else {
                 return;
             };
+            // The namespace's own installation, as recorded at the bind.
+            let recorded = ns
+                .binding
+                .as_ref()
+                .and_then(|b| b.namespace.installation_id);
+            if recorded != Some(installation_id) {
+                tracing::warn!(namespace = %ns.id, installation_id, ?recorded,
+                    "ignoring an installation event for another installation");
+                return;
+            }
             match change {
                 InstallationChange::Deleted | InstallationChange::Suspended => {
                     report(bridge, &ns.id, json!({ "type": "installationRemoved" })).await;

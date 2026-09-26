@@ -36,7 +36,7 @@ async fn state_and_secrets_live_in_the_vta_and_a_new_host_rebuilds_from_it() {
         assert!(w.bridge.store().flush(Duration::from_secs(5)).await);
         let snap = remote.snapshot();
         assert!(
-            snap.contains_key("secret/github/github.com/app"),
+            snap.contains_key("secret/github/github.com/acme/app"),
             "{:?}",
             snap.keys()
         );
@@ -67,7 +67,10 @@ async fn state_and_secrets_live_in_the_vta_and_a_new_host_rebuilds_from_it() {
         .expect("the namespace came back from the VTA");
     assert!(ns.managed.contains(&812));
     assert!(
-        w.bridge.adapters().get("github.com").is_some(),
+        w.bridge
+            .adapters()
+            .get_github("github.com", "acme")
+            .is_some(),
         "the App came back from the VTA and is in service"
     );
     // And it serves the namespace as before.

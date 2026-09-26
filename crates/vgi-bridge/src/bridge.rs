@@ -42,6 +42,10 @@ pub struct BridgeParts {
     /// How the bridge-posted check verifies commits.
     #[cfg(feature = "forge-github")]
     pub commits: Arc<dyn crate::checks::CommitVerifier>,
+    /// Registry answers in flight for the default verifier's DIDComm
+    /// channel, taken off the inbound stream ahead of the job path.
+    #[cfg(feature = "forge-github")]
+    pub registry_replies: Arc<crate::registry_channel::RegistryReplies>,
     /// How commits are fetched for the check.
     #[cfg(feature = "forge-github")]
     pub fetcher: crate::checks::GitFetcher,
@@ -58,10 +62,21 @@ impl BridgeParts {
         proof: Arc<dyn wire::ProofCheck>,
     ) -> Self {
         #[cfg(feature = "forge-github")]
-        let (commits, fetcher) = {
-            let c: Arc<dyn crate::checks::CommitVerifier> =
-                Arc::new(crate::checks::VerifyTrustVerifier::new(&config));
-            (c, crate::checks::GitFetcher::new(&config.checks))
+        let (commits, fetcher, registry_replies) = {
+            // The check queries the registry as the bridge's own DID over
+            // this link when the registry advertises DIDComm.
+            let replies = Arc::new(crate::registry_channel::RegistryReplies::new(
+                config.trust_registry_did.clone(),
+            ));
+            let channel = crate::registry_channel::BridgeRegistryChannel::new(
+                Arc::clone(&link),
+                identity.did(),
+                Arc::clone(&replies),
+            );
+            let c: Arc<dyn crate::checks::CommitVerifier> = Arc::new(
+                crate::checks::VerifyTrustVerifier::new(&config).with_channel(Arc::new(channel)),
+            );
+            (c, crate::checks::GitFetcher::new(&config.checks), replies)
         };
         BridgeParts {
             config,
@@ -74,6 +89,8 @@ impl BridgeParts {
             commits,
             #[cfg(feature = "forge-github")]
             fetcher,
+            #[cfg(feature = "forge-github")]
+            registry_replies,
         }
     }
 
@@ -118,6 +135,8 @@ pub struct Bridge {
     pub(crate) checks: crate::checks::CheckRunner,
     #[cfg(feature = "forge-github")]
     pub(crate) resign: crate::resign::ResignRunner,
+    #[cfg(feature = "forge-github")]
+    pub(crate) registry_replies: Arc<crate::registry_channel::RegistryReplies>,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -190,6 +209,8 @@ impl Bridge {
             checks,
             #[cfg(feature = "forge-github")]
             resign,
+            #[cfg(feature = "forge-github")]
+            registry_replies: parts.registry_replies,
         })
     }
 
@@ -230,6 +251,13 @@ impl Bridge {
     /// Changes on every key rotation.
     pub fn rotations(&self) -> tokio::sync::watch::Receiver<u64> {
         self.rotation.subscribe()
+    }
+
+    /// Registry answers in flight (tests drive a channel against them).
+    #[cfg(feature = "forge-github")]
+    #[doc(hidden)]
+    pub fn registry_replies(&self) -> &Arc<crate::registry_channel::RegistryReplies> {
+        &self.registry_replies
     }
 
     /// The configuration.
@@ -343,14 +371,18 @@ impl Bridge {
         let _ = ns_id;
     }
 
-    /// Put an adapter's namespaces back after it came into service later
-    /// than start-up (a GitHub App registered at run time).
-    pub(crate) fn restore_host(&self, host: &str) -> Result<()> {
-        let Some(adapter) = self.adapters.get(host) else {
-            return Ok(());
-        };
+    /// Put a GitHub App's namespaces back after it came into service later
+    /// than start-up (registered at run time): those on `host` whose owner
+    /// it serves.
+    pub(crate) fn restore_app(&self, host: &str, owner: &str) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
-            if ns.resource.host() == host {
+            if ns.resource.host() == host
+                && self
+                    .cfg
+                    .github_for(host, ns.resource.owner())
+                    .is_some_and(|g| g.app_owner.eq_ignore_ascii_case(owner))
+                && let Some(adapter) = self.adapters.for_resource(&ns.resource)
+            {
                 adapter.restore(&ns)?;
             }
         }
@@ -359,6 +391,12 @@ impl Bridge {
 
     /// One document in from the transport.
     pub async fn handle_inbound(self: &Arc<Self>, inbound: InboundDoc) {
+        // The registry's answer to a check's query (proven sender, a thread
+        // in flight) is not a job; anything else goes on as before.
+        #[cfg(feature = "forge-github")]
+        if self.registry_replies.route(&inbound) {
+            return;
+        }
         let verified = match self
             .checker
             .check(&inbound.doc, inbound.authenticated_sender.as_deref())

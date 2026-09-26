@@ -97,8 +97,8 @@ impl Guard {
 pub(crate) fn namespace_report(bridge: &Bridge, ns: &NamespaceRecord) -> Map<String, Value> {
     let mut out = Map::new();
     let host = ns.resource.host();
-    let adapter = bridge.adapters.get(host);
-    let github = bridge.cfg.github.iter().find(|g| g.host == host);
+    let adapter = bridge.adapters.for_resource(&ns.resource);
+    let github = bridge.cfg.github_for(host, ns.resource.owner());
 
     if let Some(g) = github {
         out.insert("appName".into(), json!(g.app_name));
@@ -112,7 +112,7 @@ pub(crate) fn namespace_report(bridge: &Bridge, ns: &NamespaceRecord) -> Map<Str
         }
         let registration = if adapter.is_some() {
             "registered"
-        } else if manifest_pending(bridge, host) {
+        } else if manifest_pending(bridge, host, &g.app_owner) {
             "pending"
         } else {
             "unregistered"
@@ -165,7 +165,7 @@ pub(crate) fn namespace_report(bridge: &Bridge, ns: &NamespaceRecord) -> Map<Str
 }
 
 /// A registration link for `host` is open and unexpired.
-fn manifest_pending(bridge: &Bridge, host: &str) -> bool {
+fn manifest_pending(bridge: &Bridge, host: &str, owner: &str) -> bool {
     let now = crate::bridge::now();
     bridge
         .store
@@ -173,8 +173,9 @@ fn manifest_pending(bridge: &Bridge, host: &str) -> bool {
         .unwrap_or_default()
         .into_iter()
         .any(|(_, f)| {
-            matches!(f, PendingFlow::Manifest { host: h, expires_at, .. }
-                if h == host && expires_at > now)
+            matches!(f, PendingFlow::Manifest { host: h, owner: o, expires_at }
+                if h == host && expires_at > now
+                    && o.as_deref().is_none_or(|o| o.eq_ignore_ascii_case(owner)))
         })
 }
 

@@ -45,6 +45,8 @@ mod jobs;
 pub mod mapping;
 pub mod registry;
 #[cfg(feature = "forge-github")]
+pub mod registry_channel;
+#[cfg(feature = "forge-github")]
 pub mod resign;
 pub mod rolemap;
 pub mod seal;
@@ -71,6 +73,8 @@ pub use store::Store;
 pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registry::Adapters> {
     let adapters = registry::Adapters::new();
     #[cfg(feature = "forge-github")]
+    registry::refuse_single_app_layout(cfg, store)?;
+    #[cfg(feature = "forge-github")]
     for g in &cfg.github {
         let keyring = match &g.platform_keyring_file {
             Some(p) => Some(registry::read_keyring(p)?),
@@ -79,9 +83,12 @@ pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registr
         match registry::build_github(store, g)? {
             Some(forge) => adapters.insert(
                 registry::Adapter::GitHub(forge),
+                Some(&g.app_owner),
                 registry::vgi_config(cfg, keyring),
             ),
-            None => tracing::warn!(host = %g.host, "no GitHub App registered yet"),
+            None => {
+                tracing::warn!(host = %g.host, owner = %g.app_owner, "no GitHub App registered yet")
+            }
         }
     }
     #[cfg(feature = "forge-forgejo")]
@@ -89,6 +96,7 @@ pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registr
         match registry::build_forgejo(cfg, store, f).await {
             Ok(Some(forge)) => adapters.insert(
                 registry::Adapter::Forgejo(forge),
+                None,
                 registry::vgi_config(cfg, None),
             ),
             Ok(None) => tracing::warn!(

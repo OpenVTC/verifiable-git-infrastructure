@@ -107,7 +107,11 @@ pub struct BridgeConfig {
     /// repository can override it (see [`RoleMapConfig`]).
     #[serde(default)]
     pub role_map: RoleMapConfig,
-    /// GitHub (github.com or GHES), one App each.
+    /// GitHub (github.com or GHES): one private App per organisation (or
+    /// account), keyed by `(host, app_owner)`. GitHub installs a private App
+    /// only on the account that owns it, so a community binding several
+    /// organisations on one host registers one App for each; the VTC still
+    /// maps the host to this one bridge.
     #[serde(default)]
     pub github: Vec<GitHubForgeConfig>,
     /// Forgejo instances, one bot each.
@@ -213,10 +217,13 @@ pub struct VerifyTrustConfig {
     /// The required check's name.
     #[serde(default = "default_check")]
     pub required_check: String,
-    /// The Trust Registry binding the written workflows use (the action's
-    /// `transport` input): `auto` (default — TSP, then DIDComm, then HTTPS,
-    /// no fallback), `tsp`, `didcomm` or `https`. Set `https` while the
-    /// registry's mediator does not admit a CI run's throwaway DID.
+    /// The Trust Registry binding: for the written workflows (the action's
+    /// `transport` input) `auto` (default — TSP, then DIDComm, then HTTPS,
+    /// no fallback), `tsp`, `didcomm` or `https`; for the check the bridge
+    /// posts itself `auto` is DIDComm (as the bridge's own DID, over its
+    /// mediator session), then HTTPS. `tsp` is refused while a GitHub forge
+    /// has `bridge_checks` on: the bridge never speaks TSP. Set `https` while
+    /// the registry's mediator does not admit a CI run's throwaway DID.
     #[serde(default)]
     pub transport: VerifyTransport,
 }
@@ -400,7 +407,8 @@ pub struct ForgejoNamespaceConfig {
     pub repos: BTreeMap<String, RepoConfig>,
 }
 
-/// One GitHub the bridge serves as one App.
+/// One GitHub App the bridge holds: its host, and the organisation (or
+/// account) that owns it and whose namespaces it serves.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -408,7 +416,9 @@ pub struct GitHubForgeConfig {
     /// `github.com` or the GHES host.
     #[serde(default = "default_github_host")]
     pub host: String,
-    /// The App's name for the manifest (`acme-vgi-bridge`).
+    /// The App's name for the manifest (`acme-vgi-bridge`). GitHub App names
+    /// are unique per GitHub instance, so every entry on a host names its
+    /// own.
     pub app_name: String,
     /// The organisation (or, with `app_owner_is_user`, the personal account)
     /// the App is registered under and owned by. The manifest exchange
@@ -559,7 +569,23 @@ fn default_committer_email() -> String {
     "vgi-bridge@noreply.invalid".into()
 }
 
+/// A GitHub login is letters, digits and single hyphens: what is safe in a
+/// route segment and a secret's name.
+fn url_segment_ok(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !login.starts_with('-')
+}
+
 impl GitHubForgeConfig {
+    /// The owner as the bridge keys the App by (logins are case-insensitive).
+    pub fn owner_key(&self) -> String {
+        self.app_owner.to_ascii_lowercase()
+    }
+
     /// Whether the Dependabot re-sign is on for the namespace owned by
     /// `owner` (on unless `[github.namespaces.<owner>]` turns it off).
     pub fn resign_dependabot(&self, owner: &str) -> bool {
@@ -573,6 +599,20 @@ impl GitHubForgeConfig {
 type NsLayers<'a> = (Option<RoleMapConfig>, &'a BTreeMap<String, RepoConfig>);
 
 impl BridgeConfig {
+    /// The `[[github]]` entry that serves `owner`'s namespaces on `host`: the
+    /// App `owner` owns, and no other. GitHub installs a private App only on
+    /// its owner, so an owner without an entry of its own has no App here.
+    pub fn github_for(&self, host: &str, owner: &str) -> Option<&GitHubForgeConfig> {
+        self.github
+            .iter()
+            .find(|g| g.host == host && g.app_owner.eq_ignore_ascii_case(owner))
+    }
+
+    /// Every `[[github]]` entry on `host`.
+    pub fn github_on(&self, host: &str) -> impl Iterator<Item = &GitHubForgeConfig> {
+        self.github.iter().filter(move |g| g.host == host)
+    }
+
     /// The role map for `repo` (`host/owner/name`): its repository's,
     /// namespace's, forge entry's and the bridge's overrides over the
     /// default. A resource on a host this bridge has no entry for gets the
@@ -582,7 +622,7 @@ impl BridgeConfig {
         let owner = repo.owner().to_ascii_lowercase();
         let name = repo.repo_name().map(str::to_ascii_lowercase);
         let (forge, ns): (Option<RoleMapConfig>, Option<NsLayers<'_>>) =
-            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+            if let Some(g) = self.github_for(host, &owner) {
                 (
                     g.role_map,
                     g.namespaces.get(&owner).map(|n| (n.role_map, &n.repos)),
@@ -617,7 +657,7 @@ impl BridgeConfig {
         let host = ns.host();
         let owner = ns.owner().to_ascii_lowercase();
         let repos: Option<&BTreeMap<String, RepoConfig>> =
-            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+            if let Some(g) = self.github_for(host, &owner) {
                 g.namespaces.get(&owner).map(|n| &n.repos)
             } else if let Some(f) = self
                 .forgejo
@@ -667,7 +707,7 @@ impl BridgeConfig {
         };
         for g in &self.github {
             check(
-                format!("github ({})", g.host),
+                format!("github ({}, {})", g.host, g.app_owner),
                 g.role_map,
                 g.namespaces
                     .iter()
@@ -832,6 +872,16 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
+        if self.verify_trust.transport == VerifyTransport::Tsp
+            && self.github.iter().any(|g| g.bridge_checks)
+        {
+            bail!(
+                "`verify_trust.transport = \"tsp\"`: the check this bridge posts itself queries \
+                 the registry over the bridge's DIDComm session or HTTPS, never TSP. Use `auto` \
+                 (TSP > DIDComm > HTTPS in the written workflows; DIDComm > HTTPS for the \
+                 bridge's own check), `didcomm` or `https` — or turn `bridge_checks` off"
+            );
+        }
 
         check_ident("resign.committer_name", &self.resign.committer_name)?;
         check_ident("resign.committer_email", &self.resign.committer_email)?;
@@ -841,20 +891,41 @@ impl BridgeConfig {
                  bridge's DID in their `Signed-by-DID:` trailer"
             );
         }
-        let mut hosts = std::collections::BTreeSet::new();
+        let mut apps = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
         for g in &self.github {
-            Resource::namespace_of(&g.host, "x")
-                .map_err(|e| anyhow::anyhow!("github host `{}`: {e}", g.host))?;
-            if !hosts.insert(g.host.clone()) {
-                bail!("forge host `{}` is configured twice", g.host);
+            Resource::namespace_of(&g.host, &g.app_owner).map_err(|e| {
+                anyhow::anyhow!("github `{}` / app_owner `{}`: {e}", g.host, g.app_owner)
+            })?;
+            if !apps.insert((g.host.clone(), g.owner_key())) {
+                bail!(
+                    "two `[[github]]` entries for `{}` on `{}`: one App per organisation (or \
+                     account), each its own entry",
+                    g.app_owner,
+                    g.host
+                );
+            }
+            if !names.insert((g.host.clone(), g.app_name.to_ascii_lowercase())) {
+                bail!(
+                    "two `[[github]]` entries on `{}` name the App `{}`: GitHub App names are unique \
+                     per instance, so give each organisation's App its own `app_name`",
+                    g.host,
+                    g.app_name
+                );
+            }
+            if !url_segment_ok(&g.app_owner) {
+                bail!("`app_owner` `{}` is not a GitHub login", g.app_owner);
             }
             if g.dependabot_login.is_empty() || g.dependabot_id == 0 {
                 bail!("`dependabot_login` and `dependabot_id` must be set");
             }
         }
+        let github_hosts: std::collections::BTreeSet<&str> =
+            self.github.iter().map(|g| g.host.as_str()).collect();
+        let mut hosts = std::collections::BTreeSet::new();
         for f in &self.forgejo {
             let host = f.host()?;
-            if !hosts.insert(host.clone()) {
+            if github_hosts.contains(host.as_str()) || !hosts.insert(host.clone()) {
                 bail!("forge host `{host}` is configured twice");
             }
             if let Some(label) = &f.runs_on {
@@ -967,6 +1038,23 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
+    fn tsp_is_refused_while_the_bridge_posts_checks() {
+        let tsp = EXAMPLE.replace(
+            "version = \"v0.5.0\"\n",
+            "version = \"v0.5.0\"\ntransport = \"tsp\"\n",
+        );
+        let e = BridgeConfig::parse(&tsp).unwrap_err().to_string();
+        assert!(e.contains("never TSP"), "{e}");
+        // With the bridge not posting checks, only the workflows use it.
+        let off = tsp.replace(
+            "platform_keyring_file",
+            "bridge_checks = false\nplatform_keyring_file",
+        );
+        let c = BridgeConfig::parse(&off).unwrap();
+        assert_eq!(c.verify_trust.transport, VerifyTransport::Tsp);
+    }
+
+    #[test]
     fn the_event_version_is_0_1_0_2_or_0_3() {
         let with = |v: &str| {
             BridgeConfig::parse(&EXAMPLE.replacen(
@@ -1032,6 +1120,53 @@ oauth_client_id = "0b6e3a0c"
         .unwrap_err();
         assert!(err.to_string().contains("master key"), "{err}");
         assert!(BridgeConfig::parse(&format!("did_cache_ttl_secs = 5\n{EXAMPLE}")).is_err());
+    }
+
+    #[test]
+    fn several_apps_on_one_host_are_keyed_by_owner() {
+        let second = |owner: &str, name: &str| {
+            format!("{EXAMPLE}\n[[github]]\napp_name = \"{name}\"\napp_owner = \"{owner}\"\n")
+        };
+        let c = BridgeConfig::parse(&second("globex", "globex-vgi-bridge")).unwrap();
+        assert_eq!(
+            c.github_for("github.com", "ACME").unwrap().app_owner,
+            "acme"
+        );
+        assert_eq!(
+            c.github_for("github.com", "globex").unwrap().app_name,
+            "globex-vgi-bridge"
+        );
+        assert!(
+            c.github_for("github.com", "initech").is_none(),
+            "no fallback with several"
+        );
+        assert!(c.github_for("ghe.example", "acme").is_none());
+        // One App per organisation, and GitHub App names are unique.
+        assert!(BridgeConfig::parse(&second("Acme", "other-name")).is_err());
+        assert!(BridgeConfig::parse(&second("globex", "ACME-vgi-bridge")).is_err());
+        assert!(BridgeConfig::parse(&second("glo/bex", "x")).is_err());
+        // A lone App serves only its own owner.
+        let one = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert!(one.github_for("github.com", "initech").is_none());
+    }
+
+    #[test]
+    fn role_map_repos_are_the_owners_own() {
+        // Two Apps on github.com, one configured repository map under the
+        // second: only that organisation's report lists it.
+        let text = format!(
+            "{EXAMPLE}\n[[github]]\napp_name = \"globex-vgi-bridge\"\napp_owner = \"globex\"\n\n\
+             [github.namespaces.globex.repos.w.role_map]\ncommit = \"write\"\n"
+        );
+        let c = BridgeConfig::parse(&text).unwrap();
+        let listed = |ns: &str| -> Vec<String> {
+            c.role_map_repos(&res(ns))
+                .into_iter()
+                .map(|r| r.to_string())
+                .collect()
+        };
+        assert_eq!(listed("github.com/globex"), vec!["github.com/globex/w"]);
+        assert!(listed("github.com/acme").is_empty());
     }
 
     #[test]

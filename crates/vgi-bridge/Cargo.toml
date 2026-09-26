@@ -54,6 +54,11 @@ trust-tasks-proof = { workspace = true }
 # DIDComm to the VTC: the TDK's messaging SDK (ATM), its delivery layer, and
 # vta-sdk's did:key / DID-secrets-bundle → DIDComm secret helpers.
 affinidi-tdk = { workspace = true }
+# Security floors, not new code: the messaging SDK and DIDComm crate the TDK
+# already builds, at the releases that bind an authcrypt sender to the key
+# actually used. See the workspace manifest.
+affinidi-messaging-sdk = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
 affinidi-messaging-delivery = { workspace = true }
 affinidi-messaging-core = { workspace = true }
 # VTA mode (`crate::vta`): the client, the session transports and
@@ -93,6 +98,11 @@ rand = { workspace = true }
 # Signs real commits for the verify-trust path test.
 vgi-core = { workspace = true }
 tower = { workspace = true }
+# The bridge's DIDComm registry query against an in-process mediator
+# (tests/registry_didcomm.rs), including a forged-envelope regression test.
+affinidi-messaging-test-mediator = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 # A scripted VTA behind the SDK's loopback transport, for the VTA-mode tests.
 vta-sdk = { workspace = true, features = ["test-loopback"] }
 # A fixed verification-method resolver for the key-rotation test (a

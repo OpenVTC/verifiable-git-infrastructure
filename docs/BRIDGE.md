@@ -38,8 +38,8 @@ Inbound (through your proxy, HTTPS only):
 
 | Path | From |
 |---|---|
-| `POST /github/<host>/webhook`, `POST /forgejo/<host>/webhook` | the forges |
-| `GET /github/<host>/register`, `/registered`, `/setup` | admins' browsers, redirected by GitHub |
+| `POST /github/<host>/<owner>/webhook`, `POST /forgejo/<host>/webhook` | the forges (one GitHub route per App) |
+| `GET /github/<host>/<owner>/register`, `/registered`, `/setup` | admins' browsers, redirected by GitHub |
 | `GET /forgejo/<host>/bind`, `/link` | admins' and members' browsers, redirected by Forgejo |
 | `GET /healthz` | your orchestrator (keep it internal) |
 
@@ -52,7 +52,9 @@ Outbound:
   for the bridge-posted check — for the registry's DID and the DIDs commits
   claim. Signer DIDs are resolved under verify-trust's public-hosts-only
   policy: a DID naming an internal host is refused, not fetched;
-- the **Trust Registry**'s `#rest` endpoint, for the bridge-posted check.
+- the **Trust Registry**, for the bridge-posted check: over DIDComm the query
+  rides the bridge's existing mediator link (nothing extra to open), over
+  HTTPS it goes to the `#rest` URL.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
 refuses to start with a `public_url` that is not `https`. Keep the proxy's
@@ -320,8 +322,27 @@ control again. What a lost host does lose is listed in the table above.
 
 ## 3. GitHub: register the App (manifest flow)
 
-One App per community, registered by the bridge itself so nobody copies a
-key by hand.
+One private App per organisation (or account) the community binds,
+registered by the bridge itself so nobody copies a key by hand. GitHub lets a
+private App be installed only on the account that owns it, so a community
+with several organisations gives the bridge one `[[github]]` entry each —
+its `app_owner` and its own `app_name` (App names are unique on a GitHub
+instance) — and registers one App per organisation. One bridge holds them
+all, keyed by `(host, app_owner)`: each App has its own key, webhook secret
+and routes, and the bridge picks the App from a namespace's owner. An App serves
+its own organisation (or account) only, even when it is the host's only one:
+a namespace whose owner has no entry here cannot be bound. Each App also
+**speaks only for its own organisation**. An organisation's owners can set
+their App's webhook secret, so a delivery that App verifies is acted on only
+when every namespace, repository (by name and by forge id) and installation
+it names is that organisation's. Anything else is dropped and logged. A
+repository transferred between two organisations the bridge serves is
+reported by each organisation's App for its own side. If only the new
+organisation's App reports the transfer, the bridge asks GitHub where the
+repository is now, through that App's own installation. Only when GitHub
+confirms the move does it detach the old organisation's record and tell
+that namespace (`repoTransferred`). The
+VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —
    or to your account, with `app_owner_is_user = true`. Optionally put
@@ -331,12 +352,12 @@ key by hand.
    queues). The in-repo and required-workflow plans refuse to plan without
    it; the bridge-posted check works without it, and then fails any
    platform-signed commit.
-2. Start the bridge. With no App registered for a configured host, it logs
-   a **one-time registration URL** (valid 24 hours):
-   `…/github/github.com/register?state=…`.
+2. Start the bridge. For each entry whose App is not registered yet, it
+   logs a **one-time registration URL** (valid 24 hours):
+   `…/github/github.com/<owner>/register?state=…` — one per organisation.
 3. An owner of the `app_owner` organisation opens it. The page posts the
    manifest to GitHub; they approve it; GitHub redirects back to
-   `/github/github.com/registered`, and the bridge exchanges the code for the
+   `/github/github.com/<owner>/registered`, and the bridge exchanges the code for the
    App's id, private key and webhook secret, **seals them**, and puts the
    adapter in service. It refuses an App registered under another account,
    a public App, or one with any permission beyond the reviewed set. If the
@@ -394,9 +415,17 @@ request and delete the branch and Dependabot opens it afresh.
 
 **Binding a namespace** starts at the VTC (`git-ns/namespace/bind`): the VTC
 sends the bridge a `beginBind` job, the admin follows the `next` URL to the
-App's install page, and GitHub's redirect to `/github/<host>/setup` completes
+App's install page, and GitHub's redirect to `/github/<host>/<owner>/setup` completes
 it. The bridge probes whether the organisation has org rulesets (the
 required-workflow guard) and records the answer.
+
+### A store from a single-App release
+
+A release before several Apps per host kept its App at `github/<host>/app`,
+with owner-less routes. This release reads neither. It refuses to start on
+such a store and says to re-register: delete the App on GitHub, start the
+bridge on a fresh store (an empty `data_dir`, or in VTA mode a fresh
+context), and register one App per organisation from the links it logs.
 
 ## 4. Forgejo: the bot
 
@@ -523,18 +552,32 @@ repository writers are trusted not to forge the check —
   repository's qualified resource, with the namespace as the fallback
   resource. An empty range (the head is already in the base) is a success
   only when the head *is* the base tip; otherwise it is a failure.
-- **How it asks the registry.** Over HTTPS, at the `#rest` endpoint the
-  registry's DID document names — the bridge-posted check needs the registry
-  to publish one. It does not query over DIDComm: a reply arriving on the
-  bridge's mediator session reaches it already unpacked, without the envelope
-  needed to bind the authcrypt sender key id to the key actually used, so its
-  sender cannot be proven to be the registry. (The CI workflows take the
-  packed envelope and do check that binding; they can use TSP and DIDComm.)
-- **The workflows it writes** take `transport` under `[verify_trust]` —
-  `auto` (default: TSP, then DIDComm, then HTTPS, no fallback; writes no
-  input), `tsp`, `didcomm` or `https` — passed to the action as its
-  `transport` input. Set `https` while the registry's mediator does not admit
-  a CI run's throwaway DID.
+- **How it asks the registry.** If the registry's DID document advertises
+  DIDComm, the bridge queries it **as its own DID** over the mediator session
+  it already holds for the VTC (the mediator allows one websocket per DID, so
+  it does not open another); otherwise over its `#rest` URL, so the registry's
+  REST interface is optional here too. A DIDComm answer counts only when the
+  transport proved it came from the registry's DID — a verified authcrypt
+  sender, which the messaging SDK binds to the key its key agreement actually
+  used (affinidi-messaging-sdk 0.27.2 / affinidi-messaging-didcomm 0.15.9 or
+  later, required here) — and it answers a query in flight: every query
+  carries a fresh random id. Anything else on the inbound stream goes to the
+  job path as before. Because the bridge's DID is stable, a registry in
+  private mode (`ACL_MODE=ExplicitAllow`) can admit it by name — add the
+  bridge DID to the registry's allow list. A refusal, a link that is down, or
+  no proven answer within 30 seconds fails the check (`registryUnavailable`),
+  with no fallback to HTTPS; the first such failure is not retried within the
+  same check.
+- **`transport` under `[verify_trust]`** chooses, for both the check the
+  bridge posts and the workflows it writes (the action's `transport` input):
+  - `auto` (default) — the bridge's own check: DIDComm, then HTTPS; the
+    written workflows: TSP, then DIDComm, then HTTPS (no input written).
+  - `didcomm` or `https` — that binding only, for both.
+  - `tsp` — the written workflows only. The bridge never speaks TSP, so `tsp`
+    is refused at start while any GitHub forge has `bridge_checks` on.
+
+  Set `https` while the registry's mediator does not admit a CI run's
+  throwaway DID, or does not admit the bridge's DID.
 - It completes "Verify commit trust" as **success** or **failure** with a
   per-commit table. Anything that goes wrong fails the check (closed).
 - **Re-running.** "Re-run" on the check in GitHub (`check_run` /
@@ -563,7 +606,9 @@ requests still merge without a human step, a GitHub bridge **re-signs them
 with its own DID** (design §9, "Dependabot re-sign bot"). Provenance comes
 from **signed `push` webhooks, never from who a commit says wrote it**:
 
-- **The record.** Every verified `push` to a `dependabot/*` branch is kept:
+- **The record.** Every verified `push` to a `dependabot/*` branch of a
+  repository the namespace manages — delivered by that organisation's own
+  App — is kept:
   before, after, who GitHub says pushed (login and numeric id), and whether
   the push created the branch. Deleting the branch clears its record, and
   creating it again starts a new one — but only a delivery at least as new

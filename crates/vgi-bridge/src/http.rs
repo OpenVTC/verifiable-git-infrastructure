@@ -3,13 +3,16 @@
 //! | Route | Who calls it |
 //! |---|---|
 //! | `GET  /healthz` | the orchestrator (503 on a VTA state conflict, or state not reaching the VTA) |
-//! | `GET  /github/{host}/register?state=` | the admin, from the URL the bridge logs (manifest flow) |
-//! | `GET  /github/{host}/registered?code=&state=` | GitHub, after the App is registered |
-//! | `GET  /github/{host}/setup?installation_id=&setup_action=&state=` | GitHub, after the App is installed (bind) |
-//! | `POST /github/{host}/webhook` | GitHub |
+//! | `GET  /github/{host}/{owner}/register?state=` | the admin of `owner`, from the URL the bridge logs (manifest flow) |
+//! | `GET  /github/{host}/{owner}/registered?code=&state=` | GitHub, after `owner`'s App is registered |
+//! | `GET  /github/{host}/{owner}/setup?installation_id=&setup_action=&state=` | GitHub, after `owner`'s App is installed (bind) |
+//! | `POST /github/{host}/{owner}/webhook` | GitHub, for `owner`'s App |
 //! | `GET  /forgejo/{host}/bind?code=&state=` | Forgejo's OAuth redirect (bind) |
 //! | `GET  /forgejo/{host}/link?code=&state=` | Forgejo's OAuth redirect (account link) |
 //! | `POST /forgejo/{host}/webhook` | Forgejo |
+//!
+//! One GitHub App per organisation: each has its own routes, and its own
+//! webhook secret verifies what arrives on them.
 //!
 //! Plain HTTP/1: TLS is terminated by the proxy in front (the operator guide
 //! says so, and the config refuses a non-`https` public URL). Request bodies
@@ -37,10 +40,10 @@ pub fn router(bridge: Arc<Bridge>) -> Router {
     let r = Router::new().route("/healthz", get(healthz));
     #[cfg(feature = "forge-github")]
     let r = r
-        .route("/github/{host}/register", get(github_register))
-        .route("/github/{host}/registered", get(github_registered))
-        .route("/github/{host}/setup", get(github_setup))
-        .route("/github/{host}/webhook", post(webhook));
+        .route("/github/{host}/{owner}/register", get(github_register))
+        .route("/github/{host}/{owner}/registered", get(github_registered))
+        .route("/github/{host}/{owner}/setup", get(github_setup))
+        .route("/github/{host}/{owner}/webhook", post(github_webhook));
     #[cfg(feature = "forge-forgejo")]
     let r = r
         .route("/forgejo/{host}/bind", get(forgejo_bind))
@@ -72,6 +75,15 @@ fn page(status: StatusCode, text: &str) -> Response {
         .into_response()
 }
 
+/// A GitHub App the config names (`/github/{host}/{owner}/…`).
+#[cfg(feature = "forge-github")]
+fn known_app(bridge: &Bridge, host: &str, owner: &str) -> bool {
+    bridge
+        .cfg
+        .github_on(host)
+        .any(|g| g.app_owner.eq_ignore_ascii_case(owner))
+}
+
 fn known_host(bridge: &Bridge, host: &str) -> bool {
     bridge.adapters.get(host).is_some()
         || bridge.cfg.github.iter().any(|g| g.host == host)
@@ -91,20 +103,43 @@ async fn webhook(
     if !known_host(&bridge, &host) {
         return StatusCode::NOT_FOUND;
     }
-    crate::events::on_webhook(&bridge, &host, &headers, &body).await
+    crate::events::on_webhook(&bridge, &host, None, &headers, &body).await
+}
+
+#[cfg(feature = "forge-github")]
+async fn github_webhook(
+    State(bridge): State<Arc<Bridge>>,
+    Path((host, owner)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if !known_app(&bridge, &host, &owner) {
+        return StatusCode::NOT_FOUND;
+    }
+    crate::events::on_webhook(&bridge, &host, Some(&owner), &headers, &body).await
 }
 
 #[cfg(feature = "forge-github")]
 async fn github_register(
     State(bridge): State<Arc<Bridge>>,
-    Path(host): Path<String>,
+    Path((host, owner)): Path<(String, String)>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    if !known_host(&bridge, &host) {
+    if !known_app(&bridge, &host, &owner) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    register(bridge, host, owner, q)
+}
+
+#[cfg(feature = "forge-github")]
+fn register(
+    bridge: Arc<Bridge>,
+    host: String,
+    owner: String,
+    q: BTreeMap<String, String>,
+) -> Response {
     let state = q.get("state").map(String::as_str).unwrap_or("");
-    match flows::manifest_page(&bridge, &host, state) {
+    match flows::manifest_page(&bridge, &host, &owner, state) {
         Ok(html) => (
             [
                 (header::CACHE_CONTROL, "no-store"),
@@ -126,19 +161,29 @@ async fn github_register(
 #[cfg(feature = "forge-github")]
 async fn github_registered(
     State(bridge): State<Arc<Bridge>>,
-    Path(host): Path<String>,
+    Path((host, owner)): Path<(String, String)>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    if !known_host(&bridge, &host) {
+    if !known_app(&bridge, &host, &owner) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    registered(bridge, host, owner, q).await
+}
+
+#[cfg(feature = "forge-github")]
+async fn registered(
+    bridge: Arc<Bridge>,
+    host: String,
+    owner: String,
+    q: BTreeMap<String, String>,
+) -> Response {
     let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
         return page(
             StatusCode::BAD_REQUEST,
             "The redirect is missing its code or state.",
         );
     };
-    match flows::manifest_callback(&bridge, &host, code, state).await {
+    match flows::manifest_callback(&bridge, &host, &owner, code, state).await {
         Ok(msg) => page(StatusCode::OK, &msg),
         Err(e) => {
             tracing::warn!(%host, error = %e, "App registration failed");
@@ -150,11 +195,16 @@ async fn github_registered(
     }
 }
 
-async fn bind(bridge: Arc<Bridge>, host: String, q: BTreeMap<String, String>) -> Response {
+async fn bind(
+    bridge: Arc<Bridge>,
+    host: String,
+    owner: Option<String>,
+    q: BTreeMap<String, String>,
+) -> Response {
     if !known_host(&bridge, &host) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match flows::bind_callback(&bridge, &host, q).await {
+    match flows::bind_callback(&bridge, &host, owner.as_deref(), q).await {
         Ok(msg) => page(StatusCode::OK, &msg),
         Err(e) => {
             tracing::warn!(%host, error = %e, "bind callback refused");
@@ -169,10 +219,13 @@ async fn bind(bridge: Arc<Bridge>, host: String, q: BTreeMap<String, String>) ->
 #[cfg(feature = "forge-github")]
 async fn github_setup(
     State(bridge): State<Arc<Bridge>>,
-    Path(host): Path<String>,
+    Path((host, owner)): Path<(String, String)>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    bind(bridge, host, q).await
+    if !known_app(&bridge, &host, &owner) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    bind(bridge, host, Some(owner), q).await
 }
 
 #[cfg(feature = "forge-forgejo")]
@@ -181,7 +234,7 @@ async fn forgejo_bind(
     Path(host): Path<String>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    bind(bridge, host, q).await
+    bind(bridge, host, None, q).await
 }
 
 #[cfg(feature = "forge-forgejo")]

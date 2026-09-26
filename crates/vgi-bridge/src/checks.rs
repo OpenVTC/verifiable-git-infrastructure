@@ -111,9 +111,17 @@ pub trait CommitVerifier: Send + Sync {
     }
 }
 
-/// The real verifier: verify-trust's library, with the registry endpoint
+/// The real verifier: verify-trust's library, with the registry binding
 /// discovered from the registry's DID document and signer DIDs resolved
 /// under verify-trust's public-hosts-only policy.
+///
+/// With a channel ([`VerifyTrustVerifier::with_channel`], which the bridge
+/// always sets), a registry advertising DIDComm is queried over it — as the
+/// bridge's own DID, on the bridge's mediator session — in preference to
+/// HTTPS, and a registry with no REST interface is reachable at all. TSP is
+/// never used: the bridge's session to its mediator is DIDComm.
+/// `[verify_trust] transport` chooses: `auto` (DIDComm, then HTTPS, no
+/// fallback), `didcomm` or `https`.
 pub struct VerifyTrustVerifier {
     registry_did: String,
     vtc_did: String,
@@ -121,18 +129,22 @@ pub struct VerifyTrustVerifier {
     /// Per GitHub host, the configured `web-flow` keyring, where one is.
     keyrings: BTreeMap<String, PathBuf>,
     tdk: OnceCell<Arc<affinidi_tdk::TDK>>,
-    /// How long a resolved DID document (and the endpoint read from the
+    /// How long a resolved DID document (and the binding read from the
     /// registry's) is kept.
     ttl: std::time::Duration,
-    /// The discovered endpoint, and when. Dropped whenever the registry
-    /// could not be consulted and once it is older than `ttl`, so the next
-    /// check discovers it again (a registry that moved is found without a
+    /// The discovered binding, and when. Dropped whenever the registry could
+    /// not be consulted and once it is older than `ttl`, so the next check
+    /// discovers it again (a registry that moved is found without a
     /// restart).
-    registry_url: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    registry_route: tokio::sync::Mutex<Option<(trql_client::TransportChoice, std::time::Instant)>>,
     /// Signer DIDs resolved again after an unknown key, and when.
     re_resolved: tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    /// A fixed endpoint (tests; a registry that publishes none).
+    /// A fixed HTTPS endpoint (tests; a registry that publishes none).
     registry_override: Option<String>,
+    /// `[verify_trust] transport`, for the bridge's own queries.
+    transport: verify_trust::TransportSelector,
+    /// The bridge's own channel to the registry, for the DIDComm binding.
+    channel: Option<Arc<dyn verify_trust::RegistryChannel>>,
 }
 
 impl VerifyTrustVerifier {
@@ -151,31 +163,74 @@ impl VerifyTrustVerifier {
                 .collect(),
             tdk: OnceCell::new(),
             ttl: std::time::Duration::from_secs(cfg.did_cache_ttl_secs),
-            registry_url: tokio::sync::Mutex::new(None),
+            registry_route: tokio::sync::Mutex::new(None),
             re_resolved: Default::default(),
             registry_override: None,
+            transport: bridge_transport(cfg.verify_trust.transport),
+            channel: None,
         }
     }
 
-    /// Use `url` as the registry endpoint instead of discovering it.
+    /// Use `url` as the registry's HTTPS endpoint instead of discovering a
+    /// binding.
     pub fn with_registry_url(mut self, url: impl Into<String>) -> Self {
         self.registry_override = Some(url.into());
         self
     }
 
-    async fn endpoint(&self, tdk: &affinidi_tdk::TDK) -> Result<String> {
+    /// Use `route` instead of discovering one from the registry's DID
+    /// document (tests: a registry whose document is not resolvable here).
+    #[doc(hidden)]
+    pub fn with_route(self, route: trql_client::TransportChoice) -> Self {
+        *self.registry_route.try_lock().expect("not yet shared") =
+            Some((route, std::time::Instant::now()));
+        self
+    }
+
+    /// Query over `channel` (the bridge's own DID and session) when the
+    /// registry advertises its binding.
+    pub fn with_channel(mut self, channel: Arc<dyn verify_trust::RegistryChannel>) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// The bindings this verifier can use, in preference order.
+    fn supported(&self) -> Vec<trql_client::TransportKind> {
+        let mut kinds: Vec<_> = self.channel.iter().map(|c| c.kind()).collect();
+        kinds.push(trql_client::TransportKind::Https);
+        kinds
+    }
+
+    /// The client for this check: the override, or the discovered binding.
+    async fn registry(&self, tdk: &affinidi_tdk::TDK) -> Result<verify_trust::Registry> {
         if let Some(u) = &self.registry_override {
-            return Ok(u.clone());
+            return verify_trust::Registry::https(u, &self.registry_did);
         }
-        let mut cached = self.registry_url.lock().await;
-        if let Some((u, at)) = cached.as_ref()
-            && at.elapsed() < self.ttl
-        {
-            return Ok(u.clone());
+        let mut cached = self.registry_route.lock().await;
+        let route = match cached.as_ref() {
+            Some((r, at)) if at.elapsed() < self.ttl => r.clone(),
+            _ => {
+                let r = verify_trust::registry::discover_registry_route(
+                    tdk,
+                    &self.registry_did,
+                    self.transport,
+                    &self.supported(),
+                )
+                .await?;
+                tracing::info!(binding = %r.kind, "querying the Trust Registry");
+                *cached = Some((r.clone(), std::time::Instant::now()));
+                r
+            }
+        };
+        match (&route.kind, &self.channel) {
+            (trql_client::TransportKind::Https, _) => {
+                verify_trust::Registry::https(&route.endpoint, &self.registry_did)
+            }
+            (kind, Some(channel)) if *kind == channel.kind() => Ok(
+                verify_trust::Registry::over_channel(Arc::clone(channel), &self.registry_did),
+            ),
+            (kind, _) => bail!("the bridge cannot query the registry over {kind}"),
         }
-        let u = verify_trust::resolve_registry_endpoint(tdk, &self.registry_did).await?;
-        *cached = Some((u.clone(), std::time::Instant::now()));
-        Ok(u)
     }
 
     async fn resolver(&self) -> Result<&Arc<affinidi_tdk::TDK>> {
@@ -190,7 +245,19 @@ impl VerifyTrustVerifier {
     }
 
     async fn forget_endpoint(&self) {
-        *self.registry_url.lock().await = None;
+        *self.registry_route.lock().await = None;
+    }
+}
+
+/// `[verify_trust] transport` for the bridge's own queries: `auto` is DIDComm
+/// then HTTPS (the bridge never speaks TSP — `tsp` is refused when the config
+/// is loaded).
+fn bridge_transport(t: vgi_forge::VerifyTransport) -> verify_trust::TransportSelector {
+    match t {
+        vgi_forge::VerifyTransport::Didcomm => verify_trust::TransportSelector::Didcomm,
+        vgi_forge::VerifyTransport::Https => verify_trust::TransportSelector::Https,
+        vgi_forge::VerifyTransport::Tsp => verify_trust::TransportSelector::Tsp,
+        _ => verify_trust::TransportSelector::Auto,
     }
 }
 
@@ -247,13 +314,11 @@ impl CommitVerifier for VerifyTrustVerifier {
     }
 
     async fn commit_sign_granted(&self, did: &str, resource: &str) -> Result<Option<bool>> {
-        use trql_client::{HttpsTransport, HttpsTransportConfig, TrqlClient, TrqpQuery};
+        use trql_client::TrqpQuery;
         let tdk = self.resolver().await?;
-        let url = self.endpoint(tdk).await?;
-        let transport = HttpsTransport::new(HttpsTransportConfig::new(&url))?;
-        let client = TrqlClient::new(Arc::new(transport), &self.registry_did);
+        let registry = self.registry(tdk).await?;
         let query = TrqpQuery::new(did, &self.vtc_did, "git.commit.sign", resource);
-        match client.authorization(query).await {
+        match registry.client().authorization(query).await {
             Ok(r) => Ok(Some(r.authorized)),
             // The registry answered and refused the tuple: a denial.
             Err(trql_client::TrqlError::Rejected { .. }) => Ok(Some(false)),
@@ -272,7 +337,7 @@ impl VerifyTrustVerifier {
         fallback: &str,
         claimed: &[String],
     ) -> Result<(Vec<CommitLine>, Vec<verify_trust::CommitStatus>)> {
-        let registry_url = self.endpoint(tdk).await?;
+        let registry = self.registry(tdk).await?;
         let signers = verify_trust::resolve_signer_keys(tdk, claimed).await?;
         let host = resource.split('/').next().unwrap_or_default();
         let exempt = match self.keyrings.get(host) {
@@ -283,10 +348,8 @@ impl VerifyTrustVerifier {
             repo_dir: PathBuf::new(),
             range: String::new(),
             max_signers: self.max_signers,
-            registry_url: Some(registry_url),
-            // The bridge-posted check queries the registry's `#rest`
-            // endpoint (see `VerifyTrustVerifier`).
-            transport: verify_trust::TransportSelector::Https,
+            registry_url: None,
+            transport: self.transport,
             registry_did: self.registry_did.clone(),
             vtc_did: self.vtc_did.clone(),
             action: "git.commit.sign".into(),
@@ -296,14 +359,21 @@ impl VerifyTrustVerifier {
             resolve_agent_names: false,
             json: false,
         };
-        let report =
-            match verify_trust::verify_prepared(&args, range, &signers, exempt.as_ref()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.forget_endpoint().await;
-                    return Err(e);
-                }
-            };
+        let report = match verify_trust::verify_prepared_with(
+            &args,
+            range,
+            &signers,
+            exempt.as_ref(),
+            &registry,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.forget_endpoint().await;
+                return Err(e);
+            }
+        };
         if report.commits.iter().any(|c| {
             matches!(
                 c.status,
@@ -971,7 +1041,7 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
 
     let check_name = bridge
         .adapters
-        .vgi(ctx.ns.resource.host())
+        .vgi_for(&ctx.ns.resource)
         .map(|v| v.required_check)
         .unwrap_or_else(|| vgi_forge::DEFAULT_REQUIRED_CHECK.into());
     let _permit = bridge.checks.permits.acquire().await?;

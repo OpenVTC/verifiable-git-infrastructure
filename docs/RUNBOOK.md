@@ -377,7 +377,10 @@ both sides named. `registry-url` implies `https`.
 > or `transport = "https"` in the bridge's `[verify_trust]` (the workflows it
 > writes). A DIDComm reply is believed only if the authcrypt sender key id is
 > the key its key agreement actually used, and each query carries a random id.
-> The bridge-posted check queries `#rest` (HTTPS) only.
+> The bridge-posted check queries over DIDComm as the bridge's own DID when the
+> registry advertises it (DIDComm, then HTTPS), which needs affinidi-messaging-sdk
+> 0.27.2 / affinidi-messaging-didcomm 0.15.9 or later; `transport = "tsp"` is
+> refused while GitHub `bridge_checks` are on.
 > `UNKNOWN-KEY` now says what usually causes it: the signer rotated their
 > key, and the commit must be re-signed with the current one.
 
@@ -1307,6 +1310,7 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 | `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 only | upgrade the VTC |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
 | VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
+| bind fails `notCapable` ("not bound") for an organisation on a host with several Apps | no `[[github]]` entry (and registered App) for that organisation: add one and register its App (BRIDGE.md §3) | — |
 | bridge `/healthz` 503, log "another bridge … is writing the same VTA context" | two hosts (or a stolen credential) on one bridge context; the bridge stopped writing its state and holds its results | §8i; BRIDGE.md §2a |
 | bridge `/healthz` 503 "state not reaching the VTA: N change(s) waiting" | every write to the VTA has failed for five minutes: the VTA unreachable, or its app-state lease kept by another writer (logs: "another writer holds the bridge's app-state lease") | bring the VTA back; if the lease is the cause, find the other writer on the context and stop it (revoke the credential if it is not yours) |
 | `git-ns/bridge/job:jobIdReused` | a job id came again with other content | a VTC fault; report it |

@@ -77,10 +77,13 @@ version = "v0.5.0"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
 # sha256 = "<64 hex>"
 # required_check = "Verify commit trust"
-# The Trust Registry binding the written workflows use: auto (TSP, then
-# DIDComm, then HTTPS; no fallback), tsp, didcomm or https. Use "https" while
-# the registry's mediator does not admit a CI run's throwaway DID
-# (docs/RUNBOOK.md, "Registry discovery").
+# The Trust Registry binding: auto (default; no fallback), didcomm, https, or
+# tsp. For the written workflows auto is TSP, then DIDComm, then HTTPS; for
+# the check the bridge posts itself it is DIDComm (as the bridge's own DID,
+# over its mediator link), then HTTPS. tsp applies to the workflows only and
+# is refused while a [[github]] has bridge_checks on. Use "https" while the
+# registry's mediator does not admit a CI run's throwaway DID
+# (docs/RUNBOOK.md, "Registry discovery") or the bridge's DID.
 # transport = "auto"
 
 [checks]
@@ -91,7 +94,6 @@ version = "v0.5.0"
 # fetch_timeout_secs = 120
 # max_fetch_bytes = 67108864
 # concurrency = 4
-# The bridge-posted check queries the registry's #rest endpoint (HTTPS).
 
 [resign]
 # The Dependabot re-sign (docs/BRIDGE.md §6a): the committer on re-signed
@@ -111,9 +113,15 @@ version = "v0.5.0"
 # maintain = "maintain"     # on Forgejo: write + the merge allow-list
 # commit = "none"           # "write" lets committers push branches
 
+# One [[github]] entry per organisation (or account) the community binds:
+# GitHub installs a private App only on its owner, so each organisation gets
+# its own App — registered with one click each — and this one bridge holds
+# them all, keyed by (host, app_owner). Copy the entry for another org with
+# its own app_owner and app_name.
 [[github]]
 host = "github.com"
-# The App the manifest flow registers.
+# The App the manifest flow registers. Unique per GitHub instance: every
+# entry names its own.
 app_name = "acme-vgi-bridge"
 # Required: the org the App is registered under (and owned by). For a
 # personal account, name it and set app_owner_is_user = true.
