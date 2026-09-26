@@ -27,12 +27,12 @@ pub async fn authenticate(cfg: &SigningConfig) -> Result<(VtaClient, VtaCredenti
     if creds.mediator_did.is_none()
         && let Some(token) = config::load_cached_token(&cfg.did_key_id)
     {
-        let identity = ClientIdentity::did_key(
+        let client = client_with_identity(
+            &creds.vta_url,
             &creds.credential_did,
             &creds.private_key_multibase,
             &creds.vta_did,
         );
-        let client = VtaClient::new(&creds.vta_url).with_identity(identity);
         client.set_token(token);
         return Ok((client, creds));
     }
@@ -177,6 +177,28 @@ async fn connect_with_retry(creds: &VtaCredentials) -> Result<ConnectedVta> {
     )
 }
 
+/// A client speaking as `client_did`, with the token left to the caller.
+///
+/// The identity is not optional. `keys/export-secret` — like every
+/// proof-bearing trust task — names an in-band recipient and signs the
+/// request, and the SDK refuses to build that document from an identity-less
+/// client before any I/O happens. `init` shipped exactly that regression
+/// once: a `VtaClient::new` + `set_token` client whose first
+/// [`get_signing_key`] failed with "carries no ClientIdentity".
+///
+/// What the client may *do* is the VTA's ACL's business, not this
+/// function's: `init` passes its freshly provisioned admin credential, but
+/// nothing here checks or confers a role.
+pub fn client_with_identity(
+    vta_url: &str,
+    client_did: &str,
+    private_key_mb: &str,
+    vta_did: &str,
+) -> VtaClient {
+    let identity = ClientIdentity::did_key(client_did, private_key_mb, vta_did);
+    VtaClient::new(vta_url).with_identity(identity)
+}
+
 /// Fetch the Ed25519 signing key seed from VTA. Returns 32-byte seed.
 /// The seed is zeroized on drop via the returned wrapper.
 pub async fn get_signing_key(client: &VtaClient, key_id: &str) -> Result<SeedMaterial> {
@@ -226,6 +248,45 @@ mod tests {
             key_id: "key-1".to_string(),
             mediator_did: None,
         }
+    }
+
+    /// The SDK refuses `keys/export-secret` from an identity-less client
+    /// before any I/O — the control for the regression test below. The URL is
+    /// unreachable on purpose: nothing here may touch the network.
+    #[tokio::test]
+    async fn test_get_signing_key_without_identity_refused_before_io() {
+        let bare = VtaClient::new("http://127.0.0.1:1");
+        bare.set_token("test-token".to_string());
+        let err = match get_signing_key(&bare, "key-1").await {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("an identity-less client must not fetch a key secret"),
+        };
+        assert!(
+            err.contains("ClientIdentity"),
+            "expected the SDK's identity refusal, got: {err}"
+        );
+    }
+
+    /// The client `init` builds must get past the identity gate: whatever
+    /// fails afterwards (here: an undecodable key, still with no I/O), it must
+    /// not be the "carries no ClientIdentity" refusal `init` once shipped.
+    #[tokio::test]
+    async fn test_client_with_identity_passes_identity_gate() {
+        let client = client_with_identity(
+            "http://127.0.0.1:1",
+            "did:key:z6Mk123",
+            "zNotARealKey",
+            "did:example:vta",
+        );
+        client.set_token("test-token".to_string());
+        let err = match get_signing_key(&client, "key-1").await {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("a garbage key against an unreachable VTA must not succeed"),
+        };
+        assert!(
+            !err.contains("ClientIdentity"),
+            "the init client lost its identity again: {err}"
+        );
     }
 
     #[test]

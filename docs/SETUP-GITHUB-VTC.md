@@ -153,7 +153,7 @@ public_url         = "https://bridge.acme-vtc.example/"      # must be https
 listen             = "0.0.0.0:8080"
 data_dir           = "/var/lib/vgi-bridge"
 master_key_file    = "/run/secrets/vgi-bridge-master-key"
-# event_version = "0.2"   # the default; see step 3.3
+# event_version = "0.3"   # the default; see step 3.3
 
 [verify_trust]
 # What the bootstrap writes into workflows. The action must be pinned to a
@@ -314,11 +314,12 @@ device code.
 
 ### 3.3 The event version
 
-The bridge sends `git-ns/bridge/event` **0.2**, which the VTC on `main`
-serves. Leave `event_version` unset. Only a VTC older than that needs
-`event_version = "0.1"` (it would otherwise refuse every event as an
-unsupported type); what the two versions do differently with transfers is in
-BRIDGE.md §7.
+The bridge sends `git-ns/bridge/event` **0.3**, which adds the bridge's role
+map to what the VTC is told (BRIDGE.md §6c). Leave `event_version` unset
+once your VTC serves 0.3. A VTC that serves only 0.2 needs
+`event_version = "0.2"`, and one older than that `"0.1"` (it would otherwise
+refuse every event as an unsupported type); what the versions do
+differently is in BRIDGE.md §7.
 
 **Success looks like:** the bridge's log says the adapter for `github.com` is
 in service; the App appears under the organisation's *Settings → Developer

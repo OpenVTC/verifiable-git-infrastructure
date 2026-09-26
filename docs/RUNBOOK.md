@@ -924,6 +924,18 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   repository — maintainers as `admin`, committers `write` on a repository
   that opts in ([BRIDGE.md §6c](BRIDGE.md#6c-roles-the-role-map)). A member
   with no linked GitHub account gets no role until they link (openvtc `l`).
+- **A role-map change reaches the forge by re-projection.** After you change
+  `role_map` and restart the bridge, it reports its map to the VTC
+  (`git-ns/bridge/event` 0.3) with the repositories projected under the old
+  one — and again at every reconnection to the VTC and whenever it starts
+  serving a newly bound namespace, so the VTC's copy is never older than
+  its link — and the VTC re-projects those by itself; the console shows the map
+  each right projects to. On a bridge set to `event_version = "0.2"`, or to
+  force it anyway, re-project by hand:
+  `cnm git reproject --resource github.com/acme` (a namespace) or
+  `--resource github.com/acme/widgets` (one repository), or **Re-project
+  roles** on the console's Repos page. A community administrator or a
+  namespace admin may; no right changes.
 - **A repository keeps an owner.** Revoking the last one is
   `git-ns:lastOwner`; grant the replacement first. Only an owner record
   **without an expiry** counts for this, so an expiring grant cannot be the
@@ -1302,6 +1314,6 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 | step `rateLimited` | the forge's rate limit | the job is retried |
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
-| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.2 | update the VTC, or `event_version = "0.1"` meanwhile (BRIDGE.md §7) |
+| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default) | update the VTC, or `event_version = "0.2"` (or `"0.1"` for a VTC older than 0.2) meanwhile; the VTC is then not told the role map (BRIDGE.md §7) |
 
 [vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure

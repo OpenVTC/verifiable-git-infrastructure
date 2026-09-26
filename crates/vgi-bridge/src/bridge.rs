@@ -108,6 +108,12 @@ pub struct Bridge {
     pub(crate) link: Arc<dyn VtcLink>,
     pub(crate) checker: DocChecker,
     ns_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The last send to the VTC failed: the link is down as far as the
+    /// bridge can tell. The next send that succeeds is a link-up.
+    link_down: std::sync::atomic::AtomicBool,
+    /// Raised by a send that succeeded after sends failed, for
+    /// [`Bridge::background`] to run [`Bridge::link_up`].
+    pub(crate) link_recovered: tokio::sync::Notify,
     #[cfg(feature = "forge-github")]
     pub(crate) checks: crate::checks::CheckRunner,
     #[cfg(feature = "forge-github")]
@@ -178,6 +184,8 @@ impl Bridge {
             link: parts.link,
             checker,
             ns_locks: Mutex::new(BTreeMap::new()),
+            link_down: std::sync::atomic::AtomicBool::new(false),
+            link_recovered: tokio::sync::Notify::new(),
             #[cfg(feature = "forge-github")]
             checks,
             #[cfg(feature = "forge-github")]
@@ -248,7 +256,9 @@ impl Bridge {
     ///    convergent);
     /// 3. device-flow account links still inside their window are polled
     ///    again;
-    /// 4. unacknowledged results and events are sent again.
+    /// 4. unacknowledged results and events are sent again;
+    /// 5. every bound namespace's role map is reported (`crate::rolemap`),
+    ///    the configuration being the one thing a restart can change.
     pub async fn restore(self: &Arc<Self>) -> Result<()> {
         for (_, ns) in self.store.list::<NamespaceRecord>(Table::Namespaces)? {
             if let Some(adapter) = self.adapters.for_resource(&ns.resource)
@@ -270,7 +280,11 @@ impl Bridge {
             }
         }
         crate::flows::resume_device_polls(self)?;
-        self.resend_unacknowledged(true).await;
+        // As at any link-up: everything unacknowledged, then a fresh
+        // role-map report per bound namespace (the configuration is the one
+        // thing a restart can change), replacing any report from the last
+        // run still unacknowledged under the same outbox key.
+        self.link_up().await;
         Ok(())
     }
 
@@ -398,7 +412,7 @@ impl Bridge {
     async fn send_error(&self, request: &TrustTask<Value>, payload: ErrorPayload) {
         match wire::signed_error(&self.identity(), request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     tracing::warn!(error = %e, "could not send an error response");
                 }
             }
@@ -409,7 +423,7 @@ impl Bridge {
     async fn respond(&self, request: &TrustTask<Value>, payload: Value) {
         match wire::signed_response(&self.identity(), request, payload).await {
             Ok(doc) => {
-                if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+                if let Err(e) = self.send_doc(&doc).await {
                     // The VTC repeats a job it got no answer to; the ledger
                     // answers the repeat.
                     tracing::warn!(error = %e, "could not send a job response");
@@ -773,6 +787,45 @@ impl Bridge {
         event_json: Value,
         drift: Option<Vec<Value>>,
     ) -> Result<()> {
+        self.send_event_keyed(namespace, event_json, drift, None)
+            .await
+    }
+
+    /// [`Self::send_event`] under outbox key `key`, replacing an entry
+    /// still there (a newer report supersedes an unacknowledged one), or
+    /// under a fresh key when `None`.
+    pub(crate) async fn send_event_keyed(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+        key: Option<String>,
+    ) -> Result<()> {
+        let Some(payload) = self.event_outbox_payload(namespace, event_json, drift)? else {
+            return Ok(());
+        };
+        let key = key.unwrap_or_else(|| format!("event:{}", wire::new_id()));
+        let entry = OutboxEntry {
+            kind: OutboxKind::Event,
+            payload,
+            doc_ids: Vec::new(),
+            last_sent: 0,
+            attempts: 0,
+        };
+        self.store.put(Table::Outbox, &key, &entry)?;
+        self.send_outbox(&key).await;
+        Ok(())
+    }
+
+    /// The outbox payload of an event in `namespace`: the event, its drift
+    /// and the status report (`ext`). `None` for an event that names a
+    /// repository outside `namespace`, which is logged and never sent.
+    fn event_outbox_payload(
+        &self,
+        namespace: &str,
+        event_json: Value,
+        drift: Option<Vec<Value>>,
+    ) -> Result<Option<Value>> {
         // The repository an event is about, by forge id, for the status
         // report (`ext`).
         let repo = event_json
@@ -799,28 +852,65 @@ impl Bridge {
                 r#type = ty,
                 "not reporting an event that names a repository outside its namespace"
             );
-            return Ok(());
+            return Ok(None);
         }
         let payload = mapping::event_payload(namespace, event_json, drift)?;
         let host = ns_resource.map(|r| r.host().to_string());
         let ext = crate::status::ext(self, namespace, host.as_deref().zip(repo));
-        let payload = crate::status::attach::<event::Payload>(serde_json::to_value(&payload)?, ext);
-        let key = format!("event:{}", wire::new_id());
-        let entry = OutboxEntry {
-            kind: OutboxKind::Event,
-            payload,
-            doc_ids: Vec::new(),
-            last_sent: 0,
-            attempts: 0,
+        Ok(Some(crate::status::attach::<event::Payload>(
+            serde_json::to_value(&payload)?,
+            ext,
+        )))
+    }
+
+    /// A role-map report's outbox entry `key`, built afresh for this send
+    /// (`git-ns/bridge/event` 0.3: the report with the latest `issuedAt`
+    /// wins, so a resend carries the map applied now, never the one first
+    /// queued). `false` when there is nothing to send: the VTC takes an event
+    /// version without `roleMapReported`, the namespace is no longer bound,
+    /// or its map rounds unordered. The entry is then dropped rather than
+    /// sent under an older version or with a map the bridge no longer
+    /// applies.
+    fn refresh_role_map_entry(&self, key: &str) -> bool {
+        let ns_id = &key[crate::rolemap::OUTBOX_PREFIX.len()..];
+        let fresh = if self.cfg.event_version.reports_role_map() {
+            self.store
+                .get::<NamespaceRecord>(Table::Namespaces, ns_id)
+                .ok()
+                .flatten()
+                .and_then(|ns| crate::rolemap::event(self, &ns))
+                .and_then(|ev| self.event_outbox_payload(ns_id, ev, None).ok().flatten())
+        } else {
+            None
         };
-        self.store.put(Table::Outbox, &key, &entry)?;
-        self.send_outbox(&key).await;
-        Ok(())
+        let Some(payload) = fresh else {
+            tracing::info!(
+                namespace = ns_id,
+                "dropping a pending role-map report: there is no report to send now"
+            );
+            let _ = self.store.delete(Table::Outbox, key);
+            return false;
+        };
+        self.store
+            .update::<OutboxEntry, _>(Table::Outbox, key, |e| {
+                Ok((
+                    e.map(|mut e| {
+                        e.payload = payload;
+                        e
+                    }),
+                    (),
+                ))
+            })
+            .is_ok()
     }
 
     /// Send (again) the outbox entry `key`, as a freshly issued and signed
-    /// document.
+    /// document. A role-map report is first rebuilt from the map applied now
+    /// (or dropped: [`Self::refresh_role_map_entry`]).
     pub(crate) async fn send_outbox(&self, key: &str) {
+        if key.starts_with(crate::rolemap::OUTBOX_PREFIX) && !self.refresh_role_map_entry(key) {
+            return;
+        }
         let Ok(Some(entry)) = self.store.get::<OutboxEntry>(Table::Outbox, key) else {
             return;
         };
@@ -869,20 +959,64 @@ impl Bridge {
                     (),
                 ))
             });
-        if let Err(e) = self.link.send(&self.cfg.vtc_did, &doc).await {
+        if let Err(e) = self.send_doc(&doc).await {
             tracing::warn!(key, error = %e, "send failed; the outbox will retry");
         }
+    }
+
+    /// Send `doc` to the VTC, noting whether the link works: a send that
+    /// succeeds after one failed is a link-up the transport did not signal
+    /// (a mediator or session that came back by itself), and raises
+    /// [`Bridge::link_up`] for the background loop.
+    async fn send_doc(&self, doc: &Value) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        match self.link.send(&self.cfg.vtc_did, doc).await {
+            Ok(()) => {
+                if self.link_down.swap(false, Ordering::AcqRel) {
+                    tracing::info!("the link to the VTC works again");
+                    self.link_recovered.notify_one();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.link_down.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// The link to the VTC is up — a new mediator session, or sends
+    /// succeeding again after they failed: send everything unacknowledged,
+    /// then report every bound namespace's role map afresh
+    /// (`git-ns/bridge/event` 0.3: the VTC's view must be no older than the
+    /// link it holds). One report per namespace per link-up: an
+    /// unacknowledged report is not resent first, since the fresh one
+    /// replaces it under the same outbox key; and a link-up the transport
+    /// signalled clears the down flag first, so the first successful send
+    /// does not count as a second one.
+    pub async fn link_up(&self) {
+        self.link_down
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.resend_matching(true, |key| !key.starts_with(crate::rolemap::OUTBOX_PREFIX))
+            .await;
+        self.report_role_maps().await;
     }
 
     /// Send every unacknowledged result and event that is due (all of them
     /// when `all`). Backs off per entry: the resend interval doubled per
     /// attempt, capped at an hour.
     pub async fn resend_unacknowledged(&self, all: bool) {
+        self.resend_matching(all, |_| true).await;
+    }
+
+    /// [`Self::resend_unacknowledged`], for the entries whose key `pick`
+    /// accepts.
+    async fn resend_matching(&self, all: bool, pick: impl Fn(&str) -> bool) {
         let Ok(entries) = self.store.list::<OutboxEntry>(Table::Outbox) else {
             return;
         };
         let now = now();
-        for (key, e) in entries {
+        for (key, e) in entries.into_iter().filter(|(k, _)| pick(k)) {
             let backoff = (self.cfg.resend_secs as i64)
                 .saturating_mul(1_i64 << e.attempts.min(6))
                 .min(3600);
@@ -969,6 +1103,7 @@ impl Bridge {
                 _ = expiry_tick.tick() => crate::flows::expire(&self).await,
                 _ = sweep_tick.tick() => crate::jobs::sweep_without_webhooks(&self).await,
                 _ = maint_tick.tick() => self.maintenance().await,
+                _ = self.link_recovered.notified() => self.link_up().await,
                 _ = shutdown.changed() => return,
             }
         }

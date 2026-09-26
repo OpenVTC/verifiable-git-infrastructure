@@ -1832,14 +1832,18 @@ mod tests {
     }
 
     /// A verification-method resolver that knows one set of keys — the
-    /// DID document as the VTC would resolve it after the rotation.
+    /// DID document as the VTC would resolve it after the rotation. Every
+    /// key it knows is authorised for every purpose: it stands in for a
+    /// resolved DID document in tests that are not exercising the
+    /// proof-purpose check itself.
     struct Published(std::collections::BTreeMap<String, Vec<u8>>);
 
     #[async_trait]
-    impl affinidi_data_integrity::VerificationMethodResolver for Published {
-        async fn resolve_vm(
+    impl trust_tasks_proof::affinidi::ProofPurposeResolver for Published {
+        async fn resolve_vm_for_purpose(
             &self,
             vm: &str,
+            _purpose: trust_tasks_proof::affinidi::ProofPurpose,
         ) -> std::result::Result<
             affinidi_data_integrity::did_vm::ResolvedKey,
             affinidi_data_integrity::DataIntegrityError,

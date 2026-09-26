@@ -827,11 +827,42 @@ Someone who is both a namespace admin and, in their own name, a
 repository's owner or maintainer gets that repository right's role.
 
 **When a change applies.** The bridge maps rights to roles when a
-`projectRoles` or `createRepo` job arrives. Roles already projected are not
-re-mapped on restart: a repository picks up a new map at its next role
-projection, which the VTC sends when that repository's rights or linked
-accounts change. Roles the bridge projected under the old map are the
-baseline drift is measured against until then, so they are not reported.
+`projectRoles` or `createRepo` job arrives; it keeps no desired rights of
+its own, so it cannot re-map a repository by itself. Instead it tells the
+VTC (`git-ns/bridge/event` 0.3, `roleMapReported`), one report per
+namespace:
+
+- whenever it **starts serving** a namespace: at every start (the only time
+  its configuration, and so its map, can change), and right after a
+  namespace's binding completes;
+- whenever its **link to the VTC comes up**: each new mediator session, and
+  the first send that succeeds after sends had failed (a session that came
+  back by itself). Unacknowledged results and events go out first; the
+  report is sent once per link-up, and a newer report replaces an
+  unacknowledged older one rather than queueing behind it.
+
+Each report carries:
+
+- `roleMap` — the map it applies in the namespace, **as the forge applies
+  it**: each right's configured role rounded down onto the namespace's
+  ladder (`write`/`write`/`none` on a GitHub personal account; on Forgejo
+  `maintain` is the adapter's own rung, `write` plus the merge allow-list);
+- `repos` — each repository configured with a map of its own that differs;
+- `stale` — each managed repository whose roles it last projected under
+  another map (the bridge records, per repository, the map a fully
+  successful projection applied; a record from before it did is taken to
+  be the default map).
+
+The VTC uses the map to show each right's forge role and to work out which
+right a drifted forge role adopts as, and **re-projects every `stale`
+repository by itself**. A repository leaves `stale` once a projection of it
+succeeds. To re-project by hand — a bridge on event 0.2, or a forge you
+suspect has drifted — use `cnm git reproject --resource <namespace or repo>`
+or the console's **Re-project roles** on the Repos page
+(`git-ns/roles/reproject`). Until a repository is re-projected, the roles
+projected under the old map are the baseline drift is measured against, so
+they are not reported as drift. The report never carries anything for
+`git.ns.admin`: a namespace admin gets no forge role whatever the map.
 
 ## 7. Operating it
 
@@ -861,18 +892,22 @@ baseline drift is measured against until then, so they are not reported.
 
 ### Event versions
 
-The bridge sends `git-ns/bridge/event` **0.2** by default. A VTC that does
-not understand 0.2 yet refuses it as an unsupported type; until it is
+The bridge sends `git-ns/bridge/event` **0.3** by default. A VTC that does
+not understand 0.3 yet refuses it as an unsupported type; until it is
 updated, set in the config
 
 ```toml
-event_version = "0.1"   # "0.1" or "0.2" (the default)
+event_version = "0.2"   # "0.1", "0.2" or "0.3" (the default)
 ```
 
-and restart. Switch back to `"0.2"` (or remove the line) once the VTC takes
-0.2. The two versions are wire-identical: an event is the same payload under
-either type URI, and events still queued when you switch go out under the
-new one. The VTC's acknowledgement is accepted in either version.
+and restart. Switch back (or remove the line) once the VTC takes 0.3. The
+three versions are wire-identical for every forge event: an event is the
+same payload under each type URI, and events still queued when you switch
+go out under the new one. The VTC's acknowledgement is accepted in any
+version. What 0.3 adds is `roleMapReported` (§6c), which is **never sent
+under 0.1 or 0.2**: such a VTC goes on assuming the default role map, and a
+role-map change reaches a repository only when you re-project it
+(`cnm git reproject`) or its rights next change.
 
 What 0.2 changes is what the VTC does with an event. The bridge's own
 handling is the same whichever version it sends:

@@ -476,7 +476,7 @@ async fn under_0_1_events_are_typed_0_1_and_either_acknowledgement_clears_them()
 }
 
 #[tokio::test]
-async fn by_default_events_are_typed_0_2() {
+async fn by_default_events_are_typed_0_3() {
     let mut w = world(Options::default()).await;
     seed_repo(w.bridge.store(), &repo("widgets"), 812);
     mount_inspect(&w.server).await;
@@ -487,7 +487,7 @@ async fn by_default_events_are_typed_0_2() {
     .await;
     let ev = w.next_of(EVENT).await;
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.2 payload");
+        .expect("a 0.3 payload");
     // A VTC that answers in 0.1 (the configured version changed while this
     // was out) still clears it.
     let ack = w
