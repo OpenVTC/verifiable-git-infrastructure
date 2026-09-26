@@ -40,12 +40,15 @@ use crate::identity::BridgeIdentity;
 
 /// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
 pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
-/// `git-ns/bridge/event` 0.2, the type every event is built as. 0.1 is
-/// wire-identical (0.2 changes only what the VTC does with a transfer, a
-/// reused name, and a resource outside the namespace), so an event for a
-/// VTC configured for 0.1 is the same payload under the 0.1 type URI: see
-/// [`event_type_uri`].
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event;
+/// `git-ns/bridge/event` 0.2, still sent to a VTC configured for it.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event_v0_2;
+/// `git-ns/bridge/event` 0.3, the type every event is built as. 0.1 and 0.2
+/// are wire-identical for every forge event (0.2 changes only what the VTC
+/// does with a transfer, a reused name, and a resource outside the
+/// namespace; 0.3 only adds `roleMapReported`), so an event for a VTC
+/// configured for either is the same payload under the older type URI: see
+/// [`event_type_uri`]. `roleMapReported` is never sent under them.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_3 as event;
 /// The payload types of `git-ns/bridge/job` 0.4, the only version this
 /// bridge takes. It adds rules the schema does not state, checked in
 /// [`check_kind_members`]: a namespace admin with no right of their own on
@@ -97,16 +100,19 @@ pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
     use trust_tasks_rs::Payload as _;
     match version {
         EventVersion::V0_1 => event_v0_1::Payload::TYPE_URI,
+        EventVersion::V0_2 => event_v0_2::Payload::TYPE_URI,
         _ => event::Payload::TYPE_URI,
     }
 }
 
 /// Whether `type_uri` (bare) is the VTC's acknowledgement of an event, of
-/// either version (a VTC acknowledges an event in the version it was sent,
+/// any version (a VTC acknowledges an event in the version it was sent,
 /// and the configured version may have changed since).
 pub fn is_event_response_type(type_uri: &str) -> bool {
     use trust_tasks_rs::Payload as _;
-    type_uri == event::Response::TYPE_URI || type_uri == event_v0_1::Response::TYPE_URI
+    type_uri == event::Response::TYPE_URI
+        || type_uri == event_v0_2::Response::TYPE_URI
+        || type_uri == event_v0_1::Response::TYPE_URI
 }
 
 /// Parse a `git-ns/bridge/job` 0.4 payload.

@@ -335,6 +335,16 @@ async fn a_bind_completes_through_the_setup_callback_once() {
             .is_none(),
         "no repository to report on"
     );
+    // Then the role map: until it arrives the VTC holds the map as unknown,
+    // and assumes none.
+    let map = w.next().await;
+    assert_eq!(map["type"], EVENT);
+    assert_eq!(
+        map["payload"]["event"],
+        json!({ "type": "roleMapReported",
+                "roleMap": { "own": "admin", "maintain": "maintain", "commit": "none" },
+                "ladder": ["read", "triage", "write", "maintain", "admin"] })
+    );
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded");
     assert_eq!(

@@ -50,9 +50,11 @@ pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
 /// `git-ns/bridge/job` 0.1, which the bridge refuses.
 pub const JOB_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
 pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";
-/// `git-ns/bridge/event` 0.2, what the bridge sends unless configured
+/// `git-ns/bridge/event` 0.3, what the bridge sends unless configured
 /// otherwise.
-pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
+pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.3";
+/// `git-ns/bridge/event` 0.2, for a VTC configured `event_version = "0.2"`.
+pub const EVENT_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
 /// `git-ns/bridge/event` 0.1, for a VTC configured `event_version = "0.1"`.
 pub const EVENT_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
 /// `git-ns/bridge/job` 0.2, which the bridge refuses.
@@ -126,8 +128,32 @@ pub struct World {
     pub inbox: UnboundedReceiver<(String, Value)>,
     pub dir: tempfile::TempDir,
     pub verifier: Arc<FakeVerifier>,
+    /// Documents already taken off `inbox` (by [`World::settle`]) and not
+    /// yet read by [`World::next`].
+    pub pending: std::collections::VecDeque<Value>,
+    /// The start-up role-map reports [`World::settled`] acknowledged.
+    pub startup_reports: Vec<Value>,
+    /// While set, every send to the VTC fails (the link is down).
+    pub link_down: Arc<std::sync::atomic::AtomicBool>,
     /// VTA mode: stops the mirror task when dropped.
     pub _mirror_stop: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// A [`ChannelLink`] that can be cut: while `down` is set every send fails,
+/// as a lost mediator session does.
+pub struct CuttableLink {
+    pub inner: ChannelLink,
+    pub down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl vgi_bridge::transport::VtcLink for CuttableLink {
+    async fn send(&self, to: &str, doc: &Value) -> anyhow::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("not connected to the mediator");
+        }
+        self.inner.send(to, doc).await
+    }
 }
 
 pub struct Options {
@@ -407,6 +433,11 @@ pub async fn world(o: Options) -> World {
     };
     let adapters = vgi_bridge::build_adapters(&cfg, &store).await.unwrap();
     let (link, inbox) = ChannelLink::new();
+    let link_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let link = CuttableLink {
+        inner: link,
+        down: link_down.clone(),
+    };
     let verifier = Arc::new(FakeVerifier {
         trusted: o.trusted.clone(),
         seen: Default::default(),
@@ -434,8 +465,13 @@ pub async fn world(o: Options) -> World {
         inbox,
         dir,
         verifier,
+        pending: Default::default(),
+        startup_reports: Vec::new(),
+        link_down,
         _mirror_stop: mirror_stop,
     }
+    .settled()
+    .await
 }
 
 impl World {
@@ -474,6 +510,9 @@ impl World {
     /// The next document the bridge sent, checked as the VTC checks it:
     /// addressed to the VTC, from the bridge, with a proof that verifies.
     pub async fn next(&mut self) -> Value {
+        if let Some(doc) = self.pending.pop_front() {
+            return doc;
+        }
         let (to, doc) = tokio::time::timeout(Duration::from_secs(20), self.inbox.recv())
             .await
             .expect("the bridge sent nothing in time")
@@ -502,6 +541,10 @@ impl World {
     /// Nothing more arrives within a short while.
     pub async fn quiet(&mut self) {
         assert!(
+            self.pending.is_empty(),
+            "the bridge sent something unexpected"
+        );
+        assert!(
             tokio::time::timeout(Duration::from_millis(300), self.inbox.recv())
                 .await
                 .is_err(),
@@ -524,6 +567,23 @@ impl World {
 }
 
 impl World {
+    /// Take the start-up role-map reports (`roleMapReported`, sent by
+    /// `restore` for every bound namespace) off the inbox and acknowledge
+    /// them as the VTC does, so a test sees only what it caused. Anything
+    /// else `restore` sent (an unacknowledged document resent) is kept for
+    /// [`World::next`], in order.
+    pub async fn settled(mut self) -> Self {
+        while let Ok((_, doc)) = self.inbox.try_recv() {
+            if doc["payload"]["event"]["type"] == "roleMapReported" {
+                self.ack_event(&doc).await;
+                self.startup_reports.push(doc);
+            } else {
+                self.pending.push_back(doc);
+            }
+        }
+        self
+    }
+
     /// Acknowledge an event as the VTC does.
     pub async fn ack_event(&self, event_doc: &Value) {
         let ack = self
@@ -787,6 +847,11 @@ oauth_client_id = "cid"
             trusted: vec![],
             seen: Default::default(),
         }),
+        pending: Default::default(),
+        startup_reports: Vec::new(),
+        link_down: Default::default(),
         _mirror_stop: None,
     }
+    .settled()
+    .await
 }

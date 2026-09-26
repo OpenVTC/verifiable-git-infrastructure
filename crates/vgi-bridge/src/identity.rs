@@ -325,7 +325,7 @@ impl BridgeIdentity {
     /// to `authentication` (SPEC's own examples use it), but this bridge
     /// and the VTC-side checks it faces (`wire::DocChecker::check`) still
     /// require `assertionMethod` on both sides of the wire — see the
-    /// `proofPurpose` follow-up on #91.
+    /// `proofPurpose` follow-up in #91.
     pub async fn sign(&self, doc: &Value) -> Result<Value> {
         sign_trust_task(
             doc,

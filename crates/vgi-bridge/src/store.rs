@@ -299,6 +299,12 @@ pub struct RepoRecord {
     /// The last check the bridge posted on the repository itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check: Option<LastCheck>,
+    /// The role map, as the forge applies it, under which `roles` were last
+    /// projected. `None` on a record written before the bridge kept it,
+    /// which is taken to be the default map (`crate::rolemap`): the only
+    /// map a released bridge applied until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_map: Option<vgi_forge::RoleMap>,
 }
 
 /// A check the bridge posted (GitHub fallback mode), as it reports it.
@@ -340,6 +346,7 @@ impl RepoRecord {
             last_drift: None,
             guard: None,
             last_check: None,
+            role_map: None,
         }
     }
 
