@@ -29,11 +29,14 @@ pub struct BridgeConfig {
     /// The one VTC this bridge serves. Jobs signed by any other DID are
     /// refused (spec: `permissionDenied`), whatever their proof.
     pub vtc_did: String,
-    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.2"`
-    /// (the default), or `"0.1"` for a VTC that does not understand 0.2 yet.
-    /// The two are wire-identical; what differs is what the VTC does with
-    /// a transfer (0.2 detaches the repository and never moves its rights).
-    /// The bridge's own handling is the same either way.
+    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.3"`
+    /// (the default), or `"0.2"` / `"0.1"` for a VTC that does not
+    /// understand the newer one yet. All three are wire-identical for every
+    /// forge event; 0.2 changes what the VTC does with a transfer (it
+    /// detaches the repository and never moves its rights), and 0.3 adds
+    /// `roleMapReported`, the role map the bridge projects rights with —
+    /// which is never sent under 0.1 or 0.2, so such a VTC keeps assuming
+    /// the default map. The bridge's own handling is the same either way.
     #[serde(default)]
     pub event_version: EventVersion,
     /// The community's Trust Registry, for the bootstrap plan and the
@@ -172,16 +175,27 @@ fn default_vta_start_timeout() -> u64 {
 }
 
 /// A `git-ns/bridge/event` version the bridge can send.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[non_exhaustive]
 pub enum EventVersion {
     /// `git-ns/bridge/event` 0.1, for a VTC that has not moved to 0.2.
     #[serde(rename = "0.1")]
     V0_1,
-    /// `git-ns/bridge/event` 0.2.
-    #[default]
+    /// `git-ns/bridge/event` 0.2, for a VTC that has not moved to 0.3: no
+    /// role-map report.
     #[serde(rename = "0.2")]
     V0_2,
+    /// `git-ns/bridge/event` 0.3: adds `roleMapReported`.
+    #[default]
+    #[serde(rename = "0.3")]
+    V0_3,
+}
+
+impl EventVersion {
+    /// Whether the VTC takes `roleMapReported` (event 0.3 and later).
+    pub fn reports_role_map(self) -> bool {
+        self >= EventVersion::V0_3
+    }
 }
 
 /// Inputs to every bootstrap plan.
@@ -594,6 +608,32 @@ impl BridgeConfig {
             .unwrap_or_default()
     }
 
+    /// The repositories with a `role_map` layer of their own in the
+    /// namespace `ns` (`host/owner`), as resources (the config keys them by
+    /// lowercase name). Empty on a host this bridge has no entry for.
+    pub fn role_map_repos(&self, ns: &Resource) -> Vec<Resource> {
+        let host = ns.host();
+        let owner = ns.owner().to_ascii_lowercase();
+        let repos: Option<&BTreeMap<String, RepoConfig>> =
+            if let Some(g) = self.github.iter().find(|g| g.host == host) {
+                g.namespaces.get(&owner).map(|n| &n.repos)
+            } else if let Some(f) = self
+                .forgejo
+                .iter()
+                .find(|f| f.host().is_ok_and(|h| h == host))
+            {
+                f.namespaces.get(&owner).map(|n| &n.repos)
+            } else {
+                None
+            };
+        repos
+            .into_iter()
+            .flatten()
+            .filter(|(_, r)| r.role_map.is_some())
+            .filter_map(|(name, _)| ns.namespace().join(name).ok())
+            .collect()
+    }
+
     /// Check every role map the layers can produce, and the keys.
     fn validate_role_maps(&self) -> Result<()> {
         let base = Some(self.role_map);
@@ -891,7 +931,7 @@ oauth_client_id = "0b6e3a0c"
             "https://bridge.acme.example/github/github.com/webhook"
         );
         assert_eq!(c.checks.max_commits, 250);
-        assert_eq!(c.event_version, EventVersion::V0_2, "0.2 unless set");
+        assert_eq!(c.event_version, EventVersion::V0_3, "0.3 unless set");
     }
 
     #[test]
@@ -925,7 +965,7 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn the_event_version_is_0_1_or_0_2() {
+    fn the_event_version_is_0_1_0_2_or_0_3() {
         let with = |v: &str| {
             BridgeConfig::parse(&EXAMPLE.replacen(
                 "public_url",
@@ -935,7 +975,10 @@ oauth_client_id = "0b6e3a0c"
         };
         assert_eq!(with("0.1").unwrap().event_version, EventVersion::V0_1);
         assert_eq!(with("0.2").unwrap().event_version, EventVersion::V0_2);
-        for bad in ["0.3", "1.0", "", "v0.2"] {
+        assert_eq!(with("0.3").unwrap().event_version, EventVersion::V0_3);
+        assert!(!EventVersion::V0_2.reports_role_map());
+        assert!(EventVersion::V0_3.reports_role_map());
+        for bad in ["0.4", "1.0", "", "v0.2"] {
             assert!(with(bad).is_err(), "`{bad}` is refused");
         }
     }
@@ -1086,6 +1129,13 @@ commit = "write"
         assert_eq!(got("codeberg.org/acme/gadgets"), (Admin, Write, Read));
         // Repository over the namespace; names match case-insensitively.
         assert_eq!(got("codeberg.org/Acme/Widgets"), (Admin, Write, Write));
+        // The repositories with a layer of their own, for the report.
+        assert_eq!(
+            c.role_map_repos(&res("codeberg.org/acme")),
+            vec![res("codeberg.org/acme/widgets")]
+        );
+        assert!(c.role_map_repos(&res("codeberg.org/other")).is_empty());
+        assert!(c.role_map_repos(&res("github.com/acme")).is_empty());
     }
 
     #[test]
