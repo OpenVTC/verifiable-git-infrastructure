@@ -1986,8 +1986,8 @@ mod tests {
 
         async fn exchange(
             &self,
-            request: trust_tasks_trql::TrustTask<serde_json::Value>,
-        ) -> Result<trust_tasks_trql::TrustTask<serde_json::Value>, TrqlError> {
+            request: trust_tasks_rs::TrustTask<serde_json::Value>,
+        ) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, TrqlError> {
             let request = serde_json::to_value(&request).unwrap();
             assert_eq!(request["recipient"], "did:example:registry");
             self.seen.lock().unwrap().push(request.clone());

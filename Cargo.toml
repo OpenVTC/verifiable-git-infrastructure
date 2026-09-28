@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.5.1", path = "crates/vgi-core" }
+vgi-core = { version = "0.5.2", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.5.1", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.5.2", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.5.1", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.5.1", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.5.1", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.5.2", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.5.2", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.5.2", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -98,28 +98,14 @@ verify-trust = { version = "0.5.1", path = "crates/verify-trust" }
 # Rust it ships is byte-identical; only its own `trust-tasks-rs` requirement
 # moved — so this was a manifest-only step for this workspace.
 #
-# The split is back open as of the 0.56/0.24.2 move below: published
-# trql-client is still 0.20.1, declaring `trust-tasks-rs ^0.23.4`, one line
-# behind the `^0.24.2` vta-sdk 0.56 and the bridge's own pin now resolve.
-# Unlike the 0.19/`^0.21` gap this note used to describe, this one is not
-# merely untidy: `TrqlTransport::exchange` is trql-client's own trait, and
-# verify-trust implements it for its mediator transports, so a `TrustTask`
-# from the workspace's 0.24.2 line does not unify with the 0.23.6 one that
-# trait speaks (`E0053`). The `trust-tasks-trql` alias below is back for
-# exactly that reason, and it closes the same way it did before: once
-# affinidi-trust-registry-rs publishes trql-client declaring
-# `trust-tasks-rs ^0.24`, this pin follows it and the alias retires again.
-trql-client = "0.20"
-# The Trust Task document type on the line trql-client 0.20.1 actually speaks
-# (`^0.23.4`), named only because `TrqlTransport::exchange` takes and returns
-# one: verify-trust implements that trait for its mediator transports
-# (DIDComm and TSP). This is **not** the workspace's other `trust-tasks-rs`
-# (0.24.2, below) — that one no longer unifies with what trql-client's trait
-# signature names, so an `impl TrqlTransport` built against it is a
-# different, non-unifying type. Renamed so it cannot be confused with the
-# bridge's `trust-tasks-rs`. Default features off: the document envelope is
-# all it needs. Moves only when trql-client's own requirement moves.
-trust-tasks-trql = { package = "trust-tasks-rs", version = "0.23.6", default-features = false }
+# The 0.56/0.24.2 move reopened that split for one release: trql-client
+# 0.20.1 still declared `trust-tasks-rs ^0.23.4`, and because
+# `TrqlTransport::exchange` is trql-client's own trait, verify-trust's
+# transport impls needed a `trust-tasks-trql` alias on that line (`E0053`
+# otherwise). trql-client 0.20.2 declares `trust-tasks-rs ^0.24.2`, so the
+# alias is retired again and verify-trust names the workspace's single
+# `trust-tasks-rs` directly.
+trql-client = "0.20.2"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.

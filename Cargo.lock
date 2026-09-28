@@ -394,7 +394,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "trust-tasks-rs 0.24.2",
+ "trust-tasks-rs",
  "url",
  "uuid",
 ]
@@ -486,7 +486,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "trust-tasks-proof",
- "trust-tasks-rs 0.24.2",
+ "trust-tasks-rs",
  "uuid",
 ]
 
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6495,9 +6495,9 @@ dependencies = [
 
 [[package]]
 name = "trql-client"
-version = "0.20.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad587b675bda7d4bd1a4c9cd4bde43efdfc1f2d6f9e2abaad7d7af7afe22e240"
+checksum = "33c1fdabc0cdf2af769657d67e76dfba6199a973019227ca847c997719164a44"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6506,7 +6506,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "trust-tasks-rs 0.23.6",
+ "trust-tasks-rs",
 ]
 
 [[package]]
@@ -6524,22 +6524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs 0.24.2",
-]
-
-[[package]]
-name = "trust-tasks-rs"
-version = "0.23.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c4dd274f1df2e45d554d51f4efdfc41d53e22cfa508776a20916fbc5674fb91"
-dependencies = [
- "async-trait",
- "chrono",
- "regress",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror",
+ "trust-tasks-rs",
 ]
 
 [[package]]
@@ -6754,7 +6739,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -6778,7 +6763,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-rs 0.23.6",
+ "trust-tasks-rs",
  "uuid",
  "vgi-core",
  "vta-sdk",
@@ -6793,7 +6778,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -6828,7 +6813,7 @@ dependencies = [
  "tracing-subscriber",
  "trql-client",
  "trust-tasks-proof",
- "trust-tasks-rs 0.24.2",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "verify-trust",
@@ -6843,7 +6828,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6862,7 +6847,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6876,7 +6861,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "http",
@@ -6888,7 +6873,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6908,7 +6893,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6969,7 +6954,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.24.2",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",
