@@ -97,7 +97,29 @@ verify-trust = { version = "0.5.1", path = "crates/verify-trust" }
 # There is no source change in trql-client between 0.19.0 and 0.20.0 — the
 # Rust it ships is byte-identical; only its own `trust-tasks-rs` requirement
 # moved — so this was a manifest-only step for this workspace.
+#
+# The split is back open as of the 0.56/0.24.2 move below: published
+# trql-client is still 0.20.1, declaring `trust-tasks-rs ^0.23.4`, one line
+# behind the `^0.24.2` vta-sdk 0.56 and the bridge's own pin now resolve.
+# Unlike the 0.19/`^0.21` gap this note used to describe, this one is not
+# merely untidy: `TrqlTransport::exchange` is trql-client's own trait, and
+# verify-trust implements it for its mediator transports, so a `TrustTask`
+# from the workspace's 0.24.2 line does not unify with the 0.23.6 one that
+# trait speaks (`E0053`). The `trust-tasks-trql` alias below is back for
+# exactly that reason, and it closes the same way it did before: once
+# affinidi-trust-registry-rs publishes trql-client declaring
+# `trust-tasks-rs ^0.24`, this pin follows it and the alias retires again.
 trql-client = "0.20"
+# The Trust Task document type on the line trql-client 0.20.1 actually speaks
+# (`^0.23.4`), named only because `TrqlTransport::exchange` takes and returns
+# one: verify-trust implements that trait for its mediator transports
+# (DIDComm and TSP). This is **not** the workspace's other `trust-tasks-rs`
+# (0.24.2, below) — that one no longer unifies with what trql-client's trait
+# signature names, so an `impl TrqlTransport` built against it is a
+# different, non-unifying type. Renamed so it cannot be confused with the
+# bridge's `trust-tasks-rs`. Default features off: the document envelope is
+# all it needs. Moves only when trql-client's own requirement moves.
+trust-tasks-trql = { package = "trust-tasks-rs", version = "0.23.6", default-features = false }
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -239,8 +261,14 @@ trql-client = "0.20"
 # That residual closed for good in the 0.5.1 release: trql-client 0.20
 # declares `trust-tasks-rs ^0.23.0` too, so the `trust-tasks-trql` alias is
 # gone and `cargo tree -i trust-tasks-rs` is one node, full stop.
-vta-sdk = { version = "0.53", default-features = false }
-affinidi-tdk = "0.18"
+#
+# 0.53 -> 0.56 follows the VTI/TDK stack move: vta-sdk 0.56 is the release
+# that declares `affinidi-tdk ^0.20`, `affinidi-messaging-sdk ^0.30` and
+# `trust-tasks-rs ^0.24.2` (below), so this line, `affinidi-tdk` and
+# `trust-tasks-rs` all move together in this same commit — a partial bump
+# is exactly how a second copy of one of them gets into the graph.
+vta-sdk = { version = "0.56", default-features = false }
+affinidi-tdk = "0.20"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
 # key agreement actually used — `skid` must equal the `apu` party info, and
@@ -253,7 +281,7 @@ affinidi-tdk = "0.18"
 # `affinidi-messaging-didcomm = "0.15"`, and against 0.15.9 its unpack calls
 # the deprecated `decrypt`, which now refuses every authcrypt message — the
 # 0.26 line cannot receive DIDComm at all on the fixed crate.
-affinidi-messaging-sdk = "0.28.1"
+affinidi-messaging-sdk = "0.30"
 affinidi-messaging-didcomm = "0.15.9"
 # Named directly for one reason: the **floor**. The verifier resolves DIDs a
 # pull-request author chose — the `Signed-by-DID` trailer and the committer
@@ -278,7 +306,7 @@ affinidi-messaging-didcomm = "0.15.9"
 #
 # No feature is chosen here: `affinidi-tdk` already takes this crate with its
 # default features, so this line adds a version requirement and nothing else.
-affinidi-did-resolver-cache-sdk = "0.8.37"
+affinidi-did-resolver-cache-sdk = "0.8.38"
 multibase = "0.9"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
@@ -351,8 +379,8 @@ wiremock = "0.6"
 # mediator-binding tests: the run's ephemeral DID really connects, a fake
 # registry on the same mediator really answers, and an `ExplicitAllow`
 # mediator really refuses. Dev-only. 0.11 is the line on the messaging SDK
-# 0.28 / TDK 0.18 that verify-trust's transports and the bridge use.
-affinidi-messaging-test-mediator = { version = "0.11.1", features = ["tsp"] }
+# 0.30 / TDK 0.20 that verify-trust's transports and the bridge use.
+affinidi-messaging-test-mediator = { version = "0.14", features = ["tsp"] }
 
 # ── the bridge (vgi-bridge) ─────────────────────────────────────────────────
 # The per-community service that holds the forge credentials and runs the
@@ -378,11 +406,11 @@ affinidi-messaging-test-mediator = { version = "0.11.1", features = ["tsp"] }
 # names this same `trust-tasks-rs` directly now. The bridge is `publish =
 # false`, and signs and verifies with trust-tasks-proof on the same 0.23
 # line.
-trust-tasks-rs = { version = "0.23", default-features = false, features = ["git-ns"] }
+trust-tasks-rs = { version = "0.24.2", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
-trust-tasks-proof = "0.23.0"
+trust-tasks-proof = "0.24.2"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each
