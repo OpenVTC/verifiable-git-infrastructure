@@ -13,12 +13,17 @@
 
 FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
 WORKDIR /src
+# The TDK's keyring store links libdbus on Linux (dbus-secret-service), so the
+# build needs its headers and the runtime its shared library.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --locked -p vgi-bridge
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git \
+ && apt-get install -y --no-install-recommends ca-certificates git libdbus-1-3 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /var/lib/vgi-bridge --create-home vgi
 COPY --from=build /src/target/release/vgi-bridge /usr/local/bin/vgi-bridge
