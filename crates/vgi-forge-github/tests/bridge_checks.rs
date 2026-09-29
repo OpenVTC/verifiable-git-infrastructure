@@ -635,6 +635,51 @@ async fn commits_are_compared_with_a_read_only_token() {
     );
 }
 
+/// The merge base of two commits, for recomputing a platform merge
+/// (SEC-4045 / VGI-01): one comparison, one commit listed at most, read with
+/// a read-only token — and a merge base that is not a commit id is refused.
+#[tokio::test]
+async fn a_merge_base_is_read_from_one_small_comparison() {
+    let server = MockServer::start().await;
+    let forge = bridge_forge(&server);
+    mount_any_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/widgets/compare/{SHA}...{HEAD}")))
+        .and(query_param("per_page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_commits": 400,
+            "merge_base_commit": { "sha": BASE },
+            "commits": [ { "sha": SHA } ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(
+        forge.merge_base(&repo("widgets"), SHA, HEAD).await.unwrap(),
+        BASE
+    );
+    assert!(
+        forge
+            .merge_base(&repo("widgets"), "main", HEAD)
+            .await
+            .is_err()
+    );
+
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/widgets/compare/{BASE}...{HEAD}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": { "sha": "not-a-sha" },
+        })))
+        .mount(&server)
+        .await;
+    assert!(
+        forge
+            .merge_base(&repo("widgets"), BASE, HEAD)
+            .await
+            .is_err()
+    );
+}
+
 async fn mount_any_token(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path_regex(r"^/app/installations/\d+/access_tokens$"))

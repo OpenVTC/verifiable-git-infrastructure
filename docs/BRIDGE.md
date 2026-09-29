@@ -358,6 +358,18 @@ VTC still maps the host to this one bridge.
    queues). The in-repo and required-workflow plans refuse to plan without
    it; the bridge-posted check works without it, and then fails any
    platform-signed commit.
+
+   With it, the bridge-posted check exempts a platform-signed merge — an
+   "Update branch" merge, typically — only when it is the clean merge of
+   parents that pass, as verify-trust does in CI. The bridge holds commit
+   objects only, so for each such merge it asks GitHub for the parents'
+   merge base, fetches the two parents and the base with their trees, and
+   recomputes the merge (`git merge-tree`, fetching only the blobs both
+   sides changed), under the same token, byte bound and timeout as the
+   check's fetch. At most eight are recomputed per check; any merge it
+   cannot recompute fails closed (`platformMergeAltered`, saying why). A
+   merge with more than one merge base (a criss-cross) is recomputed over
+   one of them, and can fail where GitHub's recursive merge did not.
 2. Start the bridge. For each entry whose App is not registered yet, it
    logs a **one-time registration URL** (valid 24 hours):
    `…/github/github.com/<owner>/register?state=…` — one per organisation.

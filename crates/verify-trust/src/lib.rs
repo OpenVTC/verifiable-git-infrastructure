@@ -396,12 +396,82 @@ pub async fn verify_prepared(
 ///
 /// A registry that cannot be consulted fails each signer's commits as
 /// [`CommitStatus::RegistryUnavailable`]; it is never a pass.
+///
+/// Platform-signed merges are checked against the repository at
+/// `args.repo_dir` over `args.range`, with git. A caller with no such
+/// checkout uses [`verify_prepared_with_facts`].
 pub async fn verify_prepared_with(
     args: &VerifyTrustArgs,
     commits: &[RangeCommit],
     signers: &ResolvedSigners,
     exempt: Option<&ExemptKeyring>,
     registry: &Registry,
+) -> Result<TrustReport> {
+    let source = MergeSource::Git {
+        repo_dir: &args.repo_dir,
+        range: &args.range,
+    };
+    verify_prepared_inner(args, commits, signers, exempt, registry, source).await
+}
+
+/// [`verify_prepared_with`] for a caller that holds the commits but no
+/// checkout of their repository (the bridge: commit objects fetched by id).
+/// The platform-merge policy takes what it would have asked git from
+/// `facts`; `args.repo_dir` and `args.range` are not read. A platform merge
+/// `facts` has no recomputation for fails closed.
+pub async fn verify_prepared_with_facts(
+    args: &VerifyTrustArgs,
+    commits: &[RangeCommit],
+    signers: &ResolvedSigners,
+    exempt: Option<&ExemptKeyring>,
+    registry: &Registry,
+    facts: &MergeFacts,
+) -> Result<TrustReport> {
+    let source = MergeSource::Facts(facts);
+    verify_prepared_inner(args, commits, signers, exempt, registry, source).await
+}
+
+/// What the platform-merge policy needs from the repository, supplied by a
+/// caller instead of read with git (see [`verify_prepared_with_facts`]).
+#[derive(Debug, Clone, Default)]
+pub struct MergeFacts {
+    /// Commits outside the range that are parents of commits in it **and**
+    /// on the branch the range is measured against — what
+    /// [`range_boundary`] computes from a full clone. The caller vouches for
+    /// this set: a parent in it is treated as already verified.
+    pub boundary: BTreeSet<String>,
+    /// By merge commit id, its two parents' merge, recomputed as
+    /// [`merge_tree_args`] does it.
+    pub merges: BTreeMap<String, MergeOutcome>,
+}
+
+/// The result of recomputing a two-parent merge ([`merge_outcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The parents merge cleanly, to this tree.
+    Clean { tree: String },
+    /// The parents do not merge cleanly.
+    Conflict,
+    /// The merge could not be recomputed, and why.
+    Unavailable(String),
+}
+
+/// Where the platform-merge policy gets its answers.
+#[derive(Clone, Copy)]
+enum MergeSource<'a> {
+    /// Ask git, in a checkout, about a revision range.
+    Git { repo_dir: &'a Path, range: &'a str },
+    /// Take them from the caller.
+    Facts(&'a MergeFacts),
+}
+
+async fn verify_prepared_inner(
+    args: &VerifyTrustArgs,
+    commits: &[RangeCommit],
+    signers: &ResolvedSigners,
+    exempt: Option<&ExemptKeyring>,
+    registry: &Registry,
+    source: MergeSource<'_>,
 ) -> Result<TrustReport> {
     // Pass 1: cryptographic verification, collecting the DIDs that signed.
     let mut checked = Vec::with_capacity(commits.len());
@@ -426,7 +496,7 @@ pub async fn verify_prepared_with(
         .collect();
 
     // Pass 3: a platform signature exempts only merges of passing parents.
-    apply_platform_merge_policy(&args.repo_dir, &args.range, commits, &mut verdicts)?;
+    apply_platform_merge_policy(source, commits, &mut verdicts)?;
     let commits = verdicts;
 
     // Names are reported for the signers that actually signed something here
@@ -507,8 +577,7 @@ pub async fn verify_prepared_with(
 /// dates are skewed, so verdicts are settled to a fixpoint rather than in one
 /// pass.
 fn apply_platform_merge_policy(
-    repo_dir: &Path,
-    range: &str,
+    source: MergeSource<'_>,
     commits: &[RangeCommit],
     verdicts: &mut [CommitVerdict],
 ) -> Result<()> {
@@ -557,7 +626,12 @@ fn apply_platform_merge_policy(
                     None => {
                         let boundary = match &mut boundary {
                             Some(set) => set,
-                            empty => empty.insert(range_boundary(repo_dir, range)?),
+                            empty => empty.insert(match source {
+                                MergeSource::Git { repo_dir, range } => {
+                                    range_boundary(repo_dir, range)?
+                                }
+                                MergeSource::Facts(facts) => facts.boundary.clone(),
+                            }),
                         };
                         if !boundary.contains(parent) {
                             failed = Some(parent.clone());
@@ -575,11 +649,23 @@ fn apply_platform_merge_policy(
             } else if waiting {
                 continue;
             } else {
-                if !git_checked {
+                if !git_checked && let MergeSource::Git { repo_dir, .. } = source {
                     require_attr_source_git(repo_dir)?;
-                    git_checked = true;
                 }
-                match clean_merge_mismatch(repo_dir, &commits[i].raw, &parents) {
+                git_checked = true;
+                let recompute = |ours: &str, theirs: &str| match source {
+                    MergeSource::Git { repo_dir, .. } => recompute_merge(repo_dir, ours, theirs),
+                    MergeSource::Facts(facts) => facts
+                        .merges
+                        .get(&commits[i].sha)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            MergeOutcome::Unavailable(
+                                "the merge was not recomputed for this check".to_string(),
+                            )
+                        }),
+                };
+                match clean_merge_mismatch(&commits[i].raw, &parents, recompute) {
                     None => CommitStatus::Exempt { fingerprint },
                     Some(detail) => CommitStatus::PlatformMergeAltered {
                         fingerprint,
@@ -628,17 +714,21 @@ fn commit_headers(raw: &[u8]) -> impl Iterator<Item = &str> {
         .filter_map(|line| std::str::from_utf8(line).ok())
 }
 
-/// The commit's parent SHAs, in order.
-fn commit_parents(raw: &[u8]) -> Vec<String> {
+/// The commit's parent SHAs, in order, from its raw object.
+pub fn commit_parents(raw: &[u8]) -> Vec<String> {
     commit_headers(raw)
         .filter_map(|line| line.strip_prefix("parent "))
         .map(str::to_string)
         .collect()
 }
 
-/// `None` if the commit's tree is the clean merge of `parents`; otherwise why
-/// not.
-fn clean_merge_mismatch(repo_dir: &Path, raw: &[u8], parents: &[String]) -> Option<String> {
+/// `None` if the commit's tree is the clean merge of `parents`, as
+/// `recompute` finds it; otherwise why not.
+fn clean_merge_mismatch(
+    raw: &[u8],
+    parents: &[String],
+    recompute: impl FnOnce(&str, &str) -> MergeOutcome,
+) -> Option<String> {
     let [ours, theirs] = parents else {
         return Some(format!(
             "{}-parent merge; the platform creates only two-parent merges",
@@ -648,48 +738,108 @@ fn clean_merge_mismatch(repo_dir: &Path, raw: &[u8], parents: &[String]) -> Opti
     let Some(tree) = commit_headers(raw).find_map(|line| line.strip_prefix("tree ")) else {
         return Some("commit has no tree header".to_string());
     };
-    let output = match Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        // Attributes from the empty tree only: see `apply_platform_merge_policy`.
-        .arg(format!("--attr-source={EMPTY_TREE}"))
-        .args(["-c", "core.attributesFile=/dev/null"])
-        .args([
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
-            "--end-of-options",
-            ours,
-            theirs,
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => return Some(format!("could not run git merge-tree: {e}")),
-    };
-    match output.status.code() {
-        Some(0) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let merged = stdout.lines().next().unwrap_or("").trim();
-            if merged == tree {
-                None
-            } else {
-                Some(format!(
-                    "tree {tree} is not the clean merge of its parents ({merged}); \
-                     the merge added content of its own"
-                ))
-            }
-        }
-        Some(1) => Some(
+    match recompute(ours, theirs) {
+        MergeOutcome::Clean { tree: merged } if merged == tree => None,
+        MergeOutcome::Clean { tree: merged } => Some(format!(
+            "tree {tree} is not the clean merge of its parents ({merged}); \
+             the merge added content of its own"
+        )),
+        MergeOutcome::Conflict => Some(
             "its parents do not merge cleanly, so the conflicts were resolved by hand \
              (e.g. in the web UI) and that resolution is unsigned content"
                 .to_string(),
         ),
-        _ => Some(format!(
-            "could not recompute the merge (it needs the full history, not a \
-             shallow clone): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
+        MergeOutcome::Unavailable(why) => Some(format!("could not recompute the merge: {why}")),
+    }
+}
+
+/// The git arguments that recompute the merge of `ours` and `theirs` as the
+/// platform-merge policy requires: `merge-tree --write-tree` (merge-ort, as
+/// the platform's own merges), with attributes read from the empty tree and
+/// no global attributes file, so a committed `merge=union` cannot turn a
+/// conflict into a "clean" merge. Everything after `git` (and any `-C`/`-c`
+/// of the caller's own); needs git 2.40+.
+///
+/// `merge_base` pins the merge base instead of letting git search history
+/// for it — for a repository holding too little history to find it (a
+/// shallow fetch). With several merge bases (a criss-cross), one pinned base
+/// can merge differently from git's recursive virtual base; that shows as a
+/// mismatch, which fails closed.
+pub fn merge_tree_args(ours: &str, theirs: &str, merge_base: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        format!("--attr-source={EMPTY_TREE}"),
+        "-c".to_string(),
+        "core.attributesFile=/dev/null".to_string(),
+        "merge-tree".to_string(),
+        "--write-tree".to_string(),
+        "--no-messages".to_string(),
+    ];
+    if let Some(base) = merge_base {
+        args.push(format!("--merge-base={base}"));
+    }
+    args.push("--end-of-options".to_string());
+    args.push(ours.to_string());
+    args.push(theirs.to_string());
+    args
+}
+
+/// Read the result of running [`merge_tree_args`].
+///
+/// Exit 1 is a conflict — except that git also exits 1 when a parent is not
+/// a commit it has ("not something we can merge": an unknown id, or one
+/// beyond a shallow cut), which is the repository's gap, not the merge's
+/// fault, and is reported as such (SEC-4045 / VGI-05).
+pub fn merge_outcome(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> MergeOutcome {
+    let stderr = String::from_utf8_lossy(stderr);
+    match code {
+        Some(0) => MergeOutcome::Clean {
+            tree: String::from_utf8_lossy(stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        },
+        Some(1) if stderr.contains("not something we can merge") => MergeOutcome::Unavailable(
+            format!("a parent is not in the repository: {}", stderr.trim()),
+        ),
+        Some(1) => MergeOutcome::Conflict,
+        _ => MergeOutcome::Unavailable(stderr.trim().to_string()),
+    }
+}
+
+/// Recompute the merge of `ours` and `theirs` in the checkout at `repo_dir`.
+fn recompute_merge(repo_dir: &Path, ours: &str, theirs: &str) -> MergeOutcome {
+    // A parent the repository lacks makes merge-tree fail in a way that
+    // reads as a conflict; name the gap instead (VGI-05).
+    for parent in [ours, theirs] {
+        let present = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(["cat-file", "-e", "--end-of-options"])
+            .arg(format!("{parent}^{{commit}}"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !present {
+            return MergeOutcome::Unavailable(format!(
+                "parent {parent} is not in the repository (it needs the full history, not a \
+                 shallow clone)"
+            ));
+        }
+    }
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(merge_tree_args(ours, theirs, None))
+        .output()
+    {
+        Ok(output) => match merge_outcome(output.status.code(), &output.stdout, &output.stderr) {
+            MergeOutcome::Unavailable(why) => MergeOutcome::Unavailable(format!(
+                "it needs the full history, not a shallow clone: {why}"
+            )),
+            outcome => outcome,
+        },
+        Err(e) => MergeOutcome::Unavailable(format!("could not run git merge-tree: {e}")),
     }
 }
 

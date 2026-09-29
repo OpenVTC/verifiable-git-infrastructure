@@ -437,6 +437,32 @@ impl GitHubForge {
         })
     }
 
+    /// The merge base of `a` and `b` on `repo`: GitHub's
+    /// `merge_base_commit` for `a...b`, one commit listed at most. For
+    /// recomputing a merge from a fetch too shallow to search for the base.
+    pub async fn merge_base(&self, repo: &Resource, a: &str, b: &str) -> Result<String> {
+        check_sha(a)?;
+        check_sha(b)?;
+        let (token, owner, name) = self.repo_token_for(repo, PERMS_READ).await?;
+        #[derive(Deserialize)]
+        struct Sha {
+            sha: String,
+        }
+        #[derive(Deserialize)]
+        struct Compare {
+            merge_base_commit: Sha,
+        }
+        let range = format!("{a}...{b}");
+        let mut url = self.api().url(&["repos", &owner, &name, "compare", &range]);
+        url.query_pairs_mut().append_pair("per_page", "1");
+        let c: Compare = self
+            .api()
+            .json(Method::GET, url, Auth::Bearer(&token), None, "merge base")
+            .await?;
+        check_sha(&c.merge_base_commit.sha)?;
+        Ok(c.merge_base_commit.sha)
+    }
+
     /// A token that can read (fetch) `repo` and nothing else, for one fetch
     /// of the commits under test. The caller holds it for that fetch only
     /// and drops it; it lapses on its own within the hour either way.
