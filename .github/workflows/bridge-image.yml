@@ -1,0 +1,54 @@
+name: bridge-image
+
+# The bridge's container image, built whenever what it is built from changes.
+# Nothing else builds it, and it once stopped building unnoticed: a dependency
+# began linking libdbus on Linux, which the build stage did not have. The
+# smoke test also exercises the image's HEALTHCHECK (`vgi-bridge healthcheck`)
+# both ways: failing with nothing listening, passing against a `/healthz`.
+on:
+  pull_request:
+    paths:
+      - crates/vgi-bridge/Dockerfile
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - .github/workflows/bridge-image.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Bridge image builds and answers its healthcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE: vgi-bridge:ci
+      # A stand-in `/healthz`, pinned by digest like every image here.
+      SIDECAR: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build -f crates/vgi-bridge/Dockerfile -t "$IMAGE" .
+      - name: The image declares its HEALTHCHECK
+        run: |
+          set -euo pipefail
+          test="$(docker image inspect "$IMAGE" --format '{{json .Config.Healthcheck.Test}}')"
+          echo "$test"
+          case "$test" in *'"healthcheck"'*) ;; *) echo "::error::no HEALTHCHECK running vgi-bridge healthcheck"; exit 1 ;; esac
+      - name: The healthcheck fails with nothing listening
+        run: |
+          set -euo pipefail
+          if docker run --rm -v "$PWD/crates/vgi-bridge/bridge.example.toml:/etc/vgi-bridge/bridge.toml:ro" "$IMAGE" healthcheck; then
+            echo "::error::healthcheck passed with no bridge running"; exit 1
+          fi
+      - name: The healthcheck passes against a /healthz answering 200
+        run: |
+          set -euo pipefail
+          docker run -d --name healthz "$SIDECAR" sh -c 'mkdir -p /www && echo ok > /www/healthz && httpd -f -p 8080 -h /www'
+          trap 'docker rm -f healthz >/dev/null' EXIT
+          sleep 1
+          docker run --rm --network container:healthz \
+            -v "$PWD/crates/vgi-bridge/bridge.example.toml:/etc/vgi-bridge/bridge.toml:ro" \
+            "$IMAGE" healthcheck
