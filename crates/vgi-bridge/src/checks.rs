@@ -29,6 +29,10 @@
 //!    (`--filter=tree:0`) — into a throwaway bare repository, with a
 //!    read-only token for that one repository and a bound on the bytes
 //!    fetched (see [`GitFetcher`]);
+//!    For a platform-signed merge (with a `web-flow` keyring configured) it
+//!    also fetches the parents' trees and recomputes the merge over the
+//!    merge base GitHub reports ([`merge_facts`]), since verify-trust's
+//!    platform-merge policy has no checkout here to ask git;
 //! 4. runs verify-trust **as a library** against them — the qualified
 //!    resource (`github.com/acme/widgets`) with the namespace
 //!    (`github.com/acme`) as the fallback resource, where `git.ns.admin`'s
@@ -56,7 +60,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
-use verify_trust::RangeCommit;
+use verify_trust::{MergeFacts, MergeOutcome, RangeCommit};
 use vgi_forge::Resource;
 use vgi_forge_github::checks::check_sha;
 use vgi_forge_github::{CheckConclusion, CheckTrigger, CheckTriggerKind};
@@ -101,6 +105,25 @@ pub trait CommitVerifier: Send + Sync {
         resource: &str,
         fallback: &str,
     ) -> Result<Vec<CommitLine>>;
+
+    /// [`Self::verify`], with what the platform-merge policy needs from the
+    /// repository the bridge has no checkout of (see [`merge_facts`]).
+    async fn verify_with_facts(
+        &self,
+        commits: &[RangeCommit],
+        _facts: &MergeFacts,
+        resource: &str,
+        fallback: &str,
+    ) -> Result<Vec<CommitLine>> {
+        self.verify(commits, resource, fallback).await
+    }
+
+    /// Whether platform-signed merges on `host` can be exempt at all — a
+    /// `web-flow` keyring is configured for it — and so are worth the fetches
+    /// recomputing them costs. `false` by default.
+    fn exempts_platform_merges(&self, _host: &str) -> bool {
+        false
+    }
 
     /// Whether the registry grants `did` `git.commit.sign` on `resource`
     /// right now. `Ok(None)`: this verifier cannot say (the default). Used
@@ -263,16 +286,32 @@ fn bridge_transport(t: vgi_forge::VerifyTransport) -> verify_trust::TransportSel
 
 #[async_trait]
 impl CommitVerifier for VerifyTrustVerifier {
+    /// Without facts, a platform-signed merge fails closed as not recomputed.
     async fn verify(
         &self,
         range: &[RangeCommit],
         resource: &str,
         fallback: &str,
     ) -> Result<Vec<CommitLine>> {
+        self.verify_with_facts(range, &MergeFacts::default(), resource, fallback)
+            .await
+    }
+
+    fn exempts_platform_merges(&self, host: &str) -> bool {
+        self.keyrings.contains_key(host)
+    }
+
+    async fn verify_with_facts(
+        &self,
+        range: &[RangeCommit],
+        facts: &MergeFacts,
+        resource: &str,
+        fallback: &str,
+    ) -> Result<Vec<CommitLine>> {
         let claimed = verify_trust::claimed_signer_dids(range, self.max_signers)?;
         let tdk = self.resolver().await?;
         let lines = self
-            .verify_once(tdk, range, resource, fallback, &claimed)
+            .verify_once(tdk, range, facts, resource, fallback, &claimed)
             .await?;
         // A signer that rotated its key since its document was cached shows
         // up as an unknown key (or an unresolved DID): resolve those DIDs
@@ -308,7 +347,7 @@ impl CommitVerifier for VerifyTrustVerifier {
         }
         tracing::info!(signers = ?stale, "re-resolving signer DIDs after an unknown key");
         Ok(self
-            .verify_once(tdk, range, resource, fallback, &claimed)
+            .verify_once(tdk, range, facts, resource, fallback, &claimed)
             .await?
             .0)
     }
@@ -333,6 +372,7 @@ impl VerifyTrustVerifier {
         &self,
         tdk: &affinidi_tdk::TDK,
         range: &[RangeCommit],
+        facts: &MergeFacts,
         resource: &str,
         fallback: &str,
         claimed: &[String],
@@ -344,6 +384,10 @@ impl VerifyTrustVerifier {
             Some(p) => Some(verify_trust::pgp_exempt::ExemptKeyring::load(p)?),
             None => None,
         };
+        // No checkout and no revision range: the bridge holds commit objects
+        // fetched by id, so the platform-merge policy takes `facts` instead
+        // of asking git (which, with these empty, ran in the bridge's own
+        // working directory — SEC-4045 / VGI-01).
         let args = verify_trust::VerifyTrustArgs {
             repo_dir: PathBuf::new(),
             range: String::new(),
@@ -359,12 +403,13 @@ impl VerifyTrustVerifier {
             resolve_agent_names: false,
             json: false,
         };
-        let report = match verify_trust::verify_prepared_with(
+        let report = match verify_trust::verify_prepared_with_facts(
             &args,
             range,
             &signers,
             exempt.as_ref(),
             &registry,
+            facts,
         )
         .await
         {
@@ -396,6 +441,91 @@ impl VerifyTrustVerifier {
             .collect();
         Ok((lines, statuses))
     }
+}
+
+/// Most platform-signed merges one check recomputes. Each costs a forge call
+/// and a fetch; past this, the rest fail closed as not recomputed.
+pub const MAX_PLATFORM_MERGES: usize = 8;
+
+/// The parents of `commits` that are not themselves among them.
+///
+/// `commits` is GitHub's complete listing of `base...head` — the commits
+/// reachable from the head and not from the merge base, refused when
+/// truncated — so a parent outside it is reachable from the merge base: on
+/// the protected branch already. That is the boundary verify-trust computes
+/// with `git rev-list --boundary` from a full clone, which this fetch is not.
+/// The listing is the same one the bridge trusts to say which commits to
+/// verify at all.
+pub fn boundary_of(commits: &[RangeCommit]) -> BTreeSet<String> {
+    let listed: BTreeSet<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
+    commits
+        .iter()
+        .flat_map(|c| verify_trust::commit_parents(&c.raw))
+        .filter(|parent| !listed.contains(parent.as_str()))
+        .collect()
+}
+
+/// The commits of `commits` a platform keyring could exempt: two-parent
+/// merges carrying a PGP signature (the platform's keys are PGP; a DID
+/// signature is SSH). As `(merge, ours, theirs)`, in range order.
+pub fn platform_merge_candidates(commits: &[RangeCommit]) -> Vec<(String, String, String)> {
+    commits
+        .iter()
+        .filter(|c| {
+            matches!(
+                vgi_core::split_signed_commit(&c.raw),
+                Ok(Some((_, pem))) if pem.starts_with("-----BEGIN PGP SIGNATURE-----")
+            )
+        })
+        .filter_map(|c| match verify_trust::commit_parents(&c.raw).as_slice() {
+            [ours, theirs] => Some((c.sha.clone(), ours.clone(), theirs.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What verify-trust's platform-merge policy needs, for commits fetched by
+/// [`GitFetcher::fetch`] into `dir`: the range's boundary, and each
+/// candidate merge recomputed — over the merge base `merge_base` names —
+/// when `recompute` (a keyring is configured for the host). Anything that
+/// cannot be recomputed is recorded as such and fails closed.
+pub async fn merge_facts<F, Fut>(
+    fetcher: &GitFetcher,
+    dir: &Path,
+    token: Option<&str>,
+    commits: &[RangeCommit],
+    recompute: bool,
+    merge_base: F,
+) -> MergeFacts
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let mut facts = MergeFacts {
+        boundary: boundary_of(commits),
+        merges: BTreeMap::new(),
+    };
+    if !recompute {
+        return facts;
+    }
+    for (n, (merge, ours, theirs)) in platform_merge_candidates(commits).into_iter().enumerate() {
+        let outcome = if n >= MAX_PLATFORM_MERGES {
+            MergeOutcome::Unavailable(format!(
+                "more than {MAX_PLATFORM_MERGES} platform-signed merges in one check"
+            ))
+        } else {
+            match merge_base(ours.clone(), theirs.clone()).await {
+                Ok(base) => {
+                    fetcher
+                        .recompute_merge(dir, token, &ours, &theirs, &base)
+                        .await
+                }
+                Err(e) => MergeOutcome::Unavailable(format!("no merge base from the forge: {e:#}")),
+            }
+        };
+        facts.merges.insert(merge, outcome);
+    }
+    facts
 }
 
 /// Most objects one re-sign push fetches by id (see
@@ -453,7 +583,7 @@ impl GitFetcher {
         self
     }
 
-    fn command(&self, dir: &Path, args: &[&str], token: Option<&str>) -> Command {
+    fn command(&self, dir: &Path, args: &[&str], token: Option<&str>, lazy: bool) -> Command {
         let mut cmd = Command::new(&self.git);
         cmd.arg("-C").arg(dir);
         // Hardening that must precede the subcommand.
@@ -481,12 +611,14 @@ impl GitFetcher {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "/bin/false")
             .env("GIT_PROTOCOL_FROM_USER", "0")
-            // Never reach back to the remote for an object a command wants.
-            .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if !lazy {
+            // Never reach back to the remote for an object a command wants.
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+        }
         if let Some(t) = token {
             let header = Zeroizing::new(format!(
                 "Authorization: Basic {}",
@@ -508,8 +640,36 @@ impl GitFetcher {
         token: Option<&str>,
         watch: bool,
     ) -> Result<Vec<u8>> {
+        let (status, out, err) = self.run(dir, args, token, watch, false).await?;
+        if !status.success() {
+            // The token is in the environment, not in anything git echoes;
+            // stderr is still trimmed before it reaches a check summary.
+            let err = String::from_utf8_lossy(&err);
+            // A push says why a ref was refused on its own line (a lease
+            // that no longer holds is `[rejected] … (stale info)`).
+            let line = err
+                .lines()
+                .find(|l| l.contains("rejected]"))
+                .or_else(|| err.lines().last())
+                .unwrap_or("failed");
+            bail!("git {}: {}", args[0], line.trim());
+        }
+        Ok(out)
+    }
+
+    /// [`Self::git`] without judging the exit status: the status, stdout and
+    /// stderr. With `lazy`, git may fetch objects the partial clone left out
+    /// from its promisor — with the token, under the byte bound and timeout.
+    async fn run(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        token: Option<&str>,
+        watch: bool,
+        lazy: bool,
+    ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
         let mut child = self
-            .command(dir, args, token)
+            .command(dir, args, token, lazy)
             .spawn()
             .context("running git")?;
         let mut stdout = child.stdout.take().expect("piped");
@@ -552,20 +712,7 @@ impl GitFetcher {
                 self.max_bytes
             );
         }
-        if !status.success() {
-            // The token is in the environment, not in anything git echoes;
-            // stderr is still trimmed before it reaches a check summary.
-            let err = String::from_utf8_lossy(&err);
-            // A push says why a ref was refused on its own line (a lease
-            // that no longer holds is `[rejected] … (stale info)`).
-            let line = err
-                .lines()
-                .find(|l| l.contains("rejected]"))
-                .or_else(|| err.lines().last())
-                .unwrap_or("failed");
-            bail!("git {}: {}", args[0], line.trim());
-        }
-        Ok(out)
+        Ok((status, out, err))
     }
 
     /// Before pushing commits that reuse trees of the commits they replace:
@@ -639,7 +786,7 @@ impl GitFetcher {
         input: &[u8],
     ) -> Result<Vec<u8>> {
         use tokio::io::AsyncWriteExt;
-        let mut cmd = self.command(dir, args, None);
+        let mut cmd = self.command(dir, args, None, false);
         cmd.stdin(Stdio::piped());
         let mut child = cmd.spawn().context("running git")?;
         let mut stdin = child.stdin.take().expect("piped");
@@ -849,6 +996,81 @@ impl GitFetcher {
             });
         }
         Ok(Fetched { commits: out, dir })
+    }
+
+    /// Recompute the merge of `ours` and `theirs` over `merge_base` in the
+    /// repository [`Self::fetch`] made, as verify-trust's platform-merge
+    /// policy requires ([`verify_trust::merge_tree_args`]).
+    ///
+    /// That fetch holds commit objects only, to a depth — not the parents'
+    /// trees and blobs, and not the history git would search for their
+    /// merge base. So the three commits are fetched by id with their trees
+    /// (`blob:none`, depth 1), the merge base is pinned rather than searched
+    /// for, and `merge-tree` may fetch lazily the blobs it reads: those of
+    /// paths both sides changed. Every fetch carries the token and stays
+    /// under the byte bound and timeout. Never an error: what cannot be
+    /// recomputed is [`MergeOutcome::Unavailable`], which fails the merge
+    /// closed (SEC-4045 / VGI-01).
+    pub async fn recompute_merge(
+        &self,
+        dir: &Path,
+        token: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        merge_base: &str,
+    ) -> MergeOutcome {
+        match self
+            .try_recompute_merge(dir, token, ours, theirs, merge_base)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => MergeOutcome::Unavailable(format!("{e:#}")),
+        }
+    }
+
+    async fn try_recompute_merge(
+        &self,
+        dir: &Path,
+        token: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        merge_base: &str,
+    ) -> Result<MergeOutcome> {
+        for sha in [ours, theirs, merge_base] {
+            check_sha(sha).map_err(|e| anyhow!("{e}"))?;
+        }
+        // Lazy fetches ask the promisor for single objects under this filter.
+        self.git(
+            dir,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+            None,
+            false,
+        )
+        .await?;
+        self.git(
+            dir,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--filter=blob:none",
+                "--depth=1",
+                "origin",
+                ours,
+                theirs,
+                merge_base,
+            ],
+            token,
+            true,
+        )
+        .await
+        .context("fetching the merge's parents")?;
+        let args = verify_trust::merge_tree_args(ours, theirs, Some(merge_base));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (status, stdout, stderr) = self.run(dir, &args, token, true, true).await?;
+        Ok(verify_trust::merge_outcome(status.code(), &stdout, &stderr))
     }
 }
 
@@ -1203,6 +1425,18 @@ async fn verify(
             &cmp.commits,
         )
         .await?;
+    let facts = merge_facts(
+        &bridge.checks.fetcher,
+        fetched.dir.path(),
+        Some(token.expose()),
+        &fetched.commits,
+        bridge
+            .checks
+            .verifier
+            .exempts_platform_merges(trigger.repo.host()),
+        |ours, theirs| async move { Ok(g.merge_base(&trigger.repo, &ours, &theirs).await?) },
+    )
+    .await;
     drop(token);
     let resource = trigger.repo.as_str();
     // Spec PR #623: `git.ns.admin`'s implied `git.commit.sign` is published
@@ -1211,7 +1445,7 @@ async fn verify(
     let lines = bridge
         .checks
         .verifier
-        .verify(&fetched.commits, resource, fallback)
+        .verify_with_facts(&fetched.commits, &facts, resource, fallback)
         .await?;
     Ok(summarise(&lines, base_ref))
 }
@@ -1248,6 +1482,82 @@ fn summarise(lines: &[CommitLine], base_ref: &str) -> (CheckConclusion, String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synthetic commit object: `parents`, signed with `armor` if any.
+    fn commit(sha: &str, parents: &[&str], armor: Option<&str>) -> RangeCommit {
+        let mut raw = String::from("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n");
+        for p in parents {
+            raw.push_str(&format!("parent {p}\n"));
+        }
+        raw.push_str("committer A <a@example.com> 1700000000 +0000\n");
+        if let Some(armor) = armor {
+            raw.push_str(&format!(
+                "gpgsig -----BEGIN {armor} SIGNATURE-----\n AAAA\n -----END {armor} SIGNATURE-----\n"
+            ));
+        }
+        raw.push_str("\nmsg\n");
+        RangeCommit {
+            sha: sha.to_string(),
+            raw: raw.into_bytes(),
+        }
+    }
+
+    fn sha(n: u8) -> String {
+        format!("{n:040x}")
+    }
+
+    #[test]
+    fn the_boundary_is_the_parents_outside_the_listing() {
+        let (base, a, b, m) = (sha(1), sha(2), sha(3), sha(4));
+        let commits = [
+            commit(&a, &[&base], None),
+            commit(&m, &[&a, &b], Some("PGP")),
+        ];
+        assert_eq!(boundary_of(&commits), [base, b].into());
+    }
+
+    #[test]
+    fn only_pgp_signed_two_parent_merges_are_candidates() {
+        let (x, y, z) = (sha(1), sha(2), sha(3));
+        let commits = [
+            commit(&sha(10), &[&x, &y], Some("PGP")),
+            commit(&sha(11), &[&x, &y], Some("SSH")),
+            commit(&sha(12), &[&x, &y], None),
+            commit(&sha(13), &[&x], Some("PGP")),
+            commit(&sha(14), &[&x, &y, &z], Some("PGP")),
+        ];
+        assert_eq!(platform_merge_candidates(&commits), vec![(sha(10), x, y)]);
+    }
+
+    #[tokio::test]
+    async fn merges_past_the_cap_or_without_a_base_fail_closed() {
+        let commits: Vec<RangeCommit> = (0..=MAX_PLATFORM_MERGES as u8)
+            .map(|n| commit(&sha(100 + n), &[&sha(1), &sha(2)], Some("PGP")))
+            .collect();
+        let fetcher = GitFetcher::new(&CheckConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        let facts = merge_facts(&fetcher, dir.path(), None, &commits, true, |_, _| async {
+            Err(anyhow!("no route"))
+        })
+        .await;
+        assert_eq!(facts.merges.len(), commits.len());
+        for (n, c) in commits.iter().enumerate() {
+            let MergeOutcome::Unavailable(why) = &facts.merges[&c.sha] else {
+                panic!("{:?}", facts.merges[&c.sha]);
+            };
+            if n < MAX_PLATFORM_MERGES {
+                assert!(why.contains("no merge base"), "{why}");
+            } else {
+                assert!(why.contains("more than"), "{why}");
+            }
+        }
+        // Without a keyring nothing is recomputed, and nothing is fetched.
+        let facts = merge_facts(&fetcher, dir.path(), None, &commits, false, |_, _| async {
+            Err(anyhow!("must not be asked"))
+        })
+        .await;
+        assert!(facts.merges.is_empty());
+    }
 
     #[test]
     fn the_summary_fails_on_any_untrusted_commit_and_on_none() {

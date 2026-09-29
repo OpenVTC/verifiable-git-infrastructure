@@ -574,12 +574,24 @@ async fn a_fetch_past_the_byte_bound_is_stopped() {
 
 /// A did:key and a commit it signed (sshsig, committer = the DID's key).
 fn signed_commit(repo: &Path, key: &SigningKey, msg: &str) -> (String, String) {
+    signed_commit_on(repo, key, "main", "f.txt", msg, msg)
+}
+
+/// A DID-signed commit on `branch` (checked out) writing `content` to `file`.
+fn signed_commit_on(
+    repo: &Path,
+    key: &SigningKey,
+    branch: &str,
+    file: &str,
+    content: &str,
+    msg: &str,
+) -> (String, String) {
     let public = key.verifying_key().to_bytes();
     let mb = vta_sdk::did_key::ed25519_multibase_pubkey(&public);
     let did = format!("did:key:{mb}");
     let vm = format!("{did}#{mb}");
-    std::fs::write(repo.join("f.txt"), msg).unwrap();
-    git_as(repo, &vm, &["add", "f.txt"]);
+    std::fs::write(repo.join(file), content).unwrap();
+    git_as(repo, &vm, &["add", file]);
     git_as(
         repo,
         &vm,
@@ -631,7 +643,7 @@ fn signed_commit(repo: &Path, key: &SigningKey, msg: &str) -> (String, String) {
         .unwrap()
         .trim()
         .to_string();
-    git(repo, &["update-ref", "refs/heads/main", &sha]);
+    git(repo, &["update-ref", &format!("refs/heads/{branch}"), &sha]);
     (did, sha)
 }
 
@@ -813,5 +825,255 @@ async fn the_bridge_queries_the_registry_as_its_own_did_over_its_link() {
         }
         drop(verifier);
         registry.abort();
+    }
+}
+
+// ── platform-signed merges (SEC-4045 / VGI-01) ───────────────────────────
+
+mod platform_merges {
+    use super::*;
+    use pgp::composed::{
+        ArmorOptions, DetachedSignature, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
+        SignedSecretKey,
+    };
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::types::Password;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use vgi_bridge::checks::merge_facts;
+
+    /// Generated once: a key's creation time is the wall clock.
+    fn platform_key() -> SignedSecretKey {
+        static KEY: std::sync::LazyLock<SignedSecretKey> = std::sync::LazyLock::new(|| {
+            SecretKeyParamsBuilder::default()
+                .key_type(KeyType::Ed25519)
+                .can_sign(true)
+                .primary_user_id("GitHub <noreply@github.com>".to_string())
+                .build()
+                .unwrap()
+                .generate(StdRng::seed_from_u64(7))
+                .unwrap()
+        });
+        KEY.clone()
+    }
+
+    /// Rewrite `sha` as signed by the platform key, as GitHub's web-flow
+    /// signs a merge it writes; returns the new id.
+    fn pgp_sign(repo: &Path, sha: &str) -> String {
+        let payload = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "commit", sha])
+            .output()
+            .unwrap()
+            .stdout;
+        let armored = DetachedSignature::sign_binary_data(
+            StdRng::seed_from_u64(11),
+            &platform_key().primary_key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &payload[..],
+        )
+        .unwrap()
+        .to_armored_string(ArmorOptions::default())
+        .unwrap();
+        let text = String::from_utf8(payload).unwrap();
+        let (headers, body) = text.split_once("\n\n").unwrap();
+        let mut sig = String::from("gpgsig ");
+        let mut lines = armored.trim_end().split('\n');
+        sig.push_str(lines.next().unwrap());
+        for l in lines {
+            sig.push_str("\n ");
+            sig.push_str(l);
+        }
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("{headers}\n{sig}\n\n{body}").as_bytes())
+                .unwrap();
+        }
+        String::from_utf8(child.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// GitHub's "Update branch": `feature` forks from `main` with a
+    /// DID-signed commit, `main` moves on, and the platform merges `main`
+    /// into `feature`, PGP-signed — a merge whose second parent is the base
+    /// tip, outside `base...head`. Both sides change `f.txt` (different
+    /// lines), so recomputing the merge must read blobs the commit-only
+    /// fetch left out. With `alter`, the merge's tree is hand-edited.
+    ///
+    /// Returns (Alice's DID, the base tip, the commits GitHub lists for
+    /// `base...head`, the merge).
+    fn update_branch(
+        repo: &Path,
+        alice: &SigningKey,
+        alter: bool,
+    ) -> (String, String, Vec<String>, String) {
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "uploadpack.allowFilter", "true"]);
+        git(repo, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        std::fs::write(repo.join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        git(repo, &["add", "f.txt"]);
+        git(
+            repo,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "root"],
+        );
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        let (did, feature) = signed_commit_on(
+            repo,
+            alice,
+            "feature",
+            "f.txt",
+            "A\nb\nc\nd\ne\n",
+            "feature work",
+        );
+        git(repo, &["reset", "-q", "--hard", &feature]);
+
+        git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("f.txt"), "a\nb\nc\nd\nE\n").unwrap();
+        git(
+            repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-am",
+                "main moves on",
+            ],
+        );
+        let main_tip = git(repo, &["rev-parse", "HEAD"]);
+
+        git(repo, &["checkout", "-q", "feature"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge branch 'main' into feature",
+                "main",
+            ],
+        );
+        if alter {
+            std::fs::write(repo.join("g.txt"), "not from either parent\n").unwrap();
+            git(repo, &["add", "g.txt"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--amend",
+                    "--no-edit",
+                ],
+            );
+        }
+        let merge = pgp_sign(repo, &git(repo, &["rev-parse", "HEAD"]));
+        git(repo, &["update-ref", "refs/heads/feature", &merge]);
+        (did, main_tip, vec![feature, merge.clone()], merge)
+    }
+
+    /// VGI-01: the bridge ran the platform-merge policy with an empty
+    /// repository and range — git in its own working directory — so an
+    /// "Update branch" merge errored the whole check. Now the policy takes
+    /// the boundary from GitHub's listing and the merge recomputed in the
+    /// fetch: a clean platform merge is exempt, an altered one refused.
+    #[tokio::test]
+    async fn an_update_branch_merge_is_recomputed_from_the_fetch() {
+        for alter in [false, true] {
+            let src = tempfile::tempdir().unwrap();
+            let p = src.path();
+            let alice = SigningKey::from_bytes(&[1u8; 32]);
+            let (alice_did, main_tip, listed, merge) = update_branch(p, &alice, alter);
+
+            let registry = stub_registry(vec![(alice_did, "github.com/acme".into())]).await;
+            let server = MockServer::start().await;
+            let cfg_dir = tempfile::tempdir().unwrap();
+            let cfg = config(
+                &server,
+                cfg_dir.path(),
+                "did:webvh:QmVtc:acme-vtc.example",
+                &Options::default(),
+            );
+            // The configured web-flow keyring is this test's platform key.
+            std::fs::write(
+                cfg_dir.path().join("web-flow.asc"),
+                SignedPublicKey::from(platform_key())
+                    .to_armored_string(ArmorOptions::default())
+                    .unwrap(),
+            )
+            .unwrap();
+            let verifier = VerifyTrustVerifier::new(&cfg).with_registry_url(registry);
+            assert!(verifier.exempts_platform_merges("github.com"));
+
+            let remote = url::Url::from_directory_path(p).unwrap();
+            let fetcher = GitFetcher::new(&cfg.checks).with_local_remote(remote.clone());
+            let fetched = fetcher.fetch(&remote, None, &merge, &listed).await.unwrap();
+
+            // Without facts the check no longer errors: the merge fails closed.
+            let lines = verifier
+                .verify(
+                    &fetched.commits,
+                    "github.com/acme/widgets",
+                    "github.com/acme",
+                )
+                .await
+                .expect("a platform merge no longer fails the whole check");
+            assert!(lines[0].passes, "{:?}", lines[0]);
+            assert!(!lines[1].passes, "{:?}", lines[1]);
+
+            let src_path = p.to_path_buf();
+            let facts = merge_facts(
+                &fetcher,
+                fetched.dir.path(),
+                None,
+                &fetched.commits,
+                true,
+                |ours, theirs| {
+                    let src = src_path.clone();
+                    async move { Ok(git(&src, &["merge-base", &ours, &theirs])) }
+                },
+            )
+            .await;
+            assert!(facts.boundary.contains(&main_tip), "{facts:?}");
+
+            let lines = verifier
+                .verify_with_facts(
+                    &fetched.commits,
+                    &facts,
+                    "github.com/acme/widgets",
+                    "github.com/acme",
+                )
+                .await
+                .unwrap();
+            assert!(lines[0].passes, "{:?}", lines[0]);
+            if alter {
+                assert!(!lines[1].passes, "{:?}", lines[1]);
+                assert_eq!(lines[1].verdict, "platformMergeAltered", "{facts:?}");
+            } else {
+                assert!(lines[1].passes, "{:?} {facts:?}", lines[1]);
+                assert_eq!(lines[1].verdict, "exempt");
+            }
+        }
     }
 }

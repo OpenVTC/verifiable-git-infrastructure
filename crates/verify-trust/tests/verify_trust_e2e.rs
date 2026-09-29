@@ -13,11 +13,12 @@ use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use verify_trust::{
-    CommitStatus, ResolvedSigners, TrustReport, VerifyTrustArgs, build_resolver, list_commits,
+    CommitStatus, MergeFacts, MergeOutcome, RangeCommit, ResolvedSigners, TrustReport,
+    VerifyTrustArgs, build_resolver, list_commits, merge_outcome, merge_tree_args,
     pgp_exempt::ExemptKeyring,
     read_range, resolve_signer_keys,
     resource::{CiEnv, ResourceFormat, select_resources},
-    verify_prepared,
+    verify_prepared, verify_prepared_with_facts,
 };
 use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
 
@@ -1165,6 +1166,160 @@ mod pgp_platform {
         assert!(matches!(
             report.commits[0].status,
             CommitStatus::PgpRejected { .. }
+        ));
+    }
+
+    // --- caller-supplied merge facts (the bridge's path, VGI-01) -------------
+
+    /// The platform-merge fixture's range, read, with the merge's tree.
+    fn facts_fixture(repo: &Path) -> (String, String, String, Vec<RangeCommit>, SigningKey) {
+        let did_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (main_tip, feature, merge) = platform_merge_fixture(repo, &did_key, true);
+        let commits = read_range(repo, &format!("{main_tip}..{merge}")).unwrap();
+        let tree = git(repo, &["rev-parse", &format!("{merge}^{{tree}}")]);
+        let _ = feature;
+        (main_tip, merge, tree, commits, did_key)
+    }
+
+    /// Verify with `facts`, from a `repo_dir` that does not exist: the facts
+    /// path must never ask git, as the bridge's working directory is no
+    /// repository of the commits'.
+    async fn verify_with(
+        commits: &[RangeCommit],
+        signers: &ResolvedSigners,
+        facts: &MergeFacts,
+    ) -> TrustReport {
+        let registry = stub_registry(SIGNER.to_string()).await;
+        let args = args_for(
+            Path::new("/nonexistent/vgi-01"),
+            String::new(),
+            registry.clone(),
+        );
+        let registry = verify_trust::Registry::https(&registry, "did:example:registry").unwrap();
+        verify_prepared_with_facts(
+            &args,
+            commits,
+            signers,
+            Some(&platform_keyring()),
+            &registry,
+            facts,
+        )
+        .await
+        .expect("verification runs without a repository")
+    }
+
+    #[tokio::test]
+    async fn supplied_facts_exempt_a_clean_platform_merge_without_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main_tip, merge, tree, commits, did_key) = facts_fixture(dir.path());
+        let facts = MergeFacts {
+            boundary: [main_tip].into(),
+            merges: [(merge.clone(), MergeOutcome::Clean { tree })].into(),
+        };
+
+        let report = verify_with(&commits, &signers_for(&did_key), &facts).await;
+
+        assert!(report.ok, "{:#?}", report.commits);
+        assert!(matches!(
+            status_of(&report, &merge),
+            CommitStatus::Exempt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn supplied_facts_still_refuse_an_altered_or_unrecomputed_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main_tip, merge, _, commits, did_key) = facts_fixture(dir.path());
+        let signers = signers_for(&did_key);
+
+        for (outcome, expected) in [
+            (
+                Some(MergeOutcome::Clean {
+                    tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                }),
+                "added content of its own",
+            ),
+            (Some(MergeOutcome::Conflict), "do not merge cleanly"),
+            (
+                Some(MergeOutcome::Unavailable("the fetch failed".into())),
+                "could not recompute the merge: the fetch failed",
+            ),
+            (None, "not recomputed"),
+        ] {
+            let facts = MergeFacts {
+                boundary: [main_tip.clone()].into(),
+                merges: outcome.into_iter().map(|o| (merge.clone(), o)).collect(),
+            };
+            let report = verify_with(&commits, &signers, &facts).await;
+            assert!(!report.ok);
+            match status_of(&report, &merge) {
+                CommitStatus::PlatformMergeAltered { detail, .. } => {
+                    assert!(detail.contains(expected), "{detail}");
+                }
+                other => panic!("expected platformMergeAltered, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supplied_facts_refuse_a_parent_off_the_supplied_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, merge, tree, commits, did_key) = facts_fixture(dir.path());
+        let facts = MergeFacts {
+            boundary: Default::default(),
+            merges: [(merge.clone(), MergeOutcome::Clean { tree })].into(),
+        };
+
+        let report = verify_with(&commits, &signers_for(&did_key), &facts).await;
+
+        assert!(!report.ok);
+        assert!(matches!(
+            status_of(&report, &merge),
+            CommitStatus::PlatformMergeUnverifiedParent { .. }
+        ));
+    }
+
+    /// `merge_tree_args`, run by a caller's own git with a pinned merge base,
+    /// agrees with the policy's own recomputation.
+    #[test]
+    fn merge_tree_args_with_a_pinned_base_recompute_the_platform_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, merge, tree, _, _) = facts_fixture(dir.path());
+        let parents = git(
+            dir.path(),
+            &["rev-parse", &format!("{merge}^1"), &format!("{merge}^2")],
+        );
+        let parents: Vec<&str> = parents.lines().collect();
+        let base = git(dir.path(), &["merge-base", parents[0], parents[1]]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(merge_tree_args(parents[0], parents[1], Some(&base)))
+            .output()
+            .unwrap();
+        assert_eq!(
+            merge_outcome(out.status.code(), &out.stdout, &out.stderr),
+            MergeOutcome::Clean { tree }
+        );
+    }
+
+    /// VGI-05: git exits 1 both for a conflict and for a parent it does not
+    /// have; only the first is a hand-resolved merge.
+    #[test]
+    fn an_unknown_parent_is_not_reported_as_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, merge, _, _, _) = facts_fixture(dir.path());
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(merge_tree_args(&merge, missing, None))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "git's overloaded exit code");
+        assert!(matches!(
+            merge_outcome(out.status.code(), &out.stdout, &out.stderr),
+            MergeOutcome::Unavailable(why) if why.contains("not in the repository")
         ));
     }
 }
