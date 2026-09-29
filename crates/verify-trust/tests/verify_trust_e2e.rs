@@ -364,6 +364,71 @@ async fn a_commit_claiming_a_did_it_cannot_sign_for_fails() {
     );
 }
 
+/// Rewrite commit `sha` with `header` added as the last header line, written
+/// the way a push would be (`hash-object` without `--literally`, so git's
+/// write-time fsck runs), and return the new sha.
+fn with_extra_header(repo: &Path, sha: &str, header: &str) -> String {
+    let raw = git(repo, &["cat-file", "commit", sha]);
+    let (headers, body) = raw.split_once("\n\n").unwrap();
+    let rewritten = format!("{headers}\n{header}\n\n{body}\n");
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("git hash-object spawns");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(rewritten.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "git refused {header:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+/// git drops every `gpgsig`-prefixed header from the payload it verifies, so
+/// adding one to a validly signed commit leaves it GOOD to git and GitHub. It
+/// must stay trusted here too, not turn into a bad signature by its real
+/// signer (VGI-08).
+#[tokio::test]
+async fn another_signature_header_does_not_break_a_good_signature() {
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    for header in [
+        "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n AAAA\n -----END PGP SIGNATURE-----",
+        "gpgsig-sha256 ",
+        "gpgsigx junk",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, signed) = repo_with_signed_commit(dir.path(), &key);
+        let altered = with_extra_header(dir.path(), &signed, header);
+        let registry = stub_registry(SIGNER.to_string()).await;
+
+        let args = args_for(dir.path(), format!("{base}..{altered}"), registry);
+        let report = verify(&args, &signers_for(&key), None).await;
+
+        assert_eq!(
+            report.commits[0].status,
+            CommitStatus::Trusted {
+                signer_did: SIGNER.to_string(),
+                resource: "example/repo".to_string()
+            },
+            "header {header:?}"
+        );
+    }
+}
+
 /// A signed commit whose committer is an ordinary email asserts no identity,
 /// so there is nothing to resolve or authorize.
 #[tokio::test]
