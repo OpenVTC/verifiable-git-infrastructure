@@ -803,6 +803,29 @@ impl BridgeConfig {
         Ok(())
     }
 
+    /// A warning to log at startup when the plain-HTTP listener is reachable
+    /// from beyond this host.
+    ///
+    /// The bridge terminates no TLS: `public_url` must be https, but that
+    /// governs the proxy, not the socket behind it. On a non-loopback
+    /// address — including the `0.0.0.0` default, which is right inside a
+    /// container — anything that reaches the port directly sees OAuth codes,
+    /// App-setup redirects and webhook bodies in the clear. The default stays
+    /// (changing it would break the container); the warning says what must
+    /// hold for it to be safe (SEC-4045 / VGI-06).
+    pub fn listen_warning(&self) -> Option<String> {
+        if self.listen.ip().is_loopback() {
+            return None;
+        }
+        Some(format!(
+            "the bridge serves plain HTTP on {}, which is reachable from other hosts: only the \
+             TLS proxy in front of it may reach this port (in a container, publish it to the \
+             proxy's network only). Set `listen` to a loopback address when the proxy runs on \
+             this host",
+            self.listen
+        ))
+    }
+
     /// The checks a bad value would otherwise fail late on.
     pub fn validate(&self) -> Result<()> {
         for (what, did) in [
@@ -991,6 +1014,25 @@ base_url = "https://codeberg.org/"
 bot_login = "acme-vgi-bot"
 oauth_client_id = "0b6e3a0c"
 "#;
+
+    #[test]
+    fn a_listener_beyond_loopback_is_warned_about() {
+        // The default: all interfaces, plain HTTP.
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        let warning = c
+            .listen_warning()
+            .expect("0.0.0.0 is reachable from other hosts");
+        assert!(warning.contains("0.0.0.0:8080"), "{warning}");
+
+        for listen in ["192.0.2.10:8080", "[::]:8080"] {
+            let c = BridgeConfig::parse(&format!("listen = \"{listen}\"\n{EXAMPLE}")).unwrap();
+            assert!(c.listen_warning().is_some(), "{listen}");
+        }
+        for listen in ["127.0.0.1:8080", "[::1]:8080"] {
+            let c = BridgeConfig::parse(&format!("listen = \"{listen}\"\n{EXAMPLE}")).unwrap();
+            assert_eq!(c.listen_warning(), None, "{listen}");
+        }
+    }
 
     #[test]
     fn the_example_parses_with_defaults() {

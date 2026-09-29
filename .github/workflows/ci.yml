@@ -29,6 +29,27 @@ jobs:
           rustup default stable
       - run: cargo fmt --all --check
 
+  dockerfile-pins:
+    name: Dockerfile base images pinned by digest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # As the Forgejo test image and every action are pinned: a moving tag
+      # would change what the bridge image is built from without a commit.
+      - name: Every FROM carries a digest
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r line; do
+            case "$line" in
+              *@sha256:*) ;;
+              *) echo "::error::base image not pinned by digest: $line"; status=1 ;;
+            esac
+          done < <(grep -h '^FROM ' $(git ls-files '*Dockerfile'))
+          exit "$status"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

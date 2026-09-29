@@ -20,7 +20,9 @@ mediator_did = "did:web:mediator.acme-vtc.example"
 
 # Where the forges reach the bridge, through the TLS proxy in front of it.
 public_url = "https://bridge.acme-vtc.example/"
-# Plain HTTP behind the proxy.
+# Plain HTTP behind the proxy: only the proxy may reach it. All interfaces is
+# right inside a container (publish the port to the proxy's network only);
+# with the proxy on the same host, use "127.0.0.1:8080".
 listen = "0.0.0.0:8080"
 data_dir = "/var/lib/vgi-bridge"
 

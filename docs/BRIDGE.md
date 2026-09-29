@@ -57,7 +57,13 @@ Outbound:
   HTTPS it goes to the `#rest` URL.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
-refuses to start with a `public_url` that is not `https`. Keep the proxy's
+refuses to start with a `public_url` that is not `https`. That rule covers
+the proxy, not the socket: `listen` (default `0.0.0.0:8080`, right inside a
+container) is plain HTTP carrying OAuth codes, App-setup redirects and
+webhook bodies, so only the proxy may reach it. Publish the container port to
+the proxy's network only; on a VM or bare metal with the proxy on the same
+host, set `listen = "127.0.0.1:8080"`. The bridge logs a warning at startup
+whenever `listen` is not a loopback address. Keep the proxy's
 own body limit at or above `max_body_bytes` (default 2 MiB), so the bridge's
 limit is the one that answers.
 
@@ -896,6 +902,8 @@ they are not reported as drift. The report never carries anything for
 - **`/healthz`** answers `ok` while the HTTP server runs, and 503 in VTA mode
   once another writer was found on the bridge's context, or once changes
   have waited five minutes with every write to the VTA failing (§2a).
+  `vgi-bridge healthcheck` probes it and exits non-zero unless it answers
+  200; the image's `HEALTHCHECK` runs it, since the image has no curl.
 - **DID documents are cached** for `did_cache_ttl_secs` (default 60, at most
   3600): the VTC's (job proofs), the registry's (and its endpoint) and commit
   signers' (the bridge-posted check). That bounds how long a key its owner
