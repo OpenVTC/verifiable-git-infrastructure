@@ -189,9 +189,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-did-resolver-cache-sdk"
-version = "0.8.38"
+version = "0.8.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44ba0a3f03ecdf9e4f561df39514b32b4cd8fb8e69ad9c1cf67fd7ec1e487264"
+checksum = "af5c0551422ae5fac5dd18831227f7dc63f66d134f9eb0bff0c18a95f00be3c1"
 dependencies = [
  "affinidi-did-common",
  "affinidi-did-resolver-traits",
@@ -2234,9 +2234,9 @@ dependencies = [
 
 [[package]]
 name = "did-scid"
-version = "0.2.7"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32bb54e6769f547fc641bbe63bb06f253fe41ad552e47e24cbd6c62a7b6436d8"
+checksum = "b3cb51b0528373d016d6bea1cc14cbadd3ddbc87855e6f1b8cdcfd95ab41a86c"
 dependencies = [
  "affinidi-did-common",
  "didwebvh-rs",
@@ -6745,11 +6745,14 @@ dependencies = [
  "affinidi-messaging-didcomm",
  "affinidi-messaging-sdk",
  "affinidi-messaging-test-mediator",
+ "affinidi-secrets-resolver",
  "affinidi-tdk",
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "chrono",
  "clap",
+ "didwebvh-rs",
  "ed25519-dalek 3.0.0",
  "hex",
  "multibase",

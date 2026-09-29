@@ -696,7 +696,7 @@ the remediation is unambiguous:
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
 | `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
-| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or lists no Ed25519 key under `assertionMethod` |
+| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, the DID **deactivated** (a retired signer: re-sign its commits as a live identity), or lists no Ed25519 key under `assertionMethod` |
 | `unknownKey` | the claimed DID lists no such key under `assertionMethod` | a key the document holds for another purpose (key agreement, recovery) does not count: list the signing key under `assertionMethod`. Otherwise, usually the signer **rotated their key** after signing — the DID no longer publishes the old one, so re-sign the commit with the current key (below). Otherwise it was signed by a key that identity never held: `did-git-sign init` for the right key |
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
 | `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
@@ -1251,7 +1251,7 @@ are in §5; this is what they usually mean here.
 | `malformed` | the signature is not an Ed25519 sshsig (an RSA or ECDSA SSH key, or corrupt) | sign with `did-git-sign`; amend |
 | `noSignerDid` | the commit-msg hook did not run, or is older than v2 | `did-git-sign health`, re-run `init`; amend |
 | `conflictingSignerDids` | a carried-over `Signed-by-DID:` trailer | amend so one claim remains |
-| `unresolvedSigner` | the signer's DID document is unreachable, or names a non-public host (refused, never fetched) | fix the DID's hosting |
+| `unresolvedSigner` | the signer's DID document is unreachable, names a non-public host (refused, never fetched), or the DID is deactivated | fix the DID's hosting; a deactivated signer is retired — re-sign as a live identity |
 | `unknownKey` | signed with a key the DID does not publish — most often one rotated out since | re-sign with the current key (§5); if it never was the DID's key, `did-git-sign init` for the right key |
 | `badSignature` | the commit changed after it was signed | re-sign |
 | `unauthorized` | no right on this repository or its namespace: never granted, revoked, lapsed, the member left — or a namespace-level right (a namespace admin's, the bridge's re-signed Dependabot commits) under a workflow that predates the namespace fallback (§8a, §8e) | `cnm git view --resource <repository>`; grant on the repository; upgrade the workflow (BRIDGE.md §6b) |

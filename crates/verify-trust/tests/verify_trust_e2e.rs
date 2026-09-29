@@ -1614,6 +1614,150 @@ async fn a_signer_did_on_an_internal_host_is_refused_without_being_fetched() {
     );
 }
 
+// --- deactivated signers ---------------------------------------------------------
+
+/// A signed did:webvh log for `localhost:{port}`, deactivated or not, as the
+/// DID and its `did.jsonl`, with the Ed25519 key it lists under
+/// `assertionMethod`.
+async fn webvh_log(port: u16, deactivate: bool) -> (String, String, [u8; 32]) {
+    use affinidi_secrets_resolver::secrets::Secret;
+    use didwebvh_rs::{
+        DIDWebVHState, Multibase, log_entry::LogEntryMethods, parameters::Parameters,
+    };
+    use std::sync::Arc;
+
+    let mut key = Secret::generate_ed25519(None, None);
+    let pk = key.get_public_keymultibase().unwrap();
+    key.id = format!("did:key:{pk}#{pk}");
+    let (_, bytes) = multibase::decode(&pk).unwrap();
+    let public: [u8; 32] = bytes[2..].try_into().unwrap();
+
+    let template = format!("did:webvh:{{SCID}}:localhost%3A{port}");
+    let doc = json!({
+        "id": template,
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "verificationMethod": [{
+            "id": format!("{template}#key-0"),
+            "type": "Multikey",
+            "publicKeyMultibase": pk,
+            "controller": template
+        }],
+        "authentication": [format!("{template}#key-0")],
+        "assertionMethod": [format!("{template}#key-0")],
+    });
+    let params = Parameters {
+        update_keys: Some(Arc::new(vec![Multibase::new(pk)])),
+        portable: Some(false),
+        ..Default::default()
+    };
+    // Backdated so a deactivation entry's versionTime is strictly later.
+    let genesis = (chrono::Utc::now() - chrono::Duration::seconds(100)).fixed_offset();
+    let mut state = DIDWebVHState::default();
+    state
+        .create_log_entry(Some(genesis), &doc, &params, &key)
+        .await
+        .unwrap();
+    if deactivate {
+        state.deactivate(&key).await.unwrap();
+    }
+    let did = state
+        .log_entries()
+        .last()
+        .unwrap()
+        .log_entry
+        .get_did_document()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let jsonl = state
+        .log_entries()
+        .iter()
+        .map(|entry| serde_json::to_string(&entry.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (did, jsonl, public)
+}
+
+/// Serve `body` as the answer to every request on `listener`.
+fn serve_forever(listener: tokio::net::TcpListener, body: String) {
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/jsonl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+}
+
+/// A resolver like [`build_resolver`]'s but allowed to reach loopback, where
+/// these tests serve their logs. The public-hosts-only policy of the real one
+/// is pinned by the internal-host test above.
+async fn loopback_resolver() -> affinidi_tdk::TDK {
+    use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy;
+    use affinidi_tdk::common::config::TDKConfig;
+    use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
+
+    affinidi_tdk::TDK::new(
+        TDKConfig::builder()
+            .with_load_environment(false)
+            .with_did_resolver_config(
+                DIDCacheConfigBuilder::default()
+                    .with_host_policy(HostPolicy::AllowPrivate)
+                    .build(),
+            )
+            .build()
+            .unwrap(),
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// VGI-04: a signer whose did:webvh has been deactivated no longer verifies.
+/// `didwebvh-rs` resolves a deactivated log `Ok` with its last document, keys
+/// and all; before cache-sdk 0.8.39 that reached `resolve_signer_keys` as a
+/// live signer and its commits kept verifying, with no time bound. The live
+/// DID beside it proves the harness serves a log that does resolve.
+#[tokio::test]
+async fn a_deactivated_webvh_signer_is_unresolved() {
+    let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (live, live_log, live_key) =
+        webvh_log(live_listener.local_addr().unwrap().port(), false).await;
+    let (dead, dead_log, _) = webvh_log(dead_listener.local_addr().unwrap().port(), true).await;
+    serve_forever(live_listener, live_log);
+    serve_forever(dead_listener, dead_log);
+
+    let signers = resolve_signer_keys(&loopback_resolver().await, &[live.clone(), dead.clone()])
+        .await
+        .expect("resolution runs to a verdict per DID");
+
+    assert_eq!(
+        signers.keys.get(&live),
+        Some(&vec![live_key]),
+        "the live DID resolves to its assertionMethod key (unresolved: {:?})",
+        signers.unresolved
+    );
+    assert!(
+        !signers.keys.contains_key(&dead),
+        "a deactivated DID must not come back with its last keys"
+    );
+    let reason = signers
+        .unresolved
+        .get(&dead)
+        .expect("the deactivated DID is reported unresolved");
+    assert!(reason.contains("deactivated"), "{reason}");
+}
+
 // --- committed platform keyring --------------------------------------------------
 
 #[test]
