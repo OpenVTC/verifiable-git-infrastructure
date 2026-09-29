@@ -43,7 +43,22 @@ pub fn normalize_sshsig_armor(pem: &str) -> String {
 /// Git signs the commit object with the `gpgsig` header removed; the header's
 /// value spans continuation lines (each prefixed with one space). Returns
 /// `Ok(None)` for an unsigned commit.
+///
+/// Every *other* header whose name starts with `gpgsig` (`gpgsig-sha256`, or a
+/// made-up `gpgsig-foo`) is removed too, continuation lines and all, because
+/// git removes it: that is the "other signature" arm of
+/// `parse_buffer_signed_by_header` in git's `commit.c`. Keeping such a header
+/// made this payload a superset of git's, so anyone could add one to a
+/// validly signed commit — fsck-clean, still GOOD to git — and have it
+/// reported here as a bad signature by its real signer.
 pub fn split_signed_commit(raw: &[u8]) -> Result<Option<(Vec<u8>, String)>> {
+    #[derive(PartialEq)]
+    enum Header {
+        Signature,
+        OtherSignature,
+        Kept,
+    }
+
     let text = std::str::from_utf8(raw).context("commit object is not UTF-8")?;
     let Some((headers, body)) = text.split_once("\n\n") else {
         bail!("malformed commit object: no header/body separator");
@@ -51,15 +66,23 @@ pub fn split_signed_commit(raw: &[u8]) -> Result<Option<(Vec<u8>, String)>> {
 
     let mut kept_headers: Vec<&str> = Vec::new();
     let mut signature_lines: Vec<&str> = Vec::new();
-    let mut in_gpgsig = false;
+    let mut current = Header::Kept;
     for line in headers.split('\n') {
-        if let Some(first) = line.strip_prefix("gpgsig ") {
-            in_gpgsig = true;
-            signature_lines.push(first);
-        } else if in_gpgsig && let Some(continuation) = line.strip_prefix(' ') {
+        // Same order as git: a continuation line belongs to the header before
+        // it, and is tested before any header name.
+        if current == Header::Signature
+            && let Some(continuation) = line.strip_prefix(' ')
+        {
             signature_lines.push(continuation);
+        } else if let Some(first) = line.strip_prefix("gpgsig ") {
+            current = Header::Signature;
+            signature_lines.push(first);
+        } else if line.starts_with("gpgsig")
+            || (current == Header::OtherSignature && line.starts_with(' '))
+        {
+            current = Header::OtherSignature;
         } else {
-            in_gpgsig = false;
+            current = Header::Kept;
             kept_headers.push(line);
         }
     }
@@ -465,6 +488,88 @@ mod tests {
             committer_did(&payload).unwrap(),
             "did:webvh:QmAbc:example.com"
         );
+    }
+
+    /// A signed commit with `extra` header lines inserted before or after the
+    /// `gpgsig` block, and the payload git signed (no `extra`, no `gpgsig`).
+    fn signed_with_extra_headers(extra: &str, after_signature: bool) -> (String, String) {
+        let head = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer A U Thor <a@example.com> 1700000000 +0000";
+        let signature = "gpgsig -----BEGIN SSH SIGNATURE-----\n AAAA\n -----END SSH SIGNATURE-----";
+        let headers = if after_signature {
+            format!("{head}\n{signature}\n{extra}")
+        } else {
+            format!("{head}\n{extra}\n{signature}")
+        };
+        (
+            format!("{headers}\n\na message\n"),
+            format!("{head}\n\na message\n"),
+        )
+    }
+
+    #[test]
+    fn other_gpgsig_headers_are_removed_from_the_payload_like_git() {
+        // Each of these is dropped by git's `parse_buffer_signed_by_header`
+        // (checked against git 2.50 with `git verify-commit`), so each must be
+        // dropped here or a signature git calls good is reported bad.
+        for extra in [
+            "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n AAAA\n -----END PGP SIGNATURE-----",
+            "gpgsig-sha256 ",
+            "gpgsigx junk",
+            "gpgsig-foo bar",
+            "gpgsig",
+        ] {
+            for after_signature in [false, true] {
+                let (commit, expected) = signed_with_extra_headers(extra, after_signature);
+                let (payload, pem) = split_signed_commit(commit.as_bytes()).unwrap().unwrap();
+                assert_eq!(
+                    String::from_utf8(payload).unwrap(),
+                    expected,
+                    "{extra:?} (after the signature: {after_signature})"
+                );
+                assert_eq!(
+                    pem, "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+                    "the other header must not leak into the signature"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_header_that_merely_contains_gpgsig_is_kept() {
+        // git keeps every header not *starting* with `gpgsig`, so these stay
+        // in the signed payload.
+        let (commit, _) = signed_with_extra_headers("x-gpgsig junk", false);
+        let (payload, _) = split_signed_commit(commit.as_bytes()).unwrap().unwrap();
+        assert!(
+            String::from_utf8(payload)
+                .unwrap()
+                .contains("\nx-gpgsig junk\n")
+        );
+    }
+
+    #[test]
+    fn a_header_after_another_signature_is_kept() {
+        // The other signature's continuation lines go with it; the next real
+        // header does not.
+        let (commit, expected) =
+            signed_with_extra_headers("gpgsig-sha256 first\n second\nencoding UTF-8", true);
+        let (payload, _) = split_signed_commit(commit.as_bytes()).unwrap().unwrap();
+        let expected = expected.replace("\n\na message", "\nencoding UTF-8\n\na message");
+        assert_eq!(String::from_utf8(payload).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_commit_signed_only_by_another_header_is_unsigned() {
+        // A SHA-1 repository's signature is `gpgsig`; with none, there is
+        // nothing to verify, whatever other signature headers exist.
+        let commit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             committer A U Thor <a@example.com> 1700000000 +0000\n\
+             gpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n AAAA\n\
+             \n\
+             a message\n";
+        assert!(split_signed_commit(commit.as_bytes()).unwrap().is_none());
     }
 
     fn commit_with_trailer(committer: &str, trailer: &str) -> String {

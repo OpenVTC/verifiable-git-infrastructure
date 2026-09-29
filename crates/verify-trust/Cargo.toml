@@ -66,6 +66,8 @@ hex = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+# Encodes publicKeyMultibase values for the signing-key extraction test.
+multibase = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 # Parses `.github/` for the workflow-injection regression test.

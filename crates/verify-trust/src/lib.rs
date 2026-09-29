@@ -64,8 +64,8 @@ use serde::Serialize;
 use ssh_key::{SshSig, public::KeyData};
 use trql_client::{TransportKind, TrqlClient, TrqlError, TrqpQuery};
 use vgi_core::{
-    GIT_SSHSIG_NAMESPACE, committer_identity, conflicting_signer_dids, ed25519_keys_from_doc,
-    normalize_sshsig_armor, signer_did, split_signed_commit,
+    GIT_SSHSIG_NAMESPACE, committer_identity, conflicting_signer_dids,
+    ed25519_signing_keys_from_doc, normalize_sshsig_armor, signer_did, split_signed_commit,
 };
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
@@ -953,15 +953,15 @@ pub async fn resolve_signer_keys(
 
                 let doc = serde_json::to_value(&response.doc)
                     .with_context(|| format!("DID document for {did} did not serialize"))?;
-                let published = ed25519_keys_from_doc(&doc);
+                let published = ed25519_signing_keys_from_doc(&doc);
                 if published.is_empty() {
                     // Left out of `keys` deliberately: a document with no
-                    // Ed25519 method can verify nothing, and recording it as
+                    // Ed25519 signing key can verify nothing, and recording it as
                     // resolved-but-empty would report its commits as an
                     // unknown key rather than as this, the actual cause.
                     signers.unresolved.insert(
                         did.clone(),
-                        "DID document publishes no Ed25519 verification keys".to_string(),
+                        "DID document lists no Ed25519 key under assertionMethod".to_string(),
                     );
                 } else {
                     signers.keys.insert(did.clone(), published);
@@ -1344,6 +1344,54 @@ mod tests {
     }
 
     const SIGNER: &str = "did:webvh:QmSigner:example.com";
+
+    /// The signing keys `resolve_signer_keys` takes from a resolved document,
+    /// which reaches it typed and is re-serialized: `assertionMethod` has to
+    /// survive that round trip, or every signer would come back keyless.
+    /// Shaped as the VTA issues a did:webvh — Ed25519 `#key-0` for signing,
+    /// X25519 `#key-1` for agreement — plus a second Ed25519 key the document
+    /// holds for authentication only, which must not sign (VGI-02).
+    #[test]
+    fn only_assertion_method_keys_survive_the_typed_document() {
+        let multikey = |prefix: [u8; 2], seed: u8| {
+            let public = SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes();
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(&public);
+            (
+                public,
+                multibase::encode(multibase::Base::Base58Btc, &bytes),
+            )
+        };
+        let (signing, signing_mb) = multikey(vgi_core::ED25519_MULTICODEC_PREFIX, 1);
+        let (_, agreement_mb) = multikey([0xEC, 0x01], 2);
+        let (_, auth_only_mb) = multikey(vgi_core::ED25519_MULTICODEC_PREFIX, 3);
+        let method = |fragment: &str, key: &str| {
+            serde_json::json!({
+                "id": format!("{SIGNER}#{fragment}"),
+                "type": "Multikey",
+                "controller": SIGNER,
+                "publicKeyMultibase": key,
+            })
+        };
+        let doc: affinidi_tdk::did_common::Document = serde_json::from_value(serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": SIGNER,
+            "verificationMethod": [
+                method("key-0", &signing_mb),
+                method("key-1", &agreement_mb),
+                method("key-2", &auth_only_mb),
+            ],
+            "authentication": [format!("{SIGNER}#key-0"), format!("{SIGNER}#key-2")],
+            "assertionMethod": [format!("{SIGNER}#key-0")],
+            "keyAgreement": [format!("{SIGNER}#key-1")],
+        }))
+        .unwrap();
+
+        let reserialized = serde_json::to_value(&doc).unwrap();
+        assert_eq!(ed25519_signing_keys_from_doc(&reserialized), vec![signing]);
+    }
 
     /// An unsigned commit whose committer claims `SIGNER`, as `did-git-sign`
     /// writes it: `user.email` is the verification-method id.

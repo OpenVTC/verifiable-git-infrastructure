@@ -662,7 +662,7 @@ mod tests {
                 // verify-trust finds the key the bridge re-signs Dependabot
                 // commits with in the same document.
                 let signing = id.git_signing_key().unwrap().key.verifying_key().to_bytes();
-                assert!(vgi_core::ed25519_keys_from_doc(&doc).contains(&signing));
+                assert!(vgi_core::ed25519_signing_keys_from_doc(&doc).contains(&signing));
             }
         }
     }

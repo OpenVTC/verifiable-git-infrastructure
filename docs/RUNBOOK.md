@@ -696,8 +696,8 @@ the remediation is unambiguous:
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
 | `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
-| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or publishes no Ed25519 method |
-| `unknownKey` | the claimed DID publishes no such key | usually the signer **rotated their key** after signing — the DID no longer publishes the old one, so re-sign the commit with the current key (below). Otherwise it was signed by a key that identity never held: `did-git-sign init` for the right key |
+| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, or lists no Ed25519 key under `assertionMethod` |
+| `unknownKey` | the claimed DID lists no such key under `assertionMethod` | a key the document holds for another purpose (key agreement, recovery) does not count: list the signing key under `assertionMethod`. Otherwise, usually the signer **rotated their key** after signing — the DID no longer publishes the old one, so re-sign the commit with the current key (below). Otherwise it was signed by a key that identity never held: `did-git-sign init` for the right key |
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
 | `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
 | `registryUnavailable` | the registry could not be consulted | registry outage — or, over TSP/DIDComm, a registry mediator that does not admit the run's throwaway DID (§4, *Registry discovery*; set `transport: https` meanwhile). The check fails closed by design |

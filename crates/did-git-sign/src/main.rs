@@ -947,7 +947,7 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
 
 /// Check whether a local did.jsonl file publishes the given Ed25519 key.
 fn check_key_in_did_log(path: &std::path::Path, local_key: &[u8; 32]) -> Result<bool> {
-    use vgi_core::ed25519_keys_from_doc;
+    use vgi_core::ed25519_signing_keys_from_doc;
 
     let content =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -960,9 +960,9 @@ fn check_key_in_did_log(path: &std::path::Path, local_key: &[u8; 32]) -> Result<
         .get("state")
         .context("no 'state' field in did.jsonl entry")?;
 
-    let published_keys = ed25519_keys_from_doc(state);
+    let published_keys = ed25519_signing_keys_from_doc(state);
     if published_keys.is_empty() {
-        anyhow::bail!("DID document has no Ed25519 keys");
+        anyhow::bail!("DID document lists no Ed25519 key under assertionMethod");
     }
 
     Ok(published_keys.iter().any(|k| k == local_key))

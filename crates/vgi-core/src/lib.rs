@@ -8,7 +8,7 @@
 //!   sshsig namespace ([`GIT_SSHSIG_NAMESPACE`]),
 //! - git commit-object handling ([`split_signed_commit`],
 //!   [`normalize_sshsig_armor`], [`committer_did`]),
-//! - DID-document Ed25519 key extraction ([`ed25519_keys_from_doc`]),
+//! - DID-document Ed25519 key extraction ([`ed25519_signing_keys_from_doc`]),
 //! - the forge-qualified resource grammar ([`normalize_resource`],
 //!   [`resource_contains`]) that the verifier, the VTC projection and the
 //!   forge adapters must all agree on byte for byte.
@@ -25,7 +25,7 @@ pub use commit::{
     committer_did, committer_identity, conflicting_signer_dids, normalize_sshsig_armor, signer_did,
     split_signed_commit,
 };
-pub use did::{ED25519_MULTICODEC_PREFIX, ed25519_keys_from_doc};
+pub use did::{ED25519_MULTICODEC_PREFIX, ed25519_signing_keys_from_doc};
 pub use resource::{
     ResourceError, ResourceErrorKind, normalize_resource, normalize_resource_with_depth,
     resource_contains,
