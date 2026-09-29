@@ -7,6 +7,9 @@ use crate::config::{self, SigningConfig, VtaCredentials};
 /// Maximum number of authentication retry attempts.
 const MAX_AUTH_RETRIES: u32 = 2;
 
+/// The pause before retry `n` is `n` times this.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Authenticate with VTA, using whichever transport the install captured.
 /// Returns an authenticated `VtaClient` and the loaded VTA credentials.
 ///
@@ -164,6 +167,9 @@ async fn connect_with_retry(creds: &VtaCredentials) -> Result<ConnectedVta> {
                     eprintln!(
                         "VTA connect attempt {attempt}/{MAX_AUTH_RETRIES} failed: {err_msg}, retrying..."
                     );
+                    // A pause, not a hammer: a VTA that just refused or timed
+                    // out gets a moment before the next handshake.
+                    tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 last_err = Some(err_msg);
             }

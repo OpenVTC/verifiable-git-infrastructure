@@ -1,0 +1,18 @@
+# `cargo audit` configuration, read by the `audit` CI job.
+#
+# Every ignore names the advisory, why it does not apply here, and what would
+# make it apply. Revisit each one when the dependency that carries it moves.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071, `rsa` 0.9 (Marvin): timing side-channel recovering an
+    # RSA *private* key from decryption or signing. No fixed release exists.
+    #
+    # `rsa` reaches the workspace only through `pgp` and `ssh-key`, both in
+    # verify-trust, which uses them to *verify* signatures with public keys
+    # (GitHub's RSA `web-flow` key, sshsig armor). Nothing in this workspace
+    # holds an RSA private key or decrypts: did-git-sign and the bridge sign
+    # with Ed25519, and RSA secret-key use is confined to tests. Re-evaluate
+    # if any crate here starts signing or decrypting with RSA.
+    "RUSTSEC-2023-0071",
+]

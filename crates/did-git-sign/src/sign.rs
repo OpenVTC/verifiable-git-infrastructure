@@ -170,6 +170,25 @@ fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource)
     }
 }
 
+/// The most [`handle_sign`] reads to sign. git signs commit and tag objects
+/// (and push certificates), which name their trees rather than contain them:
+/// a real one is kilobytes. Anything larger is not git's, and is refused
+/// before it is held in memory whole.
+pub const MAX_SIGN_INPUT: u64 = 16 * 1024 * 1024;
+
+/// Read all of `input`, refusing more than [`MAX_SIGN_INPUT`] bytes.
+fn read_bounded(input: impl Read) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    input.take(MAX_SIGN_INPUT + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_SIGN_INPUT {
+        anyhow::bail!(
+            "refusing to sign more than {MAX_SIGN_INPUT} bytes: git's commit and tag objects \
+             are far smaller"
+        );
+    }
+    Ok(buf)
+}
+
 /// Handle the signing invocation from git.
 /// Git calls: `did-git-sign -Y sign -f <config_path> -n <namespace> <file_to_sign>`
 /// The file to sign is passed as a positional argument; the armored SSH signature is written
@@ -187,14 +206,12 @@ pub async fn handle_sign(
     // Read data to sign from the file argument (git passes the buffer file path)
     // or fall back to stdin for compatibility.
     let data = if let Some(path) = sign_file {
-        std::fs::read(path)
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to read file to sign: {}", path.display()))?;
+        read_bounded(file)
             .with_context(|| format!("failed to read file to sign: {}", path.display()))?
     } else {
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .context("failed to read data from stdin")?;
-        buf
+        read_bounded(std::io::stdin()).context("failed to read data from stdin")?
     };
 
     // Policy gate: parent process must be git, audit every attempt. This
@@ -288,6 +305,16 @@ mod tests {
     use super::*;
 
     const SIGNER: &str = "did:webvh:QmSigner:example.com";
+
+    #[test]
+    fn input_up_to_the_bound_is_read_and_past_it_refused() {
+        let limit = MAX_SIGN_INPUT as usize;
+        assert_eq!(read_bounded(&vec![7u8; limit][..]).unwrap().len(), limit);
+        let err = read_bounded(&vec![7u8; limit + 1][..]).unwrap_err();
+        assert!(err.to_string().contains("refusing to sign"), "{err}");
+        // An endless input stops at the bound instead of exhausting memory.
+        assert!(read_bounded(std::io::repeat(0)).is_err());
+    }
 
     fn commit_committed_by(committer: &str) -> Vec<u8> {
         format!(
