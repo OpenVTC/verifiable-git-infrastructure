@@ -312,6 +312,9 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
         .await
         .with_context(|| format!("listening on {}", cfg.listen))?;
     tracing::info!(listen = %cfg.listen, public = %cfg.public_url, "HTTP server up");
+    if let Some(warning) = cfg.listen_warning() {
+        tracing::warn!("{warning}");
+    }
     let mut stop_http = stop_rx.clone();
     let server = axum::serve(listener, http::router(Arc::clone(&bridge))).with_graceful_shutdown(
         async move {

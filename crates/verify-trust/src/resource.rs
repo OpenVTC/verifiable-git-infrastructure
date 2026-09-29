@@ -160,12 +160,57 @@ pub fn normalize_qualified(what: &str, value: &str, ci: &CiEnv) -> Result<String
     }
 }
 
+/// Check a legacy resource's shape: `owner` or `owner/repo`, each segment
+/// ASCII letters, digits, `.`, `_` or `-` — the qualified grammar's character
+/// set, with case kept, since legacy values are passed through untouched.
+///
+/// Before this the legacy arm took any string at all as the one input that
+/// scopes the registry query: an empty `--resource`, a whitespace-padded one,
+/// or one with a control character went to the registry verbatim (SEC-4045 /
+/// VGI-03). Those failed closed, as no grant matches them — but they failed as
+/// `unauthorized`, pointing the operator at the registry instead of the typo,
+/// which is how a fallback gets widened to make a check go green.
+fn check_legacy(what: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{what} is empty; pass `owner/repo` (or the bare owner)");
+    }
+    if let Some(c) = value.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        bail!(
+            "{what} `{}` contains {}; pass `owner/repo` (or the bare owner) with nothing \
+             around it",
+            value.escape_debug(),
+            if c.is_whitespace() {
+                "whitespace"
+            } else {
+                "a control character"
+            }
+        );
+    }
+    let segments: Vec<&str> = value.split('/').collect();
+    if segments.len() > 2
+        || segments
+            .iter()
+            .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        bail!("{what} `{value}` is not `owner/repo` or a bare owner");
+    }
+    if let Some(c) = value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
+    {
+        bail!("{what} `{value}` contains `{c}`, which no owner or repository name can");
+    }
+    Ok(())
+}
+
 /// The primary and fallback resources a run queries, in the chosen form.
 ///
 /// `legacy` is the pre-qualification behaviour: values pass through
-/// untouched, and the primary defaults to `$GITHUB_REPOSITORY`; only a
-/// forge-qualified fallback is refused, since it would mix the two forms in
-/// one run. `qualified` validates and lowercases explicit values, derives the
+/// untouched, and the primary defaults to `$GITHUB_REPOSITORY`. Both must be
+/// shaped as an owner or `owner/repo` ([`check_legacy`]); a forge-qualified
+/// fallback is refused, since it would mix the two forms in one run, and so is
+/// a fallback that is neither the primary's owner nor the primary itself —
+/// the legacy counterpart of the containment rule below. `qualified` validates and lowercases explicit values, derives the
 /// default from [`CiEnv`], and requires the fallback to **contain** the
 /// primary — the namespace it sits in (`github.com/acme` for
 /// `github.com/acme/widgets`), or the primary itself. A fallback naming
@@ -186,14 +231,28 @@ pub fn select_resources(
             let resource = resource
                 .or_else(|| ci.github_repository.clone())
                 .context("--resource is required (or set GITHUB_REPOSITORY)")?;
-            if let Some(fallback) = &fallback_resource
-                && let Ok(qualified) = normalize_resource(fallback)
-            {
-                bail!(
-                    "--fallback-resource `{fallback}` is forge-qualified (`{qualified}`) but \
-                     --resource-format is legacy; one run uses one form: pass \
-                     --resource-format qualified, or the bare owner"
-                );
+            check_legacy("--resource", &resource)?;
+            if let Some(fallback) = &fallback_resource {
+                if let Ok(qualified) = normalize_resource(fallback) {
+                    bail!(
+                        "--fallback-resource `{fallback}` is forge-qualified (`{qualified}`) but \
+                         --resource-format is legacy; one run uses one form: pass \
+                         --resource-format qualified, or the bare owner"
+                    );
+                }
+                check_legacy("--fallback-resource", fallback)?;
+                // Owners and repositories are case-insensitive on the forges,
+                // so containment is too; the values themselves stay untouched.
+                let owner = resource.split('/').next().unwrap_or_default();
+                if !fallback.eq_ignore_ascii_case(owner)
+                    && !fallback.eq_ignore_ascii_case(&resource)
+                {
+                    bail!(
+                        "--fallback-resource `{fallback}` is not the owner of --resource \
+                         `{resource}`: the fallback must be the namespace the repository sits \
+                         in (`{owner}`), never another owner's"
+                    );
+                }
             }
             Ok((resource, fallback_resource))
         }
@@ -565,7 +624,7 @@ mod tests {
         assert!(
             select_resources(
                 ResourceFormat::Legacy,
-                None,
+                Some("john.doe/widgets".into()),
                 Some("john.doe".into()),
                 &github()
             )
@@ -579,6 +638,89 @@ mod tests {
                 .as_deref(),
             Some("Acme")
         );
+    }
+
+    /// VGI-03: the legacy arm used to send any string to the registry.
+    #[test]
+    fn legacy_mode_refuses_a_malformed_resource() {
+        for (resource, expected) in [
+            ("", "is empty"),
+            ("   ", "is empty"),
+            (" Acme/Widgets", "whitespace"),
+            ("Acme/Widgets\n", "whitespace"),
+            ("Acme/Wid\u{7}gets", "control character"),
+            ("Acme/Widgets/extra", "not `owner/repo`"),
+            ("Acme//Widgets", "not `owner/repo`"),
+            ("/Widgets", "not `owner/repo`"),
+            ("Acme/..", "not `owner/repo`"),
+            ("Acme/Wid*gets", "contains `*`"),
+        ] {
+            let message = select_resources(
+                ResourceFormat::Legacy,
+                Some(resource.into()),
+                None,
+                &github(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(message.contains(expected), "{resource:?}: {message}");
+        }
+        // $GITHUB_REPOSITORY is held to the same shape.
+        let env = ci(&[("GITHUB_REPOSITORY", "")]);
+        assert!(select_resources(ResourceFormat::Legacy, None, None, &env).is_err());
+        // What legacy has always accepted still passes, untouched.
+        for resource in ["Acme/Widgets", "acme", "john.doe/my_repo-2"] {
+            assert_eq!(
+                select_resources(
+                    ResourceFormat::Legacy,
+                    Some(resource.into()),
+                    None,
+                    &github()
+                )
+                .unwrap()
+                .0,
+                resource
+            );
+        }
+    }
+
+    /// VGI-03: a legacy fallback may widen a run to the repository's own
+    /// owner, never to someone else's.
+    #[test]
+    fn legacy_mode_refuses_a_fallback_naming_another_owner() {
+        let message =
+            select_resources(ResourceFormat::Legacy, None, Some("Evil".into()), &github())
+                .unwrap_err()
+                .to_string();
+        assert!(message.contains("is not the owner of"), "{message}");
+        assert!(message.contains("`Acme`"), "{message}");
+        for fallback in [" Acme", ""] {
+            assert!(
+                select_resources(
+                    ResourceFormat::Legacy,
+                    None,
+                    Some(fallback.into()),
+                    &github()
+                )
+                .is_err(),
+                "{fallback:?}"
+            );
+        }
+        // Its own owner, in any case, or the repository itself, pass untouched.
+        for fallback in ["Acme", "acme", "Acme/Widgets"] {
+            assert_eq!(
+                select_resources(
+                    ResourceFormat::Legacy,
+                    None,
+                    Some(fallback.into()),
+                    &github()
+                )
+                .unwrap()
+                .1
+                .as_deref(),
+                Some(fallback)
+            );
+        }
     }
 
     #[test]

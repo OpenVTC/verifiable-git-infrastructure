@@ -201,7 +201,10 @@ Two inputs carry weight that a committed signer list used to:
   nothing in the repository to contradict it. Under `qualified`, the fallback
   must contain the resource — its namespace (`github.com/acme` for
   `github.com/acme/widgets`) — and one naming another owner or forge is
-  refused; under `legacy`, a forge-qualified fallback is refused.
+  refused. Under `legacy`, both must be shaped as `owner/repo` or a bare
+  owner (no whitespace, control characters or empty segments), the fallback
+  must be the resource's own owner (or the resource itself), and a
+  forge-qualified fallback is refused.
 - **`--resource-format`** (default `legacy`) picks the form of both
   resources — see [Resource format](#resource-format).
 - **`--max-signers`** (default 32) bounds the distinct DIDs one range may

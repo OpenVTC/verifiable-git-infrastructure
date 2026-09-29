@@ -58,38 +58,44 @@ pub async fn authenticate(cfg: &SigningConfig) -> Result<(VtaClient, VtaCredenti
     Ok((connected.client, creds))
 }
 
-/// May we speak cleartext HTTP to this URL?
+/// Is this a URL we may carry VTA credentials over?
 ///
-/// Only to loopback, and decided by **parsing the host** rather than matching
-/// a prefix of the URL. `url.starts_with("http://localhost")` — the test this
-/// replaces — also accepts `http://localhost.evil.com`, which is a cleartext
-/// VTA session, carrying the credential exchange, to a host an attacker chose.
-/// `http://localhostevil.com` passed too.
+/// `https://`, or cleartext `http://` to a loopback host for local
+/// development — decided by **parsing the URL**, with the SDK's own rule
+/// (`vta_sdk::protocol::matching::is_https_or_loopback`), never by matching
+/// text. Hand-parsing got this wrong twice: `starts_with("http://localhost")`
+/// admitted `http://localhost.evil.com`, and the host-splitting parser that
+/// replaced it read `http://localhost:80@evil.com` as `localhost` — the part
+/// before `@` is userinfo, and the request, carrying the credential exchange,
+/// goes in the clear to `evil.com` (SEC-4045 / VGI-07).
 ///
-/// The Trust Registry's `validate_public_url` is the same rule applied to a
-/// different URL. Note it still carries this bug in its IPv6 arm
-/// (`rest.starts_with("[::1]")` admits `http://[::1].evil.com`), so the two
-/// are deliberately *not* identical until that is fixed there too.
-fn is_loopback_http(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
+/// Userinfo is refused outright, as the SDK's `guard_vta_endpoint` does: a
+/// VTA URL has no use for it, and it is what that bypass was built from.
+pub fn vta_url_is_secure(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    // A bracketed IPv6 literal contains ':' itself, so its host is delimited
-    // by the closing bracket, and what follows must be a port, a path, a
-    // query, or nothing — `[::1].evil.com` is a different host entirely.
-    if let Some(after) = rest.strip_prefix('[') {
-        let Some((host, tail)) = after.split_once(']') else {
-            return false;
-        };
-        return host == "::1" && (tail.is_empty() || tail.starts_with([':', '/', '?']));
-    }
-    let host = rest.split(['/', ':', '?']).next().unwrap_or("");
-    host == "localhost" || host == "127.0.0.1"
+    parsed.username().is_empty()
+        && parsed.password().is_none()
+        && vta_sdk::protocol::matching::is_https_or_loopback(url)
 }
 
-/// Is this a URL we may carry VTA credentials over?
-fn vta_url_is_secure(url: &str) -> bool {
-    url.starts_with("https://") || is_loopback_http(url)
+/// The error for a VTA URL that fails [`vta_url_is_secure`]. Any userinfo is
+/// cut from the URL it echoes, so a password never lands in a terminal or log.
+pub fn insecure_vta_url(url: &str) -> anyhow::Error {
+    let shown = match url::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            format!("{parsed} with a user:password@ part")
+        }
+        _ => url.to_string(),
+    };
+    anyhow::anyhow!(
+        "VTA URL must use HTTPS, with no user:password@ part (got: {shown}). Cleartext \
+         http:// is allowed only to loopback (localhost, 127.0.0.0/8, [::1]) for local \
+         development."
+    )
 }
 
 /// Validate VTA credentials before use.
@@ -110,11 +116,7 @@ fn validate_credentials(creds: &VtaCredentials) -> Result<()> {
         // it to the same HTTPS rule (it'll be passed through as a /health
         // fallback so we don't want to risk leaking creds over plain HTTP).
         if !creds.vta_url.is_empty() && !vta_url_is_secure(&creds.vta_url) {
-            bail!(
-                "VTA URL must use HTTPS (got: {}). Cleartext http:// is allowed only to \
-                 loopback (localhost, 127.0.0.1, [::1]) for local development.",
-                creds.vta_url
-            );
+            return Err(insecure_vta_url(&creds.vta_url));
         }
         return Ok(());
     }
@@ -124,11 +126,7 @@ fn validate_credentials(creds: &VtaCredentials) -> Result<()> {
         bail!("VTA URL is empty");
     }
     if !vta_url_is_secure(&creds.vta_url) {
-        bail!(
-            "VTA URL must use HTTPS (got: {}). Cleartext http:// is allowed only to \
-             loopback (localhost, 127.0.0.1, [::1]) for local development.",
-            creds.vta_url
-        );
+        return Err(insecure_vta_url(&creds.vta_url));
     }
     Ok(())
 }
@@ -354,6 +352,48 @@ mod tests {
                 validate_credentials(&creds).is_err(),
                 "a lookalike host must not pass the HTTPS requirement: {url}"
             );
+        }
+    }
+
+    /// VGI-07: the part before `@` is userinfo, so each of these sends the
+    /// credential exchange in the clear to `evil.com`. The hand-rolled parser
+    /// this replaced read the host as `localhost` and let them through.
+    #[test]
+    fn userinfo_cannot_disguise_a_remote_host_as_loopback() {
+        for url in [
+            "http://localhost:80@evil.com",
+            "http://localhost@evil.com/vta",
+            "http://127.0.0.1:8100@evil.com",
+            "http://[::1]:80@evil.com",
+        ] {
+            let mut creds = test_creds();
+            creds.vta_url = url.to_string();
+            assert!(
+                validate_credentials(&creds).is_err(),
+                "userinfo must not pass as a loopback host: {url}"
+            );
+        }
+    }
+
+    /// A VTA URL has no use for credentials, and refusing them costs nothing
+    /// — but the refusal must not print them.
+    #[test]
+    fn userinfo_is_refused_even_over_https_and_never_echoed() {
+        let mut creds = test_creds();
+        creds.vta_url = "https://alice:s3cret@vta.example.com".to_string();
+        let err = validate_credentials(&creds).unwrap_err().to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+        assert!(!err.contains("alice"), "{err}");
+        assert!(err.contains("vta.example.com"), "{err}");
+    }
+
+    #[test]
+    fn the_whole_loopback_range_and_trailing_dot_stay_usable() {
+        for url in ["http://127.0.0.2:8100", "http://localhost.:3000"] {
+            assert!(vta_url_is_secure(url), "{url}");
+        }
+        for url in ["ftp://vta.example.com", "not a url", "https://"] {
+            assert!(!vta_url_is_secure(url), "{url}");
         }
     }
 

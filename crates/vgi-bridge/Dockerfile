@@ -7,13 +7,16 @@
 # (a mounted secret, owner-only), a writable /var/lib/vgi-bridge for the state
 # store, and `git` (the bridge-posted check fetches commit objects with it and
 # never runs anything from them). See docs/BRIDGE.md.
+#
+# Both base images are pinned by digest, as every action is pinned by commit
+# SHA; Dependabot keeps the pins current and CI refuses a FROM without one.
 
-FROM rust:1.95-bookworm AS build
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p vgi-bridge
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git \
  && rm -rf /var/lib/apt/lists/* \
@@ -23,5 +26,8 @@ USER vgi
 ENV VGI_BRIDGE_CONFIG=/etc/vgi-bridge/bridge.toml
 VOLUME ["/var/lib/vgi-bridge"]
 EXPOSE 8080
+# `/healthz` via the binary itself: the image carries no curl.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD ["/usr/local/bin/vgi-bridge", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/vgi-bridge"]
 CMD ["run"]

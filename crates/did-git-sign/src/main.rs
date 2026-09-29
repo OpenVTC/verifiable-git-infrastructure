@@ -350,6 +350,12 @@ async fn cmd_init(
             .await
             .map_err(|e| anyhow::anyhow!("could not resolve VTA URL from {vta_did}: {e}"))?
     };
+    // The resolved URL has passed the SDK's endpoint guard; an operator's
+    // `--vta-url` has not. Hold both to the rule every later use of the
+    // stored URL is held to, before the challenge-response sends anything.
+    if !vta::vta_url_is_secure(&vta_url) {
+        return Err(vta::insecure_vta_url(&vta_url));
+    }
     println!("VTA URL: {vta_url}");
 
     // 2. Mint a fresh ephemeral did:key as the admin identity for this

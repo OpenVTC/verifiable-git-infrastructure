@@ -52,6 +52,9 @@ enum Cmd {
         #[command(subcommand)]
         command: VtaCmd,
     },
+    /// Exit 0 when the running bridge's `GET /healthz` answers 200 (for a
+    /// container HEALTHCHECK: the image has no curl). Opens no store.
+    Healthcheck,
 }
 
 #[derive(Subcommand)]
@@ -435,6 +438,42 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Ask the bridge listening at `listen` for `GET /healthz`; `Ok` on a 200.
+///
+/// Plain HTTP over a std socket, so the image needs no HTTP client. An
+/// unspecified listen address (`0.0.0.0`, `[::]`) is probed on loopback.
+fn healthcheck(listen: std::net::SocketAddr) -> Result<()> {
+    use std::io::Write;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let target = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), listen.port())
+        }
+        _ => listen,
+    };
+    let mut stream = TcpStream::connect_timeout(&target, TIMEOUT)
+        .with_context(|| format!("connecting to the bridge at {target}"))?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    let request = format!("GET /healthz HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut response = Vec::new();
+    // The status line is all that is needed; bound the read regardless.
+    stream.take(4096).read_to_end(&mut response)?;
+    let status_line = String::from_utf8_lossy(&response);
+    let status_line = status_line.lines().next().unwrap_or_default();
+    match status_line.split_whitespace().nth(1) {
+        Some("200") => Ok(()),
+        _ => bail!("the bridge at {target} is not healthy: `{status_line}`"),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -448,6 +487,9 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("VGI_BRIDGE_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/etc/vgi-bridge/bridge.toml"));
     let cfg = BridgeConfig::load(&path)?;
+    if matches!(cli.command, Cmd::Healthcheck) {
+        return healthcheck(cfg.listen);
+    }
     if cfg.vta.is_some() {
         return match cli.command {
             Cmd::Run => {
@@ -475,6 +517,7 @@ fn main() -> Result<()> {
         }
         Cmd::Init => init(&cfg),
         Cmd::Vta { .. } => bail!("the config has no `[vta]` section (VTA mode is off)"),
+        Cmd::Healthcheck => unreachable!("answered before the mode is chosen"),
         Cmd::Identity { command } => {
             let store = open_store(&cfg)?;
             match command {
@@ -556,6 +599,55 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP server answering `status_line`; returns its address.
+    fn answer_once(status_line: &'static str) -> std::net::SocketAddr {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the whole request: closing with some of it unread resets
+            // the connection before the client sees the answer.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 256];
+            while !request.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        });
+        addr
+    }
+
+    #[test]
+    fn healthcheck_passes_on_200_only() {
+        assert!(healthcheck(answer_once("200 OK")).is_ok());
+        let err = healthcheck(answer_once("503 Service Unavailable")).unwrap_err();
+        assert!(err.to_string().contains("503"), "{err}");
+    }
+
+    #[test]
+    fn healthcheck_probes_an_unspecified_listener_on_loopback() {
+        let served = answer_once("200 OK");
+        let listen: std::net::SocketAddr = format!("0.0.0.0:{}", served.port()).parse().unwrap();
+        assert!(healthcheck(listen).is_ok());
+    }
+
+    #[test]
+    fn healthcheck_fails_when_nothing_listens() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(healthcheck(format!("127.0.0.1:{port}").parse().unwrap()).is_err());
+    }
 
     #[test]
     fn only_forgejo_bot_secrets_are_set_by_hand() {
