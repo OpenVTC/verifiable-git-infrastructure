@@ -290,10 +290,19 @@ affinidi-messaging-didcomm = "0.15.9"
 # `[dev-dependencies]` would not travel with the published crate, and
 # `did-git-sign` — the crate OpenVTC consumes — resolves through the same graph.
 #
+# 0.8.39 raises it for SEC-4045 / VGI-04: before it, a did:webvh whose log ends
+# in a deactivation resolved `Ok` with its last document — `didwebvh-rs` flags
+# deactivation only in metadata the resolver discarded — so a retired signer
+# kept verifying commits indefinitely. 0.8.39 fails the resolution, and the
+# signer is reported `unresolvedSigner`.
+#
 # No feature is chosen here: `affinidi-tdk` already takes this crate with its
 # default features, so this line adds a version requirement and nothing else.
-affinidi-did-resolver-cache-sdk = "0.8.38"
+affinidi-did-resolver-cache-sdk = "0.8.39"
 multibase = "0.9"
+# Test-only: build real did:webvh logs (verify-trust's deactivated-signer test).
+didwebvh-rs = "0.7"
+affinidi-secrets-resolver = "0.5"
 pgp = "0.20"
 clap = { version = "4.6", features = ["derive"] }
 tokio = "1.53"

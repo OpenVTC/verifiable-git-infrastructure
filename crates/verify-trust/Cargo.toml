@@ -68,6 +68,10 @@ hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 # Encodes publicKeyMultibase values for the signing-key extraction test.
 multibase = { workspace = true }
+# Build and serve real did:webvh logs for the deactivated-signer test.
+didwebvh-rs = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
+chrono = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 # Parses `.github/` for the workflow-injection regression test.
