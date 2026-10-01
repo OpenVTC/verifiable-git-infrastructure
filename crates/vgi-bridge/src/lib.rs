@@ -230,7 +230,8 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
     #[cfg(feature = "forge-github")]
     flows::offer_registrations(&bridge)?;
 
-    // DIDComm: connect, serve, reconnect with capped backoff.
+    // The mediator session (TSP and DIDComm): connect, serve, reconnect with
+    // capped backoff.
     let messaging = {
         let bridge = Arc::clone(&bridge);
         let link = Arc::clone(&link);
@@ -243,14 +244,28 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
                 // the session below and the next one uses the new ones.
                 let current = bridge.identity();
                 rotations.borrow_and_update();
+                // TSP relationship invites are accepted from the VTC and
+                // the registry only.
+                let peers = vec![
+                    bridge.cfg.vtc_did.clone(),
+                    bridge.cfg.trust_registry_did.clone(),
+                ];
                 let connected =
-                    transport::DidcommLink::connect(&current, &bridge.cfg.mediator_did).await;
+                    transport::MediatorLink::connect(&current, &bridge.cfg.mediator_did, peers)
+                        .await;
                 drop(current);
                 match connected {
                     Ok((conn, mut inbound)) => {
                         let conn = Arc::new(conn);
                         link.set(Some(conn.clone())).await;
                         tracing::info!("connected to the mediator");
+                        // A VTC reached over TSP drops what a bridge without
+                        // a relationship sends it, and this side's
+                        // relationships do not survive a restart: offer one
+                        // now, before anything is sent.
+                        if let Err(e) = conn.relate(&bridge.cfg.vtc_did).await {
+                            tracing::warn!(error = %e, "could not offer the VTC a TSP relationship; the next send tries again");
+                        }
                         let started = std::time::Instant::now();
                         // Anything queued while disconnected goes out now,
                         // and the role maps are reported afresh.

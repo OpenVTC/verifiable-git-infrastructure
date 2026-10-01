@@ -549,6 +549,7 @@ impl World {
             .handle_inbound(InboundDoc {
                 doc,
                 authenticated_sender: Some(self.vtc.did().to_string()),
+                via: vgi_bridge::transport::Via::Didcomm,
             })
             .await;
     }
