@@ -77,7 +77,7 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 [verify_trust]
 # What the bootstrap writes into repositories (and the required workflow).
 action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>"
-version = "v0.6.0"
+version = "v0.7.0"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
 # sha256 = "<64 hex>"
 # required_check = "Verify commit trust"
