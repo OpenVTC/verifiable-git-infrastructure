@@ -357,14 +357,20 @@ impl DocChecker {
                 Some(doc),
             ));
         }
-        // The specification asks for an assertion: a proof made for any
-        // other purpose (authentication, say) is not the issuer asserting
-        // this document, however valid its signature. Checked here, before
-        // the signature, and bound by it (the purpose is signed).
-        if raw.pointer("/proof/proofPurpose").and_then(Value::as_str) != Some("assertionMethod") {
+        // SPEC.md "Which purpose a producer signs with": a producer signs a
+        // Trust Task document under `authentication` — proving the issuer
+        // controls the identifier — and SHOULD NOT use `assertionMethod`
+        // unless the task's own spec defines the proof as an attestation.
+        // Neither `git-ns/bridge/job` nor `git-ns/bridge/result` does, so
+        // every other purpose is refused here: `assertionMethod` (the VTC
+        // would be attesting the job as if it were a credential, which no
+        // git-ns/bridge spec asks for), `keyAgreement` (never authorises a
+        // signature), and anything else. Checked here, before the
+        // signature, and bound by it (the purpose is signed).
+        if raw.pointer("/proof/proofPurpose").and_then(Value::as_str) != Some("authentication") {
             return Err(Refusal::standard(
                 StandardCode::ProofInvalid,
-                "the proof's purpose must be assertionMethod",
+                "the proof's purpose must be authentication",
                 Some(doc),
             ));
         }
@@ -781,25 +787,40 @@ mod tests {
             "proofRequired"
         );
 
-        // Signed, but for authentication rather than as an assertion.
-        let auth = vtc
+        // Signed as an assertion rather than for authentication: the
+        // specification reserves `assertionMethod` for a task whose spec
+        // defines the proof as an attestation, which `git-ns/bridge/job`
+        // does not.
+        let assertion = vtc
             .sign_with_purpose(
                 &json!({
                     "id": new_id(), "type": JOB_TYPE, "issuer": vtc.did(),
                     "recipient": bridge.did(), "issuedAt": Utc::now().to_rfc3339(),
                     "payload": {"jobId": "j", "namespace": "n", "kind": "inspect"},
                 }),
-                "authentication",
+                "assertionMethod",
             )
             .await
             .unwrap();
-        let r = c.check(&auth, None).await.unwrap_err();
+        let r = c.check(&assertion, None).await.unwrap_err();
         assert_eq!(r.payload.code.to_string(), "proofInvalid");
         assert!(
             r.payload
                 .message
                 .unwrap_or_default()
-                .contains("assertionMethod")
+                .contains("authentication")
+        );
+
+        // `keyAgreement` never authorises a signature, so the framework
+        // itself refuses to mint a proof under it (`sign_with_purpose`
+        // would error before producing one) — forge the field directly to
+        // confirm the purpose gate still catches it, before any signature
+        // check.
+        let mut forged_ka = job_doc(&vtc, bridge.did(), payload.clone()).await;
+        forged_ka["proof"]["proofPurpose"] = json!("keyAgreement");
+        assert_eq!(
+            code(c.check(&forged_ka, None).await.unwrap_err()),
+            "proofInvalid"
         );
 
         // Stale.
@@ -810,6 +831,74 @@ mod tests {
         });
         let old = vtc.sign(&old).await.unwrap();
         assert_eq!(code(c.check(&old, None).await.unwrap_err()), "expired");
+    }
+
+    /// A resolver modelling a DID document where the signing key is listed
+    /// under `assertionMethod` only — never `authentication`. A proof that
+    /// *names* `authentication` and verifies cryptographically must still be
+    /// refused, because the issuer never authorised that key for it: the
+    /// purpose named on the wire has to be checked against the real
+    /// verification relationship, not just trusted at face value.
+    struct AssertionMethodOnly(std::collections::BTreeMap<String, Vec<u8>>);
+
+    #[async_trait]
+    impl trust_tasks_proof::affinidi::ProofPurposeResolver for AssertionMethodOnly {
+        async fn resolve_vm_for_purpose(
+            &self,
+            vm: &str,
+            purpose: trust_tasks_proof::affinidi::ProofPurpose,
+        ) -> std::result::Result<
+            affinidi_data_integrity::did_vm::ResolvedKey,
+            affinidi_data_integrity::DataIntegrityError,
+        > {
+            if purpose != trust_tasks_proof::affinidi::ProofPurpose::AssertionMethod {
+                return Err(affinidi_data_integrity::DataIntegrityError::Resolver(
+                    format!("{vm} is not listed under {purpose} in its DID document"),
+                ));
+            }
+            self.0
+                .get(vm)
+                .map(|k| {
+                    affinidi_data_integrity::did_vm::ResolvedKey::new(
+                        affinidi_tdk::affinidi_crypto::KeyType::Ed25519,
+                        k.clone(),
+                    )
+                })
+                .ok_or_else(|| {
+                    affinidi_data_integrity::DataIntegrityError::Resolver(format!(
+                        "{vm} is not published"
+                    ))
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authentication_proof_whose_key_is_listed_only_under_assertion_method_is_refused() {
+        let (vtc, _) = BridgeIdentity::generate_did_key().unwrap();
+        let (bridge, _) = BridgeIdentity::generate_did_key().unwrap();
+        let k = vtc.git_signing_key().unwrap();
+        let map = [(
+            k.verification_method.clone(),
+            k.key.verifying_key().to_bytes().to_vec(),
+        )]
+        .into_iter()
+        .collect();
+        let verifier = trust_tasks_proof::affinidi::Verifier::with_resolver(Arc::new(
+            AssertionMethodOnly(map),
+        ));
+        let c = DocChecker::new(vtc.did(), bridge.did(), 300, Arc::new(verifier));
+        let raw = job_doc(
+            &vtc,
+            bridge.did(),
+            json!({"jobId": "j", "namespace": "n", "kind": "inspect"}),
+        )
+        .await;
+        // `job_doc` signs with the default purpose (`authentication`), so
+        // this passes the wire-level purpose gate and reaches the proof
+        // check, where the resolver above refuses the key for it.
+        assert_eq!(raw["proof"]["proofPurpose"], "authentication");
+        let r = c.check(&raw, None).await.unwrap_err();
+        assert_eq!(r.payload.code.to_string(), "proofInvalid");
     }
 
     #[test]
