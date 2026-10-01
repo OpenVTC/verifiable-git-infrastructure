@@ -47,9 +47,8 @@ For each contributor, issue a grant in the registry over the tuple:
 entity    = did:webvh:…            the contributor's DID (no fragment)
 authority = <VTC_DID>              your VTC — TRQP calls this authority_id
 action    = git.commit.sign
-resource  = <owner>/<repo>         or <owner> for an org-wide grant (legacy)
 resource  = <forge-host>/<owner>/<repo>
-                                   or <forge-host>/<owner> (qualified)
+                                   or <forge-host>/<owner> for an org-wide grant
 ```
 
 `entity` is the **bare DID**, not the verification-method id. A commit signed
@@ -57,51 +56,44 @@ as `did:webvh:QmAbc:example.com#key-0` is queried as
 `did:webvh:QmAbc:example.com` — the fragment names which key, and which key is
 already settled by then.
 
-**Which resource form.** The check's `resource-format` decides which of the two
-`resource` forms it queries, and a grant only counts if it is written in that
-form:
+**The resource form.** A grant only counts if it is written in the
+forge-qualified form:
 
-| `resource-format` | Repo grant | Org grant |
-|---|---|---|
-| `qualified` (default) | `github.com/acme/widgets` | `github.com/acme` |
-| `legacy` (one more release) | `acme/widgets` | `acme` |
+| Repo grant | Org grant |
+|---|---|
+| `github.com/acme/widgets` | `github.com/acme` |
 
-The qualified form is `<forge-host>/<owner>[/<repo>]`, all lowercase. The forge
+The form is `<forge-host>/<owner>[/<repo>]`, all lowercase. The forge
 host is the one CI runs against — `github.com`, your GitHub Enterprise Server
 host, or a Forgejo instance such as `codeberg.org` — so the same `acme` on two
 forges is two different resources. `verify-trust` derives it from the runner's
 environment; the port of a self-hosted instance is not part of it.
 
-Migration is staged:
+**Moving off `owner/repo` grants.** The bare `owner/repo` form
+(`resource-format: legacy`) was the default until v0.7.0 and was **removed in
+v0.8.0**; asking for it now fails the run with how to move over. Grants the
+VTC writes are already qualified (it never dual-wrote `owner/repo`), and the
+workflows a bridge bootstraps set `qualified`. For hand-issued grants: issue
+each again as `<forge-host>/<owner>[/<repo>]`, drop `resource-format: legacy`
+from the workflow, then revoke the old `owner/repo` grants — they no longer
+authorize anything. A workflow that cannot move yet pins the action and
+`version` to v0.7.x meanwhile.
 
-1. **Until v0.7.0** — `legacy` was the default; `qualified` was opt-in.
-2. **Since v0.7.0** — `qualified` is the default. Grants the VTC writes are
-   already in that form (it does not dual-write `owner/repo`), and the
-   workflows a bridge bootstraps already set it. A workflow that still depends
-   on hand-issued `owner/repo` grants pins `resource-format: legacy` for one
-   more release; better, reissue its grants in qualified form.
-3. **The release after** removes `legacy`, and the legacy grants can go.
-
-A run queries one form only — never "qualified, else legacy". Accepting either
-would widen who may sign for as long as both exist, with nothing in the
-repository to show it.
+A run never falls back to the bare slug: a leftover `owner/repo` grant cannot
+widen who may sign.
 
 Choose the resource scope deliberately. A repo-scoped grant authorizes one
 repository; an org-scoped grant authorizes every repository that passes
-`fallback-resource: <owner>` (`<forge-host>/<owner>` under `qualified`). Grant
+`fallback-resource: <forge-host>/<owner>`. Grant
 semantics are OR, so a repo-level record **cannot veto** an org-level grant —
 narrowing is a matter of not issuing the broad grant in the first place.
 
-The fallback is checked against the resource. Under `qualified` it must
-contain it: `github.com/acme` for `github.com/acme/widgets`, or the resource
-itself. A fallback naming another owner or another forge is refused, and the
-run fails before it queries anything. Under `legacy`, a fallback that parses
-as forge-qualified is refused, because one run uses one form. That includes a
-legacy value whose first segment has a dot, such as `john.doe/repo`, which
-reads as host `john.doe`. A legacy fallback is a bare owner (`acme`, or
-`john.doe`), and those still pass unchanged. Both checks exist only in
-verify-trust releases that include them: pin one (`version:`) for them to take
-effect. An older release accepts any fallback as given.
+The fallback is checked against the resource: it must contain it —
+`github.com/acme` for `github.com/acme/widgets`, or the resource itself. A
+fallback naming another owner or another forge is refused, and the run fails
+before it queries anything. The check exists only in verify-trust releases
+that include it: pin one (`version:`) for it to take effect. An older release
+accepts any fallback as given.
 
 This step is the whole access-control decision. There is no second list to
 maintain, and nothing to commit to the repository.
@@ -551,8 +543,7 @@ jobs:
           sha256:          <SHA-256 of the Linux tarball, see below>
 ```
 
-**Use `resource-format: qualified` from day one.** A new Forgejo repository has
-no legacy grants to keep working, and the qualified resource
+**Resources are forge-qualified.** The resource
 (`codeberg.org/acme/widgets`) cannot be confused with the same owner/repo on
 another forge. `verify-trust` takes the host from `FORGEJO_SERVER_URL` (falling
 back to `GITHUB_SERVER_URL`, which Forgejo also sets) and the repository from
@@ -788,10 +779,9 @@ resource is the sole thing binding a signer to this repository. Widening
 repository will contradict it. Treat both as security-relevant configuration
 and review changes to them as you would a permissions change.
 
-Switching `resource-format` changes which grants count, so review it the same
-way: a repository moved to `qualified` before its qualified grants exist fails
-every commit `unauthorized`, and one moved back to `legacy` is governed by
-whatever legacy grants remain.
+Changing the resource changes which grants count, so review it the same way:
+a repository whose grants exist only in the old `owner/repo` form fails every
+commit `unauthorized` until they are reissued qualified.
 
 **The registry is the single gate.** Enrolment, authorization and revocation
 all resolve to one TRQP answer. This is the design's premise, not an oversight

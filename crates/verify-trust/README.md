@@ -198,15 +198,11 @@ Two inputs carry weight that a committed signer list used to:
 - **`--resource`** (and `--fallback-resource`) is the only thing scoping a
   signer to this repository. A grant is accepted exactly when the registry
   authorizes the tuple under it, so widening either widens who may sign, with
-  nothing in the repository to contradict it. Under `qualified`, the fallback
-  must contain the resource — its namespace (`github.com/acme` for
-  `github.com/acme/widgets`) — and one naming another owner or forge is
-  refused. Under `legacy`, both must be shaped as `owner/repo` or a bare
-  owner (no whitespace, control characters or empty segments), the fallback
-  must be the resource's own owner (or the resource itself), and a
-  forge-qualified fallback is refused.
-- **`--resource-format`** (default `qualified`) picks the form of both
-  resources — see [Resource format](#resource-format).
+  nothing in the repository to contradict it. The fallback must contain the
+  resource — its namespace (`github.com/acme` for `github.com/acme/widgets`)
+  — and one naming another owner or forge is refused.
+- **`--resource-format`** is `qualified`, the only form — see
+  [Resource format](#resource-format).
 - **`--max-signers`** (default 32) bounds the distinct DIDs one range may
   claim. The set is chosen by whoever wrote the commits, and for the
   network-resolved methods each entry is an outbound fetch to a host the author
@@ -214,14 +210,13 @@ Two inputs carry weight that a committed signer list used to:
 
 ## Resource format
 
-A resource either names the forge or leaves it implied:
+A resource names its forge:
 
-| `--resource-format` | Resource | Org fallback | Default `--resource` |
-|---|---|---|---|
-| `qualified` (default) | `github.com/acme/widgets` | `github.com/acme` | derived from the CI environment |
-| `legacy` (one more release) | `acme/widgets` | `acme` | `$GITHUB_REPOSITORY`, verbatim |
+| Resource | Org fallback | Default `--resource` |
+|---|---|---|
+| `github.com/acme/widgets` | `github.com/acme` | derived from the CI environment |
 
-The qualified grammar is `<forge-host>/<owner>[/<repo>]`: the first segment is
+The grammar is `<forge-host>/<owner>[/<repo>]`: the first segment is
 the forge's host (a dotted name such as `github.com`, a GitHub Enterprise
 Server host, `codeberg.org`, or `localhost`), followed by one or more path
 segments — a forge with nested groups keeps its full path. Path segments are
@@ -237,26 +232,24 @@ $ GITHUB_SERVER_URL=https://github.com verify-trust --resource acme/widgets …
 Error: --resource `acme/widgets` is not forge-qualified (--resource-format qualified expects `<forge-host>/<owner>[/<repo>]`); did you mean `github.com/acme/widgets`?
 ```
 
-Under `qualified`, the default resource comes from the CI environment: the
+The default resource comes from the CI environment: the
 host of `FORGEJO_SERVER_URL` plus `FORGEJO_REPOSITORY` on Forgejo Actions,
 otherwise the host of `GITHUB_SERVER_URL` plus `GITHUB_REPOSITORY` (which
 gives a GitHub Enterprise Server its own host). Only the host is kept — a port
 in the server URL is dropped. Elsewhere, pass `--resource` explicitly.
 
-A run uses **one form only**. It never tries the qualified resource and then
-the legacy one: accepting a grant under either would widen who may sign while
-both forms exist in the registry, and silently.
+A run never falls back to the bare slug: a leftover `owner/repo` grant in the
+registry authorizes nothing.
 
-**Migration.** Registry grants must be written in the form the check uses:
-
-1. Until v0.7.0, `legacy` was the default and `qualified` an opt-in.
-2. **Since v0.7.0** the default is `qualified`. The VTC writes grants only in
-   that form (it does not dual-write `owner/repo`), and the workflows a bridge
-   bootstraps already set it, so those runs are unaffected. A run that still
-   depends on hand-issued `owner/repo` grants pins `--resource-format legacy`
-   (`resource-format: legacy` on the Action) for one more release — or, better,
-   has its grants reissued in qualified form.
-3. The release after that removes `legacy`.
+**The removed `legacy` form.** Until v0.7.0 the default was `legacy`, the bare
+`owner/repo` slug; v0.7.0 made `qualified` the default, and **v0.8.0 removed
+`legacy`** (#109). `--resource-format legacy` (`resource-format: legacy` on the
+Action) is now refused with how to move over. The VTC writes grants only in the
+qualified form (it never dual-wrote `owner/repo`), and the workflows a bridge
+bootstraps set `qualified`, so those are unaffected. A run that still depends
+on hand-issued `owner/repo` grants has them reissued as
+`<forge-host>/<owner>[/<repo>]`, or pins the action and `version` to v0.7.x
+until they are.
 
 ## Signer names
 

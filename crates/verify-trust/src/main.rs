@@ -68,10 +68,9 @@ struct Cli {
     #[arg(long, default_value = "git.commit.sign")]
     action: String,
 
-    /// TRQP resource of the trust tuple. Under `--resource-format legacy`, the
-    /// `org/repo` slug, defaulting to $GITHUB_REPOSITORY. Under `qualified`,
-    /// `<forge-host>/org/repo` (e.g. `github.com/acme/widgets`), defaulting to
-    /// the repository the CI environment names.
+    /// TRQP resource of the trust tuple: `<forge-host>/org/repo` (e.g.
+    /// `github.com/acme/widgets`), defaulting to the repository the CI
+    /// environment names.
     ///
     /// Security-relevant: this is the only thing scoping a signer to this
     /// repository, so widening it widens who may sign.
@@ -87,12 +86,12 @@ struct Cli {
     #[arg(long)]
     fallback_resource: Option<String>,
 
-    /// Form of --resource and --fallback-resource. `qualified` (the default):
+    /// Form of --resource and --fallback-resource: `qualified`, the only one —
     /// forge-qualified (`github.com/owner/repo`, org fallback
-    /// `github.com/owner`), validated and lowercased. `legacy`: the bare
-    /// `owner/repo` slug, kept for one release and then removed. Registry
-    /// grants must be written in the same form.
-    #[arg(long, value_enum, default_value_t = ResourceFormat::Qualified)]
+    /// `github.com/owner`), validated and lowercased. Registry grants must be
+    /// written in this form. `legacy` (bare `owner/repo`) was removed in 0.8.0
+    /// and is refused with how to move over.
+    #[arg(long, default_value_t = ResourceFormat::Qualified)]
     resource_format: ResourceFormat,
 
     /// Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow
@@ -179,7 +178,8 @@ mod tests {
         assert_eq!(cli.resource_format, ResourceFormat::Qualified);
         assert_eq!(cli.resource_format, ResourceFormat::default());
 
-        let cli = Cli::try_parse_from([
+        // #109 step 3: `legacy` is refused, with how to move over.
+        let err = Cli::try_parse_from([
             "verify-trust",
             "--range",
             "origin/main..HEAD",
@@ -190,7 +190,9 @@ mod tests {
             "--resource-format",
             "legacy",
         ])
-        .expect("legacy is still accepted");
-        assert_eq!(cli.resource_format, ResourceFormat::Legacy);
+        .err()
+        .expect("legacy is refused")
+        .to_string();
+        assert!(err.contains("removed in verify-trust 0.8.0"), "{err}");
     }
 }

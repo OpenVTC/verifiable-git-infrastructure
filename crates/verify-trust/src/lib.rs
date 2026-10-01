@@ -121,9 +121,8 @@ pub struct VerifyTrustArgs {
     pub vtc_did: String,
     /// TRQP action, e.g. `git.commit.sign`.
     pub action: String,
-    /// TRQP resource: the `org/repo` slug, or forge-qualified
-    /// (`github.com/org/repo`) under `--resource-format qualified`. Already in
-    /// its final form here — [`resource::select_resources`] chooses it.
+    /// TRQP resource, forge-qualified (`github.com/org/repo`). Already in its
+    /// final form here — [`resource::select_resources`] chooses it.
     ///
     /// With no committed signer index, this is the **only** thing scoping a
     /// signer to this repository: a grant is accepted exactly when the

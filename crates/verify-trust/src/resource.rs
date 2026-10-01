@@ -1,7 +1,6 @@
 //! The TRQP resource a run is checked under, and the form it is written in.
 //!
-//! Resources are moving from the bare `owner/repo` slug (`legacy`) to a
-//! forge-qualified name (`qualified`):
+//! A resource is forge-qualified:
 //!
 //! ```text
 //! resource   = forge-host "/" owner [ "/" repo ]
@@ -19,10 +18,11 @@
 //! module adds only what is verify-trust's own: the flag names in messages
 //! and a fix suggested from the CI environment.
 //!
-//! The change is staged: `qualified` is the default (it was `legacy` until
-//! 0.7.0); `legacy`, which takes `owner/repo` as given, remains for one more
-//! release, and is then removed (#109). Registry grants must be written in the
-//! form the run uses — the VTC's projection writes only the qualified form.
+//! It is the only form. The bare `owner/repo` slug (`--resource-format
+//! legacy`) was the default until 0.7.0 and was removed in 0.8.0 (#109):
+//! asking for it is an error that says how to move over. Registry grants must
+//! be written in the qualified form — the only one the VTC's projection
+//! writes.
 //!
 //! [`CiEnv`] is the seam that knows how each CI system names the repository
 //! under test. Anything it cannot detect falls back to an explicit
@@ -31,16 +31,49 @@
 use anyhow::{Context, Result, bail};
 use vgi_core::{ResourceErrorKind, normalize_resource, resource_contains};
 
-/// Which form the TRQP resource is written in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+/// Which form the TRQP resource is written in: since 0.8.0, only
+/// `qualified`. Kept as a type (and `--resource-format` as a flag) so the
+/// workflows that pass `resource-format: qualified` — every one a bridge
+/// bootstraps, and the action on every run — keep working unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResourceFormat {
-    /// `owner/repo`, taken as given — the pre-qualification behaviour, kept
-    /// for one release after the default moved to `qualified`.
-    Legacy,
-    /// `<forge-host>/owner/repo`, validated and lowercased. The default.
+    /// `<forge-host>/owner/repo`, validated and lowercased.
     #[default]
     Qualified,
 }
+
+impl std::fmt::Display for ResourceFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceFormat::Qualified => f.write_str("qualified"),
+        }
+    }
+}
+
+/// Parses `qualified`. `legacy` is refused with what to do instead, rather
+/// than the bare "invalid value" a run still pinned to it would otherwise
+/// get.
+impl std::str::FromStr for ResourceFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "qualified" => Ok(ResourceFormat::Qualified),
+            "legacy" => Err(LEGACY_REMOVED.to_string()),
+            other => Err(format!(
+                "unknown resource format `{other}`: the only one is `qualified`"
+            )),
+        }
+    }
+}
+
+/// Why `legacy` is refused, and what to do instead.
+pub const LEGACY_REMOVED: &str = "`legacy` (bare `owner/repo` resources) was removed in \
+    verify-trust 0.8.0: write the registry grants as `<forge-host>/<owner>[/<repo>]` \
+    (e.g. `github.com/acme/widgets`, org grant `github.com/acme`) — the form the VTC writes \
+    — and drop `resource-format: legacy` (or --resource-format legacy). Until the grants \
+    are reissued, pin verify-trust v0.7.x.";
 
 /// What the CI environment says about the repository under test.
 ///
@@ -161,58 +194,10 @@ pub fn normalize_qualified(what: &str, value: &str, ci: &CiEnv) -> Result<String
     }
 }
 
-/// Check a legacy resource's shape: `owner` or `owner/repo`, each segment
-/// ASCII letters, digits, `.`, `_` or `-` — the qualified grammar's character
-/// set, with case kept, since legacy values are passed through untouched.
+/// The primary and fallback resources a run queries.
 ///
-/// Before this the legacy arm took any string at all as the one input that
-/// scopes the registry query: an empty `--resource`, a whitespace-padded one,
-/// or one with a control character went to the registry verbatim (SEC-4045 /
-/// VGI-03). Those failed closed, as no grant matches them — but they failed as
-/// `unauthorized`, pointing the operator at the registry instead of the typo,
-/// which is how a fallback gets widened to make a check go green.
-fn check_legacy(what: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        bail!("{what} is empty; pass `owner/repo` (or the bare owner)");
-    }
-    if let Some(c) = value.chars().find(|c| c.is_whitespace() || c.is_control()) {
-        bail!(
-            "{what} `{}` contains {}; pass `owner/repo` (or the bare owner) with nothing \
-             around it",
-            value.escape_debug(),
-            if c.is_whitespace() {
-                "whitespace"
-            } else {
-                "a control character"
-            }
-        );
-    }
-    let segments: Vec<&str> = value.split('/').collect();
-    if segments.len() > 2
-        || segments
-            .iter()
-            .any(|s| s.is_empty() || *s == "." || *s == "..")
-    {
-        bail!("{what} `{value}` is not `owner/repo` or a bare owner");
-    }
-    if let Some(c) = value
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
-    {
-        bail!("{what} `{value}` contains `{c}`, which no owner or repository name can");
-    }
-    Ok(())
-}
-
-/// The primary and fallback resources a run queries, in the chosen form.
-///
-/// `legacy` is the pre-qualification behaviour: values pass through
-/// untouched, and the primary defaults to `$GITHUB_REPOSITORY`. Both must be
-/// shaped as an owner or `owner/repo` ([`check_legacy`]); a forge-qualified
-/// fallback is refused, since it would mix the two forms in one run, and so is
-/// a fallback that is neither the primary's owner nor the primary itself —
-/// the legacy counterpart of the containment rule below. `qualified` validates and lowercases explicit values, derives the
-/// default from [`CiEnv`], and requires the fallback to **contain** the
+/// Explicit values are validated and lowercased, the default is derived from
+/// [`CiEnv`], and the fallback must **contain** the
 /// primary — the namespace it sits in (`github.com/acme` for
 /// `github.com/acme/widgets`), or the primary itself. A fallback naming
 /// another owner or another forge is refused, so a grant there can never
@@ -223,40 +208,7 @@ pub fn select_resources(
     fallback_resource: Option<String>,
     ci: &CiEnv,
 ) -> Result<(String, Option<String>)> {
-    // One form per run, never both. Querying `github.com/acme/widgets` and
-    // then `acme/widgets` would accept a grant under either, so during the
-    // migration window — when the VTC writes both — a stale or hand-issued
-    // legacy grant would silently widen who may sign.
     match format {
-        ResourceFormat::Legacy => {
-            let resource = resource
-                .or_else(|| ci.github_repository.clone())
-                .context("--resource is required (or set GITHUB_REPOSITORY)")?;
-            check_legacy("--resource", &resource)?;
-            if let Some(fallback) = &fallback_resource {
-                if let Ok(qualified) = normalize_resource(fallback) {
-                    bail!(
-                        "--fallback-resource `{fallback}` is forge-qualified (`{qualified}`) but \
-                         --resource-format is legacy; one run uses one form: pass \
-                         --resource-format qualified, or the bare owner"
-                    );
-                }
-                check_legacy("--fallback-resource", fallback)?;
-                // Owners and repositories are case-insensitive on the forges,
-                // so containment is too; the values themselves stay untouched.
-                let owner = resource.split('/').next().unwrap_or_default();
-                if !fallback.eq_ignore_ascii_case(owner)
-                    && !fallback.eq_ignore_ascii_case(&resource)
-                {
-                    bail!(
-                        "--fallback-resource `{fallback}` is not the owner of --resource \
-                         `{resource}`: the fallback must be the namespace the repository sits \
-                         in (`{owner}`), never another owner's"
-                    );
-                }
-            }
-            Ok((resource, fallback_resource))
-        }
         ResourceFormat::Qualified => {
             let resource = match resource {
                 Some(value) => normalize_qualified("--resource", &value, ci)?,
@@ -500,33 +452,22 @@ mod tests {
         );
     }
 
+    /// #109 step 3: `legacy` is gone. A run still asking for it is told what
+    /// to do, not handed clap's bare "invalid value".
     #[test]
-    fn legacy_still_passes_values_through_untouched() {
-        // Derived: $GITHUB_REPOSITORY verbatim — no host, no lowercasing.
+    fn legacy_is_refused_with_how_to_move_over() {
+        use std::str::FromStr;
         assert_eq!(
-            select_resources(ResourceFormat::Legacy, None, None, &github()).unwrap(),
-            ("Acme/Widgets".to_string(), None)
+            ResourceFormat::from_str("qualified"),
+            Ok(ResourceFormat::Qualified)
         );
-        // Explicit: whatever was given, qualified-looking or not.
-        assert_eq!(
-            select_resources(
-                ResourceFormat::Legacy,
-                Some("Acme/Widgets".into()),
-                Some("Acme".into()),
-                &github()
-            )
-            .unwrap(),
-            ("Acme/Widgets".to_string(), Some("Acme".to_string()))
-        );
-        // Forgejo's names are not consulted in legacy mode.
-        let env = ci(&[
-            ("FORGEJO_SERVER_URL", "https://codeberg.org"),
-            ("FORGEJO_REPOSITORY", "acme/widgets"),
-        ]);
-        let message = select_resources(ResourceFormat::Legacy, None, None, &env)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(message, "--resource is required (or set GITHUB_REPOSITORY)");
+        let err = ResourceFormat::from_str("legacy").unwrap_err();
+        assert!(err.contains("removed in verify-trust 0.8.0"), "{err}");
+        assert!(err.contains("github.com/acme/widgets"), "{err}");
+        assert!(err.contains("v0.7.x"), "{err}");
+        let err = ResourceFormat::from_str("Qualified ").unwrap_err();
+        assert!(err.contains("the only one is `qualified`"), "{err}");
+        assert_eq!(ResourceFormat::Qualified.to_string(), "qualified");
     }
 
     #[test]
@@ -604,134 +545,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(message.contains("does not contain"), "{message}");
-    }
-
-    #[test]
-    fn legacy_mode_refuses_a_qualified_fallback() {
-        let message = select_resources(
-            ResourceFormat::Legacy,
-            None,
-            Some("github.com/acme".into()),
-            &github(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            message.contains("is forge-qualified") && message.contains("legacy"),
-            "{message}"
-        );
-        // A dotted first segment reads as a host: `john.doe/repo` is refused
-        // too, while the bare dotted owner `john.doe` (no owner segment
-        // after it, so not qualified) still passes.
-        assert!(
-            select_resources(
-                ResourceFormat::Legacy,
-                None,
-                Some("john.doe/repo".into()),
-                &github()
-            )
-            .is_err()
-        );
-        assert!(
-            select_resources(
-                ResourceFormat::Legacy,
-                Some("john.doe/widgets".into()),
-                Some("john.doe".into()),
-                &github()
-            )
-            .is_ok()
-        );
-        // A bare owner is still passed through untouched.
-        assert_eq!(
-            select_resources(ResourceFormat::Legacy, None, Some("Acme".into()), &github())
-                .unwrap()
-                .1
-                .as_deref(),
-            Some("Acme")
-        );
-    }
-
-    /// VGI-03: the legacy arm used to send any string to the registry.
-    #[test]
-    fn legacy_mode_refuses_a_malformed_resource() {
-        for (resource, expected) in [
-            ("", "is empty"),
-            ("   ", "is empty"),
-            (" Acme/Widgets", "whitespace"),
-            ("Acme/Widgets\n", "whitespace"),
-            ("Acme/Wid\u{7}gets", "control character"),
-            ("Acme/Widgets/extra", "not `owner/repo`"),
-            ("Acme//Widgets", "not `owner/repo`"),
-            ("/Widgets", "not `owner/repo`"),
-            ("Acme/..", "not `owner/repo`"),
-            ("Acme/Wid*gets", "contains `*`"),
-        ] {
-            let message = select_resources(
-                ResourceFormat::Legacy,
-                Some(resource.into()),
-                None,
-                &github(),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(message.contains(expected), "{resource:?}: {message}");
-        }
-        // $GITHUB_REPOSITORY is held to the same shape.
-        let env = ci(&[("GITHUB_REPOSITORY", "")]);
-        assert!(select_resources(ResourceFormat::Legacy, None, None, &env).is_err());
-        // What legacy has always accepted still passes, untouched.
-        for resource in ["Acme/Widgets", "acme", "john.doe/my_repo-2"] {
-            assert_eq!(
-                select_resources(
-                    ResourceFormat::Legacy,
-                    Some(resource.into()),
-                    None,
-                    &github()
-                )
-                .unwrap()
-                .0,
-                resource
-            );
-        }
-    }
-
-    /// VGI-03: a legacy fallback may widen a run to the repository's own
-    /// owner, never to someone else's.
-    #[test]
-    fn legacy_mode_refuses_a_fallback_naming_another_owner() {
-        let message =
-            select_resources(ResourceFormat::Legacy, None, Some("Evil".into()), &github())
-                .unwrap_err()
-                .to_string();
-        assert!(message.contains("is not the owner of"), "{message}");
-        assert!(message.contains("`Acme`"), "{message}");
-        for fallback in [" Acme", ""] {
-            assert!(
-                select_resources(
-                    ResourceFormat::Legacy,
-                    None,
-                    Some(fallback.into()),
-                    &github()
-                )
-                .is_err(),
-                "{fallback:?}"
-            );
-        }
-        // Its own owner, in any case, or the repository itself, pass untouched.
-        for fallback in ["Acme", "acme", "Acme/Widgets"] {
-            assert_eq!(
-                select_resources(
-                    ResourceFormat::Legacy,
-                    None,
-                    Some(fallback.into()),
-                    &github()
-                )
-                .unwrap()
-                .1
-                .as_deref(),
-                Some(fallback)
-            );
-        }
     }
 
     #[test]

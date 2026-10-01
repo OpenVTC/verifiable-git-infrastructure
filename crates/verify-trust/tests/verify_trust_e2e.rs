@@ -1601,58 +1601,27 @@ async fn a_grant_on_another_owner_never_authorizes_this_repository() {
     }
 }
 
-/// A legacy run takes no forge-qualified fallback: it would query a
-/// qualified namespace grant from a run whose primary is the bare slug.
+/// A bare `owner/repo` grant left in the registry from before 0.8.0 never
+/// authorizes: the run queries the qualified resource only, and never falls
+/// back to the slug.
 #[tokio::test]
-async fn a_legacy_run_refuses_a_qualified_fallback() {
-    let message = select_resources(
-        ResourceFormat::Legacy,
-        None,
-        Some(WORKFLOW_FALLBACK.to_string()),
-        &github_actions_env(),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(message.contains("is forge-qualified"), "{message}");
-}
-
-#[tokio::test]
-async fn one_run_never_accepts_a_grant_in_the_other_form() {
+async fn a_leftover_legacy_grant_never_authorizes() {
     let dir = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[9u8; 32]);
     let (base, signed) = repo_with_signed_commit(dir.path(), &key);
     let range = format!("{base}..{signed}");
 
-    // Only a legacy grant: a qualified run must not fall back to it.
+    // Only a legacy grant: the run must not fall back to it.
     let legacy_only =
         stub_registry_with(vec![(SIGNER.to_string(), "Example/Repo".to_string())]).await;
     let args = args_in_format(
         dir.path(),
-        range.clone(),
+        range,
         legacy_only,
         ResourceFormat::Qualified,
         None,
     );
-    let report = verify(&args, &signers_for(&key), None).await;
-    assert!(matches!(
-        report.commits[0].status,
-        CommitStatus::Unauthorized { .. }
-    ));
-
-    // Only a qualified grant: a legacy run queries `Example/Repo`, verbatim.
-    let qualified_only = stub_registry_with(vec![(
-        SIGNER.to_string(),
-        "github.com/example/repo".to_string(),
-    )])
-    .await;
-    let args = args_in_format(
-        dir.path(),
-        range,
-        qualified_only,
-        ResourceFormat::Legacy,
-        None,
-    );
-    assert_eq!(args.resource, "Example/Repo");
+    assert_eq!(args.resource, "github.com/example/repo");
     let report = verify(&args, &signers_for(&key), None).await;
     assert!(matches!(
         report.commits[0].status,
