@@ -173,17 +173,37 @@ impl BridgeIdentity {
             endpoint: PeerServiceEndpoint::Uri(mediator_did.to_string()),
             id: Some("#tsp".into()),
         };
-        let (did, secrets) = DID::generate_did_peer_with_services(
-            vec![
-                (
-                    PeerKeyRole::Verification,
-                    affinidi_tdk::dids::KeyType::Ed25519,
-                ),
-                (PeerKeyRole::Encryption, affinidi_tdk::dids::KeyType::X25519),
-            ],
-            Some(vec![didcomm, tsp]),
-        )
-        .map_err(|e| anyhow::anyhow!("minting a did:peer: {e}"))?;
+        let mint = |services: Vec<PeerService>| {
+            DID::generate_did_peer_with_services(
+                vec![
+                    (
+                        PeerKeyRole::Verification,
+                        affinidi_tdk::dids::KeyType::Ed25519,
+                    ),
+                    (PeerKeyRole::Encryption, affinidi_tdk::dids::KeyType::X25519),
+                ],
+                Some(services),
+            )
+            .map_err(|e| anyhow::anyhow!("minting a did:peer: {e}"))
+        };
+        // Both services carry the mediator DID, so a mediator with a long DID
+        // (a did:peer of its own) can push the pair past the limit. Then the
+        // DIDComm service alone — the VTC still reaches the bridge, over
+        // DIDComm — rather than no bridge at all.
+        let (mut did, mut secrets) = mint(vec![didcomm.clone(), tsp])?;
+        let mut with_tsp = true;
+        if did.len() > MAX_DID_BYTES {
+            (did, secrets) = mint(vec![didcomm])?;
+            with_tsp = false;
+            if did.len() <= MAX_DID_BYTES {
+                tracing::warn!(
+                    mediator = %mediator_did,
+                    "the mediator's DID is too long to advertise both TSP and DIDComm in a \
+                     did:peer; minted one advertising DIDComm only (the VTC reaches it over \
+                     DIDComm). For TSP, use a mediator with a short DID or a did:webvh bridge DID"
+                );
+            }
+        }
         if did.len() > MAX_DID_BYTES {
             bail!(
                 "the did:peer this would mint is {} bytes, past the {MAX_DID_BYTES}-byte limit \
@@ -195,10 +215,11 @@ impl BridgeIdentity {
         }
         let bundle = bundle_of(&did, &secrets)?;
         let identity = Self::from_bundle(&bundle)?;
-        for (kind, advertised) in [
-            ("DIDComm", advertised_mediator(&did)?),
-            ("TSP", advertised_tsp_mediator(&did)?),
-        ] {
+        let mut minted = vec![("DIDComm", advertised_mediator(&did)?)];
+        if with_tsp {
+            minted.push(("TSP", advertised_tsp_mediator(&did)?));
+        }
+        for (kind, advertised) in minted {
             match advertised {
                 Some(m) if m == mediator_did => {}
                 other => bail!(
@@ -596,7 +617,7 @@ mod tests {
     const MEDIATOR: &str = "did:web:mediator.acme-vtc.example";
 
     #[tokio::test]
-    async fn a_did_peer_advertises_didcomm_through_its_mediator() {
+    async fn a_did_peer_advertises_tsp_and_didcomm_through_its_mediator() {
         let (id, bundle) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
         assert!(id.did().starts_with("did:peer:2."), "{}", id.did());
         assert!(id.did().len() <= MAX_DID_BYTES);
@@ -745,6 +766,33 @@ mod tests {
         let err = BridgeIdentity::generate_did_peer(&long).unwrap_err();
         assert!(err.to_string().contains("1000-byte"), "{err}");
         assert!(BridgeIdentity::generate_did_peer("not-a-did").is_err());
+    }
+
+    /// A mediator whose DID is too long to carry twice still gets a bridge:
+    /// one advertising DIDComm only, which the VTC reaches over DIDComm.
+    #[test]
+    fn a_mediator_too_long_for_both_services_gets_a_didcomm_only_did_peer() {
+        let short = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap().0;
+        assert!(advertised_tsp_mediator(short.did()).unwrap().is_some());
+        // Somewhere between "both fit" and "nothing fits" lies the case
+        // under test; find it rather than hard-code the encoding's sizes.
+        let (mediator, id) = (100..900)
+            .step_by(10)
+            .map(|n| format!("did:web:{}.example", "m".repeat(n)))
+            .find_map(|m| {
+                let (id, _) = BridgeIdentity::generate_did_peer(&m).ok()?;
+                advertised_tsp_mediator(id.did())
+                    .unwrap()
+                    .is_none()
+                    .then_some((m, id))
+            })
+            .expect("a mediator DID too long for both services but not for one");
+        assert!(id.did().len() <= MAX_DID_BYTES);
+        assert_eq!(
+            advertised_mediator(id.did()).unwrap().as_deref(),
+            Some(mediator.as_str())
+        );
+        assert_eq!(check_reachable(id.did(), &mediator).unwrap(), None);
     }
 
     #[test]

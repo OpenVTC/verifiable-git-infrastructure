@@ -19,12 +19,16 @@
 //! - **Everything else** — results, events, registry queries — goes over the
 //!   first of TSP, DIDComm the peer's DID document advertises
 //!   ([`preferred_via`]); [`VtcLink::send_via`] pins one instead.
-//! - **TSP relationships.** A relationship invite is accepted only from the
-//!   peers the link was connected for (the VTC and the registry): a
-//!   relationship carries no authority, but there is no reason to form one
-//!   with anybody else. The relationship store is in memory, so on every
-//!   connect the bridge invites the VTC again ([`MediatorLink::relate`]),
-//!   which is what lets a VTC that kept its half reach a restarted bridge.
+//! - **TSP peers.** The link serves the peers it was connected for (the VTC
+//!   and the registry) and nobody else over TSP. The SDK records an inbound
+//!   invite before the bridge sees it, so an invite from anyone else is not
+//!   just left unanswered: its recorded half is reset, and a TSP application
+//!   message from anyone else is dropped before it reaches the job path. A
+//!   relationship would carry no authority — every document is still checked
+//!   — but there is no reason to hold one, or read traffic, from a stranger.
+//!   The relationship store is in memory, so on every connect the bridge
+//!   invites the VTC again ([`MediatorLink::relate`]), which is what lets a
+//!   VTC that kept its half reach a restarted bridge.
 //!
 //! The transport's authentication is not what authorises a job — the
 //! document's own proof is (spec: "on every transport") — but the proven
@@ -118,8 +122,12 @@ pub struct InboundDoc {
 /// How long connecting to the mediator may take.
 const MEDIATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The longest document id remembered (a VTC's are `urn:uuid:`s).
+const ARRIVAL_ID_MAX: usize = 256;
+
 /// How many inbound requests' transports are remembered, so their responses
-/// go back the same way. A response follows its request within seconds; a
+/// go back the same way. Only the VTC's are remembered: nobody else is
+/// answered by thread, and a stranger cannot push them out. A response follows its request within seconds; a
 /// bridge that answers later (a repeat answered from the ledger) is answered
 /// over the peer's preferred transport, which the VTC also listens on.
 const ARRIVALS_KEPT: usize = 1024;
@@ -130,6 +138,9 @@ struct Arrivals(Mutex<VecDeque<(String, Via)>>);
 
 impl Arrivals {
     fn record(&self, id: &str, via: Via) {
+        if id.len() > ARRIVAL_ID_MAX {
+            return;
+        }
         let mut q = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if q.len() >= ARRIVALS_KEPT {
             q.pop_front();
@@ -158,15 +169,29 @@ pub struct MediatorLink {
 struct InboundCtx {
     atm: Arc<ATM>,
     profile: Arc<ATMProfile>,
-    /// The DIDs whose TSP relationship invites are accepted.
+    /// The VTC: whose requests' transports are remembered for the answer.
+    vtc_did: String,
+    /// The DIDs served over TSP (the VTC among them): their relationship
+    /// invites are accepted and their application messages read.
     peers: Vec<String>,
     arrivals: Arc<Arrivals>,
 }
 
+impl InboundCtx {
+    fn is_peer(&self, sender: &str) -> bool {
+        self.peers.iter().any(|p| p == sender)
+    }
+}
+
+/// `did` without a `#fragment` (a DIDComm sender is a key id).
+fn did_part(did: &str) -> &str {
+    did.split_once('#').map_or(did, |(d, _)| d)
+}
+
 impl MediatorLink {
     /// Connect `identity` to `mediator_did` and return the link and the
-    /// stream of inbound Trust Task documents. `peers` are the DIDs whose
-    /// TSP relationship invites the link accepts (the VTC, the registry).
+    /// stream of inbound Trust Task documents. The link serves `vtc_did` and
+    /// `peers` (the registry) over TSP, and nobody else.
     /// The stream ending means the session is dead: reconnect (see
     /// [`SupervisedLink`]).
     ///
@@ -176,8 +201,10 @@ impl MediatorLink {
     pub async fn connect(
         identity: &BridgeIdentity,
         mediator_did: &str,
-        peers: Vec<String>,
+        vtc_did: &str,
+        mut peers: Vec<String>,
     ) -> Result<(Self, BoxStream<'static, InboundDoc>)> {
+        peers.push(vtc_did.to_string());
         let tdk = Arc::new(
             TDKSharedState::new(TDKConfig::builder().build()?)
                 .await
@@ -197,6 +224,7 @@ impl MediatorLink {
                 let ctx = Arc::new(InboundCtx {
                     atm: Arc::clone(&atm),
                     profile: Arc::clone(&profile),
+                    vtc_did: vtc_did.to_string(),
                     peers,
                     arrivals: Arc::clone(&arrivals),
                 });
@@ -287,6 +315,18 @@ impl MediatorLink {
                 .map_err(|e| anyhow!("TSP relationship invite to `{peer}`: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Whether a TSP relationship with `peer` is on record (any state that
+    /// admits application messages).
+    pub async fn has_relationship(&self, peer: &str) -> Result<bool> {
+        Ok(self
+            .atm
+            .tsp()
+            .send_readiness(&self.profile, peer)
+            .await
+            .map_err(|e| anyhow!("TSP relationship with `{peer}`: {e}"))?
+            != SendReadiness::Reestablish)
     }
 
     /// Stop the websocket and the messaging tasks. There is no `Drop`: an
@@ -414,7 +454,11 @@ fn inbound_stream(
                         None
                     }
                 }?;
-                if let Some(id) = doc.doc.get("id").and_then(Value::as_str) {
+                let from_vtc = doc
+                    .authenticated_sender
+                    .as_deref()
+                    .is_some_and(|s| did_part(s) == ctx.vtc_did);
+                if from_vtc && let Some(id) = doc.doc.get("id").and_then(Value::as_str) {
                     ctx.arrivals.record(id, doc.via);
                 }
                 Some(doc)
@@ -480,6 +524,10 @@ async fn tsp_doc(
             return None;
         }
     }
+    if !ctx.is_peer(&sender) {
+        tracing::warn!(%sender, "dropping a TSP message from a DID this bridge does not serve");
+        return None;
+    }
     let document = match vta_sdk::tsp_binding::open_envelope(&inbound.message.payload) {
         Ok(d) => d,
         Err(e) => {
@@ -536,7 +584,7 @@ async fn answer_control(
     thread_digest: [u8; 32],
     reply_expected: bool,
 ) {
-    let from_peer = ctx.peers.iter().any(|p| p == sender);
+    let from_peer = ctx.is_peer(sender);
     let tsp = ctx.atm.tsp();
     match decide_control(request, reply_expected, from_peer) {
         ControlDecision::Accept => {
@@ -559,8 +607,13 @@ async fn answer_control(
             }
         }
         ControlDecision::Nothing => {
-            if request == RelationshipRequest::Invite {
-                tracing::warn!(%sender, "not accepting a TSP relationship invite from a DID this bridge does not serve");
+            // The transport recorded the invite before this saw it, which
+            // would admit the stranger's application messages: undo that.
+            if request == RelationshipRequest::Invite && !from_peer {
+                tracing::warn!(%sender, "refusing a TSP relationship invite from a DID this bridge does not serve");
+                if let Err(e) = tsp.reset_relationship(&ctx.profile, sender).await {
+                    tracing::warn!(%sender, error = %e, "could not forget a stranger's TSP relationship invite");
+                }
             }
         }
     }
@@ -729,6 +782,9 @@ mod tests {
         assert_eq!(a.of("urn:uuid:job"), Some(Via::Tsp));
         assert_eq!(a.of("urn:uuid:other"), Some(Via::Didcomm));
         assert_eq!(a.of("urn:uuid:unknown"), None);
+        let long = format!("urn:uuid:{}", "x".repeat(ARRIVAL_ID_MAX));
+        a.record(&long, Via::Tsp);
+        assert_eq!(a.of(&long), None, "an over-long id is not remembered");
         for i in 0..ARRIVALS_KEPT {
             a.record(&format!("urn:uuid:{i}"), Via::Didcomm);
         }

@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve: DIDComm to the VTC, HTTP for the forges.
+    /// Serve: TSP or DIDComm to the VTC, HTTP for the forges.
     Run,
     /// First start: create the master key file (if the config names one and
     /// it does not exist) and mint a `did:peer` identity naming the

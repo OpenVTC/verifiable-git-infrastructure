@@ -267,23 +267,18 @@ async fn run(forged: bool) -> Run {
     let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
     let server = serve(env.clone(), registry.clone(), mallory, forged, delivered_tx);
 
-    // The bridge: a did:peer routed through this mediator (DIDComm only — the
-    // harness mediator's own DID is a long did:peer, and a bridge-minted
-    // did:peer carrying it twice, for TSP and DIDComm, would pass the 1000-byte
-    // resolver limit), on its real link.
-    let bridge = env.add_user("Bridge").await.unwrap();
-    let signing = bridge
-        .secrets
-        .iter()
-        .find(|s| s.get_key_type() == affinidi_tdk::affinidi_crypto::KeyType::Ed25519)
-        .unwrap()
-        .clone();
-    let identity =
-        BridgeIdentity::from_secrets(&bridge.did, signing, bridge.secrets.clone()).unwrap();
-    let (link, mut inbound) =
-        MediatorLink::connect(&identity, env.mediator.did(), vec![registry.did.clone()])
-            .await
-            .unwrap();
+    // The bridge: a did:peer routed through this mediator, on its real link.
+    // The harness mediator's own DID is a long did:peer, so the bridge's
+    // carries DIDComm only (too long for TSP as well) — what is under test.
+    let (identity, _) = BridgeIdentity::generate_did_peer(env.mediator.did()).unwrap();
+    let (link, mut inbound) = MediatorLink::connect(
+        &identity,
+        env.mediator.did(),
+        "did:example:vtc",
+        vec![registry.did.clone()],
+    )
+    .await
+    .unwrap();
     let link = Arc::new(link);
     let replies = Arc::new(RegistryReplies::new(registry.did.clone()));
     let surfaced = Arc::new(Mutex::new(Vec::new()));

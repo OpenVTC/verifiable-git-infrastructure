@@ -4,7 +4,8 @@
 //! that an honest answer arrives through `RegistryReplies::route`, and that a
 //! correlated reply from another VID — one naming the registry as its issuer
 //! — never answers the query: the TSP-verified sender VID is what is
-//! believed, not anything the document says.
+//! believed, not anything the document says. A VID the link does not serve
+//! gets no relationship and none of its messages reach the bridge at all.
 
 #![cfg(feature = "forge-github")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -153,7 +154,9 @@ struct Run {
     delivered: Vec<Delivered>,
     surfaced: Vec<(Value, Option<String>, Via)>,
     registry_did: String,
-    mallory_did: String,
+    /// Whether the bridge's link held a TSP relationship with Mallory once
+    /// her invite and reply had been processed.
+    mallory_related: bool,
 }
 
 async fn run(impostor: bool) -> Run {
@@ -184,10 +187,14 @@ async fn run(impostor: bool) -> Run {
         delivered_tx,
     );
 
-    let (link, mut inbound) =
-        MediatorLink::connect(&identity, env.mediator.did(), vec![registry.did.clone()])
-            .await
-            .unwrap();
+    let (link, mut inbound) = MediatorLink::connect(
+        &identity,
+        env.mediator.did(),
+        "did:example:vtc",
+        vec![registry.did.clone()],
+    )
+    .await
+    .unwrap();
     let link = Arc::new(link);
     let replies = Arc::new(RegistryReplies::new(registry.did.clone()));
     let surfaced = Arc::new(Mutex::new(Vec::new()));
@@ -231,6 +238,7 @@ async fn run(impostor: bool) -> Run {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+    let mallory_related = link.has_relationship(&mallory.did).await.unwrap();
     pump.abort();
     server.abort();
     link.shutdown().await;
@@ -244,7 +252,7 @@ async fn run(impostor: bool) -> Run {
         delivered,
         surfaced,
         registry_did: registry.did,
-        mallory_did: mallory.did,
+        mallory_related,
     }
 }
 
@@ -267,16 +275,9 @@ async fn a_correlated_tsp_reply_from_another_vid_is_not_believed() {
         run.result
     );
     assert_eq!(run.delivered, [Delivered::Impostor, Delivered::Canary]);
-    // Not vacuous: the impostor's reply reached the bridge, naming the
-    // registry as issuer, with Mallory as the proven sender — and the canary
-    // after it came through as the registry.
-    let forged = run
-        .surfaced
-        .iter()
-        .find(|(d, _, _)| d["threadId"] != CANARY_THREAD)
-        .expect("the impostor's reply reached the bridge");
-    assert_eq!(forged.0["issuer"], run.registry_did.as_str());
-    assert_eq!(forged.1.as_deref(), Some(run.mallory_did.as_str()));
+    // Not vacuous: the canary the registry sent after the impostor's invite
+    // and reply came through, so the link was live past them — and they
+    // never surfaced, and left no relationship behind.
     let canary = run
         .surfaced
         .iter()
@@ -284,4 +285,15 @@ async fn a_correlated_tsp_reply_from_another_vid_is_not_believed() {
         .expect("the canary sent after the impostor's reply reached the bridge");
     assert_eq!(canary.1.as_deref(), Some(run.registry_did.as_str()));
     assert_eq!(canary.2, Via::Tsp);
+    assert!(
+        run.surfaced
+            .iter()
+            .all(|(d, _, _)| d["threadId"] == CANARY_THREAD),
+        "a stranger's TSP message must not reach the bridge: {:?}",
+        run.surfaced
+    );
+    assert!(
+        !run.mallory_related,
+        "a stranger's invite must leave no relationship"
+    );
 }

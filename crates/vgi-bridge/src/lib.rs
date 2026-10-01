@@ -244,15 +244,14 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
                 // the session below and the next one uses the new ones.
                 let current = bridge.identity();
                 rotations.borrow_and_update();
-                // TSP relationship invites are accepted from the VTC and
-                // the registry only.
-                let peers = vec![
-                    bridge.cfg.vtc_did.clone(),
-                    bridge.cfg.trust_registry_did.clone(),
-                ];
-                let connected =
-                    transport::MediatorLink::connect(&current, &bridge.cfg.mediator_did, peers)
-                        .await;
+                // Served over TSP: the VTC and the registry, nobody else.
+                let connected = transport::MediatorLink::connect(
+                    &current,
+                    &bridge.cfg.mediator_did,
+                    &bridge.cfg.vtc_did,
+                    vec![bridge.cfg.trust_registry_did.clone()],
+                )
+                .await;
                 drop(current);
                 match connected {
                     Ok((conn, mut inbound)) => {

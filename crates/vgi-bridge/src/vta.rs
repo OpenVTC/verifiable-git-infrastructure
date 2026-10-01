@@ -153,9 +153,10 @@ impl Session {
     /// REST: the VTA releases the bridge's keys only over a channel
     /// confidential end to end, and TSP and DIDComm both are.
     ///
-    /// A TSP leg that cannot be established falls back to DIDComm, loudly
-    /// (vta-sdk's `Auto` policy): the fallback is to an equally end-to-end
-    /// channel, and a bridge that cannot fetch its keys cannot run at all.
+    /// A TSP leg that cannot be established (and only that) falls back to
+    /// DIDComm, loudly (vta-sdk's `Auto` policy): the fallback is to an
+    /// equally end-to-end channel, and a bridge that cannot fetch its keys
+    /// cannot run at all.
     pub async fn connect(cfg: &VtaConfig, cred: &CredentialBundle) -> Result<Self> {
         let mediator = cfg
             .mediator_did
@@ -185,11 +186,15 @@ impl Session {
                     tracing::info!(tsp_mediator = %tsp_mediator, "reached the VTA over TSP");
                     return Ok(Session::from_client(client, cfg.context.clone()));
                 }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    tsp_mediator = %tsp_mediator,
-                    "the VTA advertises TSP but it could not be reached over it; using DIDComm"
-                ),
+                // Only the TSP leg's failure is retried over DIDComm: a
+                // DIDComm or authentication failure would fail the same way
+                // again, and is reported as itself.
+                Err(e @ vta_sdk::error::VtaError::TspTransport(_)) => {
+                    tracing::warn!(tsp_mediator = %tsp_mediator, "TSP connect failed: {e}; using DIDComm")
+                }
+                Err(e) => {
+                    return Err(anyhow!("authenticating to the VTA as `{}`: {e}", cred.did));
+                }
             }
         }
         let connected = VtaClient::connect_auto(vta_sdk::client::AutoConnect {
@@ -1171,8 +1176,8 @@ pub async fn setup(
         Ok(None) => {
             r.fail(format!(
                 "context `{ctx}` has no DID: provision a did:webvh for the bridge into it (an \
-                 Ed25519 signing key and an X25519 key-agreement key, and a DIDCommMessaging \
-                 service naming `{mediator_did}`)"
+                 Ed25519 signing key and an X25519 key-agreement key, and a TSPTransport and a \
+                 DIDCommMessaging service naming `{mediator_did}`)"
             ));
             return r;
         }
