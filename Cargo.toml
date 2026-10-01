@@ -253,7 +253,12 @@ trql-client = "0.21.0"
 # `trust-tasks-rs ^0.24.2` (below), so this line, `affinidi-tdk` and
 # `trust-tasks-rs` all move together in this same commit — a partial bump
 # is exactly how a second copy of one of them gets into the graph.
-vta-sdk = { version = "0.58", default-features = false }
+#
+# 0.58 -> 0.59 keeps OpenVTC on one vta-sdk: it moved to 0.59 (community-issued
+# vetted/1), and did-git-sign on ^0.58 would put a second copy in its graph.
+# 0.59 is on the same TDK line (affinidi-tdk ^0.21, messaging-sdk ^0.31.1) and
+# declares `trust-tasks-rs ^0.25.3`, so that floor moves with it (below).
+vta-sdk = { version = "0.59", default-features = false }
 affinidi-tdk = "0.21"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
@@ -401,7 +406,7 @@ affinidi-messaging-test-mediator = { version = "0.15", features = ["tsp"] }
 # names this same `trust-tasks-rs` directly now. The bridge is `publish =
 # false`, and signs and verifies with trust-tasks-proof on the same 0.23
 # line.
-trust-tasks-rs = { version = "0.25.1", default-features = false, features = ["git-ns"] }
+trust-tasks-rs = { version = "0.25.3", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
