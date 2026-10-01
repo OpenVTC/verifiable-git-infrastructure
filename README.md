@@ -76,14 +76,12 @@ set `transport: https` (inputs: `auto` — the default — `tsp`, `didcomm`,
 publishes no service entry.
 
 `resource` defaults to the current repo and is security-relevant — it is the
-only thing scoping a signer to this repository. It comes in two forms, chosen
-by `resource-format`: `qualified` (the default since v0.7.0) names the forge
-— `github.com/owner/repo`, org fallback `github.com/owner`, lowercased — so
-`github.com/acme` and `codeberg.org/acme` can never be confused; `legacy` is
-the bare `owner/repo` slug, kept for one more release and then removed.
-Registry grants must be written in the form the check uses; the VTC writes
-only the qualified form. See the [runbook](docs/RUNBOOK.md#2-enrol-the-signers)
-for the migration. `version` selects which release to download (default `latest`).
+only thing scoping a signer to this repository. It is forge-qualified —
+`github.com/owner/repo`, org fallback `github.com/owner`, lowercased — so
+`github.com/acme` and `codeberg.org/acme` can never be confused. Registry
+grants must be written in that form, the only one the VTC writes. The bare
+`owner/repo` slug (`resource-format: legacy`) was removed in v0.8.0; see the
+[runbook](docs/RUNBOOK.md#2-enrol-the-signers) for moving over. `version` selects which release to download (default `latest`).
 
 The action also runs on **Forgejo Actions** runners, referenced by full URL
 (`uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z`).

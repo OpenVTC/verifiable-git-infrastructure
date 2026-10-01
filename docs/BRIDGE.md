@@ -768,8 +768,7 @@ and the namespace as the fallback (git-ns `right/grant` 0.1):
   in another owner's repository names that owner, never this one. The value
   reaches verify-trust through the action's environment, never a script,
   and verify-trust refuses a qualified fallback that does not contain the
-  repository's resource — another owner, another forge — and a
-  forge-qualified one under `resource-format: legacy`.
+  repository's resource — another owner, another forge.
 
 **Upgrading.** Workflows written by a bridge before this passed no fallback:
 there, namespace admins who do not own the repository, namespace-wide
