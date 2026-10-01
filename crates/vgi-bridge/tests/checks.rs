@@ -756,6 +756,7 @@ async fn the_bridge_queries_the_registry_as_its_own_did_over_its_link() {
             Arc::new(link),
             bridge_did.clone(),
             Arc::clone(w.bridge.registry_replies()),
+            vgi_bridge::transport::Via::Didcomm,
         )
         .with_timeout(std::time::Duration::from_millis(500));
         let verifier = VerifyTrustVerifier::new(w.bridge.config())

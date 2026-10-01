@@ -3,8 +3,8 @@
 //! token — and acts on the forges for its VTC.
 //!
 //! ```text
-//!  VTC ──DIDComm (authcrypt, via mediator)──▶ bridge ──adapters──▶ GitHub / Forgejo
-//!      ◀── git-ns/bridge/result, /event ────       ◀── webhooks, OAuth redirects (HTTPS)
+//!  VTC ──TSP or DIDComm (via mediator)──▶ bridge ──adapters──▶ GitHub / Forgejo
+//!      ◀── git-ns/bridge/result, /event ──       ◀── webhooks, OAuth redirects (HTTPS)
 //! ```
 //!
 //! - **Identity.** Its own DID ([`identity`]), keys sealed ([`seal`]). It

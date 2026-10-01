@@ -456,7 +456,10 @@ fn tsp_sender(m: &affinidi_messaging_core::ReceivedMessage) -> Option<String> {
 
 /// A TSP frame's Trust Task document, or `None` (a relationship request,
 /// answered here; anything unproven or outside the binding envelope).
-async fn tsp_doc(ctx: &InboundCtx, inbound: affinidi_messaging_core::Inbound) -> Option<InboundDoc> {
+async fn tsp_doc(
+    ctx: &InboundCtx,
+    inbound: affinidi_messaging_core::Inbound,
+) -> Option<InboundDoc> {
     let Some(sender) = tsp_sender(&inbound.message) else {
         tracing::warn!("dropping a TSP frame with no verified sender");
         return None;
@@ -542,7 +545,9 @@ async fn answer_control(
                 .await
             {
                 Ok(_) => tracing::info!(%sender, "accepted a TSP relationship"),
-                Err(e) => tracing::warn!(%sender, error = %e, "could not accept a TSP relationship"),
+                Err(e) => {
+                    tracing::warn!(%sender, error = %e, "could not accept a TSP relationship")
+                }
             }
         }
         ControlDecision::AnswerCancel => {
@@ -628,7 +633,10 @@ pub mod memory {
 
         /// The transports sends were pinned to, in order.
         pub fn pinned(&self) -> Vec<Via> {
-            self.pinned.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            self.pinned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
         }
     }
 

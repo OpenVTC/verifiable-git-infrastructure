@@ -1513,7 +1513,11 @@ mod tests {
         let ours = v.supported();
         assert_eq!(
             ours,
-            [TransportKind::Tsp, TransportKind::Didcomm, TransportKind::Https]
+            [
+                TransportKind::Tsp,
+                TransportKind::Didcomm,
+                TransportKind::Https
+            ]
         );
 
         let caps = |services: serde_json::Value| {
@@ -1538,7 +1542,9 @@ mod tests {
             TransportKind::Tsp
         );
         assert_eq!(
-            pick(&both, vgi_forge::VerifyTransport::Didcomm).unwrap().kind,
+            pick(&both, vgi_forge::VerifyTransport::Didcomm)
+                .unwrap()
+                .kind,
             TransportKind::Didcomm
         );
         // `tsp` against a registry that does not advertise it: refused, not

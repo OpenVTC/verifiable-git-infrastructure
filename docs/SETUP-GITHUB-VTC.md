@@ -38,7 +38,7 @@ the Dependabot re-sign — is in [BRIDGE.md](BRIDGE.md). Day-two operations
 |---|---|---|
 | A **VTA** | mints the contributors' signing keys, and the bridge's DID | — |
 | A **Trust Registry** the VTC can write to | the VTC publishes every commit right there with `registry/record/put`; `verify-trust` queries it | the VTC's `[registry] did` is set and `registry_status` is not `degraded` |
-| A **VTC** with messaging running | holds the rights, sends bridge jobs over DIDComm (or TSP) | members can reach it from `openvtc` |
+| A **VTC** with messaging running | holds the rights, sends bridge jobs over TSP or DIDComm | members can reach it from `openvtc` |
 | A **GitHub organisation** you own | the namespace | you can open its *Settings* |
 | A host for the bridge with a **public HTTPS URL** | GitHub sends webhooks and redirects there | TLS terminates at a proxy in front of it |
 
@@ -215,13 +215,14 @@ secret mounted read-only into a container has to exist first.) Back it up
 two together are every credential the community has on GitHub.
 
 **The bridge's DID.** `vgi-bridge init` mints a `did:peer:2` whose
-identifier carries the bridge's keys and a `DIDCommMessaging` service naming
-`mediator_did` — enough for the VTC to reach it, with nothing to host
+identifier carries the bridge's keys and a `TSPTransport` and a
+`DIDCommMessaging` service naming `mediator_did` — enough for the VTC to
+reach it, with nothing to host
 (BRIDGE.md §2). The mediator is fixed in that DID: moving mediators means a
 new identity, registered again. To avoid that, provision a `did:webvh` from
 the VTA instead. Use a DID
 template with an Ed25519 signing key, an X25519 key-agreement key, and a
-`DIDCommMessaging` service naming `mediator_did`. Export its secrets bundle
+`TSPTransport` and a `DIDCommMessaging` service naming `mediator_did`. Export its secrets bundle
 and import it (bridge stopped — the admin commands take the store's lock):
 
 ```sh
@@ -269,7 +270,7 @@ Put the DID from `identity show` (VTA mode: from `vta setup`) into the VTC's `[g
 `"github.com"` (step 1) and restart the VTC.
 
 **Success looks like:** `curl http://127.0.0.1:8080/healthz` answers `ok`;
-the bridge's log shows the DIDComm link to the mediator up, and — since no
+the bridge's log shows the link to the mediator up, and — since no
 App is registered yet — a warning with a one-time registration URL.
 
 ## 3. Register the GitHub App

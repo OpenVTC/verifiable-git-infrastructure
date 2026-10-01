@@ -1,8 +1,8 @@
 [package]
 name = "vgi-bridge"
-description = "The per-community VGI bridge: holds the community's forge credentials, takes git-ns/bridge jobs from its VTC over DIDComm, runs the forge adapters, reports results, events and drift, and posts the commit-trust check where no forge feature can be trusted to."
+description = "The per-community VGI bridge: holds the community's forge credentials, takes git-ns/bridge jobs from its VTC over TSP or DIDComm, runs the forge adapters, reports results, events and drift, and posts the commit-trust check where no forge feature can be trusted to."
 readme = "README.md"
-keywords = ["git", "forge", "did", "didcomm", "trust-registry"]
+keywords = ["git", "forge", "did", "tsp", "trust-registry"]
 categories = ["development-tools", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true

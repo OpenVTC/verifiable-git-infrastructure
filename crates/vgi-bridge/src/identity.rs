@@ -443,7 +443,7 @@ fn endpoint_uri(endpoint: &Value) -> Option<String> {
 ///
 /// - `Ok(None)`: yes, or it cannot be told locally (a `did:webvh` publishes
 ///   its own document; the VTC resolves it).
-/// - `Ok(Some(warning))`: the DID advertises no DIDComm service (a
+/// - `Ok(Some(warning))`: the DID advertises no TSP or DIDComm service (a
 ///   `did:key`), so no VTC can send it jobs. The bridge still runs — results
 ///   and events still go out — but the operator must know.
 /// - `Err`: the DID names another mediator. A `did:peer` names its mediator
@@ -454,19 +454,16 @@ pub fn check_reachable(did: &str, mediator_did: &str) -> Result<Option<String>> 
         return Ok(None);
     }
     // A did:peer minted before the bridge spoke TSP advertises DIDComm only:
-    // still served (the VTC reaches it over DIDComm). One whose TSP service
-    // names another mediator is refused like a DIDComm one.
-    if let Some(m) = advertised_tsp_mediator(did)?
-        && m != mediator_did
+    // still served (the VTC reaches it over DIDComm). One whose TSP or DIDComm
+    // service names another mediator is refused.
+    let tsp = advertised_tsp_mediator(did)?;
+    let didcomm = advertised_mediator(did)?;
+    if let Some(m) = [&tsp, &didcomm]
+        .into_iter()
+        .flatten()
+        .find(|m| m.as_str() != mediator_did)
     {
         bail!(
-            "the bridge's DID `{did}` advertises TSP at the mediator `{m}`, but the config \
-             names `{mediator_did}`: set `mediator_did = \"{m}\"` back in the config"
-        );
-    }
-    match advertised_mediator(did)? {
-        Some(m) if m == mediator_did => Ok(None),
-        Some(m) => bail!(
             "the bridge's DID `{did}` advertises the mediator `{m}`, but the config names \
              `{mediator_did}`. A did:peer names its mediator in its identifier, so the VTC \
              would send jobs to `{m}`, where this bridge would not be listening.\n\
@@ -475,9 +472,14 @@ pub fn check_reachable(did: &str, mediator_did: &str) -> Result<Option<String>> 
              Only for a bridge that serves no bound namespace: mint a new identity \
              (`vgi-bridge identity mint --replace --backup <file>`) and register the new DID \
              at the VTC — see `identity mint --help` for what a new DID breaks"
-        ),
+        );
+    }
+    match didcomm {
+        Some(_) => Ok(None),
+        // TSP only: reachable (checked above).
+        None if tsp.is_some() => Ok(None),
         None => Ok(Some(format!(
-            "the bridge's DID `{did}` advertises no DIDComm service, so no VTC can send it \
+            "the bridge's DID `{did}` advertises no TSP or DIDComm service, so no VTC can send it \
              jobs (they fail with `noMatchingProtocol`). Mint a did:peer that names the \
              mediator (`vgi-bridge identity mint --replace --backup <file>`) and register \
              the new DID at the VTC"

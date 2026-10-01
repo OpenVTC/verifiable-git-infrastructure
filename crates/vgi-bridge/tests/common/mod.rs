@@ -154,6 +154,18 @@ impl vgi_bridge::transport::VtcLink for CuttableLink {
         }
         self.inner.send(to, doc).await
     }
+
+    async fn send_via(
+        &self,
+        to: &str,
+        doc: &Value,
+        via: vgi_bridge::transport::Via,
+    ) -> anyhow::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("not connected to the mediator");
+        }
+        self.inner.send_via(to, doc, via).await
+    }
 }
 
 pub struct Options {

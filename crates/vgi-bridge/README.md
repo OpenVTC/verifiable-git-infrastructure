@@ -6,8 +6,8 @@ its Forgejo bot's token — and acts on the forges for its VTC. The VTC decides;
 the bridge carries it out and reports back.
 
 ```
- VTC ──DIDComm (authcrypt, via mediator)──▶ vgi-bridge ──adapters──▶ GitHub / Forgejo
-     ◀── git-ns/bridge/result, /event ────            ◀── webhooks, OAuth redirects (HTTPS)
+ VTC ──TSP or DIDComm (via mediator)──▶ vgi-bridge ──adapters──▶ GitHub / Forgejo
+     ◀── git-ns/bridge/result, /event ──            ◀── webhooks, OAuth redirects (HTTPS)
 ```
 
 - **Identity.** Its own DID. In **VTA mode** (recommended), the `did:webvh`

@@ -112,7 +112,10 @@ impl RegistryReplies {
             let mut pending = self.lock();
             // Over the transport the query went out on, or not an answer:
             // the binding was chosen, and nothing falls back from it.
-            if pending.get(thread).is_none_or(|(via, _)| *via != inbound.via) {
+            if pending
+                .get(thread)
+                .is_none_or(|(via, _)| *via != inbound.via)
+            {
                 return false;
             }
             match pending.remove(thread) {
@@ -243,8 +246,12 @@ mod tests {
     async fn a_query_goes_out_as_the_bridge_and_its_proven_answer_comes_back() {
         let (link, mut sent) = ChannelLink::new();
         let replies = Arc::new(RegistryReplies::new(REGISTRY));
-        let channel =
-            BridgeRegistryChannel::new(Arc::new(link), "did:key:z6MkBridge", replies.clone(), Via::Didcomm);
+        let channel = BridgeRegistryChannel::new(
+            Arc::new(link),
+            "did:key:z6MkBridge",
+            replies.clone(),
+            Via::Didcomm,
+        );
 
         let answer = tokio::spawn(async move {
             channel
@@ -277,8 +284,12 @@ mod tests {
         let (link, mut sent) = ChannelLink::new();
         let link = Arc::new(link);
         let replies = Arc::new(RegistryReplies::new(REGISTRY));
-        let channel =
-            BridgeRegistryChannel::new(link.clone(), "did:key:z6MkBridge", replies.clone(), Via::Tsp);
+        let channel = BridgeRegistryChannel::new(
+            link.clone(),
+            "did:key:z6MkBridge",
+            replies.clone(),
+            Via::Tsp,
+        );
         assert_eq!(channel.kind(), TransportKind::Tsp);
         let answer = tokio::spawn(async move {
             channel
@@ -286,9 +297,14 @@ mod tests {
                 .await
         });
         sent.recv().await.unwrap();
-        assert_eq!(link.pinned(), [Via::Tsp], "pinned to TSP, not the link's choice");
+        assert_eq!(
+            link.pinned(),
+            [Via::Tsp],
+            "pinned to TSP, not the link's choice"
+        );
 
-        let doc = serde_json::json!({ "threadId": "urn:uuid:q", "payload": { "authorized": true } });
+        let doc =
+            serde_json::json!({ "threadId": "urn:uuid:q", "payload": { "authorized": true } });
         // The registry's own key, but over DIDComm: not the chosen binding.
         assert!(!replies.route(&inbound(Some(REGISTRY), doc.clone())));
         // Over TSP, from another VID: not the registry.
@@ -302,16 +318,23 @@ mod tests {
             ..inbound(Some(REGISTRY), doc)
         };
         assert!(replies.route(&real));
-        assert_eq!(answer.await.unwrap().unwrap()["payload"]["authorized"], true);
+        assert_eq!(
+            answer.await.unwrap().unwrap()["payload"]["authorized"],
+            true
+        );
     }
 
     #[tokio::test]
     async fn a_registry_that_never_answers_times_out_and_later_mail_is_not_taken() {
         let (link, _sent) = ChannelLink::new();
         let replies = Arc::new(RegistryReplies::new(REGISTRY));
-        let channel =
-            BridgeRegistryChannel::new(Arc::new(link), "did:key:z6MkBridge", replies.clone(), Via::Didcomm)
-                .with_timeout(Duration::from_millis(20));
+        let channel = BridgeRegistryChannel::new(
+            Arc::new(link),
+            "did:key:z6MkBridge",
+            replies.clone(),
+            Via::Didcomm,
+        )
+        .with_timeout(Duration::from_millis(20));
         let e = channel
             .exchange(REGISTRY, serde_json::json!({ "id": "urn:uuid:q" }))
             .await
@@ -327,8 +350,12 @@ mod tests {
     async fn an_exchange_dropped_mid_wait_leaves_no_query_in_flight() {
         let (link, mut sent) = ChannelLink::new();
         let replies = Arc::new(RegistryReplies::new(REGISTRY));
-        let channel =
-            BridgeRegistryChannel::new(Arc::new(link), "did:key:z6MkBridge", replies.clone(), Via::Didcomm);
+        let channel = BridgeRegistryChannel::new(
+            Arc::new(link),
+            "did:key:z6MkBridge",
+            replies.clone(),
+            Via::Didcomm,
+        );
         let waiting = tokio::spawn(async move {
             channel
                 .exchange(REGISTRY, serde_json::json!({ "id": "urn:uuid:q" }))
@@ -347,12 +374,8 @@ mod tests {
     async fn a_link_that_is_down_fails_the_query_rather_than_waiting() {
         let link = crate::transport::SupervisedLink::new(); // never connected
         let replies = Arc::new(RegistryReplies::new(REGISTRY));
-        let channel = BridgeRegistryChannel::new(
-            Arc::new(link),
-            "did:key:z6MkBridge",
-            replies,
-            Via::Didcomm,
-        );
+        let channel =
+            BridgeRegistryChannel::new(Arc::new(link), "did:key:z6MkBridge", replies, Via::Didcomm);
         let e = channel
             .exchange(REGISTRY, serde_json::json!({ "id": "urn:uuid:q" }))
             .await

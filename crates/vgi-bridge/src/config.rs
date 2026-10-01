@@ -42,7 +42,7 @@ pub struct BridgeConfig {
     /// The community's Trust Registry, for the bootstrap plan and the
     /// bridge-posted check.
     pub trust_registry_did: String,
-    /// The DIDComm mediator the bridge's DID is reachable through.
+    /// The mediator the bridge's DID is reachable through (TSP and DIDComm).
     pub mediator_did: String,
     /// The URL the forges reach the bridge at (behind the TLS proxy), e.g.
     /// `https://bridge.acme.example/`. Callback and webhook URLs are built
@@ -980,7 +980,7 @@ pub(crate) fn tests_example() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) const EXAMPLE: &str = r#"
@@ -1126,7 +1126,7 @@ oauth_client_id = "0b6e3a0c"
         assert_eq!(
             v.mediator_did.as_deref(),
             Some("did:web:mediator.acme.example"),
-            "the VTA is reached over DIDComm, through the bridge's mediator by default"
+            "the VTA is reached through the bridge's mediator by default"
         );
         assert!(
             with("context = \"vgi-bridge\"").is_err(),
