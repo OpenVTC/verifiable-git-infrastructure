@@ -205,7 +205,7 @@ Two inputs carry weight that a committed signer list used to:
   owner (no whitespace, control characters or empty segments), the fallback
   must be the resource's own owner (or the resource itself), and a
   forge-qualified fallback is refused.
-- **`--resource-format`** (default `legacy`) picks the form of both
+- **`--resource-format`** (default `qualified`) picks the form of both
   resources — see [Resource format](#resource-format).
 - **`--max-signers`** (default 32) bounds the distinct DIDs one range may
   claim. The set is chosen by whoever wrote the commits, and for the
@@ -218,8 +218,8 @@ A resource either names the forge or leaves it implied:
 
 | `--resource-format` | Resource | Org fallback | Default `--resource` |
 |---|---|---|---|
-| `legacy` (default) | `acme/widgets` | `acme` | `$GITHUB_REPOSITORY`, verbatim |
-| `qualified` | `github.com/acme/widgets` | `github.com/acme` | derived from the CI environment |
+| `qualified` (default) | `github.com/acme/widgets` | `github.com/acme` | derived from the CI environment |
+| `legacy` (one more release) | `acme/widgets` | `acme` | `$GITHUB_REPOSITORY`, verbatim |
 
 The qualified grammar is `<forge-host>/<owner>[/<repo>]`: the first segment is
 the forge's host (a dotted name such as `github.com`, a GitHub Enterprise
@@ -233,7 +233,7 @@ the VTC's registry projection and the forge adapters use, so a grant and a
 query name a repository with the same bytes:
 
 ```
-$ GITHUB_SERVER_URL=https://github.com verify-trust --resource-format qualified --resource acme/widgets …
+$ GITHUB_SERVER_URL=https://github.com verify-trust --resource acme/widgets …
 Error: --resource `acme/widgets` is not forge-qualified (--resource-format qualified expects `<forge-host>/<owner>[/<repo>]`); did you mean `github.com/acme/widgets`?
 ```
 
@@ -249,12 +249,13 @@ both forms exist in the registry, and silently.
 
 **Migration.** Registry grants must be written in the form the check uses:
 
-1. Now: `legacy` is the default, so nothing deployed changes. Opt in with
-   `--resource-format qualified` (`resource-format: qualified` on the Action)
-   once the grants exist in qualified form — during the window the VTC can
-   write both forms for each grant.
-2. A later minor release flips the default to `qualified`. Pin
-   `resource-format: legacy` to keep the old behaviour for one more release.
+1. Until v0.7.0, `legacy` was the default and `qualified` an opt-in.
+2. **Since v0.7.0** the default is `qualified`. The VTC writes grants only in
+   that form (it does not dual-write `owner/repo`), and the workflows a bridge
+   bootstraps already set it, so those runs are unaffected. A run that still
+   depends on hand-issued `owner/repo` grants pins `--resource-format legacy`
+   (`resource-format: legacy` on the Action) for one more release — or, better,
+   has its grants reissued in qualified form.
 3. The release after that removes `legacy`.
 
 ## Signer names
