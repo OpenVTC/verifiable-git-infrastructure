@@ -121,8 +121,13 @@ identities carry the services:
   part of the DID. Change `mediator_did` and the bridge refuses to start
   rather than have the VTC deliver jobs where it no longer listens. For a
   bridge serving bound namespaces the fix is to set `mediator_did` back: a new
-  DID is a different bridge (below). `init` refuses a mediator whose own DID would make the `did:peer`
-  longer than the 1000 bytes DID resolvers accept.
+  DID is a different bridge (below). Each service carries the mediator's
+  DID, so a mediator with a long DID (a `did:peer` of its own) may leave room
+  for only one: `init` then mints a `did:peer` advertising DIDComm only, with
+  a warning, and the VTC reaches the bridge over DIDComm. It refuses a
+  mediator whose DID would make even that longer than the 1000 bytes DID
+  resolvers accept. For TSP there, use a mediator with a short DID
+  (`did:web`/`did:webvh`) or a `did:webvh` for the bridge.
 - **A `did:webvh`** publishes the services in its document (the VTA template
   adds them), and can move mediators without changing DID.
 

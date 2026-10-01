@@ -716,7 +716,8 @@ async fn the_real_verifier_trusts_a_namespace_grant_and_refuses_the_rest() {
     assert!(!lines[0].passes);
 }
 
-/// The bridge-posted check over DIDComm: the real verifier queries the
+/// The bridge-posted check over the bridge's mediator link (here its DIDComm
+/// channel): the real verifier queries the
 /// registry **as the bridge's DID**, over the bridge's own link, and the
 /// registry's answer comes back through `Bridge::handle_inbound` — taken off
 /// the job path only when the transport proved it is from the registry.
