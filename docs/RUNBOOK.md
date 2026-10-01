@@ -63,8 +63,8 @@ form:
 
 | `resource-format` | Repo grant | Org grant |
 |---|---|---|
-| `legacy` (default for now) | `acme/widgets` | `acme` |
-| `qualified` | `github.com/acme/widgets` | `github.com/acme` |
+| `qualified` (default) | `github.com/acme/widgets` | `github.com/acme` |
+| `legacy` (one more release) | `acme/widgets` | `acme` |
 
 The qualified form is `<forge-host>/<owner>[/<repo>]`, all lowercase. The forge
 host is the one CI runs against — `github.com`, your GitHub Enterprise Server
@@ -74,12 +74,12 @@ environment; the port of a self-hosted instance is not part of it.
 
 Migration is staged:
 
-1. **Now** — `legacy` is the default; nothing deployed changes. To move a
-   repository over, issue its grants in qualified form (during the window the
-   VTC can write both forms for each grant), then set
-   `resource-format: qualified` on its workflow.
-2. **A later minor release** flips the default to `qualified`. A workflow that
-   still needs the old form pins `resource-format: legacy`.
+1. **Until v0.7.0** — `legacy` was the default; `qualified` was opt-in.
+2. **Since v0.7.0** — `qualified` is the default. Grants the VTC writes are
+   already in that form (it does not dual-write `owner/repo`), and the
+   workflows a bridge bootstraps already set it. A workflow that still depends
+   on hand-issued `owner/repo` grants pins `resource-format: legacy` for one
+   more release; better, reissue its grants in qualified form.
 3. **The release after** removes `legacy`, and the legacy grants can go.
 
 A run queries one form only — never "qualified, else legacy". Accepting either

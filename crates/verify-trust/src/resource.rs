@@ -19,10 +19,10 @@
 //! module adds only what is verify-trust's own: the flag names in messages
 //! and a fix suggested from the CI environment.
 //!
-//! The change is staged so nothing deployed moves under an operator's feet:
-//! `legacy` is the default and behaves exactly as before; the default flips to
-//! `qualified` in a later release, and `legacy` is then removed. Registry
-//! grants must be written in the form the run uses.
+//! The change is staged: `qualified` is the default (it was `legacy` until
+//! 0.7.0); `legacy`, which takes `owner/repo` as given, remains for one more
+//! release, and is then removed (#109). Registry grants must be written in the
+//! form the run uses — the VTC's projection writes only the qualified form.
 //!
 //! [`CiEnv`] is the seam that knows how each CI system names the repository
 //! under test. Anything it cannot detect falls back to an explicit
@@ -34,10 +34,11 @@ use vgi_core::{ResourceErrorKind, normalize_resource, resource_contains};
 /// Which form the TRQP resource is written in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ResourceFormat {
-    /// `owner/repo`, taken as given — the pre-qualification behaviour.
-    #[default]
+    /// `owner/repo`, taken as given — the pre-qualification behaviour, kept
+    /// for one release after the default moved to `qualified`.
     Legacy,
-    /// `<forge-host>/owner/repo`, validated and lowercased.
+    /// `<forge-host>/owner/repo`, validated and lowercased. The default.
+    #[default]
     Qualified,
 }
 
@@ -488,9 +489,19 @@ mod tests {
 
     // --- mode selection --------------------------------------------------------
 
+    /// #109: the default is the forge-qualified form, derived from the CI
+    /// environment — the form the VTC writes grants in.
     #[test]
-    fn legacy_is_the_default_and_passes_values_through_untouched() {
-        assert_eq!(ResourceFormat::default(), ResourceFormat::Legacy);
+    fn qualified_is_the_default() {
+        assert_eq!(ResourceFormat::default(), ResourceFormat::Qualified);
+        assert_eq!(
+            select_resources(ResourceFormat::default(), None, None, &github()).unwrap(),
+            ("github.com/acme/widgets".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn legacy_still_passes_values_through_untouched() {
         // Derived: $GITHUB_REPOSITORY verbatim — no host, no lowercasing.
         assert_eq!(
             select_resources(ResourceFormat::Legacy, None, None, &github()).unwrap(),

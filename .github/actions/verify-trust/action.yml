@@ -29,17 +29,17 @@ inputs:
     required: false
     default: "git.commit.sign"
   resource:
-    description: "TRQP resource of the trust tuple. Defaults to this repository: owner/name under resource-format legacy, or <forge-host>/owner/name (e.g. github.com/acme/widgets) under qualified. SECURITY-RELEVANT: with no committed signer list, this is the only thing scoping a signer to this repository — widening it widens who may sign."
+    description: "TRQP resource of the trust tuple. Defaults to this repository: <forge-host>/owner/name (e.g. github.com/acme/widgets) under resource-format qualified (the default), or owner/name under legacy. SECURITY-RELEVANT: with no committed signer list, this is the only thing scoping a signer to this repository — widening it widens who may sign."
     required: false
     default: ""
   fallback-resource:
-    description: "Broader resource to also accept a grant under (e.g. the org: acme under legacy, github.com/acme under qualified). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`. Under qualified it must contain the resource (its namespace); another owner's or forge's is refused. To name the running repository's own namespace in a workflow shared by several repositories, pass your forge's host, a slash, and the github.repository_owner expression (as the workflows a VGI bridge bootstraps do)."
+    description: "Broader resource to also accept a grant under (e.g. the org: github.com/acme under qualified, acme under legacy). Grant semantics are OR. Omitted: only the primary resource is queried. Widens who may sign, exactly like `resource`. Under qualified it must contain the resource (its namespace); another owner's or forge's is refused. To name the running repository's own namespace in a workflow shared by several repositories, pass your forge's host, a slash, and the github.repository_owner expression (as the workflows a VGI bridge bootstraps do)."
     required: false
     default: ""
   resource-format:
-    description: "Form of resource and fallback-resource: 'legacy' (owner/name, as before) or 'qualified' (<forge-host>/owner/name, lowercased). Registry grants must use the same form. The default flips to 'qualified' in a later release, and 'legacy' is then removed."
+    description: "Form of resource and fallback-resource: 'qualified' (<forge-host>/owner/name, lowercased; the default since v0.7.0, and the form the VTC writes grants in) or 'legacy' (owner/name, as before — kept for one more release, then removed). Registry grants must use the same form. Needs a `version` of v0.4.13 or later (the release that added the choice)."
     required: false
-    default: "legacy"
+    default: "qualified"
   max-signers:
     description: "Ceiling on the number of distinct signer DIDs a range may claim. Each costs one DID resolution, to a host the commit's author chose, so this bounds what a pull request can make the runner resolve."
     required: false
@@ -281,15 +281,19 @@ runs:
         if [ -n "$VT_RESOURCE" ]; then
           args+=(--resource "$VT_RESOURCE")
         fi
-        # Passed only when not the default, so a `version:` pinned to a release
-        # that predates the flag keeps working.
-        if [ -n "$VT_RESOURCE_FORMAT" ] && [ "$VT_RESOURCE_FORMAT" != "legacy" ]; then
-          args+=(--resource-format "$VT_RESOURCE_FORMAT")
-        fi
+        # Always passed, never left to the binary's own default: a `version:`
+        # pinned to a release before v0.7.0 defaults to legacy, so leaving it
+        # out would silently run that release in the other form. Releases
+        # before v0.4.13 have no such flag (and predate every SEC-4045 fix).
+        case "$VT_RESOURCE_FORMAT" in
+          qualified|legacy) args+=(--resource-format "$VT_RESOURCE_FORMAT") ;;
+          *) echo "::error::verify-trust: resource-format must be qualified or legacy"; exit 1 ;;
+        esac
         if [ -n "$VT_REGISTRY_URL" ]; then
           args+=(--registry-url "$VT_REGISTRY_URL")
         fi
-        # Passed only when not the default, like resource-format.
+        # Passed only when not the default, so a `version:` pinned to a release
+        # that predates the flag keeps working.
         if [ -n "$VT_TRANSPORT" ] && [ "$VT_TRANSPORT" != "auto" ]; then
           args+=(--transport "$VT_TRANSPORT")
         fi

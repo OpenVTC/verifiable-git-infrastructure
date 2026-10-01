@@ -87,11 +87,12 @@ struct Cli {
     #[arg(long)]
     fallback_resource: Option<String>,
 
-    /// Form of --resource and --fallback-resource. `legacy`: the bare
-    /// `owner/repo` slug, taken as given. `qualified`: forge-qualified
-    /// (`github.com/owner/repo`, org fallback `github.com/owner`), validated
-    /// and lowercased. Registry grants must be written in the same form.
-    #[arg(long, value_enum, default_value_t = ResourceFormat::Legacy)]
+    /// Form of --resource and --fallback-resource. `qualified` (the default):
+    /// forge-qualified (`github.com/owner/repo`, org fallback
+    /// `github.com/owner`), validated and lowercased. `legacy`: the bare
+    /// `owner/repo` slug, kept for one release and then removed. Registry
+    /// grants must be written in the same form.
+    #[arg(long, value_enum, default_value_t = ResourceFormat::Qualified)]
     resource_format: ResourceFormat,
 
     /// Armored PGP keyring of exempt platform keys (e.g. GitHub's web-flow
@@ -155,4 +156,41 @@ async fn main() -> Result<()> {
     })
     .await?;
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #109: with no `--resource-format`, the CLI runs qualified — the same
+    /// default the library's `ResourceFormat` has.
+    #[test]
+    fn the_cli_defaults_to_the_qualified_form() {
+        let cli = Cli::try_parse_from([
+            "verify-trust",
+            "--range",
+            "origin/main..HEAD",
+            "--registry-did",
+            "did:example:registry",
+            "--vtc-did",
+            "did:example:vtc",
+        ])
+        .expect("parses");
+        assert_eq!(cli.resource_format, ResourceFormat::Qualified);
+        assert_eq!(cli.resource_format, ResourceFormat::default());
+
+        let cli = Cli::try_parse_from([
+            "verify-trust",
+            "--range",
+            "origin/main..HEAD",
+            "--registry-did",
+            "did:example:registry",
+            "--vtc-did",
+            "did:example:vtc",
+            "--resource-format",
+            "legacy",
+        ])
+        .expect("legacy is still accepted");
+        assert_eq!(cli.resource_format, ResourceFormat::Legacy);
+    }
 }
