@@ -387,7 +387,9 @@ impl VerifyTrustVerifier {
         // No checkout and no revision range: the bridge holds commit objects
         // fetched by id, so the platform-merge policy takes `facts` instead
         // of asking git (which, with these empty, ran in the bridge's own
-        // working directory — SEC-4045 / VGI-01).
+        // working directory — SEC-4045 / VGI-01). Left empty on purpose:
+        // `verify_prepared_with`, the git path, refuses them, so a switch
+        // back to it fails every check instead of reopening VGI-01.
         let args = verify_trust::VerifyTrustArgs {
             repo_dir: PathBuf::new(),
             range: String::new(),

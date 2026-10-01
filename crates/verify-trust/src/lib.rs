@@ -75,9 +75,12 @@ pub use crate::registry::{Registry, RegistryChannel, TransportSelector};
 /// Everything `verify-trust` needs for one run.
 #[derive(Debug, Clone)]
 pub struct VerifyTrustArgs {
-    /// Repository to verify (a working tree with `git` available).
+    /// Repository to verify (a working tree with `git` available). Required
+    /// by [`verify_prepared_with`]; not read by [`verify_prepared_with_facts`].
     pub repo_dir: PathBuf,
     /// Commit range in `git rev-list` syntax, e.g. `origin/main..HEAD`.
+    /// Required by [`verify_prepared_with`]; not read by
+    /// [`verify_prepared_with_facts`].
     pub range: String,
     /// Ceiling on the number of *distinct* DIDs a range may claim, each of
     /// which costs one resolution.
@@ -400,6 +403,13 @@ pub async fn verify_prepared(
 /// Platform-signed merges are checked against the repository at
 /// `args.repo_dir` over `args.range`, with git. A caller with no such
 /// checkout uses [`verify_prepared_with_facts`].
+///
+/// An empty `repo_dir` or `range` is refused before anything is verified.
+/// git reads `-C ""` as the current directory, so with them empty the
+/// platform-merge policy ran in whatever directory the caller was started in
+/// — the bridge's own, in SEC-4045 / VGI-01. Refusing them outright, rather
+/// than only when a platform merge reaches git, makes a caller that drifts
+/// back onto this path fail on its first check of any commit.
 pub async fn verify_prepared_with(
     args: &VerifyTrustArgs,
     commits: &[RangeCommit],
@@ -407,6 +417,13 @@ pub async fn verify_prepared_with(
     exempt: Option<&ExemptKeyring>,
     registry: &Registry,
 ) -> Result<TrustReport> {
+    if args.repo_dir.as_os_str().is_empty() || args.range.trim().is_empty() {
+        bail!(
+            "verify_prepared_with needs the repository and the revision range the commits came \
+             from (repo_dir and range are empty); a caller with no checkout passes what git \
+             would have answered to verify_prepared_with_facts instead"
+        );
+    }
     let source = MergeSource::Git {
         repo_dir: &args.repo_dir,
         range: &args.range,
@@ -2223,8 +2240,9 @@ mod tests {
 
     fn args_for_registry() -> VerifyTrustArgs {
         VerifyTrustArgs {
-            repo_dir: PathBuf::new(),
-            range: String::new(),
+            // Never read: these ranges hold no platform-signed merge.
+            repo_dir: PathBuf::from("."),
+            range: "HEAD".to_string(),
             max_signers: 32,
             registry_url: None,
             transport: TransportSelector::Auto,
@@ -2260,6 +2278,50 @@ mod tests {
                 .to_string();
             assert!(e.contains("cannot be combined"), "{e}");
         }
+    }
+
+    /// VGI-01 cannot come back by a caller drifting onto the git path with
+    /// no checkout: git reads `-C ""` as the current directory, so an empty
+    /// `repo_dir` (or `range`) is refused — before the registry is asked,
+    /// and even for a range with no platform merge in it.
+    #[tokio::test]
+    async fn the_git_path_refuses_an_empty_repository_or_range() {
+        let channel = Arc::new(FakeChannel::answering(true));
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
+        let (commits, signers) = one_signed_commit();
+        for (repo_dir, range) in [("", "HEAD"), (".", ""), (".", "  "), ("", "")] {
+            let args = VerifyTrustArgs {
+                repo_dir: PathBuf::from(repo_dir),
+                range: range.to_string(),
+                ..args_for_registry()
+            };
+            let err = verify_prepared_with(&args, &commits, &signers, None, &registry)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("verify_prepared_with_facts"), "{err}");
+        }
+        assert!(
+            channel.seen.lock().unwrap().is_empty(),
+            "refused before any query"
+        );
+        // The facts path takes the same empty fields: it never asks git.
+        let args = VerifyTrustArgs {
+            repo_dir: PathBuf::new(),
+            range: String::new(),
+            ..args_for_registry()
+        };
+        let report = verify_prepared_with_facts(
+            &args,
+            &commits,
+            &signers,
+            None,
+            &registry,
+            &MergeFacts::default(),
+        )
+        .await
+        .unwrap();
+        assert!(report.ok, "{:?}", report.commits);
     }
 
     #[tokio::test]
