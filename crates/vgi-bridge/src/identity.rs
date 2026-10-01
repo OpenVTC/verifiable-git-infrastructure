@@ -317,20 +317,20 @@ impl BridgeIdentity {
         self.secrets.clone()
     }
 
-    /// Sign a Trust Task document (`eddsa-jcs-2022`, `assertionMethod`).
+    /// Sign a Trust Task document (`eddsa-jcs-2022`, `authentication`).
     /// `doc.issuer` must already be this DID.
     ///
-    /// `assertionMethod` is passed explicitly rather than left to
-    /// `SignOptions`' default: trust-tasks-proof 0.23 changed that default
-    /// to `authentication` (SPEC's own examples use it), but this bridge
-    /// and the VTC-side checks it faces (`wire::DocChecker::check`) still
-    /// require `assertionMethod` on both sides of the wire — see the
-    /// `proofPurpose` follow-up in #91.
+    /// `authentication` is passed explicitly — it is also
+    /// `sign_trust_task`'s own default — because this is the purpose SPEC.md
+    /// asks a producer to sign with (proving the bridge controls its
+    /// identifier), and the one `wire::DocChecker::check` requires on every
+    /// inbound document: `git-ns/bridge/result` and `git-ns/bridge/event`
+    /// define no attestation, so `assertionMethod` is never right for them.
     pub async fn sign(&self, doc: &Value) -> Result<Value> {
         sign_trust_task(
             doc,
             &self.signing,
-            SignOptions::new().with_proof_purpose("assertionMethod"),
+            SignOptions::new().with_proof_purpose("authentication"),
         )
         .await
         .map_err(|e| anyhow::anyhow!("signing a document: {e}"))
@@ -495,7 +495,7 @@ impl BridgeIdentity {
     }
 
     /// Sign with a chosen `proofPurpose` — for tests of the purpose check
-    /// only; every document the bridge sends is an `assertionMethod` proof.
+    /// only; every document the bridge sends is an `authentication` proof.
     #[doc(hidden)]
     pub async fn sign_with_purpose(&self, doc: &Value, purpose: &str) -> Result<Value> {
         sign_trust_task(
