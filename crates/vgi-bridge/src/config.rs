@@ -42,7 +42,7 @@ pub struct BridgeConfig {
     /// The community's Trust Registry, for the bootstrap plan and the
     /// bridge-posted check.
     pub trust_registry_did: String,
-    /// The DIDComm mediator the bridge's DID is reachable through.
+    /// The mediator the bridge's DID is reachable through (TSP and DIDComm).
     pub mediator_did: String,
     /// The URL the forges reach the bridge at (behind the TLS proxy), e.g.
     /// `https://bridge.acme.example/`. Callback and webhook URLs are built
@@ -136,14 +136,15 @@ pub struct VtaConfig {
     /// bridge clears it once read.
     #[serde(default)]
     pub credential_env: Option<String>,
-    /// The mediator the VTA is reached through, over DIDComm. Default: the
-    /// bridge's own `mediator_did`. Always DIDComm: the VTA releases a
-    /// private key only over a channel confidential end to end (never over
-    /// REST, where the key would exist wherever TLS terminates).
+    /// The mediator the VTA is reached through: over TSP when the VTA's DID
+    /// document advertises it, else DIDComm. Default: the bridge's own
+    /// `mediator_did`. Never REST: the VTA releases a private key only over
+    /// a channel confidential end to end (never over REST, where the key
+    /// would exist wherever TLS terminates).
     #[serde(default)]
     pub mediator_did: Option<String>,
     /// The VTA's REST URL, when the bundle carries none: used only as the
-    /// DIDComm client's fallback for unauthenticated calls.
+    /// messaging client's fallback for unauthenticated calls.
     #[serde(default)]
     pub url: Option<Url>,
     /// The bridge's DID. `None`: the context's DID.
@@ -217,13 +218,13 @@ pub struct VerifyTrustConfig {
     /// The required check's name.
     #[serde(default = "default_check")]
     pub required_check: String,
-    /// The Trust Registry binding: for the written workflows (the action's
-    /// `transport` input) `auto` (default — TSP, then DIDComm, then HTTPS,
-    /// no fallback), `tsp`, `didcomm` or `https`; for the check the bridge
-    /// posts itself `auto` is DIDComm (as the bridge's own DID, over its
-    /// mediator session), then HTTPS. `tsp` is refused while a GitHub forge
-    /// has `bridge_checks` on: the bridge never speaks TSP. Set `https` while
-    /// the registry's mediator does not admit a CI run's throwaway DID.
+    /// The Trust Registry binding, for the written workflows (the action's
+    /// `transport` input) and for the check the bridge posts itself: `auto`
+    /// (default — TSP, then DIDComm, then HTTPS, whichever the registry
+    /// advertises first, no fallback once chosen), `tsp`, `didcomm` or
+    /// `https`. The bridge's own check queries as the bridge's DID over its
+    /// mediator session. Set `https` while the registry's mediator does not
+    /// admit a CI run's throwaway DID.
     #[serde(default)]
     pub transport: VerifyTransport,
 }
@@ -895,17 +896,6 @@ impl BridgeConfig {
         if self.checks.max_commits == 0 || self.checks.max_signers == 0 {
             bail!("`checks.max_commits` and `checks.max_signers` must be at least 1");
         }
-        if self.verify_trust.transport == VerifyTransport::Tsp
-            && self.github.iter().any(|g| g.bridge_checks)
-        {
-            bail!(
-                "`verify_trust.transport = \"tsp\"`: the check this bridge posts itself queries \
-                 the registry over the bridge's DIDComm session or HTTPS, never TSP. Use `auto` \
-                 (TSP > DIDComm > HTTPS in the written workflows; DIDComm > HTTPS for the \
-                 bridge's own check), `didcomm` or `https` — or turn `bridge_checks` off"
-            );
-        }
-
         check_ident("resign.committer_name", &self.resign.committer_name)?;
         check_ident("resign.committer_email", &self.resign.committer_email)?;
         if self.resign.committer_email.starts_with("did:") {
@@ -990,7 +980,7 @@ pub(crate) fn tests_example() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) const EXAMPLE: &str = r#"
@@ -1080,20 +1070,14 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn tsp_is_refused_while_the_bridge_posts_checks() {
+    fn tsp_is_taken_while_the_bridge_posts_checks() {
         let tsp = EXAMPLE.replace(
             "version = \"v0.5.0\"\n",
             "version = \"v0.5.0\"\ntransport = \"tsp\"\n",
         );
-        let e = BridgeConfig::parse(&tsp).unwrap_err().to_string();
-        assert!(e.contains("never TSP"), "{e}");
-        // With the bridge not posting checks, only the workflows use it.
-        let off = tsp.replace(
-            "platform_keyring_file",
-            "bridge_checks = false\nplatform_keyring_file",
-        );
-        let c = BridgeConfig::parse(&off).unwrap();
+        let c = BridgeConfig::parse(&tsp).unwrap();
         assert_eq!(c.verify_trust.transport, VerifyTransport::Tsp);
+        assert!(c.github.iter().any(|g| g.bridge_checks));
     }
 
     #[test]
@@ -1142,7 +1126,7 @@ oauth_client_id = "0b6e3a0c"
         assert_eq!(
             v.mediator_did.as_deref(),
             Some("did:web:mediator.acme.example"),
-            "the VTA is reached over DIDComm, through the bridge's mediator by default"
+            "the VTA is reached through the bridge's mediator by default"
         );
         assert!(
             with("context = \"vgi-bridge\"").is_err(),

@@ -131,6 +131,7 @@ async fn jobs_from_anyone_but_the_configured_vtc_are_refused_and_not_recorded() 
         .handle_inbound(vgi_bridge::transport::InboundDoc {
             doc,
             authenticated_sender: Some(stranger.did().to_string()),
+            via: vgi_bridge::transport::Via::Didcomm,
         })
         .await;
     // Not even an error goes back: the bridge answers only its VTC.
@@ -150,6 +151,7 @@ async fn jobs_from_anyone_but_the_configured_vtc_are_refused_and_not_recorded() 
         .handle_inbound(vgi_bridge::transport::InboundDoc {
             doc,
             authenticated_sender: Some(stranger.did().to_string()),
+            via: vgi_bridge::transport::Via::Didcomm,
         })
         .await;
     let err = w.next().await;

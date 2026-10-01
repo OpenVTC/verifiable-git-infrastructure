@@ -453,9 +453,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.31.0"
+version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e473fbd27e6f3fecd641ce90959cb68f78ac78060841aa80c3a56d1d8a3b24a8"
+checksum = "6f313c6181ca97db6a370d92fa0449eaa85e0326b06fc1e59e0e921aaa80e4d8"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -6545,6 +6545,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-tasks-tsp"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bed9445352de35debb977e1e70f1cfb4efb938c6600a83e03bab912a3421592"
+dependencies = [
+ "affinidi-tsp",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "trust-tasks-rs",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6935,6 +6949,7 @@ dependencies = [
  "affinidi-messaging-core",
  "affinidi-messaging-delivery",
  "affinidi-messaging-didcomm",
+ "affinidi-messaging-sdk",
  "affinidi-openid4vci",
  "affinidi-openid4vp",
  "affinidi-secrets-resolver",
@@ -6960,6 +6975,7 @@ dependencies = [
  "tokio",
  "tracing",
  "trust-tasks-rs",
+ "trust-tasks-tsp",
  "url",
  "uuid",
  "x25519-dalek 3.0.0",

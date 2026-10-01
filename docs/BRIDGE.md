@@ -6,7 +6,7 @@ its VTC (design §5.7). Each community runs its own, next to its VTC. This
 guide is for the operator who deploys it.
 
 The shape to hold in your head: **the VTC decides, the bridge acts.** The
-VTC sends `git-ns/bridge/job`s over DIDComm; the bridge changes the forge,
+VTC sends `git-ns/bridge/job`s over TSP or DIDComm; the bridge changes the forge,
 answers with exactly one `git-ns/bridge/result` per job, and reports what it
 sees happening on the forge as `git-ns/bridge/event`s. It serves exactly one
 VTC and refuses a job signed by anyone else.
@@ -25,7 +25,7 @@ the bridge itself.
 | | Why |
 |---|---|
 | A **DID** for the bridge | the VTC records which bridge serves a namespace and accepts results and events only from it |
-| The **VTC's DID** and **mediator DID** | the bridge accepts jobs only from that DID, over DIDComm through that mediator |
+| The **VTC's DID** and **mediator DID** | the bridge accepts jobs only from that DID, over TSP or DIDComm through that mediator |
 | The **Trust Registry's DID** | written into every bootstrapped repository, and used by the check the bridge posts itself |
 | A **public HTTPS URL** behind a TLS-terminating proxy | the forges send App-setup and OAuth redirects and signed webhooks to it |
 | A **master key** (32 bytes, base64) — *or*, in VTA mode (§2a), a **context credential** for the bridge's trust context in the VTC's VTA | seals every secret in the store; from a file, or an environment variable that the bridge clears once read. In VTA mode there is no master key: secrets and state live in the VTA |
@@ -45,16 +45,17 @@ Inbound (through your proxy, HTTPS only):
 
 Outbound:
 
-- the **mediator** (websocket) — the DIDComm link to the VTC;
+- the **mediator** (websocket) — the link to the VTC, carrying TSP and
+  DIDComm on one socket;
 - the **forges' APIs** (`api.github.com` / your GHES, your Forgejo
   instances) and, for the check, their git endpoints (HTTPS fetch);
 - **DID resolution** for the VTC's DID (`did:webvh` / `did:web` hosts), and —
   for the bridge-posted check — for the registry's DID and the DIDs commits
   claim. Signer DIDs are resolved under verify-trust's public-hosts-only
   policy: a DID naming an internal host is refused, not fetched;
-- the **Trust Registry**, for the bridge-posted check: over DIDComm the query
-  rides the bridge's existing mediator link (nothing extra to open), over
-  HTTPS it goes to the `#rest` URL.
+- the **Trust Registry**, for the bridge-posted check: over TSP or DIDComm
+  the query rides the bridge's existing mediator link (nothing extra to
+  open), over HTTPS it goes to the `#rest` URL.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
 refuses to start with a `public_url` that is not `https`. That rule covers
@@ -109,18 +110,25 @@ Register the printed DID at the VTC as the bridge serving its namespaces:
 the VTC's `[git_ns] bridges` maps each forge host to it.
 
 The VTC reaches the bridge through a transport the bridge's DID document
-advertises: it resolves the DID and needs a `DIDCommMessaging` service naming
-the mediator the bridge listens at. Both identities carry one:
+advertises: it resolves the DID and takes the first of a `TSPTransport` and a
+`DIDCommMessaging` service naming the mediator the bridge listens at. The
+bridge answers each job over the transport it came in on, and sends results
+and events over the first of the two the VTC's own document advertises. Both
+identities carry the services:
 
-- **The `did:peer:2` `init` mints** encodes its keys *and* that service in
+- **The `did:peer:2` `init` mints** encodes its keys *and* both services in
   the identifier, so there is nothing to host. The flip side: the mediator is
   part of the DID. Change `mediator_did` and the bridge refuses to start
   rather than have the VTC deliver jobs where it no longer listens. For a
   bridge serving bound namespaces the fix is to set `mediator_did` back: a new
   DID is a different bridge (below). `init` refuses a mediator whose own DID would make the `did:peer`
   longer than the 1000 bytes DID resolvers accept.
-- **A `did:webvh`** publishes the service in its document (the VTA template
-  adds it), and can move mediators without changing DID.
+- **A `did:webvh`** publishes the services in its document (the VTA template
+  adds them), and can move mediators without changing DID.
+
+A `did:peer` minted by an earlier release advertises DIDComm only: the VTC
+keeps reaching it over DIDComm. Mint a new one (below) to have it reached over
+TSP.
 
 A store from an earlier release may hold a `did:key`, which advertises no
 service: no VTC can send it jobs (they fail `noMatchingProtocol`). `run` warns
@@ -175,7 +183,8 @@ the VTC.
 **1. The context and the DID.** In the VTA, create a context for the bridge
 (`vgi-bridge`, say) and provision a `did:webvh` into it from a DID template
 with an Ed25519 signing key (`#key-0`), an X25519 key-agreement key (`#key-1`)
-and a `DIDCommMessaging` service naming `mediator_did`.
+and a `TSPTransport` (`#tsp`) and a `DIDCommMessaging` service naming
+`mediator_did` (the VTC prefers TSP; DIDComm alone also works).
 
 **2. The credential.** Issue a `did:key` credential that is an **admin
 scoped to that context only** — exporting the context's keys needs the VTA's
@@ -204,14 +213,18 @@ entries in it), which is why it is issued to the bridge host alone.
 [vta]
 context = "vgi-bridge"
 credential_file = "/run/secrets/vgi-bridge-vta-credential"
-# The VTA is reached over DIDComm, through the bridge's `mediator_did`
-# unless this names another:
+# The VTA is reached over TSP when its DID document advertises `#tsp`,
+# else DIDComm, through the bridge's `mediator_did` unless this names
+# another:
 # mediator_did = "did:web:mediator.acme-vtc.example"
 ```
 
-The bridge talks to the VTA over DIDComm only: the VTA releases a private
-key only over a channel confidential end to end, never over REST, where the
-key would exist wherever TLS terminates.
+The bridge talks to the VTA over TSP when the VTA's DID document advertises
+it (a DIDComm session holds the mediator socket and the Trust Tasks go over
+TSP), else over DIDComm; a TSP leg that cannot be established falls back to
+DIDComm with a warning in the log. Never REST: the VTA releases a private key
+only over a channel confidential end to end, never over REST, where the key
+would exist wherever TLS terminates.
 
 **4. Check it.** `vta setup` verifies the context has a DID with both keys,
 the credential can fetch them and read, write and delete app-state, creates
@@ -309,7 +322,7 @@ rotation that means:
 
 1. The VTA mints the successor keys: not listed yet, so not used.
 2. The document lists old and new (the overlap): the bridge holds all of
-   them, and DIDComm reconnects with every listed key-agreement key, so a
+   them, and the mediator link reconnects with every listed key-agreement key, so a
    job encrypted to either key opens. The old key keeps signing until the new
    one has been listed for the horizon; then the new one signs.
 3. The document stops listing the old keys (the end of the overlap): the
@@ -571,11 +584,13 @@ repository writers are trusted not to forge the check —
   resource. An empty range (the head is already in the base) is a success
   only when the head *is* the base tip; otherwise it is a failure.
 - **How it asks the registry.** If the registry's DID document advertises
-  DIDComm, the bridge queries it **as its own DID** over the mediator session
-  it already holds for the VTC (the mediator allows one websocket per DID, so
-  it does not open another); otherwise over its `#rest` URL, so the registry's
-  REST interface is optional here too. A DIDComm answer counts only when the
-  transport proved it came from the registry's DID — a verified authcrypt
+  TSP or DIDComm (TSP first), the bridge queries it **as its own DID** over
+  the mediator session it already holds for the VTC (the mediator allows one
+  websocket per DID, so it does not open another); otherwise over its `#rest`
+  URL, so the registry's REST interface is optional here too. An answer
+  counts only when it came over the transport the query went out on, the
+  transport proved it came from the registry's DID — over TSP the sender VID
+  the message's signature verified against; over DIDComm a verified authcrypt
   sender, which the messaging SDK binds to the key its key agreement actually
   used (affinidi-messaging-sdk 0.27.2 / affinidi-messaging-didcomm 0.15.9 or
   later, required here) — and it answers a query in flight: every query
@@ -584,15 +599,14 @@ repository writers are trusted not to forge the check —
   private mode (`ACL_MODE=ExplicitAllow`) can admit it by name — add the
   bridge DID to the registry's allow list. A refusal, a link that is down, or
   no proven answer within 30 seconds fails the check (`registryUnavailable`),
-  with no fallback to HTTPS; the first such failure is not retried within the
-  same check.
+  with no fallback to another binding; the first such failure is not retried
+  within the same check.
 - **`transport` under `[verify_trust]`** chooses, for both the check the
   bridge posts and the workflows it writes (the action's `transport` input):
-  - `auto` (default) — the bridge's own check: DIDComm, then HTTPS; the
-    written workflows: TSP, then DIDComm, then HTTPS (no input written).
-  - `didcomm` or `https` — that binding only, for both.
-  - `tsp` — the written workflows only. The bridge never speaks TSP, so `tsp`
-    is refused at start while any GitHub forge has `bridge_checks` on.
+  - `auto` (default) — TSP, then DIDComm, then HTTPS, whichever the
+    registry advertises first, with no fallback once chosen (no input
+    written).
+  - `tsp`, `didcomm` or `https` — that binding only, for both.
 
   Set `https` while the registry's mediator does not admit a CI run's
   throwaway DID, or does not admit the bridge's DID.
@@ -923,8 +937,10 @@ they are not reported as drift. The report never carries anything for
   document does not publish, is checked once more against a fresh resolution
   before it is refused — so a rotated-in key is not refused for the cache's
   lifetime — and refused (closed) if it still fails.
-- The DIDComm link reconnects on its own with capped backoff; results and
-  events queued meanwhile go out when it is back.
+- The mediator link reconnects on its own with capped backoff; results and
+  events queued meanwhile go out when it is back. On each connect the bridge
+  offers the VTC a TSP relationship (its relationships live in memory), so a
+  VTC that kept its half reaches a restarted bridge.
 - A job that fails half-way reports `partial` with each step's outcome; every
   step is check-then-apply, so the VTC may simply send it again.
 - **What the VTC's console shows about the forge** comes from the bridge: each

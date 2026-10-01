@@ -138,13 +138,13 @@ pub trait CommitVerifier: Send + Sync {
 /// discovered from the registry's DID document and signer DIDs resolved
 /// under verify-trust's public-hosts-only policy.
 ///
-/// With a channel ([`VerifyTrustVerifier::with_channel`], which the bridge
-/// always sets), a registry advertising DIDComm is queried over it — as the
-/// bridge's own DID, on the bridge's mediator session — in preference to
-/// HTTPS, and a registry with no REST interface is reachable at all. TSP is
-/// never used: the bridge's session to its mediator is DIDComm.
-/// `[verify_trust] transport` chooses: `auto` (DIDComm, then HTTPS, no
-/// fallback), `didcomm` or `https`.
+/// With channels ([`VerifyTrustVerifier::with_channel`]; the bridge always
+/// sets one for TSP and one for DIDComm), a registry advertising TSP or
+/// DIDComm is queried over it — as the bridge's own DID, on the bridge's
+/// mediator session — in preference to HTTPS, and a registry with no REST
+/// interface is reachable at all. `[verify_trust] transport` chooses: `auto`
+/// (TSP, then DIDComm, then HTTPS, no fallback once chosen), `tsp`,
+/// `didcomm` or `https`.
 pub struct VerifyTrustVerifier {
     registry_did: String,
     vtc_did: String,
@@ -166,8 +166,9 @@ pub struct VerifyTrustVerifier {
     registry_override: Option<String>,
     /// `[verify_trust] transport`, for the bridge's own queries.
     transport: verify_trust::TransportSelector,
-    /// The bridge's own channel to the registry, for the DIDComm binding.
-    channel: Option<Arc<dyn verify_trust::RegistryChannel>>,
+    /// The bridge's own channels to the registry, one per mediated binding,
+    /// in preference order (TSP, then DIDComm).
+    channels: Vec<Arc<dyn verify_trust::RegistryChannel>>,
 }
 
 impl VerifyTrustVerifier {
@@ -190,7 +191,7 @@ impl VerifyTrustVerifier {
             re_resolved: Default::default(),
             registry_override: None,
             transport: bridge_transport(cfg.verify_trust.transport),
-            channel: None,
+            channels: Vec::new(),
         }
     }
 
@@ -210,16 +211,16 @@ impl VerifyTrustVerifier {
         self
     }
 
-    /// Query over `channel` (the bridge's own DID and session) when the
-    /// registry advertises its binding.
+    /// Also query over `channel` (the bridge's own DID and session) when the
+    /// registry advertises its binding. Channels added earlier are preferred.
     pub fn with_channel(mut self, channel: Arc<dyn verify_trust::RegistryChannel>) -> Self {
-        self.channel = Some(channel);
+        self.channels.push(channel);
         self
     }
 
     /// The bindings this verifier can use, in preference order.
     fn supported(&self) -> Vec<trql_client::TransportKind> {
-        let mut kinds: Vec<_> = self.channel.iter().map(|c| c.kind()).collect();
+        let mut kinds: Vec<_> = self.channels.iter().map(|c| c.kind()).collect();
         kinds.push(trql_client::TransportKind::Https);
         kinds
     }
@@ -245,14 +246,15 @@ impl VerifyTrustVerifier {
                 r
             }
         };
-        match (&route.kind, &self.channel) {
-            (trql_client::TransportKind::Https, _) => {
-                verify_trust::Registry::https(&route.endpoint, &self.registry_did)
-            }
-            (kind, Some(channel)) if *kind == channel.kind() => Ok(
-                verify_trust::Registry::over_channel(Arc::clone(channel), &self.registry_did),
-            ),
-            (kind, _) => bail!("the bridge cannot query the registry over {kind}"),
+        if route.kind == trql_client::TransportKind::Https {
+            return verify_trust::Registry::https(&route.endpoint, &self.registry_did);
+        }
+        match self.channels.iter().find(|c| c.kind() == route.kind) {
+            Some(channel) => Ok(verify_trust::Registry::over_channel(
+                Arc::clone(channel),
+                &self.registry_did,
+            )),
+            None => bail!("the bridge cannot query the registry over {}", route.kind),
         }
     }
 
@@ -272,9 +274,9 @@ impl VerifyTrustVerifier {
     }
 }
 
-/// `[verify_trust] transport` for the bridge's own queries: `auto` is DIDComm
-/// then HTTPS (the bridge never speaks TSP — `tsp` is refused when the config
-/// is loaded).
+/// `[verify_trust] transport` for the bridge's own queries: `auto` is TSP,
+/// then DIDComm, then HTTPS — whichever the registry advertises first, with
+/// no fallback once chosen.
 fn bridge_transport(t: vgi_forge::VerifyTransport) -> verify_trust::TransportSelector {
     match t {
         vgi_forge::VerifyTransport::Didcomm => verify_trust::TransportSelector::Didcomm,
@@ -1484,6 +1486,80 @@ fn summarise(lines: &[CommitLine], base_ref: &str) -> (CheckConclusion, String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bridge's own registry query: a channel per mediated binding, TSP
+    /// first, chosen by verify-trust's route selection with no fallback.
+    #[tokio::test]
+    async fn the_registry_is_queried_over_tsp_then_didcomm_then_https() {
+        use crate::registry_channel::{BridgeRegistryChannel, RegistryReplies};
+        use crate::transport::{Via, memory::ChannelLink};
+        use trql_client::TransportKind;
+
+        let cfg = crate::config::BridgeConfig::parse(crate::config::tests::EXAMPLE).unwrap();
+        let replies = Arc::new(RegistryReplies::new(cfg.trust_registry_did.clone()));
+        let (link, _sent) = ChannelLink::new();
+        let link: Arc<dyn crate::transport::VtcLink> = Arc::new(link);
+        let channel = |via| {
+            Arc::new(BridgeRegistryChannel::new(
+                Arc::clone(&link),
+                "did:key:z6MkBridge",
+                Arc::clone(&replies),
+                via,
+            ))
+        };
+        let v = VerifyTrustVerifier::new(&cfg)
+            .with_channel(channel(Via::Tsp))
+            .with_channel(channel(Via::Didcomm));
+        let ours = v.supported();
+        assert_eq!(
+            ours,
+            [
+                TransportKind::Tsp,
+                TransportKind::Didcomm,
+                TransportKind::Https
+            ]
+        );
+
+        let caps = |services: serde_json::Value| {
+            trql_client::ServiceCapabilities::from_document(&serde_json::json!({
+                "id": cfg.trust_registry_did, "service": services
+            }))
+        };
+        let both = caps(serde_json::json!([
+            { "id": "#didcomm", "type": "DIDCommMessaging", "serviceEndpoint": "did:web:m.example" },
+            { "id": "#tsp", "type": "TSPTransport", "serviceEndpoint": "did:web:m.example" },
+            { "id": "#rest", "type": "TRQPRest", "serviceEndpoint": "https://r.example" }
+        ]));
+        let pick = |caps: &trql_client::ServiceCapabilities, t| {
+            verify_trust::registry::choose_route(caps, bridge_transport(t), &ours)
+        };
+        assert_eq!(
+            pick(&both, vgi_forge::VerifyTransport::Auto).unwrap().kind,
+            TransportKind::Tsp
+        );
+        assert_eq!(
+            pick(&both, vgi_forge::VerifyTransport::Tsp).unwrap().kind,
+            TransportKind::Tsp
+        );
+        assert_eq!(
+            pick(&both, vgi_forge::VerifyTransport::Didcomm)
+                .unwrap()
+                .kind,
+            TransportKind::Didcomm
+        );
+        // `tsp` against a registry that does not advertise it: refused, not
+        // quietly sent over DIDComm.
+        let didcomm_only = caps(serde_json::json!([
+            { "id": "#didcomm", "type": "DIDCommMessaging", "serviceEndpoint": "did:web:m.example" }
+        ]));
+        assert!(pick(&didcomm_only, vgi_forge::VerifyTransport::Tsp).is_err());
+        assert_eq!(
+            pick(&didcomm_only, vgi_forge::VerifyTransport::Auto)
+                .unwrap()
+                .kind,
+            TransportKind::Didcomm
+        );
+    }
 
     /// A synthetic commit object: `parents`, signed with `armor` if any.
     fn commit(sha: &str, parents: &[&str], armor: Option<&str>) -> RangeCommit {

@@ -1,8 +1,8 @@
 [package]
 name = "vgi-bridge"
-description = "The per-community VGI bridge: holds the community's forge credentials, takes git-ns/bridge jobs from its VTC over DIDComm, runs the forge adapters, reports results, events and drift, and posts the commit-trust check where no forge feature can be trusted to."
+description = "The per-community VGI bridge: holds the community's forge credentials, takes git-ns/bridge jobs from its VTC over TSP or DIDComm, runs the forge adapters, reports results, events and drift, and posts the commit-trust check where no forge feature can be trusted to."
 readme = "README.md"
-keywords = ["git", "forge", "did", "didcomm", "trust-registry"]
+keywords = ["git", "forge", "did", "tsp", "trust-registry"]
 categories = ["development-tools", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
@@ -51,9 +51,10 @@ trql-client = { workspace = true, optional = true }
 trust-tasks-rs = { workspace = true }
 trust-tasks-proof = { workspace = true }
 
-# DIDComm to the VTC: the TDK's messaging SDK (ATM), its delivery layer, and
-# vta-sdk's did:key / DID-secrets-bundle → DIDComm secret helpers.
-affinidi-tdk = { workspace = true }
+# TSP and DIDComm to the VTC and the registry, on the one mediator socket:
+# the TDK's messaging SDK (ATM, built with TSP), its delivery layer, and
+# vta-sdk's DID-secrets-bundle helpers and TSP binding envelope.
+affinidi-tdk = { workspace = true, features = ["tsp"] }
 # Security floors, not new code: the messaging SDK and DIDComm crate the TDK
 # already builds, at the releases that bind an authcrypt sender to the key
 # actually used. See the workspace manifest.
@@ -61,9 +62,10 @@ affinidi-messaging-sdk = { workspace = true }
 affinidi-messaging-didcomm = { workspace = true }
 affinidi-messaging-delivery = { workspace = true }
 affinidi-messaging-core = { workspace = true }
-# VTA mode (`crate::vta`): the client, the session transports and
-# `connect_auto`.
-vta-sdk = { workspace = true, features = ["didcomm", "client", "session"] }
+# VTA mode (`crate::vta`): the client, the session transports (DIDComm, with
+# a TSP leg when the VTA advertises TSP) and `connect_auto`; `tsp` also
+# brings the `trust-tasks-tsp` binding envelope the VTC link uses.
+vta-sdk = { workspace = true, features = ["didcomm", "client", "session", "tsp"] }
 ed25519-dalek = { workspace = true }
 
 axum = { workspace = true }

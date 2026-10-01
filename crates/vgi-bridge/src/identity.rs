@@ -9,10 +9,11 @@
 //!   VTC's is (a DID template), and imports the resulting secrets bundle with
 //!   `vgi-bridge identity import`. The VTA mints; the bridge only holds.
 //! - **`did:peer:2`**, minted locally by `vgi-bridge init`. Nothing to host:
-//!   the identifier carries the keys *and* a `DIDCommMessaging` service
-//!   naming the mediator the bridge listens at, which is how the VTC finds
-//!   where to send jobs (it picks a transport from the services the bridge's
-//!   DID document advertises, and a `did:key` advertises none). Because the
+//!   the identifier carries the keys *and* a `TSPTransport` and a
+//!   `DIDCommMessaging` service naming the mediator the bridge listens at,
+//!   which is how the VTC finds where to send jobs (it picks a transport from
+//!   the services the bridge's DID document advertises — TSP first — and a
+//!   `did:key` advertises none). Because the
 //!   mediator is part of the identifier, moving the bridge to another
 //!   mediator means a new DID, registered again at the VTC.
 //! - **`did:key`**: still loaded from a store that holds one (earlier
@@ -24,8 +25,8 @@
 //! run time ([`crate::Bridge::replace_identity`]).
 //!
 //! Otherwise the private keys are held only in the sealed store, and the
-//! same keys serve DIDComm (authcrypt) and the Data Integrity proofs on every
-//! Trust Task document the bridge sends.
+//! same keys serve TSP, DIDComm (authcrypt) and the Data Integrity proofs on
+//! every Trust Task document the bridge sends.
 
 use std::fmt;
 
@@ -50,9 +51,13 @@ pub const IDENTITY_SECRET: &str = "identity";
 /// a long DID (a `did:peer` of its own) can push it past this.
 pub const MAX_DID_BYTES: usize = 1000;
 
-/// The DID-document service `type` of a DIDComm v2 endpoint (W3C) — what
-/// the VTC selects a bridge's transport by.
+/// The DID-document service `type` of a DIDComm v2 endpoint (W3C) — one of
+/// the services the VTC selects a bridge's transport by.
 pub const DIDCOMM_SERVICE_TYPE: &str = "DIDCommMessaging";
+
+/// The DID-document service `type` of a TSP endpoint, whose
+/// `serviceEndpoint` is the mediator's DID — the service the VTC prefers.
+pub const TSP_SERVICE_TYPE: &str = "TSPTransport";
 
 /// What the sealed identity secret holds.
 #[derive(Serialize, Deserialize)]
@@ -139,10 +144,11 @@ impl BridgeIdentity {
         })
     }
 
-    /// A new `did:peer:2` whose document advertises DIDComm through
+    /// A new `did:peer:2` whose document advertises TSP and DIDComm through
     /// `mediator_did`: an Ed25519 key that signs (and authenticates), an
-    /// X25519 key for key agreement, and one `DIDCommMessaging` service. The
-    /// returned bundle is what to seal ([`Self::store_bundle`]).
+    /// X25519 key for key agreement (and TSP's encryption), a `#tsp`
+    /// `TSPTransport` service and a `DIDCommMessaging` service. The returned
+    /// bundle is what to seal ([`Self::store_bundle`]).
     pub fn generate_did_peer(mediator_did: &str) -> Result<(Self, DidSecretsBundle)> {
         use affinidi_tdk::dids::{
             DID, OneOrMany, PeerKeyRole, PeerService, PeerServiceEndpoint, PeerServiceEndpointLong,
@@ -150,7 +156,7 @@ impl BridgeIdentity {
         if mediator_did.trim().is_empty() || !mediator_did.starts_with("did:") {
             bail!("`{mediator_did}` is not a mediator DID");
         }
-        let service = PeerService {
+        let didcomm = PeerService {
             type_: DIDCOMM_SERVICE_TYPE.into(),
             endpoint: PeerServiceEndpoint::Long(OneOrMany::One(PeerServiceEndpointLong {
                 uri: mediator_did.to_string(),
@@ -158,6 +164,14 @@ impl BridgeIdentity {
                 routing_keys: vec![],
             })),
             id: None,
+        };
+        // The shape the TSP stack reads a peer's mediator from: the bare
+        // mediator DID, no DIDComm `accept` (that would claim something
+        // untrue of TSP).
+        let tsp = PeerService {
+            type_: TSP_SERVICE_TYPE.into(),
+            endpoint: PeerServiceEndpoint::Uri(mediator_did.to_string()),
+            id: Some("#tsp".into()),
         };
         let (did, secrets) = DID::generate_did_peer_with_services(
             vec![
@@ -167,7 +181,7 @@ impl BridgeIdentity {
                 ),
                 (PeerKeyRole::Encryption, affinidi_tdk::dids::KeyType::X25519),
             ],
-            Some(vec![service]),
+            Some(vec![didcomm, tsp]),
         )
         .map_err(|e| anyhow::anyhow!("minting a did:peer: {e}"))?;
         if did.len() > MAX_DID_BYTES {
@@ -181,10 +195,16 @@ impl BridgeIdentity {
         }
         let bundle = bundle_of(&did, &secrets)?;
         let identity = Self::from_bundle(&bundle)?;
-        match advertised_mediator(&did)? {
-            Some(m) if m == mediator_did => {}
-            other => {
-                bail!("the minted did:peer advertises {other:?}, not `{mediator_did}`: refusing it")
+        for (kind, advertised) in [
+            ("DIDComm", advertised_mediator(&did)?),
+            ("TSP", advertised_tsp_mediator(&did)?),
+        ] {
+            match advertised {
+                Some(m) if m == mediator_did => {}
+                other => bail!(
+                    "the minted did:peer advertises {kind} at {other:?}, not `{mediator_did}`: \
+                     refusing it"
+                ),
             }
         }
         Ok((identity, bundle))
@@ -372,6 +392,18 @@ fn bundle_of(did: &str, secrets: &[Secret]) -> Result<DidSecretsBundle> {
 /// `did:web`): its document is its host's to publish, not the bridge's to
 /// second-guess.
 pub fn advertised_mediator(did: &str) -> Result<Option<String>> {
+    advertised_endpoint(did, DIDCOMM_SERVICE_TYPE)
+}
+
+/// Where a DID resolvable without the network says it takes TSP: the
+/// mediator DID its `TSPTransport` service names. `Ok(None)`: it advertises
+/// no TSP (a `did:key`, or a `did:peer` minted before the bridge spoke TSP).
+/// `Err` as for [`advertised_mediator`].
+pub fn advertised_tsp_mediator(did: &str) -> Result<Option<String>> {
+    advertised_endpoint(did, TSP_SERVICE_TYPE)
+}
+
+fn advertised_endpoint(did: &str, service_type: &str) -> Result<Option<String>> {
     if !(did.starts_with("did:key:") || did.starts_with("did:peer:")) {
         bail!("`{did}` is not resolvable without the network");
     }
@@ -387,8 +419,8 @@ pub fn advertised_mediator(did: &str) -> Result<Option<String>> {
     };
     Ok(services.iter().find_map(|svc| {
         let typed = match svc.get("type") {
-            Some(Value::String(t)) => t == DIDCOMM_SERVICE_TYPE,
-            Some(Value::Array(ts)) => ts.iter().any(|t| t == DIDCOMM_SERVICE_TYPE),
+            Some(Value::String(t)) => t == service_type,
+            Some(Value::Array(ts)) => ts.iter().any(|t| t == service_type),
             _ => false,
         };
         typed
@@ -411,7 +443,7 @@ fn endpoint_uri(endpoint: &Value) -> Option<String> {
 ///
 /// - `Ok(None)`: yes, or it cannot be told locally (a `did:webvh` publishes
 ///   its own document; the VTC resolves it).
-/// - `Ok(Some(warning))`: the DID advertises no DIDComm service (a
+/// - `Ok(Some(warning))`: the DID advertises no TSP or DIDComm service (a
 ///   `did:key`), so no VTC can send it jobs. The bridge still runs — results
 ///   and events still go out — but the operator must know.
 /// - `Err`: the DID names another mediator. A `did:peer` names its mediator
@@ -421,9 +453,17 @@ pub fn check_reachable(did: &str, mediator_did: &str) -> Result<Option<String>> 
     if !(did.starts_with("did:key:") || did.starts_with("did:peer:")) {
         return Ok(None);
     }
-    match advertised_mediator(did)? {
-        Some(m) if m == mediator_did => Ok(None),
-        Some(m) => bail!(
+    // A did:peer minted before the bridge spoke TSP advertises DIDComm only:
+    // still served (the VTC reaches it over DIDComm). One whose TSP or DIDComm
+    // service names another mediator is refused.
+    let tsp = advertised_tsp_mediator(did)?;
+    let didcomm = advertised_mediator(did)?;
+    if let Some(m) = [&tsp, &didcomm]
+        .into_iter()
+        .flatten()
+        .find(|m| m.as_str() != mediator_did)
+    {
+        bail!(
             "the bridge's DID `{did}` advertises the mediator `{m}`, but the config names \
              `{mediator_did}`. A did:peer names its mediator in its identifier, so the VTC \
              would send jobs to `{m}`, where this bridge would not be listening.\n\
@@ -432,9 +472,14 @@ pub fn check_reachable(did: &str, mediator_did: &str) -> Result<Option<String>> 
              Only for a bridge that serves no bound namespace: mint a new identity \
              (`vgi-bridge identity mint --replace --backup <file>`) and register the new DID \
              at the VTC — see `identity mint --help` for what a new DID breaks"
-        ),
+        );
+    }
+    match didcomm {
+        Some(_) => Ok(None),
+        // TSP only: reachable (checked above).
+        None if tsp.is_some() => Ok(None),
         None => Ok(Some(format!(
-            "the bridge's DID `{did}` advertises no DIDComm service, so no VTC can send it \
+            "the bridge's DID `{did}` advertises no TSP or DIDComm service, so no VTC can send it \
              jobs (they fail with `noMatchingProtocol`). Mint a did:peer that names the \
              mediator (`vgi-bridge identity mint --replace --backup <file>`) and register \
              the new DID at the VTC"
@@ -565,10 +610,15 @@ mod tests {
             "{}",
             id.did()
         );
-        // What the VTC selects a transport by: a `DIDCommMessaging` service
-        // naming the mediator, found in the document the DID resolves to.
+        // What the VTC selects a transport by: a `TSPTransport` and a
+        // `DIDCommMessaging` service naming the mediator, found in the
+        // document the DID resolves to.
         assert_eq!(
             advertised_mediator(id.did()).unwrap().as_deref(),
+            Some(MEDIATOR)
+        );
+        assert_eq!(
+            advertised_tsp_mediator(id.did()).unwrap().as_deref(),
             Some(MEDIATOR)
         );
         assert_eq!(check_reachable(id.did(), MEDIATOR).unwrap(), None);
@@ -629,10 +679,10 @@ mod tests {
     /// The VTC's own selection (`vtc-service` `git_ns::bridge`): resolve the
     /// bridge's DID with the DID cache client, read its services by type,
     /// and intersect with what the VTC speaks. A did:key fails exactly here
-    /// (`noMatchingProtocol`); a did:peer minted by `init` picks DIDComm
-    /// through its mediator.
+    /// (`noMatchingProtocol`); a did:peer minted by `init` picks TSP through
+    /// its mediator, and DIDComm from a VTC that speaks no TSP.
     #[tokio::test]
-    async fn the_vtc_selects_didcomm_for_a_did_peer_and_nothing_for_a_did_key() {
+    async fn the_vtc_selects_tsp_for_a_did_peer_and_nothing_for_a_did_key() {
         use affinidi_tdk::did_resolver::DIDCacheClient;
         use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
         use vta_sdk::protocol::matching::{Protocol, ServiceCapabilities, select_protocol};
@@ -641,7 +691,7 @@ mod tests {
             .unwrap();
         let (peer, _) = BridgeIdentity::generate_did_peer(MEDIATOR).unwrap();
         let key = BridgeIdentity::from_seed(&[5u8; 32]).unwrap();
-        for (id, want) in [(&peer, Some(Protocol::Didcomm)), (&key, None)] {
+        for (id, want) in [(&peer, Some(Protocol::Tsp)), (&key, None)] {
             let resolved = resolver.resolve(id.did()).await.unwrap();
             let doc = serde_json::to_value(&resolved.doc).unwrap();
             let theirs = ServiceCapabilities::from_did_document(&doc);
@@ -656,9 +706,18 @@ mod tests {
             assert_eq!(got, want, "{}", id.did());
             if want.is_some() {
                 assert_eq!(theirs.didcomm.as_deref(), Some(MEDIATOR));
-                // DIDComm only: the bridge speaks no TSP, so advertising it
-                // would have the VTC prefer a transport nobody answers.
-                assert_eq!(theirs.tsp, None);
+                assert_eq!(theirs.tsp.as_deref(), Some(MEDIATOR));
+                // A VTC built without TSP still reaches it over DIDComm.
+                let didcomm_only = ServiceCapabilities {
+                    tsp: None,
+                    ..ours.clone()
+                };
+                assert_eq!(
+                    select_protocol(&didcomm_only, &theirs, id.did())
+                        .unwrap()
+                        .protocol,
+                    Protocol::Didcomm
+                );
                 // verify-trust finds the key the bridge re-signs Dependabot
                 // commits with in the same document.
                 let signing = id.git_signing_key().unwrap().key.verifying_key().to_bytes();

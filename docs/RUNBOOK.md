@@ -377,10 +377,11 @@ both sides named. `registry-url` implies `https`.
 > or `transport = "https"` in the bridge's `[verify_trust]` (the workflows it
 > writes). A DIDComm reply is believed only if the authcrypt sender key id is
 > the key its key agreement actually used, and each query carries a random id.
-> The bridge-posted check queries over DIDComm as the bridge's own DID when the
-> registry advertises it (DIDComm, then HTTPS), which needs affinidi-messaging-sdk
-> 0.27.2 / affinidi-messaging-didcomm 0.15.9 or later; `transport = "tsp"` is
-> refused while GitHub `bridge_checks` are on.
+> The bridge-posted check queries over TSP or DIDComm as the bridge's own DID
+> when the registry advertises it (TSP, then DIDComm, then HTTPS), which over
+> DIDComm needs affinidi-messaging-sdk 0.27.2 / affinidi-messaging-didcomm
+> 0.15.9 or later; a TSP reply is believed only from the registry's own
+> verified sender VID.
 > `UNKNOWN-KEY` now says what usually causes it: the signer rotated their
 > key, and the commit must be re-signed with the current one.
 
@@ -1294,7 +1295,7 @@ fix where one applies.
 | `git-ns/account/link-status:unknownLink` | the link attempt is unknown, or forgotten (after 7 days) | start again (`l`) |
 | `permissionDenied` | the signer lacks the right; or an elevated or destructive action from someone who is not a community administrator (`elevated_requires_admin`); or a bind or reseat without the community-administrator capability | a community administrator does it |
 | `malformedRequest` | a DID that is not DID-core (`did:<method>:<id>`, the id only letters, digits, `.` `-` `_` `:` and `%`-escapes — no fragment, spaces or shell characters); a resource that is not forge-qualified; an unknown right | fix the value; `cnm` refuses these before signing |
-| `unavailable` | the bridge did not answer an in-line job (bind, link), or refused it — the message carries its code, e.g. `noMatchingProtocol` (no DIDComm service in the bridge's DID document: a `did:key` from an earlier release — `vgi-bridge identity mint --replace --backup <file>` — or a `did:webvh` whose template lacks it); earlier records at the name still being withdrawn (§8h); **two governed repositories recorded at one name** | check the bridge and its DID document, retry; for two at one name, below |
+| `unavailable` | the bridge did not answer an in-line job (bind, link), or refused it — the message carries its code, e.g. `noMatchingProtocol` (no TSP or DIDComm service in the bridge's DID document: a `did:key` from an earlier release — `vgi-bridge identity mint --replace --backup <file>` — or a `did:webvh` whose template lacks it); earlier records at the name still being withdrawn (§8h); **two governed repositories recorded at one name** | check the bridge and its DID document, retry; for two at one name, below |
 
 *Two governed repositories at one name* is refused rather than guessed at
 (*N governed repositories are recorded at …; an administrator must resolve

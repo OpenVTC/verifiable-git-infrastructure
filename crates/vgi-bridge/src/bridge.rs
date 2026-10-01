@@ -42,8 +42,8 @@ pub struct BridgeParts {
     /// How the bridge-posted check verifies commits.
     #[cfg(feature = "forge-github")]
     pub commits: Arc<dyn crate::checks::CommitVerifier>,
-    /// Registry answers in flight for the default verifier's DIDComm
-    /// channel, taken off the inbound stream ahead of the job path.
+    /// Registry answers in flight for the default verifier's TSP and
+    /// DIDComm channels, taken off the inbound stream ahead of the job path.
     #[cfg(feature = "forge-github")]
     pub registry_replies: Arc<crate::registry_channel::RegistryReplies>,
     /// How commits are fetched for the check.
@@ -64,17 +64,23 @@ impl BridgeParts {
         #[cfg(feature = "forge-github")]
         let (commits, fetcher, registry_replies) = {
             // The check queries the registry as the bridge's own DID over
-            // this link when the registry advertises DIDComm.
+            // this link when the registry advertises TSP or DIDComm (TSP
+            // first).
             let replies = Arc::new(crate::registry_channel::RegistryReplies::new(
                 config.trust_registry_did.clone(),
             ));
-            let channel = crate::registry_channel::BridgeRegistryChannel::new(
-                Arc::clone(&link),
-                identity.did(),
-                Arc::clone(&replies),
-            );
+            let channel = |via| {
+                Arc::new(crate::registry_channel::BridgeRegistryChannel::new(
+                    Arc::clone(&link),
+                    identity.did(),
+                    Arc::clone(&replies),
+                    via,
+                ))
+            };
             let c: Arc<dyn crate::checks::CommitVerifier> = Arc::new(
-                crate::checks::VerifyTrustVerifier::new(&config).with_channel(Arc::new(channel)),
+                crate::checks::VerifyTrustVerifier::new(&config)
+                    .with_channel(channel(crate::transport::Via::Tsp))
+                    .with_channel(channel(crate::transport::Via::Didcomm)),
             );
             (c, crate::checks::GitFetcher::new(&config.checks), replies)
         };
@@ -117,8 +123,8 @@ pub struct Bridge {
     did: String,
     /// Its keys, replaced when the VTA rotates them ([`Bridge::replace_identity`]).
     identity: std::sync::RwLock<BridgeIdentity>,
-    /// Bumped on every rotation, so the DIDComm link reconnects with the
-    /// new key-agreement key.
+    /// Bumped on every rotation, so the mediator link reconnects with the
+    /// new keys.
     rotation: tokio::sync::watch::Sender<u64>,
     pub(crate) store: Store,
     pub(crate) adapters: Adapters,
@@ -225,8 +231,8 @@ impl Bridge {
     }
 
     /// Put rotated keys in service: from now on every document and re-sign
-    /// is signed with `new`, and the DIDComm link reconnects with its
-    /// key-agreement key. The old keys are dropped. `Ok(false)`: the keys are
+    /// is signed with `new`, and the mediator link reconnects with the
+    /// new keys. The old keys are dropped. `Ok(false)`: the keys are
     /// the ones already in service. Refused for another DID — a rotation
     /// keeps the DID, and the VTC knows the bridge by it.
     pub fn replace_identity(&self, new: BridgeIdentity) -> Result<bool> {

@@ -7,7 +7,7 @@
 //!
 //! - the bridge's DID (a `did:webvh` the VTA minted into the context) and its
 //!   keys — Ed25519 for Trust Task proofs, job results and Dependabot
-//!   re-signs, X25519 for DIDComm — are fetched into memory at start-up
+//!   re-signs, X25519 for TSP and DIDComm — are fetched into memory at start-up
 //!   ([`Session::load_identity`]) and never written to disk or logs. Which
 //!   keys it holds is what its current DID document lists, through every
 //!   step of a rotation ([`refresh_keys`]). They are the
@@ -146,9 +146,16 @@ impl Session {
         }
     }
 
-    /// Authenticate once, over DIDComm through `vta.mediator_did` (the
-    /// bridge's mediator by default). Never REST: the VTA releases the
-    /// bridge's keys only over an end-to-end channel.
+    /// Authenticate once, through `vta.mediator_did` (the bridge's mediator
+    /// by default): over TSP when the VTA's DID document advertises it (a
+    /// DIDComm session holds the mediator socket, and Trust Tasks go over a
+    /// TSP leg — vta-sdk's own shape for this), else over DIDComm. Never
+    /// REST: the VTA releases the bridge's keys only over a channel
+    /// confidential end to end, and TSP and DIDComm both are.
+    ///
+    /// A TSP leg that cannot be established falls back to DIDComm, loudly
+    /// (vta-sdk's `Auto` policy): the fallback is to an equally end-to-end
+    /// channel, and a bridge that cannot fetch its keys cannot run at all.
     pub async fn connect(cfg: &VtaConfig, cred: &CredentialBundle) -> Result<Self> {
         let mediator = cfg
             .mediator_did
@@ -162,6 +169,28 @@ impl Session {
             .unwrap_or_default();
         if !url.is_empty() && !url_is_secure(&url) {
             bail!("the VTA URL must be https (cleartext only to loopback), got `{url}`");
+        }
+        if let Some(tsp_mediator) = vta_tsp_mediator(&cred.vta_did).await {
+            match VtaClient::connect_didcomm_with_tsp(
+                &cred.did,
+                &cred.private_key_multibase,
+                &cred.vta_did,
+                mediator,
+                &tsp_mediator,
+                (!url.is_empty()).then(|| url.clone()),
+            )
+            .await
+            {
+                Ok(client) => {
+                    tracing::info!(tsp_mediator = %tsp_mediator, "reached the VTA over TSP");
+                    return Ok(Session::from_client(client, cfg.context.clone()));
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    tsp_mediator = %tsp_mediator,
+                    "the VTA advertises TSP but it could not be reached over it; using DIDComm"
+                ),
+            }
         }
         let connected = VtaClient::connect_auto(vta_sdk::client::AutoConnect {
             vta_url: &url,
@@ -208,7 +237,7 @@ impl Session {
         &self.client
     }
 
-    /// Close the session (a DIDComm session holds a mediator slot).
+    /// Close the session (a mediator session holds a mediator slot).
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
     }
@@ -1282,6 +1311,26 @@ pub async fn attach(
     Ok((store, mirror, remote))
 }
 
+/// The mediator the VTA's `#tsp` (`TSPTransport`) service names, if its DID
+/// document advertises TSP. `None` when it does not, or the document cannot
+/// be read here (the DIDComm connect then reports the real failure).
+async fn vta_tsp_mediator(vta_did: &str) -> Option<String> {
+    use affinidi_tdk::did_resolver::DIDCacheClient;
+    use affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder;
+    let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        .await
+        .ok()?;
+    let resolved = match resolver.resolve(vta_did).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read the VTA's DID document for TSP");
+            return None;
+        }
+    };
+    let doc = serde_json::to_value(&resolved.doc).ok()?;
+    vta_sdk::protocol::matching::ServiceCapabilities::from_did_document(&doc).tsp
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     #![allow(dead_code)]
@@ -1952,6 +2001,7 @@ version = "v0.5.0"
             arc.handle_inbound(InboundDoc {
                 doc,
                 authenticated_sender: Some(vtc.did().into()),
+                via: crate::transport::Via::Didcomm,
             })
             .await;
             inbox.try_recv().expect("the bridge answered").1

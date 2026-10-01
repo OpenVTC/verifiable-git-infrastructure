@@ -1,5 +1,5 @@
 //! The bridge-posted check's registry query over DIDComm, end to end: the
-//! bridge's real `DidcommLink` on an in-process mediator, as the bridge's own
+//! bridge's real `MediatorLink` on an in-process mediator, as the bridge's own
 //! DID, against a fake registry on the same mediator. What is under test is
 //! that an honest answer arrives through `RegistryReplies::route`, and that a
 //! reply sealed with another DID's key but naming the registry's key in its
@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use trql_client::{TrqlError, TrqpQuery};
 use vgi_bridge::BridgeIdentity;
 use vgi_bridge::registry_channel::{BridgeRegistryChannel, RegistryReplies};
-use vgi_bridge::transport::DidcommLink;
+use vgi_bridge::transport::{MediatorLink, Via};
 
 const DIDCOMM_ENVELOPE: &str = "https://trusttasks.org/binding/didcomm/0.1/envelope";
 
@@ -267,11 +267,23 @@ async fn run(forged: bool) -> Run {
     let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
     let server = serve(env.clone(), registry.clone(), mallory, forged, delivered_tx);
 
-    // The bridge: a did:peer routed through this mediator, on its real link.
-    let (identity, _) = BridgeIdentity::generate_did_peer(env.mediator.did()).unwrap();
-    let (link, mut inbound) = DidcommLink::connect(&identity, env.mediator.did())
-        .await
-        .unwrap();
+    // The bridge: a did:peer routed through this mediator (DIDComm only — the
+    // harness mediator's own DID is a long did:peer, and a bridge-minted
+    // did:peer carrying it twice, for TSP and DIDComm, would pass the 1000-byte
+    // resolver limit), on its real link.
+    let bridge = env.add_user("Bridge").await.unwrap();
+    let signing = bridge
+        .secrets
+        .iter()
+        .find(|s| s.get_key_type() == affinidi_tdk::affinidi_crypto::KeyType::Ed25519)
+        .unwrap()
+        .clone();
+    let identity =
+        BridgeIdentity::from_secrets(&bridge.did, signing, bridge.secrets.clone()).unwrap();
+    let (link, mut inbound) =
+        MediatorLink::connect(&identity, env.mediator.did(), vec![registry.did.clone()])
+            .await
+            .unwrap();
     let link = Arc::new(link);
     let replies = Arc::new(RegistryReplies::new(registry.did.clone()));
     let surfaced = Arc::new(Mutex::new(Vec::new()));
@@ -290,7 +302,7 @@ async fn run(forged: bool) -> Run {
             }
         })
     };
-    let channel = BridgeRegistryChannel::new(link.clone(), identity.did(), replies)
+    let channel = BridgeRegistryChannel::new(link.clone(), identity.did(), replies, Via::Didcomm)
         .with_timeout(Duration::from_secs(8));
     let client = verify_trust::Registry::over_channel(Arc::new(channel), &registry.did);
     let result = client
