@@ -451,9 +451,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-messaging-sdk"
-version = "0.32.0"
+version = "0.32.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa3877ad34323d18e5228f7504ca2cbb59227313b086019c905458bc5f6097d9"
+checksum = "b284ccc5bc6b352ef2a8aef63ab84c185f3098c4e4ef7b36ee4cfa78864fc268"
 dependencies = [
  "affinidi-crypto",
  "affinidi-did-authentication",
@@ -2199,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6520,9 +6520,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-proof"
-version = "0.26.0"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c90e3443a643c028202d32b73c1136c253bd9610689055b2665d7e45dd1f544"
+checksum = "667a384bc0d0f479a03a66519d249a6e7888a86104ef9a355371165a3a361392"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -6538,9 +6538,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.26.0"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff5e5cf6e5bd8fab9b2d8214d0ba7e934bce5c4b7921174614ac0e9a6997af1c"
+checksum = "31cee56fe9192df0388cd94e6a7be9f13c9acc390d45e626f453f0e20369875d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6762,7 +6762,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -6805,7 +6805,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -6855,7 +6855,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6874,7 +6874,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6888,7 +6888,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "http",
@@ -6900,7 +6900,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6920,7 +6920,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6945,9 +6945,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.61.0"
+version = "0.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ac457205be0e0e52beb0e59851cfdc0a50a2aca751ebfe98e1d64b13667244e"
+checksum = "dfb8e7eccdc4d510d5a49a62959face1c43ae87fe961f4b831a5e5e427cddc78"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
