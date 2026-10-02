@@ -110,4 +110,4 @@ vta-sdk = { workspace = true, features = ["test-loopback"] }
 # A fixed verification-method resolver for the key-rotation test (a
 # did:webvh resolved without the network). Already in the graph through
 # trust-tasks-proof.
-affinidi-data-integrity = "0.7.11"
+affinidi-data-integrity = "0.8"
