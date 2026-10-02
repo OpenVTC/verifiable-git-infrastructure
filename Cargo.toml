@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.10.0", path = "crates/vgi-core" }
+vgi-core = { version = "0.11.0", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.10.0", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.11.0", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.10.0", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.10.0", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.10.0", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.11.0", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.11.0", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.11.0", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -266,7 +266,11 @@ trql-client = "0.22.0"
 # `affinidi-tdk ^0.22`, `affinidi-messaging-sdk ^0.32` and `trust-tasks-rs
 # ^0.26` (affinidi-data-integrity 0.8), so those, trql-client 0.22 and the test
 # mediator move together here.
-vta-sdk = { version = "0.61", default-features = false }
+#
+# 0.61 -> 0.62 keeps OpenVTC on one vta-sdk: 0.62 is a minor only because the
+# join-requests status types gained fields (VTI #1900, credential re-delivery).
+# Same TDK line; it declares `trust-tasks-rs ^0.26.1`, so that floor moves too.
+vta-sdk = { version = "0.62", default-features = false }
 affinidi-tdk = "0.22"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
@@ -414,11 +418,11 @@ affinidi-messaging-test-mediator = { version = "0.16", features = ["tsp"] }
 # names this same `trust-tasks-rs` directly now. The bridge is `publish =
 # false`, and signs and verifies with trust-tasks-proof on the same 0.23
 # line.
-trust-tasks-rs = { version = "0.26.0", default-features = false, features = ["git-ns"] }
+trust-tasks-rs = { version = "0.26.1", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
-trust-tasks-proof = "0.26.0"
+trust-tasks-proof = "0.26.1"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each
