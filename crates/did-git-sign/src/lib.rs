@@ -7,6 +7,7 @@
 //! re-running the VTA bootstrap.
 
 pub mod config;
+pub mod enable;
 pub mod init;
 pub mod names;
 pub mod policy;

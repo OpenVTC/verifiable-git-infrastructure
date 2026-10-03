@@ -89,70 +89,32 @@ pub fn install(args: InstallArgs<'_>) -> Result<InstallResult> {
         mediator_did: args.mediator_did,
     };
 
-    let config_path = if args.global {
-        SigningConfig::default_global_path()?
-    } else {
-        SigningConfig::repo_local_path()
-    };
-
+    // Since 0.14 this writes no git configuration and `args.global` is
+    // ignored. The identity is kept in did-git-sign's own directory, and a
+    // repository signs with it only once its settings are included there
+    // (`did-git-sign enable`, [`crate::enable`]), so an existing signing
+    // setup is never replaced.
+    let config_path = SigningConfig::default_global_path()?;
     cfg.save(&config_path)?;
     config::store_vta_credentials(&args.did_key_id, &vta_creds)?;
-
-    setup_git(&config_path, &cfg, args.global)?;
-
-    let entry = allowed_signers_entry(&cfg, args.verifying_key);
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    setup_allowed_signers(config_dir, &entry, args.global)?;
-
-    // Install the hook dispatcher that injects the Signed-by-DID trailer while
-    // preserving any repository hooks shadowed by core.hooksPath.
-    //
-    // Non-fatal, because the rest of the install is still worth keeping — but
-    // loudly so. Without the hook, commits carry no DID claim, and `sign`
-    // refuses them rather than writing something CI would reject as
-    // `noSignerDid`. Saying only "no trailer" would understate that: signing
-    // does not degrade here, it stops.
-    if let Err(e) = install_hook_dispatcher(args.global) {
-        eprintln!(
-            "warning: could not install the git hook that writes the Signed-by-DID trailer:\n  \
-             {e}\n  \
-             Until this is resolved, `git commit` will refuse to sign in this repository: \
-             a commit with no DID claim cannot be verified. Resolve the conflict above and \
-             re-run `did-git-sign init`, or set user.email to '{}' as the legacy claim.",
-            cfg.did_key_id
-        );
-    }
-
-    // If we just shadowed a global user.signingKey with a local one, tell
-    // the caller so they can surface it. Best-effort — failures here are
-    // non-fatal.
-    let overridden_global_signing_key = (!args.global)
-        .then(|| {
-            std::process::Command::new("git")
-                .args(["config", "--global", "user.signingKey"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .flatten();
+    append_allowed_signer(&allowed_signers_entry(&cfg, args.verifying_key))?;
+    install_hooks()?;
 
     Ok(InstallResult {
         config_path,
         ssh_public_key: ssh_public_key_string(args.verifying_key),
-        overridden_global_signing_key,
-        global_committer_email: args.global.then(|| cfg.did_key_id.clone()),
+        overridden_global_signing_key: None,
+        global_committer_email: None,
     })
 }
 
 /// Store one more identity without making it the default.
 ///
 /// Its credentials go in the keyring, under its `did:…#key-N`, and its key
-/// into the `allowed_signers` file beside the config, so `git log
-/// --show-signature` recognises its commits. The config file and the git
-/// config, which name the default identity, are left alone: the identity
-/// signs only where `did-git-sign.key` (or `DID_GIT_SIGN_KEY`) selects it.
+/// into did-git-sign's `allowed_signers` file, so `git log --show-signature`
+/// recognises its commits. The config file, which names the default
+/// identity, is left alone, and no git config is written: the identity signs
+/// only in repositories that include its settings (`did-git-sign enable`).
 /// Returns its SSH public key line.
 pub fn add_identity(args: InstallArgs<'_>) -> Result<String> {
     let cfg = SigningConfig {
@@ -168,26 +130,9 @@ pub fn add_identity(args: InstallArgs<'_>) -> Result<String> {
         mediator_did: args.mediator_did,
     };
     config::store_vta_credentials(&args.did_key_id, &vta_creds)?;
-
-    let config_path = if args.global {
-        SigningConfig::default_global_path()?
-    } else {
-        SigningConfig::repo_local_path()
-    };
-    let entry = allowed_signers_entry(&cfg, args.verifying_key);
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    setup_allowed_signers(config_dir, &entry, args.global)?;
-
+    append_allowed_signer(&allowed_signers_entry(&cfg, args.verifying_key))?;
+    install_hooks()?;
     Ok(ssh_public_key_string(args.verifying_key))
-}
-
-/// Select which identity signs, in this repository (`global = false`) or for
-/// every repository: `git config did-git-sign.key <did_key_id>`. The signer
-/// and the commit-msg hook both read it, so the key and the claim move
-/// together.
-pub fn set_signing_identity(global: bool, did_key_id: &str) -> Result<()> {
-    let scope = if global { "--global" } else { "--local" };
-    git_config(scope, "did-git-sign.key", did_key_id)
 }
 
 /// Tear down a did-git-sign install for `did_key_id`. Idempotent — every
@@ -203,104 +148,120 @@ pub fn set_signing_identity(global: bool, did_key_id: &str) -> Result<()> {
 /// failure.
 pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
     let mut summary = UninstallResult::default();
+    let data_config = SigningConfig::default_global_path()?;
+    let data_signers = crate::enable::allowed_signers_path()?;
 
-    let config_path = if global {
-        SigningConfig::default_global_path()?
-    } else {
-        SigningConfig::repo_local_path()
-    };
-
-    // 1. Remove SigningConfig JSON file (silently if absent).
-    if config_path.exists() {
-        match std::fs::remove_file(&config_path) {
-            Ok(()) => {
-                summary.removed_config_file = Some(config_path.clone());
-            }
-            Err(e) => {
-                summary
+    // 1. The config file, only when it names this identity: a profile being
+    //    removed must not take the default with it. A repository-local file
+    //    from before 0.14 (`.did-git-sign.json`) is removed the same way.
+    let mut config_files = vec![data_config.clone()];
+    if !global {
+        config_files.push(SigningConfig::repo_local_path());
+    }
+    for path in config_files {
+        let ours = SigningConfig::load(&path)
+            .map(|c| c.did_key_id == did_key_id)
+            .unwrap_or(false);
+        if ours {
+            match std::fs::remove_file(&path) {
+                Ok(()) => summary.removed_config_file = Some(path),
+                Err(e) => summary
                     .warnings
-                    .push(format!("could not remove {}: {e}", config_path.display()));
+                    .push(format!("could not remove {}: {e}", path.display())),
             }
         }
     }
 
-    // 2. Drop the keyring entries that are keyed by did_key_id. The
-    //    `delete_credential` API errors when the entry doesn't exist —
-    //    swallow that case.
+    // 2. The keyring entries keyed by this identity.
     for suffix in [":vta", ":token"] {
         let key = format!("{did_key_id}{suffix}");
         if let Ok(entry) = keyring_core::Entry::new(config::KEYRING_SERVICE, &key) {
             match entry.delete_credential() {
                 Ok(()) => summary.removed_keyring_entries.push(key),
                 Err(keyring_core::Error::NoEntry) => {}
-                Err(e) => {
-                    summary
-                        .warnings
-                        .push(format!("could not remove keyring entry '{key}': {e}"));
-                }
-            }
-        }
-    }
-
-    // 3. Strip the matching line out of allowed_signers (if the file
-    //    exists and contains an entry for this principal). Other principals
-    //    in the same file are preserved.
-    let signers_path = config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("allowed_signers");
-    if signers_path.exists() {
-        match std::fs::read_to_string(&signers_path) {
-            Ok(content) => {
-                let prefix = format!("{did_key_id} ");
-                let mut kept = Vec::new();
-                let mut removed = false;
-                for line in content.lines() {
-                    if line.trim_start().starts_with(&prefix) {
-                        removed = true;
-                    } else {
-                        kept.push(line);
-                    }
-                }
-                if removed {
-                    let mut new_content = kept.join("\n");
-                    if !new_content.is_empty() {
-                        new_content.push('\n');
-                    }
-                    // Atomic for the same reason as the install path: a reader
-                    // must never catch this file mid-truncate and conclude the
-                    // remaining principals are not allowed to sign.
-                    if let Err(e) = write_file_atomic(&signers_path, &new_content) {
-                        summary
-                            .warnings
-                            .push(format!("could not rewrite {}: {e}", signers_path.display()));
-                    } else {
-                        summary.allowed_signers_entry_removed = true;
-                    }
-                }
-            }
-            Err(e) => {
-                summary
+                Err(e) => summary
                     .warnings
-                    .push(format!("could not read {}: {e}", signers_path.display()));
+                    .push(format!("could not remove keyring entry '{key}': {e}")),
             }
         }
     }
 
-    // 4. Unset the git config keys we own at the install scope. Best
-    //    effort — `git config --unset` errors when the key isn't set,
-    //    which we ignore.
+    // 3. Its line in allowed_signers. Other identities' lines stay.
+    let mut signer_files = vec![data_signers.clone()];
+    if !global {
+        signer_files.push(PathBuf::from("allowed_signers"));
+    }
+    for signers_path in signer_files {
+        match remove_allowed_signer(&signers_path, did_key_id) {
+            Ok(true) => summary.allowed_signers_entry_removed = true,
+            Ok(false) => {}
+            Err(e) => summary.warnings.push(e.to_string()),
+        }
+    }
+
+    // 4. Its include files, and the lines that include them: every global
+    //    `include.path` / `includeIf.*.path`, and this repository's.
+    if let Ok(dir) = crate::enable::include_dir()
+        && let Ok(entries) = std::fs::read_dir(&dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if crate::enable::include_identity(&path).as_deref() != Some(did_key_id) {
+                continue;
+            }
+            match crate::enable::remove_references(&path) {
+                Ok(n) => summary.removed_include_lines += n,
+                Err(e) => summary.warnings.push(e.to_string()),
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => summary.removed_include_files.push(path),
+                Err(e) => summary
+                    .warnings
+                    .push(format!("could not remove {}: {e}", path.display())),
+            }
+        }
+    }
+
+    // 5. Settings an install before 0.14 wrote directly into git config.
+    //    Each is unset only while it still holds the value did-git-sign
+    //    wrote, so a signing setup the user has since restored is never
+    //    touched. `gpg.format` and `commit.gpgsign` are never unset: they are
+    //    as likely to be the user's own as ours.
     let scope = if global { "--global" } else { "--local" };
+    let config_str = data_config.to_string_lossy().into_owned();
+    let signers_str = data_signers.to_string_lossy().into_owned();
+    let legacy_local_config = std::env::current_dir()
+        .map(|d| d.join(SigningConfig::repo_local_path()))
+        .ok();
+    let is_ours = |key: &str, value: &str| -> bool {
+        let v = value.trim();
+        match key {
+            "gpg.ssh.program" => v == "did-git-sign",
+            "did-git-sign.key" => v == did_key_id,
+            "user.signingKey" | "gpg.ssh.defaultKeyFile" => {
+                v == config_str
+                    || v == ".did-git-sign.json"
+                    || legacy_local_config
+                        .as_ref()
+                        .is_some_and(|p| Path::new(v) == p.as_path())
+            }
+            "gpg.ssh.allowedSignersFile" => {
+                v == signers_str || Path::new(v).ends_with("did-git-sign/allowed_signers")
+            }
+            _ => false,
+        }
+    };
     for key in [
         "user.signingKey",
-        "gpg.format",
         "gpg.ssh.program",
         "gpg.ssh.defaultKeyFile",
         "gpg.ssh.allowedSignersFile",
-        "commit.gpgsign",
         "did-git-sign.key",
     ] {
-        if git_config_unset(scope, key) {
+        if let Ok(Some(value)) = git_config_get(scope, key)
+            && is_ours(key, &value)
+            && git_config_unset(scope, key)
+        {
             summary.git_config_keys_unset.push(key.to_string());
         }
     }
@@ -317,6 +278,33 @@ pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
     Ok(summary)
 }
 
+/// Remove `did_key_id`'s line from the allowed_signers file at `path`, if
+/// there is one. Returns whether a line was removed.
+fn remove_allowed_signer(path: &Path, did_key_id: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let prefix = format!("{did_key_id} ");
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(&prefix))
+        .collect();
+    if kept.len() == content.lines().count() {
+        return Ok(false);
+    }
+    let mut new_content = kept.join("\n");
+    if !new_content.is_empty() {
+        new_content.push('\n');
+    }
+    // Atomic: a reader must never catch this file mid-truncate and conclude
+    // the remaining principals are not allowed to sign.
+    write_file_atomic(path, &new_content)
+        .with_context(|| format!("could not rewrite {}", path.display()))?;
+    Ok(true)
+}
+
 /// Outcome of an [`uninstall`] call. None of the variants represent fatal
 /// errors — the caller is expected to render `warnings` if it wants to
 /// surface partial-state issues to the operator.
@@ -328,8 +316,13 @@ pub struct UninstallResult {
     pub removed_keyring_entries: Vec<String>,
     /// True when an allowed_signers line for this principal was removed.
     pub allowed_signers_entry_removed: bool,
-    /// Git config keys that were unset at the install scope.
+    /// Git config keys an install before 0.14 had written, unset because
+    /// they still held did-git-sign's values.
     pub git_config_keys_unset: Vec<String>,
+    /// did-git-sign include files removed (`<config dir>/did-git-sign/gitconfig/`).
+    pub removed_include_files: Vec<PathBuf>,
+    /// `include.path` / `includeIf.*.path` lines removed that named them.
+    pub removed_include_lines: usize,
     /// Best-effort warnings — used for display, not error propagation.
     pub warnings: Vec<String>,
 }
@@ -382,53 +375,6 @@ fn expected_hooks_dir(global: bool) -> Result<Option<PathBuf>> {
     Ok(Some(git_dir.join("did-git-sign-hooks")))
 }
 
-/// Initialize git configuration for DID-based SSH signing.
-pub fn setup_git(config_path: &Path, cfg: &SigningConfig, global: bool) -> Result<()> {
-    let scope = if global { "--global" } else { "--local" };
-    let config_path_str = config_path
-        .to_str()
-        .context("config path is not valid UTF-8")?;
-
-    // Set gpg format to ssh
-    git_config(scope, "gpg.format", "ssh")?;
-
-    // Set our tool as the signing program
-    // Git calls: <program> -Y sign -f <user.signingKey or defaultKeyFile> -n git
-    git_config(scope, "gpg.ssh.program", "did-git-sign")?;
-
-    // Point git to our config file as both the signing key and the fallback key file.
-    // user.signingKey takes precedence over gpg.ssh.defaultKeyFile when set, so we
-    // must set it here to override any global user.signingKey (e.g. an SSH public key)
-    // that would otherwise be passed as -f and cause a config parse error.
-    //
-    // NOTE: user.signingKey is conventionally a .pub path; using a .json path here
-    // is unconventional. Third-party tools inspecting this repo's git config will
-    // see a non-.pub value. This is an accepted trade-off — the local override is
-    // the only non-destructive way to win over a global user.signingKey without
-    // modifying the user's global git configuration.
-    git_config(scope, "user.signingKey", config_path_str)?;
-    git_config(scope, "gpg.ssh.defaultKeyFile", config_path_str)?;
-
-    // Enable commit signing by default
-    git_config(scope, "commit.gpgsign", "true")?;
-
-    // The committer identity IS the DID claim. With the Signed-by-DID trailer
-    // flow, the DID is injected as a trailer by the commit-msg hook rather
-    // than set as user.email. This lets user.email stay a normal email for
-    // git-host attribution (GitLab/GitHub account linking).
-    //
-    // For backwards compatibility, also store the DID in did-git-sign.key
-    // git config so the hook can read it.
-    git_config(scope, "did-git-sign.key", &cfg.did_key_id)?;
-
-    // Optionally set user.name
-    if let Some(name) = &cfg.user_name {
-        git_config(scope, "user.name", name)?;
-    }
-
-    Ok(())
-}
-
 /// Generate an allowed_signers file entry for verification.
 pub fn allowed_signers_entry(cfg: &SigningConfig, public_key_bytes: &[u8; 32]) -> String {
     let pub_b64 = base64_encode_pubkey(public_key_bytes);
@@ -468,16 +414,18 @@ fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
 }
 
 /// Set up the allowed_signers file for signature verification.
-pub fn setup_allowed_signers(config_dir: &Path, entry: &str, global: bool) -> Result<()> {
-    let signers_path = config_dir.join("allowed_signers");
-    let signers_path_str = signers_path
-        .to_str()
-        .context("signers path is not valid UTF-8")?;
-
-    // Append or create the allowed_signers file. Read-modify-write is still a
-    // race against a *concurrent* init — two personas provisioned at once can
-    // still lose one entry — but the write itself no longer exposes a
-    // truncated file to a reader mid-update.
+/// Add `entry` to did-git-sign's allowed_signers file, unless it is already
+/// there. The file is named to git only by the include files, so this
+/// changes no git configuration.
+pub fn append_allowed_signer(entry: &str) -> Result<()> {
+    let signers_path = crate::enable::allowed_signers_path()?;
+    if let Some(dir) = signers_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    // Read-modify-write is still a race against a *concurrent* init — two
+    // personas provisioned at once can still lose one entry — but the write
+    // itself never exposes a truncated file to a reader mid-update.
     let existing = std::fs::read_to_string(&signers_path).unwrap_or_default();
     if !existing.contains(entry) {
         let mut content = existing;
@@ -488,28 +436,6 @@ pub fn setup_allowed_signers(config_dir: &Path, entry: &str, global: bool) -> Re
         content.push('\n');
         write_file_atomic(&signers_path, &content)?;
     }
-
-    let scope = if global { "--global" } else { "--local" };
-    git_config(scope, "gpg.ssh.allowedSignersFile", signers_path_str)?;
-
-    Ok(())
-}
-
-/// Run `git config <scope> <key> <value>`.
-fn git_config(scope: &str, key: &str, value: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("config")
-        .arg(scope)
-        .arg(key)
-        .arg(value)
-        .output()
-        .context("failed to run git config")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git config {scope} {key} failed: {stderr}");
-    }
-
     Ok(())
 }
 
@@ -707,8 +633,8 @@ fn classify_commit_msg_hook(path: PathBuf, content: Option<&str>) -> CommitMsgHo
 /// Inspect the commit-msg hook git would run from the current directory.
 ///
 /// Inside a repository that is `git rev-parse --git-path hooks/commit-msg`,
-/// which honours `core.hooksPath` at every scope; outside one, the global
-/// `core.hooksPath` is the only place a `--global` install can be found.
+/// which honours `core.hooksPath` at every scope, included files too; outside
+/// one, the global `core.hooksPath` or did-git-sign's own hook directory.
 pub fn commit_msg_hook_status() -> Result<CommitMsgHookStatus> {
     let output = Command::new("git")
         .args(["rev-parse", "--git-path", "hooks/commit-msg"])
@@ -722,9 +648,12 @@ pub fn commit_msg_hook_status() -> Result<CommitMsgHookStatus> {
             .map(|cwd| cwd.join(&path))
             .unwrap_or(path)
     } else {
+        // Outside a repository: a global `core.hooksPath` (an install
+        // before 0.14), else did-git-sign's own hook directory, which the
+        // include files point repositories at.
         match git_config_get("--global", "core.hooksPath")? {
             Some(dir) => PathBuf::from(dir.trim()).join("commit-msg"),
-            None => return Ok(CommitMsgHookStatus::Unknown),
+            None => crate::enable::hooks_dir()?.join("commit-msg"),
         }
     };
     let content = std::fs::read_to_string(&path).ok();
@@ -771,59 +700,23 @@ exec "$repo_hook" "$@"
     )
 }
 
-/// Install the hook dispatcher that injects the `Signed-by-DID:` trailer while
-/// delegating every other standard Git hook back to the repository's default
-/// `.git/hooks` directory.
-///
-/// For a **local** install, writes to `.git/did-git-sign-hooks/` in the current
-/// repo and sets repo-local `core.hooksPath`. For a **global** install, writes
-/// to `~/.config/did-git-sign/hooks/` and sets global `core.hooksPath` (git
-/// 2.9+). The original `.git/hooks` directory remains the source for repository
-/// hooks, including hooks added after did-git-sign is installed.
-fn install_hook_dispatcher(global: bool) -> Result<()> {
-    let hooks_dir = expected_hooks_dir(global)?
-        .context("not inside a git repository — cannot install hook dispatcher")?;
-    let scope = if global { "--global" } else { "--local" };
-
-    // `core.hooksPath` is a single slot, and husky, lefthook and pre-commit
-    // all claim it. Taking it from one of them is silent breakage: the
-    // delegating hooks below fall back to `$git_dir/hooks`, never to whatever
-    // was configured here before, so every hook that tool installed simply
-    // stops running. Refuse in both scopes — the local case is the common one.
-    if let Some(existing) = git_config_get(scope, "core.hooksPath")?
-        && Path::new(existing.trim()) != hooks_dir
-    {
-        anyhow::bail!(
-            "{scope} core.hooksPath is already set to '{existing}'; refusing to overwrite it. \
-             Unset it, or add the Signed-by-DID trailer logic to that directory's commit-msg \
-             hook manually."
-        );
-    }
-
-    let hooks_dir_str = hooks_dir
-        .to_str()
-        .context("hooks directory path is not valid UTF-8")?
-        .to_string();
-
-    // Populate the directory *before* pointing git at it. `write_executable_hook`
-    // refuses to clobber a hook it did not write, so this loop can fail partway;
-    // if `core.hooksPath` already named this directory by then, the hooks that
-    // were never written would silently stop running instead of the install
-    // failing cleanly with the old configuration still intact.
-    std::fs::create_dir_all(&hooks_dir)?;
+/// Write the hook dispatcher into did-git-sign's hook directory: a
+/// commit-msg hook that adds the `Signed-by-DID:` trailer, and for every
+/// other standard hook a stub that runs the repository's own `.git/hooks`
+/// one. Git uses it only in repositories whose included settings point
+/// `core.hooksPath` here; no git configuration is written.
+pub fn install_hooks() -> Result<()> {
+    let hooks_dir = crate::enable::hooks_dir()?;
+    std::fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("failed to create {}", hooks_dir.display()))?;
     for hook_name in STANDARD_GIT_HOOKS {
-        let hook_path = hooks_dir.join(hook_name);
         let content = if *hook_name == "commit-msg" {
             COMMIT_MSG_HOOK.to_string()
         } else {
             delegating_hook(hook_name)
         };
-
-        write_executable_hook(&hook_path, &content)?;
+        write_executable_hook(&hooks_dir.join(hook_name), &content)?;
     }
-
-    git_config(scope, "core.hooksPath", &hooks_dir_str)?;
-
     Ok(())
 }
 
@@ -930,19 +823,21 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_allowed_signers_creates_file() {
+    fn remove_allowed_signer_keeps_the_other_principals() {
         let dir = tempfile::tempdir().unwrap();
-        let entry = "did:webvh:test:host#key-0 ssh-ed25519 AAAA";
-
-        // We cannot test the git config part without a git repo, but we can test
-        // the file-writing portion by calling the function in a git repo context.
-        // Instead, verify the file-writing logic directly:
-        let signers_path = dir.path().join("allowed_signers");
-        let content = format!("{entry}\n");
-        std::fs::write(&signers_path, &content).unwrap();
-
-        let read_back = std::fs::read_to_string(&signers_path).unwrap();
-        assert!(read_back.contains(entry));
+        let path = dir.path().join("allowed_signers");
+        std::fs::write(
+            &path,
+            "did:x:bob#key-0 ssh-ed25519 AAAA\ndid:x:carol#key-0 ssh-ed25519 BBBB\n",
+        )
+        .unwrap();
+        assert!(remove_allowed_signer(&path, "did:x:bob#key-0").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "did:x:carol#key-0 ssh-ed25519 BBBB\n"
+        );
+        assert!(!remove_allowed_signer(&path, "did:x:bob#key-0").unwrap());
+        assert!(!remove_allowed_signer(&dir.path().join("absent"), "did:x:bob#key-0").unwrap());
     }
 
     #[test]
@@ -1449,7 +1344,7 @@ mod tests {
     /// slot would silently stop every hook that tool installed.
     #[test]
     #[serial_test::serial]
-    fn install_hook_dispatcher_refuses_to_take_a_local_hooks_path_it_does_not_own() {
+    fn enable_refuses_to_take_a_local_hooks_path_it_does_not_own() {
         let dir = tempfile::tempdir().unwrap();
         Command::new("git")
             .args(["init", "-q"])
@@ -1464,17 +1359,69 @@ mod tests {
 
         let err = {
             let _cwd = CwdGuard::change_to(dir.path());
-            install_hook_dispatcher(false).unwrap_err().to_string()
+            let include = crate::enable::include_path("test").unwrap();
+            crate::enable::enable_repo(&include)
+                .unwrap_err()
+                .to_string()
         };
         assert!(err.contains(".husky"), "names the path it refused: {err}");
 
-        // And it must have left that configuration alone.
-        let out = Command::new("git")
-            .args(["-C", dir.path().to_str().unwrap()])
-            .args(["config", "--local", "core.hooksPath"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ".husky");
+        // It left that configuration alone, and added no include.
+        let get = |key: &str| {
+            let out = Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(["config", "--local", "--get-all", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(get("core.hooksPath"), ".husky");
+        assert_eq!(get("include.path"), "");
+    }
+
+    /// Enabling a repository adds exactly one `include.path` line; enabling
+    /// another identity replaces it; disabling removes it and leaves every
+    /// other setting, other includes included, as it was.
+    #[test]
+    #[serial_test::serial]
+    fn enable_and_disable_touch_only_their_own_include_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(["-C", &d])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.signingKey", "~/.ssh/id_ed25519.pub"]);
+        git(&["config", "--add", "include.path", "/somewhere/else.inc"]);
+        let local =
+            || String::from_utf8_lossy(&git(&["config", "--local", "--list"]).stdout).to_string();
+        let before = local();
+
+        let bob = crate::enable::include_path("bob").unwrap();
+        let carol = crate::enable::include_path("carol").unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+
+        crate::enable::enable_repo(&bob).unwrap();
+        assert_eq!(crate::enable::repo_include(), Some(bob.clone()));
+        crate::enable::enable_repo(&carol).unwrap();
+        assert_eq!(crate::enable::repo_include(), Some(carol.clone()));
+        let includes = String::from_utf8_lossy(
+            &git(&["config", "--local", "--get-all", "include.path"]).stdout,
+        )
+        .to_string();
+        assert_eq!(
+            includes.lines().collect::<Vec<_>>(),
+            vec!["/somewhere/else.inc", carol.to_str().unwrap()],
+            "one did-git-sign include, and the other include kept"
+        );
+
+        assert!(crate::enable::disable_repo().unwrap());
+        assert_eq!(local(), before, "disable restores the config exactly");
+        assert!(!crate::enable::disable_repo().unwrap());
     }
 
     #[test]
@@ -1515,81 +1462,6 @@ mod tests {
         fn drop(&mut self) {
             // Best-effort restore; ignore errors (e.g. if the temp dir was already removed).
             let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
-    /// `setup_git` must write the signing DID into `did-git-sign.key` git
-    /// config so the commit-msg hook can read it and inject the
-    /// `Signed-by-DID:` trailer. Previously the DID was written to
-    /// `user.email`, but that broke git-host attribution (GitLab/GitHub
-    /// account linking).
-    #[test]
-    #[serial_test::serial]
-    fn setup_git_writes_did_to_git_config_key() {
-        let dir = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
-        let original_cwd = std::env::current_dir().unwrap();
-        {
-            let _cwd = CwdGuard::change_to(dir.path());
-            let config_path = dir.path().join(".did-git-sign.json");
-            let cfg = SigningConfig {
-                did_key_id: "did:webvh:test#key-0".to_string(),
-                user_name: None,
-            };
-            setup_git(&config_path, &cfg, false).unwrap();
-        }
-        assert_eq!(
-            std::env::current_dir().unwrap(),
-            original_cwd,
-            "CwdGuard must restore the original directory on drop"
-        );
-
-        // did-git-sign.key must carry the signing DID for the commit-msg hook.
-        let out = std::process::Command::new("git")
-            .args([
-                "-C",
-                dir.path().to_str().unwrap(),
-                "config",
-                "--local",
-                "did-git-sign.key",
-            ])
-            .output()
-            .unwrap();
-
-        assert!(
-            out.status.success(),
-            "did-git-sign.key must be set by setup_git"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "did:webvh:test#key-0",
-        );
-
-        // user.email must NOT be overwritten to a DID.
-        let email_out = std::process::Command::new("git")
-            .args([
-                "-C",
-                dir.path().to_str().unwrap(),
-                "config",
-                "--local",
-                "user.email",
-            ])
-            .output()
-            .unwrap();
-
-        if email_out.status.success() {
-            let email = String::from_utf8_lossy(&email_out.stdout)
-                .trim()
-                .to_string();
-            assert!(
-                !email.starts_with("did:"),
-                "user.email must not be set to a DID (got {email})"
-            );
         }
     }
 }
