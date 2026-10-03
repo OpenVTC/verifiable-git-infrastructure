@@ -36,6 +36,11 @@
 //!   the bridge runs verify-trust on each pull request and posts the check
 //!   as the App ([`checks`]), and the ruleset requires it from the App's own
 //!   integration id, which no workflow can post as (§9).
+//! - **Pull-request gate.** `pull_request` `opened` / `reopened` become
+//!   [`vgi_forge::ForgeEventKind::PullRequestOpened`] (who and where, never
+//!   what), and the four [`vgi_forge::Forge`] pull-request calls read a pull
+//!   request, find the App's own comment, comment and close, for the
+//!   bridge's `closePullRequest` job (needs `pull_requests: write`).
 //! - **Dependabot re-sign.** `push` deliveries (who moved which branch) and
 //!   a per-repository push token, for the bridge to re-sign Dependabot pull
 //!   requests with its own DID on signed provenance ([`resign`]).
@@ -50,6 +55,7 @@ mod forge;
 pub mod jwt;
 pub mod manifest;
 pub mod plan;
+mod pulls;
 pub mod resign;
 mod secret;
 pub mod webhook;

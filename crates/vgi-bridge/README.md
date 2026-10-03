@@ -20,9 +20,9 @@ the bridge carries it out and reports back.
   the VTC reaches it through, with every key sealed (AES-256-GCM under a
   mounted master key) in a redb store. It serves **one** VTC and refuses a
   document from any other DID, whatever its proof.
-- **Protocol.** `git-ns/bridge/job` 0.4 in (older versions refused
+- **Protocol.** `git-ns/bridge/job` 0.5 and 0.4 in (older versions refused
   `unsupportedVersion`; `trust-task-discovery/0.2` from the VTC is answered
-  with the 0.4 type URI); exactly one `git-ns/bridge/result`
+  with both type URIs); exactly one `git-ns/bridge/result`
   per job; `git-ns/bridge/event`s for what happens on the forge. The payload
   types are generated from the normative specifications
   (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed
@@ -32,8 +32,8 @@ the bridge carries it out and reports back.
 - **Jobs.** `jobId` idempotency from a durable ledger (a repeat is answered,
   never run twice; a finished job repeated has its result sent again;
   different content is `jobIdReused`). `createRepo`, `bootstrap`,
-  `projectRoles`, `archive`, `inspect` map onto the forge-neutral `Forge`
-  trait with the adapter's `ForgeHooks` around each operation; `beginBind`
+  `projectRoles`, `archive`, `inspect` and (0.5) `closePullRequest` map onto
+  the forge-neutral `Forge` trait with the adapter's `ForgeHooks` around each operation; `beginBind`
   and `beginAccountLink` answer with `next` and complete through the forge's
   redirect or the device flow, reporting `bindCompleted` / `accountLinked`
   then the result. A 0.2 `projectRoles` may name `removeAccounts` — the
@@ -60,6 +60,14 @@ the bridge carries it out and reports back.
 - **Events and drift.** Webhooks are verified before they are parsed, then
   used only as a prompt to inspect; forges without webhooks are swept on a
   schedule.
+- **The pull-request gate.** With `event_version = "0.4"` (opt-in: only for
+  a VTC that lists event 0.4), a GitHub pull request opened or reopened on a
+  managed repository is reported as `pullRequestOpened` — who and where,
+  never what. A `closePullRequest` job (job 0.5) posts the community's
+  message and closes it, idempotently: nothing for one already closed or
+  reopened by someone else since the job, and never a second comment for the
+  same job (a hidden marker on the App's own comment). Needs the App's
+  `pull_requests: write`; hygiene, not the merge gate.
 - **The bridge-posted check.** Where GitHub has no org required workflow
   (personal accounts, organisations without org rulesets), the bridge runs
   verify-trust as a library against each pull request's commits — fetched as

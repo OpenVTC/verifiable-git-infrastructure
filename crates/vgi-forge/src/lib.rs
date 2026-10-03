@@ -28,6 +28,7 @@ mod event;
 mod forge;
 mod hooks;
 mod model;
+mod pulls;
 mod resource;
 mod rights;
 
@@ -49,6 +50,7 @@ pub use model::{
     Namespace, NamespaceBinding, NamespaceKind, Projection, ProtectionState, RepoSpec, RepoState,
     RequiredCheckKind, RoleAssignment, RoleChange, RoleOutcome, Unlisted, Visibility,
 };
+pub use pulls::{PullRequest, PullRequestState, Reopen};
 pub use resource::{OWNER_REPO_DEPTH, Resource};
 pub use rights::{EffectiveRights, ForgeRole, Right, RoleMap, collapse_to_ladder};
 

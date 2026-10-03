@@ -61,6 +61,21 @@ use crate::secret::Secret;
 /// current base. None of them reaches code: checks only posts check runs,
 /// and the reads see pull request and queue metadata. Tokens for them are
 /// minted per pull request, for that one repository.
+///
+/// Pull requests is requested at **write**, not read, for one more thing:
+/// the **pull-request gate** (`git-ns/bridge/job` 0.5 `closePullRequest`).
+/// When the community's pull-request policy does not allow a pull request's
+/// author, the VTC has the bridge post the community's message on it and
+/// close it. GitHub files a pull request's conversation comments under
+/// Issues *or* Pull requests (write) and closing one under Pull requests
+/// (write) alone, so `pull_requests: write` is the single least permission
+/// that does both — Issues is not requested. It reaches no code either: it
+/// cannot push, and merging needs Contents. Tokens for it are minted per
+/// job, for the one repository. An installation that approved only `read`
+/// keeps everything else (the bridge-posted check needs only
+/// [`CHECK_PERMISSIONS`]); its `closePullRequest` jobs fail `forbidden`, and
+/// the binding's `missing_permissions` lists `pull_requests:write` until the owner
+/// approves the upgrade.
 pub const APP_PERMISSIONS: [(&str, &str); 9] = [
     ("actions_variables", "write"),
     ("administration", "write"),
@@ -70,7 +85,7 @@ pub const APP_PERMISSIONS: [(&str, &str); 9] = [
     ("merge_queues", "read"),
     ("metadata", "read"),
     ("organization_administration", "write"),
-    ("pull_requests", "read"),
+    ("pull_requests", "write"),
 ];
 
 /// What the bridge-posted check needs on an installation: the permissions

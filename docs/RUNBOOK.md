@@ -1146,7 +1146,8 @@ Dependabot will not update the pull request after your push;
 A manifest change reaches only new App registrations. When a release adds a
 permission or an event — the bridge-posted check (Checks, Pull requests,
 Merge queues; `pull_request`, `merge_group`, `check_run`, `check_suite`), the
-Dependabot re-sign (`push`) — an existing App keeps working with what it has,
+Dependabot re-sign (`push`), the pull-request gate (Pull requests raised from
+read to **write**) — an existing App keeps working with what it has,
 and the bridge says what it lacks: in its log, on the console's namespace card
 (*missing permissions*, *permission upgrade pending*), and in
 `cnm --json git namespace list` (`forgeStatus.missingPermissions`,
@@ -1161,7 +1162,10 @@ and the bridge says what it lacks: in its log, on the console's namespace card
    at its next inspection.
 
 A newly subscribed `push` re-signs only Dependabot branches created after it.
-The detail of each upgrade is in BRIDGE.md §3.
+Without Pull requests (write) the gate's `closePullRequest` jobs report the
+`comment` step `forbidden` and `close` `skipped`, the bridge lists
+`pull_requests:write` in `missingPermissions`, and the pull request stays
+open; nothing else is affected. The detail of each upgrade is in BRIDGE.md §3.
 
 ### 8g. A headless namespace: reseat
 
@@ -1368,7 +1372,7 @@ outcomes (the Repos page).
 | Code | Cause | Fix |
 |---|---|---|
 | `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
-| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 only | upgrade the VTC |
+| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 and 0.5 only | upgrade the VTC |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
 | VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
 | bind fails `notCapable` ("not bound") for an organisation on a host with several Apps | no `[[github]]` entry (and registered App) for that organisation: add one and register its App (BRIDGE.md §3) | — |
@@ -1381,7 +1385,8 @@ outcomes (the Repos page).
 | step `rateLimited` | the forge's rate limit | the job is retried |
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
-| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default) | update the VTC, or `event_version = "0.2"` (or `"0.1"` for a VTC older than 0.2) meanwhile; the VTC is then not told the role map (BRIDGE.md §7) |
+| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default), or older than 0.4 with `event_version = "0.4"` set | update the VTC, or set the version it takes (`"0.3"`, `"0.2"`, `"0.1"`) meanwhile; below 0.3 the VTC is not told the role map, below 0.4 no pull requests (BRIDGE.md §7) |
+| the pull-request gate closes nothing | `event_version` below 0.4 (the default), the VTC not on job 0.5, the App without Pull requests (write), or a Forgejo namespace (no gate yet) | §8m |
 
 ### 8l. Separation of duties and break-glass
 
@@ -1453,3 +1458,30 @@ code shown on the requester's screen, which approval never proceeds without.
 It takes effect on the approval that reaches the threshold.
 
 [vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure
+
+### 8m. The pull-request gate
+
+The community decides who may open pull requests on its governed
+repositories — anyone (the default), members, committers, maintainers, or
+named VTC roles — with the **`pr_open`** setting of its `gitNamespace`
+policy at the VTC, and the message a closed pull request gets. Owners,
+maintainers and the bridge are always allowed, and an owner's or
+maintainer's reopen of a pull request the gate closed is an override.
+
+The bridge's part (BRIDGE.md §6d): it reports each pull request opened or
+reopened on a managed repository, and closes one when the VTC says so, with
+the community's message. For that it needs:
+
+- `event_version = "0.4"` in its config, once the VTC lists
+  `git-ns/bridge/event/0.4` in its discovery answer (never the default —
+  BRIDGE.md §7);
+- a bridge that takes `git-ns/bridge/job` 0.5 (this one), which the VTC
+  learns from discovery;
+- the GitHub App's Pull requests at **write** (§8f).
+
+Forgejo namespaces have no gate yet (`closePullRequest` is `notCapable`).
+
+**This is hygiene, not the merge gate.** The required commit-trust check is
+still what stops untrusted code from merging. While the VTC or the bridge is
+down, or the App lacks the permission, pull requests simply stay open; a
+pull request the gate let through is not "approved" for anything.

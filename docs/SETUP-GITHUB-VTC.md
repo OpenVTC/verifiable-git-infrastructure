@@ -153,7 +153,7 @@ public_url         = "https://bridge.acme-vtc.example/"      # must be https
 listen             = "0.0.0.0:8080"
 data_dir           = "/var/lib/vgi-bridge"
 master_key_file    = "/run/secrets/vgi-bridge-master-key"
-# event_version = "0.3"   # the default; see step 3.3
+# event_version = "0.3"   # the default; "0.4" for the pull-request gate (step 3.3)
 
 [verify_trust]
 # What the bootstrap writes into workflows. The action must be pinned to a
@@ -307,10 +307,13 @@ The bridge registers its own App, so no one copies a private key by hand.
    If the exchange fails (GitHub down), open the same link again — it is spent
    only once an App is registered.
 
-The App asks for repository Administration, Contents, Variables and Checks
-(write), Metadata, Pull requests and Merge queues (read); organisation
+The App asks for repository Administration, Contents, Variables, Checks and
+Pull requests (write), Metadata and Merge queues (read); organisation
 Members (read) and Administration (write). No secrets, no `workflows`, no
-Actions logs. Why each one is there is in BRIDGE.md §3.
+Actions logs, no Issues. Pull requests is at write for the pull-request gate
+(closing a pull request the community's policy does not allow, with its
+message); an App registered before it asked for write keeps working without
+the gate (BRIDGE.md §3). Why each one is there is in BRIDGE.md §3.
 
 ### 3.2 Enable Device Flow — by hand
 
@@ -330,6 +333,10 @@ once your VTC serves 0.3. A VTC that serves only 0.2 needs
 `event_version = "0.2"`, and one older than that `"0.1"` (it would otherwise
 refuse every event as an unsupported type); what the versions do
 differently is in BRIDGE.md §7.
+
+For the **pull-request gate** (RUNBOOK §8m), set `event_version = "0.4"`
+once your VTC lists `git-ns/bridge/event/0.4` in its discovery answer. It is
+never the default: a VTC that does not take 0.4 would refuse every event.
 
 **Success looks like:** the bridge's log says the adapter for `github.com` is
 in service; the App appears under the organisation's *Settings → Developer

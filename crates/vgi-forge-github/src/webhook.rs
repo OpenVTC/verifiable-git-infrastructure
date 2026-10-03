@@ -121,6 +121,17 @@ pub fn parse(
                 action: action.to_string(),
             })
         }
+        // The pull-request gate (`git-ns/bridge/event` 0.4): an opening and
+        // a reopen only — `synchronize`, `edited`, `closed` and the rest are
+        // not reported. The same delivery also prompts the bridge-posted
+        // check (`GitHubForge::parse_check_trigger`); the two are
+        // independent.
+        "pull_request" => match action {
+            "opened" | "reopened" => {
+                Some(pull_request_opened(host, action == "reopened", &payload)?)
+            }
+            _ => return Ok(None),
+        },
         "installation" => {
             let change = match action {
                 "created" => InstallationChange::Created,
@@ -185,6 +196,54 @@ fn repository_event(host: &str, action: &str, payload: &Value) -> Result<Option<
         }
         _ => return Ok(None),
     }))
+}
+
+/// A `pull_request` `opened` / `reopened` delivery → who and where. The
+/// author is `pull_request.user`, the actor the delivery's `sender` (who
+/// performed this action, never assumed to be the author). Nothing of what
+/// the pull request contains is read: not its title, body, branches or diff.
+fn pull_request_opened(host: &str, reopened: bool, payload: &Value) -> Result<ForgeEventKind> {
+    let (repo, forge_id) = repository(host, payload)?;
+    let pr = &payload["pull_request"];
+    let number = u64_field(pr, "number")?;
+    if number == 0 {
+        return Err(ForgeError::Webhook("pull request number 0".into()));
+    }
+    let author = account(&pr["user"])?;
+    let actor = account(&payload["sender"])?;
+    let draft = pr.get("draft").and_then(Value::as_bool);
+    // A head repository GitHub no longer reports (a deleted fork) is not the
+    // base: it is from a fork. Otherwise compare the two repositories by id,
+    // by name when an id is missing.
+    let head = &pr["head"]["repo"];
+    let base = &pr["base"]["repo"];
+    let from_fork = if head.is_null() {
+        Some(true)
+    } else {
+        match (
+            head.get("id").and_then(Value::as_u64),
+            base.get("id").and_then(Value::as_u64),
+        ) {
+            (Some(h), Some(b)) => Some(h != b),
+            _ => match (
+                head.get("full_name").and_then(Value::as_str),
+                base.get("full_name").and_then(Value::as_str),
+            ) {
+                (Some(h), Some(b)) => Some(!h.eq_ignore_ascii_case(b)),
+                _ => None,
+            },
+        }
+    };
+    Ok(ForgeEventKind::PullRequestOpened {
+        repo,
+        forge_id,
+        number,
+        reopened,
+        author,
+        actor,
+        draft,
+        from_fork,
+    })
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>> {

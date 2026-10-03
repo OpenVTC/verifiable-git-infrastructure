@@ -412,8 +412,8 @@ VTC still maps the host to this one bridge.
    cannot): *Settings → Developer settings → GitHub Apps → the App → Enable
    Device Flow*. Members link their accounts with it.
 
-The App asks for: repository Administration, Contents, Variables and Checks
-(write), Metadata, Pull requests and Merge queues (read); organisation
+The App asks for: repository Administration, Contents, Variables, Checks
+and Pull requests (write), Metadata and Merge queues (read); organisation
 Members (read) and Administration (write); and the events
 `branch_protection_rule`, `check_run`, `check_suite`, `member`,
 `membership`, `merge_group`, `organization`, `pull_request`, `push`,
@@ -423,7 +423,12 @@ requests, Merge queues and the `pull_request` / `merge_group` / `check_*`
 events are for the check the bridge posts itself where there is none (§6);
 `push` (delivered under Contents) is the provenance record the Dependabot
 re-sign acts on, and Contents (write) is also what it pushes the re-signed
-commits with (§6a). No secrets, Actions logs, code scanning or packages.
+commits with (§6a). Pull requests is at **write** for the pull-request gate
+(§6d): commenting on a pull request and closing it. GitHub files a pull
+request's comments under Issues *or* Pull requests (write) and closing it
+under Pull requests (write) only, so that one permission covers both and
+Issues is not requested; it cannot push or merge. No secrets, Actions logs,
+code scanning or packages.
 
 ### Upgrading an App registered before the bridge-posted check
 
@@ -456,6 +461,20 @@ on its settings page (*Permissions & events*; it needs no new permission —
 Contents is already granted) and save. Only branches created after that are
 re-signed: an older branch has no record of its creation, so close its pull
 request and delete the branch and Dependabot opens it afresh.
+
+### Upgrading an App registered before the pull-request gate
+
+An App registered with Pull requests at **read** keeps everything it did —
+the bridge-posted check needs only read — but cannot comment on or close a
+pull request, so the VTC's `closePullRequest` jobs fail: the result's
+`comment` step is `forbidden` (and `close` `skipped`), and the bridge reads
+the installation again and reports `pull_requests:write` in the namespace's
+`missingPermissions` (`permissionUpgradePending: true`). Nothing else
+changes; a pull request the gate would have closed simply stays open, and
+the required check still decides what merges. To turn the gate on, raise
+*Pull requests* to *Read and write* on the App's settings page
+(*Permissions & events*), save, and have an owner of each installation
+approve the change.
 
 **Binding a namespace** starts at the VTC (`git-ns/namespace/bind`): the VTC
 sends the bridge a `beginBind` job, the admin follows the `next` URL to the
@@ -883,14 +902,15 @@ collaborator role on that repository removed, one given by hand on the
 forge as much as one the bridge projected (only accounts a job does not
 list are left alone). `git-ns/bridge/job` 0.4 has no namespace-level role
 job (organisation owners): one without `repo` is `malformedRequest`. The
-bridge takes 0.4 only — older versions are refused `unsupportedVersion` —
-and answers `trust-task-discovery/0.2` from its VTC with the 0.4 type URI,
-which is how a VTC learns it may send 0.4.
+bridge takes 0.4 and 0.5 (0.5 only adds `closePullRequest`, §6d) — older
+versions are refused `unsupportedVersion` — and answers
+`trust-task-discovery/0.2` from its VTC with both type URIs, which is how a
+VTC learns it may send them.
 
 Job 0.4 has the VTC send `git.ns.admin` for a namespace admin with no right
 of their own on a repository, never the `git.repo.own` it implies; a VTC
 that sent earlier versions folded the two together, which is why this
-bridge takes 0.4 only. `git.ns.admin` is exercised through the VTC
+bridge takes nothing before 0.4. `git.ns.admin` is exercised through the VTC
 and the bridge; who owns the organisation stays yours to manage by hand.
 Someone who is both a namespace admin and, in their own name, a
 repository's owner or maintainer gets that repository right's role.
@@ -933,6 +953,66 @@ projected under the old map are the baseline drift is measured against, so
 they are not reported as drift. The report never carries anything for
 `git.ns.admin`: a namespace admin gets no forge role whatever the map.
 
+## 6d. The pull-request gate
+
+A community can limit who may open pull requests on the repositories it
+governs — anyone, its members, committers, maintainers, or holders of named
+VTC roles: the `pr_open` setting of the community's `gitNamespace` policy at
+the VTC (RUNBOOK.md §8m). GitHub cannot enforce that by itself, so the
+bridge reports and the VTC decides:
+
+1. **The report** (`git-ns/bridge/event` 0.4 `pullRequestOpened`). A
+   verified `pull_request` webhook with action `opened` or `reopened`, on a
+   repository the namespace manages, is reported with the pull request's
+   number, its author (`pull_request.user`), who performed the action (the
+   delivery's `sender` — for a reopen, whoever reopened it), whether it is a
+   draft, and whether it comes from a fork (its head repository is not the
+   base, or GitHub no longer reports one). Never its title, body, branches
+   or diff. Other actions (`synchronize`, `edited`, `closed`, …),
+   repositories the namespace does not manage, the binding's `.vgi`, and
+   deliveries naming another organisation's repository are not reported;
+   each delivery is reported once. The same delivery still prompts the
+   bridge-posted check (§6) exactly as before.
+
+   **Only under event 0.4**, which is opt-in (`event_version = "0.4"`, §7):
+   a VTC that does not take 0.4 is told of no pull request at all, and a
+   report still queued when the setting goes back below 0.4 is dropped
+   rather than sent under an older type.
+2. **The order** (`git-ns/bridge/job` 0.5 `closePullRequest`). When the
+   policy does not allow the author, the VTC sends the community's message
+   and the bridge runs two steps, reported as `comment` and `close`:
+   - a pull request **already closed or merged** is left alone — both steps
+     `unchanged`, no comment;
+   - one **reopened after the job was issued by anyone but the bridge's own
+     App** is left alone too (both `unchanged`, the detail naming who): that
+     reopen is newer than the order — an owner's or maintainer's override —
+     and it reaches the VTC as its own `pullRequestOpened`;
+   - otherwise the bridge posts the message verbatim, followed by a hidden
+     marker `<!-- vgi-bridge job:<jobId> -->`, then closes the pull request
+     without merging it. A run of the same job that finds the App's own
+     comment with that marker already there (a restart between the comment
+     and the close) reports `comment` `unchanged` and only closes: a job
+     never comments twice. A comment by anyone else carrying the marker does
+     not count.
+
+   Errors are the result's codes: `notFound` (no such pull request, or the
+   repository is gone), `forbidden` (the App lacks Pull requests write — §3
+   — or GitHub refused), `rateLimited`, `forgeError`. When `comment` fails,
+   `close` is `skipped` and the job `failed`; when `close` fails after it,
+   `partial`. Tokens are minted per job for the one repository, with
+   `pull_requests: read` to look and `pull_requests: write` to act.
+
+The bridge takes `git-ns/bridge/job` 0.5 and 0.4, and lists both in its
+answer to `trust-task-discovery`, so a VTC learns it may send
+`closePullRequest`; a 0.4 job naming that kind is `malformedRequest`.
+**Forgejo** has no gate yet: a `closePullRequest` there is `notCapable`, and
+the pull request stays open.
+
+**Hygiene, not the merge gate.** The required commit-trust check is still
+what keeps untrusted commits out. If the VTC or the bridge is down, or the
+App lacks the permission, a pull request simply stays open, and nothing the
+check refuses can be merged through it.
+
 ## 7. Operating it
 
 - **Logs** go to standard error (`RUST_LOG=info` by default). They never
@@ -970,17 +1050,36 @@ not understand 0.3 yet refuses it as an unsupported type; until it is
 updated, set in the config
 
 ```toml
-event_version = "0.2"   # "0.1", "0.2" or "0.3" (the default)
+event_version = "0.2"   # "0.1", "0.2", "0.3" (the default) or "0.4"
 ```
 
 and restart. Switch back (or remove the line) once the VTC takes 0.3. The
-three versions are wire-identical for every forge event: an event is the
-same payload under each type URI, and events still queued when you switch
-go out under the new one. The VTC's acknowledgement is accepted in any
-version. What 0.3 adds is `roleMapReported` (§6c), which is **never sent
-under 0.1 or 0.2**: such a VTC goes on assuming the default role map, and a
-role-map change reaches a repository only when you re-project it
+versions are wire-identical for every event an older one carries: an event
+is the same payload under each type URI, and events still queued when you
+switch go out under the new one. The VTC's acknowledgement is accepted in
+any version. What 0.3 adds is `roleMapReported` (§6c), which is **never
+sent under 0.1 or 0.2**: such a VTC goes on assuming the default role map,
+and a role-map change reaches a repository only when you re-project it
 (`cnm git reproject`) or its rights next change.
+
+What 0.4 adds is `pullRequestOpened`, the report the pull-request gate
+decides on (§6d). **0.4 is not the default, and you set it yourself** once
+your VTC takes it — when the VTC lists
+`https://trusttasks.org/spec/git-ns/bridge/event/0.4` in its
+`trust-task-discovery` answer (a VTC with the pull-request gate does):
+
+```toml
+event_version = "0.4"
+```
+
+Event 0.4 forbids a bridge to send 0.4 to a VTC that has not listed it
+there, because a VTC that knows only 0.3 refuses the type — and with it
+every event this bridge would send it, the role map included. This bridge
+answers discovery but does not ask it, so it cannot find that out on its
+own; the setting is your statement that the VTC takes it. (0.3 became the
+default on release because 0.3 had no such rule.) Below 0.4 the bridge
+reports **no** pull requests, under any type, and a pull-request report still
+queued when you go back below 0.4 is dropped, not sent under the older type.
 
 What 0.2 changes is what the VTC does with an event. The bridge's own
 handling is the same whichever version it sends:

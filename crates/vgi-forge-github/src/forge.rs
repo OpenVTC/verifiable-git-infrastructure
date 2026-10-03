@@ -512,6 +512,24 @@ impl GitHubForge {
             )
             .await
             .map_err(|e| match e {
+                // GitHub answers 422 too when the installation has not
+                // granted a permission the token asks for (an App whose
+                // owner has not approved an upgrade): that is "forbidden",
+                // and the namespace's `missingPermissions` says which.
+                ForgeError::Rejected {
+                    status: 422,
+                    ref message,
+                } if message.contains("permissions requested are not granted") => {
+                    ForgeError::Forbidden(format!(
+                        "the App installation on `{}` does not grant {}: {message}",
+                        ns.resource,
+                        perms
+                            .iter()
+                            .map(|(n, l)| format!("{n}:{l}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
                 // GitHub answers 422 when a named repository is not in the
                 // installation — for the caller that is "not found".
                 ForgeError::Rejected { status: 422, .. } if repo.is_some() => {
@@ -1809,6 +1827,27 @@ impl Forge for GitHubForge {
                 hint: "this GitHub adapter does not know that step".into(),
             }),
         }
+    }
+
+    async fn pull_request(&self, repo: &Resource, number: u64) -> Result<vgi_forge::PullRequest> {
+        self.read_pull_request(repo, number).await
+    }
+
+    async fn has_own_comment(&self, repo: &Resource, number: u64, marker: &str) -> Result<bool> {
+        self.find_own_comment(repo, number, marker).await
+    }
+
+    async fn comment_on_pull_request(
+        &self,
+        repo: &Resource,
+        number: u64,
+        body: &str,
+    ) -> Result<()> {
+        self.post_pull_request_comment(repo, number, body).await
+    }
+
+    async fn close_pull_request(&self, repo: &Resource, number: u64) -> Result<()> {
+        self.patch_pull_request_closed(repo, number).await
     }
 
     fn parse_event(&self, headers: &HeaderMap, body: &[u8]) -> Result<Option<ForgeEvent>> {

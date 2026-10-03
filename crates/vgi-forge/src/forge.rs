@@ -11,6 +11,7 @@ use crate::model::{
     IndirectAccess, LinkCallback, LinkStep, Namespace, NamespaceBinding, Projection, RepoSpec,
     RepoState, RoleAssignment, Unlisted,
 };
+use crate::pulls::PullRequest;
 use crate::resource::Resource;
 use crate::rights::{EffectiveRights, ForgeRole, RoleMap, collapse_to_ladder};
 
@@ -137,6 +138,47 @@ pub trait Forge: Send + Sync {
     /// Run one step, check-then-apply.
     async fn run_step(&self, repo: &Resource, step: &BootstrapStep) -> Result<StepOutcome>;
 
+    // ── pull requests (the pull-request gate) ────────────────────────────
+    //
+    // `git-ns/bridge/job` 0.5 `closePullRequest`. The defaults refuse with
+    // [`ForgeError::Unsupported`] (the job's `notCapable`): a forge whose
+    // adapter does not implement them has no pull-request gate, and a pull
+    // request simply stays open — the required check still guards merges.
+
+    /// Read pull request `number` of `repo` now: open, closed or merged, and
+    /// the most recent reopen by an account other than the adapter's own.
+    /// [`ForgeError::NotFound`] when there is no such pull request.
+    async fn pull_request(&self, repo: &Resource, number: u64) -> Result<PullRequest> {
+        let _ = (repo, number);
+        Err(pulls_unsupported())
+    }
+
+    /// Whether pull request `number` of `repo` already carries a comment
+    /// **the adapter's own account** posted that contains `marker` — how a
+    /// retried `closePullRequest` finds the comment an earlier attempt
+    /// posted. A comment by anyone else never counts, whatever it contains.
+    async fn has_own_comment(&self, repo: &Resource, number: u64, marker: &str) -> Result<bool> {
+        let _ = (repo, number, marker);
+        Err(pulls_unsupported())
+    }
+
+    /// Post `body` as a comment on pull request `number` of `repo`, verbatim.
+    async fn comment_on_pull_request(
+        &self,
+        repo: &Resource,
+        number: u64,
+        body: &str,
+    ) -> Result<()> {
+        let _ = (repo, number, body);
+        Err(pulls_unsupported())
+    }
+
+    /// Close pull request `number` of `repo` without merging it.
+    async fn close_pull_request(&self, repo: &Resource, number: u64) -> Result<()> {
+        let _ = (repo, number);
+        Err(pulls_unsupported())
+    }
+
     // ── events and drift ─────────────────────────────────────────────────
 
     /// Verify and translate a webhook. `Ok(None)` for a verified delivery
@@ -147,5 +189,14 @@ pub trait Forge: Send + Sync {
     /// Compare observed state with the projection.
     fn diff(&self, observed: &RepoState, desired: &Projection) -> Vec<Drift> {
         default_diff(observed, desired)
+    }
+}
+
+fn pulls_unsupported() -> ForgeError {
+    ForgeError::Unsupported {
+        operation: "closePullRequest".into(),
+        hint: "this forge adapter has no pull-request gate; the pull request stays open, and \
+               the required commit-trust check still guards what merges"
+            .into(),
     }
 }
