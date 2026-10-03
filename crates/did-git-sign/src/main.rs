@@ -373,6 +373,17 @@ async fn cmd_init(
     }
     println!("VTA URL: {vta_url}");
 
+    // The VTA's DIDComm mediator, if it advertises one. With it, `init` and
+    // every later signing reach the VTA over DIDComm, which is the only way in
+    // to a VTA that publishes no REST service. Without one, REST as before.
+    let mediator_did = vta_sdk::session::resolve_mediator_did(&vta_did)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not resolve the VTA's mediator from {vta_did}: {e}"))?;
+    match &mediator_did {
+        Some(m) => println!("VTA mediator: {m}"),
+        None => println!("VTA mediator: none advertised; using REST"),
+    }
+
     // 2. Mint a fresh ephemeral did:key as the admin identity for this
     //    setup session. Held in memory only — if did-git-sign is rerun the
     //    operator must re-grant the ACL for the new DID.
@@ -410,124 +421,134 @@ async fn cmd_init(
     //    interactive context / DID / key picker.
     println!();
     println!("Authenticating as {}…", admin.admin_did);
-    let client = vta::client_with_identity(
-        &vta_url,
-        &admin.admin_did,
-        &admin.admin_private_key_mb,
-        &vta_did,
-    );
-    let token = vta_sdk::session::challenge_response(
-        &vta_url,
-        &admin.admin_did,
-        &admin.admin_private_key_mb,
-        &vta_did,
-    )
+    let connected = vta::connect_with_retry_auto(vta_sdk::client::AutoConnect {
+        vta_url: &vta_url,
+        vta_did: &vta_did,
+        credential_did: &admin.admin_did,
+        private_key_multibase: &admin.admin_private_key_mb,
+        mediator_did: mediator_did.as_deref(),
+    })
     .await
     .map_err(|e| anyhow::anyhow!("VTA authentication failed: {e}"))?;
-    client.set_token(token.access_token.clone());
+    let client = connected.client;
+    // Only a REST handshake issues a bearer token; a DIDComm session is its
+    // own authenticator.
+    let token = connected.rest_token;
     println!("Authenticated.");
     println!();
 
-    // Names for the pickers and the closing summary. ACL labels and context
-    // names ride along on listings we fetch anyway; agent names cost network
-    // and are opt-in.
-    let mut book = names::book_from_vta(&client).await;
+    // A DIDComm session owns a live mediator connection that only `shutdown`
+    // closes, so everything that uses it runs in one block and the session is
+    // closed whether the block succeeds or fails.
+    let outcome: Result<()> = async {
+        // Names for the pickers and the closing summary. ACL labels and context
+        // names ride along on listings we fetch anyway; agent names cost network
+        // and are opt-in.
+        let mut book = names::book_from_vta(&client).await;
 
-    let (key_id, did_key_id) =
-        if let (Some(kid), Some(dkid)) = (key_id_override, did_key_id_override) {
-            // Non-interactive: use provided values directly
-            (kid, dkid)
-        } else {
-            // Interactive: select context, DID, and signing key
-            interactive_select(&client, &mut book, resolve_agent_names).await?
-        };
-    names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names).await;
+        let (key_id, did_key_id) =
+            if let (Some(kid), Some(dkid)) = (key_id_override, did_key_id_override) {
+                // Non-interactive: use provided values directly
+                (kid, dkid)
+            } else {
+                // Interactive: select context, DID, and signing key
+                interactive_select(&client, &mut book, resolve_agent_names).await?
+            };
+        names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names)
+            .await;
 
-    // Fetch the persona signing key so we know its public bytes for the
-    // allowed_signers entry. Uses the freshly-issued admin token.
-    let seed = vta::get_signing_key(&client, &key_id).await?;
-    let signing_key = SigningKey::from_bytes(seed.as_bytes());
-    let verifying_key = signing_key.verifying_key();
+        // Fetch the persona signing key so we know its public bytes for the
+        // allowed_signers entry. Uses the freshly-issued admin token.
+        let seed = vta::get_signing_key(&client, &key_id).await?;
+        let signing_key = SigningKey::from_bytes(seed.as_bytes());
+        let verifying_key = signing_key.verifying_key();
 
-    // Cache the token we already have so the very next sign operation
-    // doesn't have to re-auth.
-    let _ = config::cache_token(&did_key_id, &token.access_token, token.access_expires_at);
+        // Cache the REST token we already have so the very next sign operation
+        // doesn't have to re-auth. A DIDComm session has none to cache.
+        if let Some(token) = &token {
+            let _ = config::cache_token(&did_key_id, &token.access_token, token.access_expires_at);
+        }
 
-    let result = init::install(init::InstallArgs {
-        global,
-        did_key_id: did_key_id.clone(),
-        vta_key_id: key_id,
-        credential_did: admin.admin_did.clone(),
-        credential_private_key_mb: admin.admin_private_key_mb.clone(),
-        vta_did: vta_did.clone(),
-        vta_url,
-        // Standalone CLI install path uses REST today; the openvtc setup
-        // flow populates this via its own InstallArgs construction.
-        // A follow-up could plumb DIDComm into this path too.
-        mediator_did: None,
-        user_name,
-        verifying_key: verifying_key.as_bytes(),
-    })?;
+        let result = init::install(init::InstallArgs {
+            global,
+            did_key_id: did_key_id.clone(),
+            vta_key_id: key_id,
+            credential_did: admin.admin_did.clone(),
+            credential_private_key_mb: admin.admin_private_key_mb.clone(),
+            vta_did: vta_did.clone(),
+            vta_url,
+            // Stored so signing connects the way setup just did: over DIDComm
+            // when the VTA advertises a mediator, REST otherwise.
+            mediator_did: mediator_did.clone(),
+            user_name,
+            verifying_key: verifying_key.as_bytes(),
+        })?;
 
-    println!("Config saved to: {}", result.config_path.display());
-    println!("VTA credentials stored in OS keyring");
-    println!("Git configured for DID signing");
-    println!("Allowed signers file updated");
+        println!("Config saved to: {}", result.config_path.display());
+        println!("VTA credentials stored in OS keyring");
+        println!("Git configured for DID signing");
+        println!("Allowed signers file updated");
 
-    if let Some(prev) = result.overridden_global_signing_key {
+        if let Some(prev) = result.overridden_global_signing_key {
+            println!();
+            println!("Note: your global user.signingKey ({prev}) has been overridden locally");
+            println!("      for this repository. did-git-sign uses its JSON config file as the");
+            println!("      signing key path. Your global signing configuration is unchanged.");
+        }
+
+        // A global install sets the committer identity machine-wide. That is right
+        // for one community and wrong for two, and the failure is quiet: commits in
+        // the other community claim this DID, are signed by its key, and are
+        // rejected as unauthorized rather than as misconfigured.
+        if let Some(email) = &result.global_committer_email {
+            println!();
+            println!("Note: user.email is now {email}");
+            println!("      for every repository on this machine — that is the identity your");
+            println!("      commits will claim, and it must match the key that signs them.");
+            println!();
+            println!("      Signing for more than one community? Scope it per remote instead,");
+            println!("      keeping the identity and the key together so they cannot drift:");
+            println!();
+            println!("        # ~/.gitconfig");
+            println!(
+                "        [includeIf \"hasconfig:remote.*.url:https://github.com/YourOrg/**\"]"
+            );
+            println!("            path = ~/.config/git/community-yourorg");
+            println!();
+            println!("        # ~/.config/git/community-yourorg");
+            println!("        [user]");
+            println!("            email = {email}");
+            println!("        [did-git-sign]");
+            println!("            key = {email}");
+        }
+
         println!();
-        println!("Note: your global user.signingKey ({prev}) has been overridden locally");
-        println!("      for this repository. did-git-sign uses its JSON config file as the");
-        println!("      signing key path. Your global signing configuration is unchanged.");
+        println!("Setup complete! Git commits will now be signed with:");
+        // The DID stays whole here — this is the identity the operator has to be
+        // able to recognise later, and abbreviating it is exactly what a summary
+        // must not do. The name goes above it, never in place of it.
+        if let Some(name) = names::name_line(&book, &did_key_id) {
+            println!("  Name: {name}");
+        }
+        println!("  DID: {did_key_id}");
+        println!("  Key: {}", result.ssh_public_key);
+        println!();
+        println!("IMPORTANT — to make signatures show as 'Verified':");
+        println!("  1. Copy the SSH public key above.");
+        println!("  2. Add it to your account:");
+        println!("       User Settings → SSH Keys → Add new key");
+        println!("       Set Usage type to 'Signing' (or 'Authentication & Signing').");
+        println!("  3. Ensure git user.email matches your account email:");
+        println!("       git config user.email");
+        println!();
+        println!("To sign a commit: git commit -S -m \"your message\"");
+        println!("To verify: git log --show-signature");
+
+        Ok(())
     }
-
-    // A global install sets the committer identity machine-wide. That is right
-    // for one community and wrong for two, and the failure is quiet: commits in
-    // the other community claim this DID, are signed by its key, and are
-    // rejected as unauthorized rather than as misconfigured.
-    if let Some(email) = &result.global_committer_email {
-        println!();
-        println!("Note: user.email is now {email}");
-        println!("      for every repository on this machine — that is the identity your");
-        println!("      commits will claim, and it must match the key that signs them.");
-        println!();
-        println!("      Signing for more than one community? Scope it per remote instead,");
-        println!("      keeping the identity and the key together so they cannot drift:");
-        println!();
-        println!("        # ~/.gitconfig");
-        println!("        [includeIf \"hasconfig:remote.*.url:https://github.com/YourOrg/**\"]");
-        println!("            path = ~/.config/git/community-yourorg");
-        println!();
-        println!("        # ~/.config/git/community-yourorg");
-        println!("        [user]");
-        println!("            email = {email}");
-        println!("        [did-git-sign]");
-        println!("            key = {email}");
-    }
-
-    println!();
-    println!("Setup complete! Git commits will now be signed with:");
-    // The DID stays whole here — this is the identity the operator has to be
-    // able to recognise later, and abbreviating it is exactly what a summary
-    // must not do. The name goes above it, never in place of it.
-    if let Some(name) = names::name_line(&book, &did_key_id) {
-        println!("  Name: {name}");
-    }
-    println!("  DID: {did_key_id}");
-    println!("  Key: {}", result.ssh_public_key);
-    println!();
-    println!("IMPORTANT — to make signatures show as 'Verified':");
-    println!("  1. Copy the SSH public key above.");
-    println!("  2. Add it to your account:");
-    println!("       User Settings → SSH Keys → Add new key");
-    println!("       Set Usage type to 'Signing' (or 'Authentication & Signing').");
-    println!("  3. Ensure git user.email matches your account email:");
-    println!("       git config user.email");
-    println!();
-    println!("To sign a commit: git commit -S -m \"your message\"");
-    println!("To verify: git log --show-signature");
-
-    Ok(())
+    .await;
+    client.shutdown().await;
+    outcome
 }
 
 /// Interactive flow: select context → DID → signing key.

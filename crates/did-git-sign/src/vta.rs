@@ -140,16 +140,25 @@ fn validate_credentials(creds: &VtaCredentials) -> Result<()> {
 /// covers both paths uniformly — a transient mediator or network hiccup is
 /// worth a second attempt regardless of transport.
 async fn connect_with_retry(creds: &VtaCredentials) -> Result<ConnectedVta> {
+    connect_with_retry_auto(AutoConnect {
+        vta_url: &creds.vta_url,
+        vta_did: &creds.vta_did,
+        credential_did: &creds.credential_did,
+        private_key_multibase: &creds.private_key_multibase,
+        mediator_did: creds.mediator_did.as_deref(),
+    })
+    .await
+}
+
+/// [`connect_with_retry`] for a caller that has not stored credentials yet:
+/// `init`, right after it provisioned the admin DID. The same transport
+/// choice and the same retry, so setup and signing cannot reach the VTA
+/// differently — setup used to hardcode a REST handshake, which a VTA that
+/// publishes no REST service answers with something that is not JSON.
+pub async fn connect_with_retry_auto(input: AutoConnect<'_>) -> Result<ConnectedVta> {
     let mut last_err = None;
     for attempt in 1..=MAX_AUTH_RETRIES {
-        let result = VtaClient::connect_auto(AutoConnect {
-            vta_url: &creds.vta_url,
-            vta_did: &creds.vta_did,
-            credential_did: &creds.credential_did,
-            private_key_multibase: &creds.private_key_multibase,
-            mediator_did: creds.mediator_did.as_deref(),
-        })
-        .await;
+        let result = VtaClient::connect_auto(input.clone()).await;
         match result {
             Ok(connected) => {
                 // A REST handshake must yield a non-empty bearer token; DIDComm
