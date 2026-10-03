@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use dialoguer::{Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use did_git_sign::{config, init, names, sign, vta};
 use ed25519_dalek::SigningKey;
 use std::path::PathBuf;
@@ -452,7 +452,7 @@ async fn cmd_init(
                 (kid, dkid)
             } else {
                 // Interactive: select context, DID, and signing key
-                interactive_select(&client, &mut book, resolve_agent_names).await?
+                interactive_select(&client, &mut book, resolve_agent_names, yes).await?
             };
         names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names)
             .await;
@@ -557,6 +557,7 @@ async fn interactive_select(
     client: &vta_sdk::client::VtaClient,
     book: &mut vta_sdk::display_name::NameBook,
     resolve_agent_names: bool,
+    yes: bool,
 ) -> Result<(String, String)> {
     // 1. List and select context
     let contexts = client
@@ -599,12 +600,17 @@ async fn interactive_select(
         .await
         .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?;
 
-    if dids.dids.is_empty() {
-        bail!(
-            "no DIDs found in context '{}' — create a DID first",
-            context.id
-        );
-    }
+    // A context `init` just created (`pnm contexts create`) holds no DID yet.
+    // Create one there rather than send the operator away to do it.
+    let dids = if dids.dids.is_empty() {
+        create_context_did(client, &context.id, yes).await?;
+        client
+            .list_dids_webvh(Some(&context.id), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
+    } else {
+        dids
+    };
 
     // A DID is what the operator is choosing between here, so this is the
     // picker that most needs a name. `list_dids_webvh` carries no label of
@@ -684,6 +690,109 @@ async fn interactive_select(
     println!();
 
     Ok((selected_key.key_id.clone(), did_key_id))
+}
+
+/// Create a `did:webvh` for `context`, on a DID-hosting server the VTA has
+/// registered, and return it.
+///
+/// The request is the one `pnm contexts provision --server` makes: portable,
+/// no pre-rotation keys, set as the context's primary DID, the VTA choosing
+/// the path and domain. With one server it is used; with several the operator
+/// picks (or, under `--yes`, is told to create the DID themselves); with none
+/// there is nowhere to publish the DID, and the error says how to make one.
+async fn create_context_did(
+    client: &vta_sdk::client::VtaClient,
+    context: &str,
+    yes: bool,
+) -> Result<String> {
+    let servers = client
+        .list_webvh_servers()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list DID-hosting servers: {e}"))?
+        .servers;
+    let label = |s: &vta_sdk::webvh::WebvhServerRecord| match &s.label {
+        Some(l) => format!("{l} ({})", s.id),
+        None => s.id.clone(),
+    };
+    let server = match servers.len() {
+        0 => bail!(
+            "context '{context}' has no DID, and the VTA has no DID-hosting server to \
+             create one on.\n\nRegister one (`pnm did-mgmt servers add …`), or create the \
+             DID yourself:\n  pnm did-mgmt dids create --context {context} --did-url <url>\n\
+             then run `did-git-sign init` again."
+        ),
+        1 => &servers[0],
+        n if yes => bail!(
+            "context '{context}' has no DID, and the VTA has {n} DID-hosting servers to \
+             create one on. Run without --yes to choose, or create it yourself:\n  \
+             pnm did-mgmt dids create --context {context} --server <id>"
+        ),
+        _ => {
+            let labels: Vec<String> = servers.iter().map(label).collect();
+            let idx = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!(
+                    "Context '{context}' has no DID. Create one on which server?"
+                ))
+                .items(&labels)
+                .default(0)
+                .interact()?;
+            &servers[idx]
+        }
+    };
+
+    if !yes
+        && servers.len() == 1
+        && !Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(format!(
+                "Context '{context}' has no DID. Create a did:webvh for it on {}?",
+                label(server)
+            ))
+            .default(true)
+            .interact()?
+    {
+        bail!(
+            "no DID to sign with. Create one with\n  pnm did-mgmt dids create --context \
+             {context} --server {}\nand run `did-git-sign init` again.",
+            server.id
+        );
+    }
+
+    println!(
+        "Creating a did:webvh in context '{context}' on {}…",
+        label(server)
+    );
+    let req = vta_sdk::client::CreateDidWebvhRequest {
+        context_id: context.to_string(),
+        server_id: Some(server.id.clone()),
+        url: None,
+        path: None,
+        path_mode: None,
+        domain: None,
+        label: Some(context.to_string()),
+        portable: true,
+        add_mediator_service: false,
+        add_tsp_service: false,
+        additional_services: None,
+        pre_rotation_count: 0,
+        did_document: None,
+        did_log: None,
+        set_primary: true,
+        signing_key_id: None,
+        ka_key_id: None,
+        template: None,
+        template_context: None,
+        template_vars: std::collections::HashMap::new(),
+    };
+    let created = client
+        .create_did_webvh(req)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create a DID in context '{context}': {e}"))?;
+    println!(
+        "Created {} (signing key {})",
+        created.did, created.signing_key_id
+    );
+    println!();
+    Ok(created.did)
 }
 
 /// Match a VTA key's public key against a DID document's verification methods

@@ -47,6 +47,10 @@ see [Selecting which community persona signs](#selecting-which-community-persona
   that publishes no REST service is reachable only through its mediator, and
   the mediator DID is stored with the credentials so signing connects the same
   way `init` did.
+- If the context has no DID yet (as after `pnm contexts create`), `init`
+  offers to create a `did:webvh` there on a DID-hosting server the VTA has
+  registered, as `pnm contexts provision --server` does. With no server
+  registered, create the DID first: `pnm did-mgmt dids create --context <ctx> …`.
 
 ## Install
 
