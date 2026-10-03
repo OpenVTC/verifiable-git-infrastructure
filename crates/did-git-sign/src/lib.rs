@@ -10,5 +10,6 @@ pub mod config;
 pub mod init;
 pub mod names;
 pub mod policy;
+pub mod profiles;
 pub mod sign;
 pub mod vta;

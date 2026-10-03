@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
-use did_git_sign::{config, init, names, sign, vta};
+use did_git_sign::{config, init, names, profiles, sign, vta};
 use ed25519_dalek::SigningKey;
 use std::path::PathBuf;
 
@@ -184,6 +184,33 @@ enum Commands {
         /// paid for by accident.
         #[arg(long)]
         resolve_agent_names: bool,
+
+        /// Save this identity as a named profile. If did-git-sign is already
+        /// set up here (or globally, with --global), the identity is added
+        /// beside the default instead of replacing it; switch to it with
+        /// `did-git-sign use <name>`.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// With --profile: also make this identity the default, replacing
+        /// the current one.
+        #[arg(long = "default", requires = "profile")]
+        make_default: bool,
+    },
+
+    /// List the named profiles, marking the default and the one this
+    /// repository signs as.
+    Profiles,
+
+    /// Sign as a named profile in this repository (or, with --global, in
+    /// every repository): sets `git config did-git-sign.key`.
+    Use {
+        /// The profile's name (`did-git-sign profiles` lists them).
+        name: String,
+
+        /// Set it in the global git config instead of this repository's.
+        #[arg(long)]
+        global: bool,
     },
 
     /// Verify the signing setup by performing a test sign operation
@@ -198,6 +225,9 @@ enum Commands {
         /// Path to a did.jsonl file to verify the signing key against.
         #[arg(long)]
         did_jsonl: Option<std::path::PathBuf>,
+        /// Check this named profile instead of the default identity.
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// Remove this host's did-git-sign install: deletes the JSON config,
@@ -283,6 +313,8 @@ async fn main() -> Result<()> {
             did_key_id,
             yes,
             resolve_agent_names,
+            profile,
+            make_default,
         }) => {
             cmd_init(
                 global,
@@ -294,14 +326,26 @@ async fn main() -> Result<()> {
                 did_key_id,
                 yes,
                 resolve_agent_names,
+                profile,
+                make_default,
             )
             .await
         }
+        Some(Commands::Profiles) => cmd_profiles(),
+        Some(Commands::Use { name, global }) => cmd_use(&name, global),
         Some(Commands::Verify) => cmd_verify().await,
         Some(Commands::Health {
             resolve_agent_names,
             did_jsonl,
-        }) => cmd_health(resolve_agent_names, did_jsonl.as_deref()).await,
+            profile,
+        }) => {
+            cmd_health(
+                resolve_agent_names,
+                did_jsonl.as_deref(),
+                profile.as_deref(),
+            )
+            .await
+        }
         Some(Commands::Uninstall {
             global,
             local,
@@ -355,7 +399,22 @@ async fn cmd_init(
     did_key_id_override: Option<String>,
     yes: bool,
     resolve_agent_names: bool,
+    profile: Option<String>,
+    make_default: bool,
 ) -> Result<()> {
+    // A bad profile name is refused before anything is provisioned.
+    if let Some(name) = &profile {
+        profiles::validate_name(name)?;
+    }
+    // A profile is added beside an existing install rather than replacing its
+    // default; the first install, or --default, sets the default as before.
+    let target_config = if global {
+        SigningConfig::default_global_path()?
+    } else {
+        SigningConfig::repo_local_path()
+    };
+    let add_beside_default = profile.is_some() && !make_default && target_config.exists();
+
     // 1. Resolve the VTA service URL (or take the override).
     let vta_url = if let Some(url) = vta_url_override {
         url
@@ -469,7 +528,7 @@ async fn cmd_init(
             let _ = config::cache_token(&did_key_id, &token.access_token, token.access_expires_at);
         }
 
-        let result = init::install(init::InstallArgs {
+        let install_args = init::InstallArgs {
             global,
             did_key_id: did_key_id.clone(),
             vta_key_id: key_id,
@@ -482,7 +541,32 @@ async fn cmd_init(
             mediator_did: mediator_did.clone(),
             user_name,
             verifying_key: verifying_key.as_bytes(),
-        })?;
+        };
+
+        if add_beside_default {
+            let name = profile.as_deref().unwrap_or_default();
+            let ssh_public_key = init::add_identity(install_args)?;
+            save_profile(name, &did_key_id, &vta_did, &context)?;
+            println!("VTA credentials stored in OS keyring");
+            println!("Allowed signers file updated");
+            println!();
+            println!("Profile '{name}' saved. It does not replace the default identity;");
+            println!("sign as it in a repository with:");
+            println!("  did-git-sign use {name}");
+            println!();
+            if let Some(n) = names::name_line(&book, &did_key_id) {
+                println!("  Name: {n}");
+            }
+            println!("  DID: {did_key_id}");
+            println!("  Key: {ssh_public_key}");
+            return Ok(());
+        }
+
+        let result = init::install(install_args)?;
+        if let Some(name) = &profile {
+            save_profile(name, &did_key_id, &vta_did, &context)?;
+            println!("Profile '{name}' saved (the default identity)");
+        }
 
         println!("Config saved to: {}", result.config_path.display());
         println!("VTA credentials stored in OS keyring");
@@ -500,26 +584,26 @@ async fn cmd_init(
         // for one community and wrong for two, and the failure is quiet: commits in
         // the other community claim this DID, are signed by its key, and are
         // rejected as unauthorized rather than as misconfigured.
-        if let Some(email) = &result.global_committer_email {
+        if let Some(did) = &result.global_committer_email {
             println!();
-            println!("Note: user.email is now {email}");
-            println!("      for every repository on this machine — that is the identity your");
-            println!("      commits will claim, and it must match the key that signs them.");
+            println!("Note: {did}");
+            println!("      now signs in every repository on this machine (did-git-sign.key in");
+            println!("      your global git config), and the commit-msg hook names it as the");
+            println!("      signer. user.email is unchanged.");
             println!();
-            println!("      Signing for more than one community? Scope it per remote instead,");
-            println!("      keeping the identity and the key together so they cannot drift:");
+            println!("      Signing as more than one identity? Give each a profile and choose");
+            println!("      one per repository:");
+            println!("        did-git-sign init --global --profile <name> --vta-did <VTA DID>");
+            println!("        did-git-sign use <name>");
             println!();
-            println!("        # ~/.gitconfig");
+            println!("      or scope it per remote in ~/.gitconfig:");
             println!(
                 "        [includeIf \"hasconfig:remote.*.url:https://github.com/YourOrg/**\"]"
             );
             println!("            path = ~/.config/git/community-yourorg");
-            println!();
             println!("        # ~/.config/git/community-yourorg");
-            println!("        [user]");
-            println!("            email = {email}");
             println!("        [did-git-sign]");
-            println!("            key = {email}");
+            println!("            key = {did}");
         }
 
         println!();
@@ -947,8 +1031,140 @@ fn print_commit_msg_hook_status() {
     println!();
 }
 
-async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Path>) -> Result<()> {
-    let (config_path, cfg) = load_config()?;
+/// Record `name` as the profile for this identity.
+fn save_profile(name: &str, did_key_id: &str, vta_did: &str, context: &str) -> Result<()> {
+    let mut all = profiles::Profiles::load()?;
+    if let Some(old) = all.profiles.get(name)
+        && old.did_key_id != did_key_id
+    {
+        println!(
+            "Profile '{name}' now names {did_key_id} (was {}).",
+            old.did_key_id
+        );
+    }
+    all.profiles.insert(
+        name.to_string(),
+        profiles::Profile {
+            did_key_id: did_key_id.to_string(),
+            vta_did: vta_did.to_string(),
+            context: Some(context.to_string()),
+        },
+    );
+    all.save()
+}
+
+/// `git config --get <key>` in the current directory, if set.
+fn git_config_get(key: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+/// `did-git-sign profiles`: every profile, which one is the default, which
+/// one this repository signs as, and whether its credentials are present.
+fn cmd_profiles() -> Result<()> {
+    let all = profiles::Profiles::load()?;
+    if all.profiles.is_empty() {
+        println!("No profiles yet. Create one with:");
+        println!("  did-git-sign init --profile <name> --vta-did <VTA DID>");
+        return Ok(());
+    }
+    // The default is the config file's identity: this repository's own
+    // install if it has one, otherwise the global one.
+    let default = [
+        Some(SigningConfig::repo_local_path()),
+        SigningConfig::default_global_path().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists())
+    .and_then(|p| SigningConfig::load(&p).ok())
+    .map(|c| c.did_key_id);
+    let here = git_config_get(sign::SIGNING_KEY_GIT_CONFIG);
+
+    for (name, p) in &all.profiles {
+        let mut marks = Vec::new();
+        if default.as_deref() == Some(p.did_key_id.as_str()) {
+            marks.push("default");
+        }
+        if here.as_deref() == Some(p.did_key_id.as_str()) {
+            marks.push("signs here");
+        }
+        let marks = if marks.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", marks.join(", "))
+        };
+        println!("{name}{marks}");
+        println!("  DID:      {}", p.did_key_id);
+        println!("  VTA:      {}", p.vta_did);
+        if let Some(ctx) = &p.context {
+            println!("  Context:  {ctx}");
+        }
+        if config::load_vta_credentials(&p.did_key_id).is_err() {
+            println!(
+                "  Credentials: MISSING from the keyring; run `did-git-sign init --profile {name} …` again"
+            );
+        }
+    }
+    if let Some(sel) = &here
+        && all.name_of(sel).is_none()
+    {
+        println!();
+        println!("This repository signs as {sel}, which is not a profile.");
+    }
+    Ok(())
+}
+
+/// `did-git-sign use <name>`: make this repository (or, with `--global`,
+/// every repository) sign as the named profile.
+fn cmd_use(name: &str, global: bool) -> Result<()> {
+    let all = profiles::Profiles::load()?;
+    let p = all.get(name)?;
+    config::load_vta_credentials(&p.did_key_id).with_context(|| {
+        format!(
+            "profile '{name}' has no credentials in the keyring; run \
+             `did-git-sign init --profile {name} …` again"
+        )
+    })?;
+    if !global {
+        let inside = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !inside {
+            bail!("not inside a git repository; run this in one, or pass --global");
+        }
+    }
+    init::set_signing_identity(global, &p.did_key_id)?;
+    if global {
+        println!("Every repository now signs as '{name}' unless it selects another:");
+    } else {
+        println!("This repository now signs as '{name}':");
+    }
+    println!("  {}", p.did_key_id);
+    // `use` only picks the identity; signing itself is set up by `init`.
+    if git_config_get("gpg.ssh.program").as_deref() != Some("did-git-sign") {
+        println!();
+        println!("Note: git here is not set up to sign with did-git-sign yet. Run");
+        println!("`did-git-sign init` in this repository (or with --global) first.");
+    }
+    Ok(())
+}
+
+async fn cmd_health(
+    resolve_agent_names: bool,
+    did_jsonl: Option<&std::path::Path>,
+    profile: Option<&str>,
+) -> Result<()> {
+    let (config_path, mut cfg) = load_config()?;
+    // A named profile is checked in place of the default identity.
+    if let Some(name) = profile {
+        cfg.did_key_id = profiles::Profiles::load()?.get(name)?.did_key_id.clone();
+    }
 
     println!("did-git-sign health check");
     println!("=========================");
@@ -981,6 +1197,9 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
 
     // Config
     println!("Config:          {}", config_path.display());
+    if let Some(name) = profile {
+        println!("Profile:         {name}");
+    }
     named("Signing name:", &cfg.did_key_id);
     println!("DID:             {}", cfg.did_key_id);
     if let Some(name) = &cfg.user_name {

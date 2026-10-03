@@ -146,6 +146,50 @@ pub fn install(args: InstallArgs<'_>) -> Result<InstallResult> {
     })
 }
 
+/// Store one more identity without making it the default.
+///
+/// Its credentials go in the keyring, under its `did:…#key-N`, and its key
+/// into the `allowed_signers` file beside the config, so `git log
+/// --show-signature` recognises its commits. The config file and the git
+/// config, which name the default identity, are left alone: the identity
+/// signs only where `did-git-sign.key` (or `DID_GIT_SIGN_KEY`) selects it.
+/// Returns its SSH public key line.
+pub fn add_identity(args: InstallArgs<'_>) -> Result<String> {
+    let cfg = SigningConfig {
+        did_key_id: args.did_key_id.clone(),
+        user_name: None,
+    };
+    let vta_creds = VtaCredentials {
+        vta_url: args.vta_url,
+        vta_did: args.vta_did,
+        credential_did: args.credential_did,
+        private_key_multibase: args.credential_private_key_mb,
+        key_id: args.vta_key_id,
+        mediator_did: args.mediator_did,
+    };
+    config::store_vta_credentials(&args.did_key_id, &vta_creds)?;
+
+    let config_path = if args.global {
+        SigningConfig::default_global_path()?
+    } else {
+        SigningConfig::repo_local_path()
+    };
+    let entry = allowed_signers_entry(&cfg, args.verifying_key);
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    setup_allowed_signers(config_dir, &entry, args.global)?;
+
+    Ok(ssh_public_key_string(args.verifying_key))
+}
+
+/// Select which identity signs, in this repository (`global = false`) or for
+/// every repository: `git config did-git-sign.key <did_key_id>`. The signer
+/// and the commit-msg hook both read it, so the key and the claim move
+/// together.
+pub fn set_signing_identity(global: bool, did_key_id: &str) -> Result<()> {
+    let scope = if global { "--global" } else { "--local" };
+    git_config(scope, "did-git-sign.key", did_key_id)
+}
+
 /// Tear down a did-git-sign install for `did_key_id`. Idempotent — every
 /// step succeeds (best-effort) when its target is already gone, so the
 /// function is safe to run repeatedly or against a partial install.

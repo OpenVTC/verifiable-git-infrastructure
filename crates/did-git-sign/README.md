@@ -173,6 +173,30 @@ line in a commit message. Commits made that way are signed but carry no claim
 (for older commits in a branch, `reword` them in `git rebase -i`, which also
 runs the hook).
 
+## Profiles: more than one identity
+
+Each identity `init` sets up keeps its credentials in the keyring under its
+own `did:…#key-N`, and signing signs as whichever one `DID_GIT_SIGN_KEY` or
+`git config did-git-sign.key` selects. A profile gives each a name, so
+switching is one command instead of copying a DID:
+
+```bash
+did-git-sign init --global --profile bob   --vta-did <VTA DID> --context bob
+did-git-sign init --global --profile carol --vta-did <VTA DID> --context carol
+
+did-git-sign profiles          # list them; marks the default and the one this repo uses
+did-git-sign use bob           # this repository signs as bob
+did-git-sign use carol         # …now as carol
+did-git-sign health --profile carol
+```
+
+The first `init` sets the default as usual. A later `init --profile` adds the
+identity beside it without replacing it (pass `--default` to replace it).
+`use` sets this repository's `did-git-sign.key` (`--global` for every
+repository); the signer and the commit-msg hook both read it, so the key and
+the `Signed-by-DID:` claim always move together. Profiles are recorded in
+`profiles.json` beside the global config; it holds DIDs only, never secrets.
+
 ## Usage
 
 After setup, commits are signed automatically:
