@@ -26,7 +26,9 @@ async fn run_provision(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VtaEvent>();
     // AdminRotated rolls the ephemeral setup did:key over to a fresh
     // long-term admin DID server-side, so the credential we persist
-    // doesn't carry the setup key's `--admin-expires 1h` lifetime.
+    // doesn't carry the setup key's `--admin-expires 1h` lifetime. The VTA only
+    // allows that rollover for a setup entry created with `--admin-handoff`
+    // (VTI-ACL-054), so the command we print must carry it.
     let ask = ProvisionAsk::vta_admin_rotated(context.to_string()).with_label("did-git-sign");
     let setup_did = setup_key.did.clone();
     let setup_priv = setup_key.private_key_multibase().to_string();
@@ -329,6 +331,19 @@ async fn main() -> Result<()> {
     }
 }
 
+/// The `pnm` command that authorises the setup session's temporary admin DID.
+///
+/// `--admin-handoff` is required, not decoration: `init` rolls the setup DID
+/// over to a long-term admin (`ProvisionAsk::vta_admin_rotated`), and the VTA
+/// refuses that rollover for an entry created without the one-time hand-off
+/// (VTI-ACL-053, VTI-ACL-054). It in turn requires `--admin-expires`.
+fn pnm_grant_command(context: &str, setup_did: &str) -> String {
+    format!(
+        "    pnm contexts create --id {context} --name \"did-git-sign\" \\\n        \
+         --admin-did {setup_did} --admin-expires 1h --admin-handoff"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_init(
     global: bool,
@@ -372,11 +387,11 @@ async fn cmd_init(
     println!();
     println!("Authorise it on the VTA via your Personal Network Manager (PNM):");
     println!();
-    println!("    pnm contexts create --id {context} --name \"did-git-sign\" \\");
-    println!("        --admin-did {} --admin-expires 1h", setup_key.did);
+    println!("{}", pnm_grant_command(context, &setup_key.did));
     println!();
     if !yes {
-        println!("The admin grant is short-lived (1h). Once the command above has run,");
+        println!("The admin grant is short-lived (1h) and can hand off once to a long-term");
+        println!("admin DID (--admin-handoff). Once the command above has run,");
         print!("press Enter to continue (or Ctrl+C to abort)... ");
         use std::io::Write;
         std::io::stdout().flush().ok();
@@ -1097,6 +1112,19 @@ fn delegate_to_ssh_keygen(op: &str, cli: &Cli) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_command_carries_the_one_time_handoff() {
+        let cmd = pnm_grant_command("did-git-sign", "did:key:z6MkExample");
+        assert_eq!(
+            cmd,
+            "    pnm contexts create --id did-git-sign --name \"did-git-sign\" \\\n        \
+             --admin-did did:key:z6MkExample --admin-expires 1h --admin-handoff"
+        );
+        // The VTA refuses the rollover without the hand-off, which needs the expiry.
+        assert!(cmd.contains("--admin-handoff"));
+        assert!(cmd.contains("--admin-expires"));
+    }
 
     /// Sets an env var on construction, removes it on drop (panic-safe).
     /// Requires `#[serial_test::serial]` — `set_var`/`remove_var` are `unsafe`
