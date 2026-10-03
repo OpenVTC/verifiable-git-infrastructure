@@ -270,7 +270,16 @@ trql-client = "0.22.0"
 # 0.61 -> 0.62 keeps OpenVTC on one vta-sdk: 0.62 is a minor only because the
 # join-requests status types gained fields (VTI #1900, credential re-delivery).
 # Same TDK line; it declares `trust-tasks-rs ^0.26.1`, so that floor moves too.
-vta-sdk = { version = "0.62", default-features = false }
+#
+# 0.62 -> 0.63 keeps OpenVTC on one vta-sdk: 0.63 is a major only for the VTC
+# join-criteria types (VTI #1907, Keyring VTI-13), none of which this
+# workspace names. Same TDK line; it declares `trust-tasks-rs ^0.26.2`, so
+# that floor moves with it. It is *not* the trust-tasks 0.27 release: VTI main
+# moved to 0.27 (VTI #1922) after 0.63.0 was cut, so the next vta-sdk is the
+# one that takes this workspace to 0.27 — and trql-client 0.22 still declares
+# `^0.26`, so it has to move too before `cargo tree -i trust-tasks-rs` can
+# stay one node on that line.
+vta-sdk = { version = "0.63", default-features = false }
 affinidi-tdk = "0.22"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
@@ -418,11 +427,11 @@ affinidi-messaging-test-mediator = { version = "0.16", features = ["tsp"] }
 # names this same `trust-tasks-rs` directly now. The bridge is `publish =
 # false`, and signs and verifies with trust-tasks-proof on the same 0.23
 # line.
-trust-tasks-rs = { version = "0.26.1", default-features = false, features = ["git-ns"] }
+trust-tasks-rs = { version = "0.26.2", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
-trust-tasks-proof = "0.26.1"
+trust-tasks-proof = "0.26.2"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each
