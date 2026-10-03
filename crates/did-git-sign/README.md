@@ -42,12 +42,20 @@ see [Selecting which community persona signs](#selecting-which-community-persona
   discovers the service URL from the DID document, mints a short-lived admin
   did:key for the setup session, and prints the `pnm contexts create` command
   to authorise it.
+- `init` and signing reach the VTA over the transport it advertises: TSP or
+  DIDComm through its mediator, REST only when it advertises no mediator. A VTA
+  that publishes no REST service is reachable only through its mediator, and
+  the mediator DID is stored with the credentials so signing connects the same
+  way `init` did.
 
 ## Install
 
 ```bash
 cargo install did-git-sign
 ```
+
+The `tsp` feature is on by default, so the TSP leg of setup is built in;
+`--no-default-features` builds without it and falls back to DIDComm.
 
 `did-git-sign` is the signing half of
 [Verifiable Git Infrastructure (VGI)](https://github.com/OpenVTC/verifiable-git-infrastructure);

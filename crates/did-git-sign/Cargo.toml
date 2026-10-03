@@ -21,6 +21,12 @@ name = "did-git-sign"
 path = "src/main.rs"
 
 [features]
+# TSP is a default transport: `init` provisions over the VTA's advertised
+# bindings (TSP, then DIDComm) and a VTA that publishes no REST service is
+# reachable only that way. A build without it skips the TSP leg ("built
+# without the `tsp` feature") and falls back to DIDComm.
+default = ["tsp"]
+tsp = ["vta-sdk/tsp"]
 # Test-only: lets DID_GIT_SIGN_BYPASS_POLICY skip the parent-process check.
 # Never enable it in a published or released build; with it on, a build
 # without debug assertions (any release profile) fails to compile.
