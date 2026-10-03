@@ -387,7 +387,7 @@ async fn cmd_init(
     println!();
     println!("Authorise it on the VTA via your Personal Network Manager (PNM):");
     println!();
-    println!("{}", pnm_grant_command(context, &setup_key.did));
+    println!("{}", pnm_grant_command(&context, &setup_key.did));
     println!();
     if !yes {
         println!("The admin grant is short-lived (1h) and can hand off once to a long-term");
