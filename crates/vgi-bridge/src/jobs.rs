@@ -22,8 +22,9 @@ use crate::status::Guard;
 use crate::store::{NamespaceRecord, PinRecord, RepoRecord, Table, repo_key};
 use crate::wire::job;
 
-/// Run one job to its report.
-pub(crate) async fn run(bridge: &Arc<Bridge>, p: &job::Payload) -> Report {
+/// Run one job to its report. `issued_at` is the job document's `issuedAt`
+/// (Unix seconds), when the ledger has it.
+pub(crate) async fn run(bridge: &Arc<Bridge>, p: &job::Payload, issued_at: Option<i64>) -> Report {
     let mut report = Report::default();
     let ns_id = p.namespace.to_string();
     let ctx = match Ctx::load(bridge, &ns_id) {
@@ -63,9 +64,147 @@ pub(crate) async fn run(bridge: &Arc<Bridge>, p: &job::Payload) -> Report {
             }
         }
         (K::Inspect, None) => sweep(bridge, &ctx, true, &mut report).await,
+        (K::ClosePullRequest, Some(repo)) => {
+            close_pull_request(bridge, &ctx, &repo, p, issued_at, &mut report).await
+        }
         (kind, _) => report.fail_with("notCapable", format!("`{kind}` is not run here")),
     }
     report
+}
+
+/// The marker the bridge appends to the comment it posts for `closePullRequest`
+/// job `job_id`: an HTML comment, which GitHub and Forgejo do not display
+/// (job 0.5, *message*: the bridge MAY append one naming the `jobId`, and
+/// adds nothing else). A retry finds its own comment by it — together with
+/// its author being the bridge's own account — and posts no second one.
+pub(crate) fn comment_marker(job_id: &str) -> String {
+    format!("<!-- vgi-bridge job:{job_id} -->")
+}
+
+/// `closePullRequest` (`git-ns/bridge/job` 0.5, request rule 7): post the
+/// community's message on pull request `number` of `repo`, then close it —
+/// two steps, `comment` and `close`, in that order, idempotent across
+/// retries:
+///
+/// 1. a pull request already closed (merged included) is left alone: both
+///    steps `unchanged`, no comment;
+/// 2. one reopened after the job was issued by an account other than the
+///    bridge's own is left alone too (both `unchanged`, saying so): that
+///    reopen is newer than the VTC's order, and the bridge reports it as a
+///    `pullRequestOpened` for the VTC to judge;
+/// 3. otherwise `comment` — `unchanged` when the bridge's own comment for
+///    this `jobId` is already there ([`comment_marker`]) — then `close`.
+///
+/// When `comment` fails, `close` is `skipped` and the job `failed`; when
+/// `close` fails after `comment`, it is `partial`. A refusal for a
+/// permission the installation lacks (`pull_requests: write` on GitHub) is
+/// `forbidden`, and the namespace's installation is read again so that its
+/// `missingPermissions` says so.
+async fn close_pull_request(
+    bridge: &Arc<Bridge>,
+    ctx: &Ctx,
+    repo: &Resource,
+    p: &job::Payload,
+    issued_at: Option<i64>,
+    report: &mut Report,
+) {
+    let number = p.number.expect("checked by kind").get();
+    let message = p
+        .message
+        .as_ref()
+        .map(|m| m.to_string())
+        .expect("checked by kind");
+    let job_id = p.job_id.to_string();
+    if let Some(rec) = repo_record_by_resource(bridge, repo) {
+        report.repo = Some((repo.clone(), rec.forge_id));
+    }
+    let forge = ctx.adapter.forge();
+    let failed = |report: &mut Report, step: &str, e: &ForgeError| {
+        report.step(step, StepStatus::Failed, Some(e.to_string()));
+        report.fail(e);
+    };
+
+    let pr = match forge.pull_request(repo, number).await {
+        Ok(pr) => pr,
+        Err(e) => {
+            failed(report, "comment", &e);
+            report.step(
+                "close",
+                StepStatus::Skipped,
+                Some("the pull request could not be read".into()),
+            );
+            forbidden_reprobe(bridge, ctx, &e).await;
+            return;
+        }
+    };
+    if !pr.is_open() {
+        let why = match pr.state {
+            vgi_forge::PullRequestState::Merged => "already merged",
+            _ => "already closed",
+        };
+        report.step(
+            "comment",
+            StepStatus::Unchanged,
+            Some(format!("{why}; nothing posted")),
+        );
+        report.step("close", StepStatus::Unchanged, Some(why.into()));
+        return;
+    }
+    if let (Some(reopen), Some(issued)) = (&pr.last_reopen_by_other, issued_at)
+        && reopen.at > issued
+    {
+        let why = format!(
+            "reopened by {} after the job was issued; left open for the VTC to judge the reopen",
+            reopen.by.login
+        );
+        report.step("comment", StepStatus::Unchanged, Some(why.clone()));
+        report.step("close", StepStatus::Unchanged, Some(why));
+        return;
+    }
+
+    let marker = comment_marker(&job_id);
+    match forge.has_own_comment(repo, number, &marker).await {
+        Ok(true) => report.step(
+            "comment",
+            StepStatus::Unchanged,
+            Some("already posted for this job".into()),
+        ),
+        Ok(false) => {
+            let body = format!("{message}\n\n{marker}");
+            match forge.comment_on_pull_request(repo, number, &body).await {
+                Ok(()) => report.step("comment", StepStatus::Applied, None),
+                Err(e) => {
+                    failed(report, "comment", &e);
+                    report.step("close", StepStatus::Skipped, Some("not commented".into()));
+                    forbidden_reprobe(bridge, ctx, &e).await;
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            failed(report, "comment", &e);
+            report.step("close", StepStatus::Skipped, Some("not commented".into()));
+            forbidden_reprobe(bridge, ctx, &e).await;
+            return;
+        }
+    }
+    match forge.close_pull_request(repo, number).await {
+        Ok(()) => report.step("close", StepStatus::Applied, None),
+        Err(e) => {
+            failed(report, "close", &e);
+            forbidden_reprobe(bridge, ctx, &e).await;
+        }
+    }
+}
+
+/// After a `forbidden`: read the installation again, so that the
+/// namespace's `missingPermissions` (in the result's status report) names
+/// what the owner has not approved — an installation bound before the App
+/// asked for it has it recorded as complete.
+async fn forbidden_reprobe(bridge: &Bridge, ctx: &Ctx, e: &ForgeError) {
+    if mapping::error_code(e) == "forbidden" {
+        bridge.probe_bridge_checks(&ctx.ns.id).await;
+    }
 }
 
 /// A job's namespace, adapter and the adapter's view of the namespace.

@@ -9,7 +9,11 @@
 vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
 # The git-ns/bridge/event version sent to that VTC: "0.3" (the default; it
 # reports the bridge's role map, BRIDGE.md §6c), or "0.2" / "0.1" until the
-# VTC understands 0.3 (BRIDGE.md §7, "Event versions").
+# VTC understands 0.3 (BRIDGE.md §7, "Event versions"). Set "0.4" — never by
+# default — once the VTC lists git-ns/bridge/event/0.4 in its discovery
+# answer: it adds the pull requests opened and reopened, which the VTC's
+# pull-request gate decides on (BRIDGE.md §6d). Below 0.4 no pull request
+# is reported.
 # event_version = "0.3"
 # The community's Trust Registry (for the bootstrap and the bridge's check).
 trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"

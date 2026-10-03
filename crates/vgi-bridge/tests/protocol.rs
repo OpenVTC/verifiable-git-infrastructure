@@ -370,7 +370,7 @@ fn assert_no_nulls(v: &Value) {
 }
 
 #[tokio::test]
-async fn discovery_lists_job_0_4_and_older_job_versions_are_refused() {
+async fn discovery_lists_job_0_5_and_0_4_and_older_job_versions_are_refused() {
     let mut w = world(Options::default()).await;
     let ask = w
         .doc(
@@ -386,7 +386,7 @@ async fn discovery_lists_job_0_4_and_older_job_versions_are_refused() {
         "https://trusttasks.org/spec/trust-task-discovery/0.2#response"
     );
     assert_eq!(answer["threadId"], ask["id"]);
-    assert_eq!(answer["payload"]["supportedTypes"], json!([JOB]));
+    assert_eq!(answer["payload"]["supportedTypes"], json!([JOB_0_5, JOB]));
 
     for old in [
         JOB_0_1,

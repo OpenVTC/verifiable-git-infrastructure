@@ -428,6 +428,26 @@ affinidi-messaging-test-mediator = { version = "0.16", features = ["tsp"] }
 # false`, and signs and verifies with trust-tasks-proof on the same 0.23
 # line.
 trust-tasks-rs = { version = "0.26.2", default-features = false, features = ["git-ns"] }
+# The git-ns payload types the bridge speaks (`wire::{event, job, result}`),
+# taken from the trust-tasks-rs line that generates `git-ns/bridge/event` 0.4
+# (`pullRequestOpened`) and `git-ns/bridge/job` 0.5 (`closePullRequest`).
+# Everything else — `TrustTask`, errors, freshness, proofs, and every type
+# vta-sdk, trql-client and verify-trust pass across their APIs — stays on the
+# single `trust-tasks-rs` above. The payload types never cross an API: the
+# bridge serialises them to JSON before a document is built, so a second
+# copy here is contained to `crates/vgi-bridge/src/wire.rs`.
+#
+# A separate name, not a bump of the line above, because nothing published
+# can take that line yet: vta-sdk 0.63 (and the messaging SDK and trql-client
+# 0.22 under it) declare `^0.26`, and verify-trust implements trql-client's
+# transport traits over trust-tasks types (`E0053` on a split). When a
+# vta-sdk and a trql-client on the 0.27 line are published, this collapses
+# into the line above (rename `trust_tasks_git_ns` to `trust_tasks_rs` in
+# vgi-bridge) and `cargo tree -i trust-tasks-rs` is one node again.
+#
+# 0.27.3 is the release that carries event 0.4 and job 0.5
+# (dtgwg-trust-tasks-tf#723).
+trust-tasks-git-ns = { package = "trust-tasks-rs", version = "0.27.3", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.

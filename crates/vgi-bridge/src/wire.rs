@@ -1,7 +1,7 @@
 //! Trust Task documents on the VTC ↔ bridge link.
 //!
 //! The payload types are the ones generated from the normative
-//! `git-ns/bridge/*` specifications (`trust_tasks_rs::specs::git_ns`); this
+//! `git-ns/bridge/*` specifications (`trust_tasks_git_ns::specs::git_ns`); this
 //! module adds only behaviour: checking an inbound document before anything
 //! reads its payload, the rules JSON Schema cannot state (which members each
 //! job `kind` carries), and building signed outbound documents.
@@ -38,48 +38,78 @@ use trust_tasks_rs::{
 
 use crate::identity::BridgeIdentity;
 
+// The git-ns payload types come from `trust_tasks_git_ns`, the
+// trust-tasks-rs line that generates event 0.4 and job 0.5, while
+// everything else here (`TrustTask`, errors, freshness, proofs) stays on the
+// line vta-sdk and trql-client share (see the workspace manifest). The two
+// meet only as JSON. When vta-sdk and trql-client are on the 0.27 line too,
+// `trust_tasks_git_ns` becomes `trust_tasks_rs` again.
+use trust_tasks_git_ns::Payload as GitNsPayload;
+
 /// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
+pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_1 as event_v0_1;
 /// `git-ns/bridge/event` 0.2, still sent to a VTC configured for it.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event_v0_2;
-/// `git-ns/bridge/event` 0.3, the type every event is built as. 0.1 and 0.2
-/// are wire-identical for every forge event (0.2 changes only what the VTC
-/// does with a transfer, a reused name, and a resource outside the
-/// namespace; 0.3 only adds `roleMapReported`), so an event for a VTC
-/// configured for either is the same payload under the older type URI: see
-/// [`event_type_uri`]. `roleMapReported` is never sent under them.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_3 as event;
-/// The payload types of `git-ns/bridge/job` 0.4, the only version this
-/// bridge takes. It adds rules the schema does not state, checked in
+pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_2 as event_v0_2;
+/// `git-ns/bridge/event` 0.3, still sent to a VTC configured for it.
+pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_3 as event_v0_3;
+/// `git-ns/bridge/event` 0.4, the type every event is built as. Each version
+/// is wire-identical for every event the older ones carry (0.2 changes only
+/// what the VTC does with a transfer, a reused name, and a resource outside
+/// the namespace; 0.3 only adds `roleMapReported`; 0.4 only adds
+/// `pullRequestOpened`), so an event for a VTC configured for an older one
+/// is the same payload under the older type URI: see [`event_type_uri`].
+/// `roleMapReported` is never sent under 0.1 or 0.2, and
+/// `pullRequestOpened` never under anything before 0.4.
+pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_4 as event;
+/// `git-ns/bridge/job` 0.4, still taken (job 0.5: a bridge that takes 0.5
+/// SHOULD go on accepting 0.4).
+pub use trust_tasks_git_ns::specs::git_ns::bridge::job::v0_4 as job_v0_4;
+/// The payload types of `git-ns/bridge/job` 0.5, which every job is read
+/// as: a 0.4 job is a valid 0.5 job with the same meaning (0.5 only adds
+/// `closePullRequest`, which a 0.4 job cannot carry — [`job_kind_allowed`]).
+/// It adds rules the schema does not state, checked in
 /// [`check_kind_members`]: a namespace admin with no right of their own on
 /// a repository is listed at `git.ns.admin` and gets no role; there is no
 /// namespace-level `projectRoles`; each account appears once.
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_4 as job;
-pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
+pub use trust_tasks_git_ns::specs::git_ns::bridge::job::v0_5 as job;
+pub use trust_tasks_git_ns::specs::git_ns::bridge::result::v0_1 as result;
 
+/// `git-ns/bridge/job/0.5`'s type URI.
+pub const JOB_TYPE: &str = <job::Payload as GitNsPayload>::TYPE_URI;
 /// `git-ns/bridge/job/0.4`'s type URI.
-pub const JOB_TYPE: &str = <job::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+pub const JOB_TYPE_V0_4: &str = <job_v0_4::Payload as GitNsPayload>::TYPE_URI;
+/// The job versions this bridge takes, newest first — what it lists in
+/// answer to `trust-task-discovery`.
+pub const JOB_TYPES: [&str; 2] = [JOB_TYPE, JOB_TYPE_V0_4];
 
-/// `trust-task-discovery/0.2`, which a VTC asks before it sends 0.4 jobs
-/// (`git-ns/bridge/job` 0.4 forbids sending 0.4 to a bridge that has not
-/// shown it takes it).
+/// `trust-task-discovery/0.2`, which a VTC asks before it sends 0.4 or 0.5
+/// jobs (`git-ns/bridge/job` 0.4 and 0.5 each forbid sending that version to
+/// a bridge that has not shown it takes it).
 pub const DISCOVERY_TYPE: &str = "https://trusttasks.org/spec/trust-task-discovery/0.2";
 
 /// Whether `type_uri` (bare) is a job this bridge takes: `git-ns/bridge/job`
-/// 0.4 only.
+/// 0.5 or 0.4.
 pub fn is_job_type(type_uri: &str) -> bool {
-    type_uri == JOB_TYPE
+    JOB_TYPES.contains(&type_uri)
 }
 
 /// Whether `type_uri` (bare) is another version of `git-ns/bridge/job`,
 /// which this bridge refuses with `unsupportedVersion`: before 0.4 a
 /// namespace admin was sent as an owner, and nothing here reads that.
 pub fn is_other_job_version(type_uri: &str) -> bool {
-    type_uri != JOB_TYPE && type_uri.starts_with("https://trusttasks.org/spec/git-ns/bridge/job/")
+    !is_job_type(type_uri) && type_uri.starts_with("https://trusttasks.org/spec/git-ns/bridge/job/")
 }
 
-/// The `trust-task-discovery` answer: the job type this bridge takes, if
-/// any of `patterns` (SPEC §10.2 grammar; empty means `*`) selects its
+/// Whether a job of `kind` may arrive under `type_uri` (one
+/// [`is_job_type`] accepts): `closePullRequest` exists only from 0.5, so a
+/// 0.4 job naming it is malformed — 0.4's schema has no such kind, and the
+/// 0.5 types every job is read with would otherwise let it through.
+pub fn job_kind_allowed(type_uri: &str, kind: job::PayloadKind) -> bool {
+    type_uri == JOB_TYPE || kind != job::PayloadKind::ClosePullRequest
+}
+
+/// The `trust-task-discovery` answer: the job types this bridge takes, if
+/// any of `patterns` (SPEC §10.2 grammar; empty means `*`) selects their
 /// slug.
 pub fn discovery_answer(patterns: &[String]) -> Value {
     const SLUG: &str = "git-ns/bridge/job";
@@ -90,17 +120,34 @@ pub fn discovery_answer(patterns: &[String]) -> Value {
                 .is_some_and(|prefix| SLUG.starts_with(&format!("{prefix}/")))
     };
     let listed = patterns.is_empty() || patterns.iter().any(|p| selects(p));
-    let types: Vec<&str> = if listed { vec![JOB_TYPE] } else { Vec::new() };
+    let types: Vec<&str> = if listed {
+        JOB_TYPES.to_vec()
+    } else {
+        Vec::new()
+    };
     serde_json::json!({ "supportedTypes": types })
+}
+
+/// An error response carrying a code a git-ns specification declares (the
+/// generated `error_codes`), with the retryability it declares. Built from
+/// the code's wire form because the declaration comes from
+/// `trust_tasks_git_ns` and the error payload from `trust_tasks_rs`; when the
+/// two are one crate again this is `ErrorPayload::from(code)`.
+pub fn declared_error(code: trust_tasks_git_ns::DeclaredErrorCode) -> ErrorPayload {
+    let parsed: trust_tasks_rs::TrustTaskCode = code
+        .code
+        .parse()
+        .expect("a generated error code is a valid extended code");
+    ErrorPayload::new(parsed).with_retryable(code.retryable)
 }
 
 /// The type URI an event is sent under, for the version the VTC takes.
 pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
     use crate::config::EventVersion;
-    use trust_tasks_rs::Payload as _;
     match version {
         EventVersion::V0_1 => event_v0_1::Payload::TYPE_URI,
         EventVersion::V0_2 => event_v0_2::Payload::TYPE_URI,
+        EventVersion::V0_3 => event_v0_3::Payload::TYPE_URI,
         _ => event::Payload::TYPE_URI,
     }
 }
@@ -109,13 +156,13 @@ pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
 /// any version (a VTC acknowledges an event in the version it was sent,
 /// and the configured version may have changed since).
 pub fn is_event_response_type(type_uri: &str) -> bool {
-    use trust_tasks_rs::Payload as _;
     type_uri == event::Response::TYPE_URI
+        || type_uri == event_v0_3::Response::TYPE_URI
         || type_uri == event_v0_2::Response::TYPE_URI
         || type_uri == event_v0_1::Response::TYPE_URI
 }
 
-/// Parse a `git-ns/bridge/job` 0.4 payload.
+/// Parse a `git-ns/bridge/job` 0.4 or 0.5 payload (as 0.5).
 pub fn parse_job(payload: &Value) -> std::result::Result<job::Payload, String> {
     serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))
 }
@@ -464,65 +511,22 @@ pub fn check_kind_members(p: &job::Payload) -> std::result::Result<(), String> {
             Ok(())
         }
     };
-    // (repo, spec, desiredRoles, steps, target, subject): (allowed, required)
-    let rules: [(bool, bool); 6] = match p.kind {
+    // (repo, spec, desiredRoles, steps, target, subject, number, message):
+    // (allowed, required)
+    const NO: (bool, bool) = (false, false);
+    const MAY: (bool, bool) = (true, false);
+    const MUST: (bool, bool) = (true, true);
+    let rules: [(bool, bool); 8] = match p.kind {
         // 0.4: no namespace-level `projectRoles`.
-        K::ProjectRoles => [
-            (true, true),
-            (false, false),
-            (true, true),
-            (false, false),
-            (false, false),
-            (false, false),
-        ],
-        K::CreateRepo => [
-            (true, true),
-            (true, true),
-            (true, false),
-            (false, false),
-            (false, false),
-            (false, false),
-        ],
-        K::Bootstrap => [
-            (true, true),
-            (false, false),
-            (false, false),
-            (true, false),
-            (false, false),
-            (false, false),
-        ],
-        K::Archive => [
-            (true, true),
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-        ],
-        K::Inspect => [
-            (true, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-        ],
-        K::BeginBind => [
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (true, true),
-            (false, false),
-        ],
-        K::BeginAccountLink => [
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (false, false),
-            (true, true),
-        ],
+        K::ProjectRoles => [MUST, NO, MUST, NO, NO, NO, NO, NO],
+        K::CreateRepo => [MUST, MUST, MAY, NO, NO, NO, NO, NO],
+        K::Bootstrap => [MUST, NO, NO, MAY, NO, NO, NO, NO],
+        K::Archive => [MUST, NO, NO, NO, NO, NO, NO, NO],
+        K::Inspect => [MAY, NO, NO, NO, NO, NO, NO, NO],
+        K::BeginBind => [NO, NO, NO, NO, MUST, NO, NO, NO],
+        K::BeginAccountLink => [NO, NO, NO, NO, NO, MUST, NO, NO],
+        // 0.5: `repo`, `number` and `message` together.
+        K::ClosePullRequest => [MUST, NO, NO, NO, NO, NO, MUST, MUST],
         _ => return Err(format!("unknown job kind `{}`", p.kind)),
     };
     let present = [
@@ -532,9 +536,20 @@ pub fn check_kind_members(p: &job::Payload) -> std::result::Result<(), String> {
         p.steps.is_some(),
         p.target.is_some(),
         p.subject.is_some(),
+        p.number.is_some(),
+        p.message.is_some(),
     ];
-    let names = ["repo", "spec", "desiredRoles", "steps", "target", "subject"];
-    for i in 0..6 {
+    let names = [
+        "repo",
+        "spec",
+        "desiredRoles",
+        "steps",
+        "target",
+        "subject",
+        "number",
+        "message",
+    ];
+    for i in 0..names.len() {
         has(present[i], names[i], rules[i].0, rules[i].1)?;
     }
     if let Some(steps) = &p.steps {
@@ -604,7 +619,7 @@ pub fn clip(s: &str, max: usize) -> String {
 }
 
 /// Whether `v` is one of this module's request types, by bare type URI.
-pub fn is_type<P: trust_tasks_rs::Payload>(v: &VerifiedDoc) -> bool {
+pub fn is_type<P: GitNsPayload>(v: &VerifiedDoc) -> bool {
     v.doc.type_uri.to_string() == P::TYPE_URI
 }
 
@@ -946,18 +961,29 @@ mod tests {
     }
 
     #[test]
-    fn only_job_0_4_is_taken() {
+    fn job_0_4_and_0_5_are_taken() {
         assert!(is_job_type(JOB_TYPE));
-        for v in ["0.1", "0.2", "0.3"] {
+        assert!(is_job_type(JOB_TYPE_V0_4));
+        assert!(JOB_TYPE.ends_with("/git-ns/bridge/job/0.5"));
+        assert!(JOB_TYPE_V0_4.ends_with("/git-ns/bridge/job/0.4"));
+        for v in ["0.1", "0.2", "0.3", "0.6"] {
             let t = format!("https://trusttasks.org/spec/git-ns/bridge/job/{v}");
             assert!(!is_job_type(&t));
             assert!(is_other_job_version(&t));
         }
         assert!(!is_other_job_version(JOB_TYPE));
+        assert!(!is_other_job_version(JOB_TYPE_V0_4));
+        // `closePullRequest` is a 0.5 kind: refused under 0.4, taken under
+        // 0.5; every other kind under either.
+        use job::PayloadKind as K;
+        assert!(job_kind_allowed(JOB_TYPE, K::ClosePullRequest));
+        assert!(!job_kind_allowed(JOB_TYPE_V0_4, K::ClosePullRequest));
+        assert!(job_kind_allowed(JOB_TYPE_V0_4, K::ProjectRoles));
+        assert!(job_kind_allowed(JOB_TYPE, K::ProjectRoles));
     }
 
     #[test]
-    fn discovery_lists_job_0_4_for_a_pattern_that_selects_it() {
+    fn discovery_lists_job_0_5_and_0_4_for_a_pattern_that_selects_them() {
         for p in [
             vec![],
             vec!["*".to_string()],
@@ -966,7 +992,10 @@ mod tests {
         ] {
             assert_eq!(
                 discovery_answer(&p)["supportedTypes"],
-                json!([JOB_TYPE]),
+                json!([
+                    "https://trusttasks.org/spec/git-ns/bridge/job/0.5",
+                    "https://trusttasks.org/spec/git-ns/bridge/job/0.4"
+                ]),
                 "{p:?}"
             );
         }
@@ -976,6 +1005,40 @@ mod tests {
             vec!["git-ns/bridge/job/0.4".into()],
         ] {
             assert_eq!(discovery_answer(&p)["supportedTypes"], json!([]), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn close_pull_request_carries_repo_number_and_message() {
+        let parse = |v: Value| serde_json::from_value::<job::Payload>(v).unwrap();
+        let base = || {
+            json!({"jobId":"j","namespace":"n","kind":"closePullRequest",
+                "repo":"github.com/a/b","number":42,"message":"Not open to you."})
+        };
+        check_kind_members(&parse(base())).unwrap();
+        for missing in ["repo", "number", "message"] {
+            let mut v = base();
+            v.as_object_mut().unwrap().remove(missing);
+            assert!(check_kind_members(&parse(v)).is_err(), "without {missing}");
+        }
+        // Nothing another kind uses.
+        let mut v = base();
+        v["steps"] = json!(["workflow"]);
+        assert!(check_kind_members(&parse(v)).is_err());
+        // And no other kind carries `number` or `message`.
+        let v = json!({"jobId":"j","namespace":"n","kind":"archive","repo":"github.com/a/b","number":1});
+        assert!(check_kind_members(&parse(v)).is_err());
+        let v = json!({"jobId":"j","namespace":"n","kind":"inspect","message":"x"});
+        assert!(check_kind_members(&parse(v)).is_err());
+        // The schema's bounds: a pull request number is at least 1, and the
+        // message at most 16384 characters.
+        for bad in [
+            json!({"jobId":"j","namespace":"n","kind":"closePullRequest",
+                "repo":"github.com/a/b","number":0,"message":"m"}),
+            json!({"jobId":"j","namespace":"n","kind":"closePullRequest",
+                "repo":"github.com/a/b","number":1,"message":"x".repeat(16_385)}),
+        ] {
+            assert!(serde_json::from_value::<job::Payload>(bad).is_err());
         }
     }
 

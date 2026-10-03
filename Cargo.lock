@@ -392,7 +392,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-tasks-proof",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
  "url",
  "uuid",
 ]
@@ -484,7 +484,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "trust-tasks-proof",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
  "uuid",
 ]
 
@@ -6515,7 +6515,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
 ]
 
 [[package]]
@@ -6533,7 +6533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
 ]
 
 [[package]]
@@ -6553,6 +6553,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-tasks-rs"
+version = "0.27.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b8bf480c13e79e23ac3aaca5f03cc249b469fef91d5cf1248d4483f5622aef0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "regress",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror",
+]
+
+[[package]]
 name = "trust-tasks-tsp"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6563,7 +6578,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
 ]
 
 [[package]]
@@ -6790,7 +6805,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
  "uuid",
  "vgi-core",
  "vta-sdk",
@@ -6840,7 +6855,8 @@ dependencies = [
  "tracing-subscriber",
  "trql-client",
  "trust-tasks-proof",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
+ "trust-tasks-rs 0.27.3",
  "url",
  "uuid",
  "verify-trust",
@@ -6924,6 +6940,7 @@ version = "0.14.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "chrono",
  "hex",
  "http",
  "reqwest",
@@ -6982,7 +6999,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.26.3",
  "trust-tasks-tsp",
  "url",
  "uuid",

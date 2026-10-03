@@ -97,7 +97,8 @@ impl Scope {
             | ForgeEventKind::RepoDeleted { repo, .. }
             | ForgeEventKind::RepoArchived { repo, .. }
             | ForgeEventKind::RepoVisibilityChanged { repo, .. }
-            | ForgeEventKind::CollaboratorChanged { repo, .. } => self.covers(repo),
+            | ForgeEventKind::CollaboratorChanged { repo, .. }
+            | ForgeEventKind::PullRequestOpened { repo, .. } => self.covers(repo),
             ForgeEventKind::RepoRenamed { from, to, .. } => self.covers(from) && self.covers(to),
             ForgeEventKind::RepoTransferred {
                 from_namespace, to, ..
@@ -166,6 +167,15 @@ pub(crate) async fn on_webhook(
                 return StatusCode::UNAUTHORIZED;
             }
         }
+        // A pull request opened or reopened (event 0.4): reported to the
+        // VTC beside the bridge-posted check the same delivery may prompt,
+        // never instead of it. Deduplicated under its own key, so the
+        // check's handling of the delivery is unaffected.
+        if let Ok(Some(ev)) = adapter.forge().parse_event(headers, body)
+            && matches!(ev.kind, ForgeEventKind::PullRequestOpened { .. })
+        {
+            pull_request_opened(bridge, &scope, ev.delivery_id.as_deref(), ev.kind);
+        }
         match g.parse_check_trigger(headers, body) {
             Ok(mut triggers) if !triggers.is_empty() => {
                 let before = triggers.len();
@@ -220,6 +230,10 @@ pub(crate) async fn on_webhook(
         tracing::warn!(%host, owner = ?scope.owner, event = ?event.kind,
             "dropping an event that names a namespace or repository outside the App's organisation");
         return StatusCode::NO_CONTENT;
+    }
+    if let ForgeEventKind::PullRequestOpened { .. } = &event.kind {
+        pull_request_opened(bridge, &scope, event.delivery_id.as_deref(), event.kind);
+        return StatusCode::ACCEPTED;
     }
     if seen(bridge, host, event.delivery_id.as_deref()) {
         return StatusCode::OK;
@@ -481,6 +495,87 @@ async fn inspect_in(bridge: &Bridge, ns: &NamespaceRecord, repo: &Resource) {
     if let Err(e) = jobs::inspect_repo(bridge, &ctx, repo, true, None).await {
         tracing::warn!(%repo, error = %e, "could not inspect after a webhook");
     }
+}
+
+/// A pull request opened or reopened on a repository the namespace manages
+/// → `pullRequestOpened` (`git-ns/bridge/event` 0.4), queued for the VTC to
+/// decide on its pull-request policy. Returns whether one was queued.
+///
+/// Nothing is reported unless the VTC takes event 0.4
+/// ([`crate::config::EventVersion::reports_pull_requests`]): below it there
+/// is no pull-request gate, and no pull request is ever sent under an older
+/// type. Nor for a repository the namespace does not manage (the VTC
+/// governs no other), one of the binding's own (`.vgi`), or one outside the
+/// delivering App's organisation. Only who and where leave the bridge —
+/// never the title, body, branches or diff. Each delivery is reported once
+/// (by delivery id, under a key of its own: the same delivery's check is
+/// recorded separately).
+pub(crate) fn pull_request_opened(
+    bridge: &Arc<Bridge>,
+    scope: &Scope,
+    delivery_id: Option<&str>,
+    kind: ForgeEventKind,
+) -> bool {
+    let ForgeEventKind::PullRequestOpened {
+        repo,
+        forge_id,
+        number,
+        reopened,
+        author,
+        actor,
+        draft,
+        from_fork,
+    } = kind
+    else {
+        return false;
+    };
+    if !bridge.cfg.event_version.reports_pull_requests() {
+        tracing::debug!(%repo, number,
+            "not reporting a pull request: event_version is below 0.4 (no pull-request gate)");
+        return false;
+    }
+    if !scope.admits_repo(bridge, &repo, forge_id, true) {
+        tracing::debug!(%repo, forge_id, "not reporting a pull request on an unmanaged repository");
+        return false;
+    }
+    let Some(ns) = namespace_in(bridge, scope, &repo) else {
+        return false;
+    };
+    if NAMESPACE_REPOS.contains(&repo.repo_name().unwrap_or_default())
+        || !ns.managed.contains(&forge_id)
+        || repo_in(bridge, &ns, forge_id).is_none()
+    {
+        return false;
+    }
+    if let Some(d) = delivery_id {
+        let key = format!("{}#{d}#pullRequestOpened", repo.host());
+        if !bridge
+            .store
+            .put_new(Table::Deliveries, &key, &now())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    let host = repo.host();
+    let mut ev = json!({
+        "type": "pullRequestOpened",
+        "forgeId": forge_id.to_string(),
+        "resource": repo.as_str(),
+        "number": number,
+        "action": if reopened { "reopened" } else { "opened" },
+        "author": crate::mapping::wire_account(host, &author),
+        "actor": crate::mapping::wire_account(host, &actor),
+    });
+    if let Some(d) = draft {
+        ev["draft"] = json!(d);
+    }
+    if let Some(f) = from_fork {
+        ev["fromFork"] = json!(f);
+    }
+    let me = Arc::clone(bridge);
+    tokio::spawn(async move { report(&me, &ns.id, ev).await });
+    true
 }
 
 async fn report(bridge: &Bridge, ns: &str, ev: serde_json::Value) {

@@ -78,9 +78,11 @@ fn manifest_asks_for_exactly_the_reviewed_permissions() {
             // §9: the org ruleset that makes verify-trust a required workflow.
             "organization_administration": "write",
             // §9: the check the bridge posts itself where there is none, and
-            // the reads its trigger events need.
+            // the reads its trigger events need; pull requests at write for
+            // the pull-request gate (job 0.5 `closePullRequest`: comment,
+            // then close — the one permission that covers both).
             "checks": "write",
-            "pull_requests": "read",
+            "pull_requests": "write",
             "merge_queues": "read",
         })
     );
@@ -329,7 +331,7 @@ async fn complete_bind_records_installation_owner_and_kind() {
             "members:read".to_string(),
             "merge_queues:read".to_string(),
             "organization_administration:write".to_string(),
-            "pull_requests:read".to_string(),
+            "pull_requests:write".to_string(),
             "event:merge_group".to_string(),
             "event:pull_request".to_string(),
         ]
@@ -543,7 +545,7 @@ async fn device_flow_stops_on_expiry_denial_or_deadline() {
 fn good_permissions() -> serde_json::Value {
     json!({
         "administration": "write", "contents": "write", "actions_variables": "write",
-        "checks": "write", "pull_requests": "read", "merge_queues": "read",
+        "checks": "write", "pull_requests": "write", "merge_queues": "read",
         "metadata": "read", "members": "read", "organization_administration": "write",
     })
 }
@@ -710,4 +712,50 @@ async fn a_member_bound_redirect_link_is_refused_by_the_device_flow_adapter() {
     );
     let e = forge.complete_account_link(cb).await.unwrap_err();
     assert!(matches!(e, ForgeError::Unsupported { .. }), "{e:?}");
+}
+
+/// An installation approved before the App asked for `pull_requests: write`
+/// (the pull-request gate) keeps the bridge-posted check — that needs only
+/// read — and reports the write as missing, for the owner to approve.
+#[tokio::test]
+async fn an_installation_with_pull_requests_read_keeps_the_check_and_lacks_the_gate() {
+    let server = wiremock::MockServer::start().await;
+    let forge = forge_with(&server, |cfg| cfg.with_bridge_checks());
+    let mut perms = good_permissions();
+    perms["pull_requests"] = json!("read");
+    Mock::given(method("GET"))
+        .and(path("/app/installations/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "account": { "id": 500, "login": "newco", "type": "Organization" },
+            "permissions": perms,
+            "events": APP_EVENTS,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/orgs/newco/rulesets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/77/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "token": "ghs_t" })))
+        .mount(&server)
+        .await;
+    let state = GitHubForge::new_state().unwrap();
+    let ns = Resource::parse("github.com/newco").unwrap();
+    let binding = forge
+        .complete_bind(BindCallback::new(
+            callback(&state, "77", "install"),
+            state.clone(),
+            ns.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        binding.missing_permissions,
+        vec!["pull_requests:write".to_string()]
+    );
+    assert_eq!(forge.bridge_checks_ready(&ns), Some(true));
 }

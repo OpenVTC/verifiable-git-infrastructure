@@ -47,6 +47,8 @@ pub const KEYRING: &str =
 
 /// `git-ns/bridge/job` 0.4, the only version the bridge takes.
 pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
+/// `git-ns/bridge/job` 0.5 (adds `closePullRequest`); the bridge takes both.
+pub const JOB_0_5: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.5";
 /// `git-ns/bridge/job` 0.1, which the bridge refuses.
 pub const JOB_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
 pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";

@@ -50,6 +50,9 @@ trql-client = { workspace = true, optional = true }
 # Wire types (generated from the git-ns specifications) and their proofs.
 trust-tasks-rs = { workspace = true }
 trust-tasks-proof = { workspace = true }
+# The git-ns payload types, from the line that has event 0.4 and job 0.5
+# (see the workspace manifest; temporary until that line is published).
+trust-tasks-git-ns = { workspace = true }
 
 # TSP and DIDComm to the VTC and the registry, on the one mediator socket:
 # the TDK's messaging SDK (ATM, built with TSP), its delivery layer, and

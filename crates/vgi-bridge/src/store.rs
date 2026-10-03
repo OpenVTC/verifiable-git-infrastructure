@@ -158,6 +158,10 @@ pub struct JobRecord {
     pub result: Option<Value>,
     /// Unix seconds.
     pub received_at: i64,
+    /// The job document's `issuedAt`, in Unix seconds (absent in records
+    /// written before it was kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<i64>,
     /// Unix seconds, once finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
@@ -183,6 +187,7 @@ impl JobRecord {
             next: None,
             result: None,
             received_at,
+            issued_at: None,
             finished_at: None,
         }
     }

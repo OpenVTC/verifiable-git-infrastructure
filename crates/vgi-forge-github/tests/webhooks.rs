@@ -343,3 +343,80 @@ async fn member_ruleset_and_installation_events_translate() {
             .is_none()
     );
 }
+
+fn pull_request_delivery(action: &str, head_repo: Value, draft: Option<bool>) -> Value {
+    let mut pr = json!({
+        "number": 42,
+        "title": "never forwarded",
+        "body": "never forwarded",
+        "user": { "id": 5550123, "login": "eve-dev" },
+        "head": { "ref": "feature", "repo": head_repo },
+        "base": { "ref": "main", "repo": { "id": 9, "full_name": "acme/widgets" } },
+    });
+    if let Some(d) = draft {
+        pr["draft"] = json!(d);
+    }
+    json!({
+        "action": action,
+        "number": 42,
+        "pull_request": pr,
+        "repository": repository(9, "acme/widgets"),
+        "sender": { "id": 4410987, "login": "alice-acme" },
+    })
+}
+
+#[tokio::test]
+async fn pull_request_openings_and_reopens_translate() {
+    let same = json!({ "id": 9, "full_name": "acme/widgets" });
+    let fork = json!({ "id": 77, "full_name": "eve-dev/widgets" });
+    for (action, head, draft, reopened, from_fork) in [
+        ("opened", same.clone(), Some(false), false, Some(false)),
+        ("opened", fork.clone(), Some(true), false, Some(true)),
+        ("reopened", fork, None, true, Some(true)),
+        // A deleted fork: GitHub reports no head repository.
+        ("opened", Value::Null, None, false, Some(true)),
+    ] {
+        let ev = parse("pull_request", pull_request_delivery(action, head, draft))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ev.kind,
+            ForgeEventKind::PullRequestOpened {
+                repo: Resource::parse("github.com/acme/widgets").unwrap(),
+                forge_id: 9,
+                number: 42,
+                reopened,
+                author: ForgeAccount::new(5550123, "eve-dev"),
+                // The delivery's sender, never assumed to be the author.
+                actor: ForgeAccount::new(4410987, "alice-acme"),
+                draft,
+                from_fork,
+            },
+            "{action}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_pull_request_actions_are_not_events() {
+    let same = json!({ "id": 9, "full_name": "acme/widgets" });
+    for action in [
+        "synchronize",
+        "edited",
+        "closed",
+        "labeled",
+        "ready_for_review",
+    ] {
+        assert!(
+            parse(
+                "pull_request",
+                pull_request_delivery(action, same.clone(), None)
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "{action}"
+        );
+    }
+}

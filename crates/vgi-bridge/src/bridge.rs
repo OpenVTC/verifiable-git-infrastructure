@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Value, json};
-use trust_tasks_rs::{ErrorPayload, Payload as _, StandardCode, TrustTask};
+use trust_tasks_git_ns::Payload as _;
+use trust_tasks_rs::{ErrorPayload, StandardCode, TrustTask};
 use vgi_forge::Resource;
 
 use crate::config::BridgeConfig;
@@ -174,13 +175,13 @@ impl JobRefusal {
 
     pub(crate) fn unknown_namespace(msg: impl Into<String>) -> Self {
         JobRefusal(Box::new(
-            ErrorPayload::from(job::error_codes::UNKNOWN_NAMESPACE).with_message(msg),
+            wire::declared_error(job::error_codes::UNKNOWN_NAMESPACE).with_message(msg),
         ))
     }
 
     pub(crate) fn not_capable(msg: impl Into<String>) -> Self {
         JobRefusal(Box::new(
-            ErrorPayload::from(job::error_codes::NOT_CAPABLE).with_message(msg),
+            wire::declared_error(job::error_codes::NOT_CAPABLE).with_message(msg),
         ))
     }
 }
@@ -434,7 +435,7 @@ impl Bridge {
             self.send_error(
                 &verified.doc,
                 ErrorPayload::new(StandardCode::UnsupportedVersion)
-                    .with_message("this bridge takes git-ns/bridge/job 0.4 only"),
+                    .with_message("this bridge takes git-ns/bridge/job 0.5 and 0.4 only"),
             )
             .await;
         } else if ty == wire::DISCOVERY_TYPE {
@@ -506,6 +507,19 @@ impl Bridge {
                 return;
             }
         };
+        // Every job is read as 0.5; a kind 0.5 added is not a 0.4 job's.
+        let ty = v.doc.type_uri.to_string();
+        if !wire::job_kind_allowed(&ty, payload.kind) {
+            self.send_error(
+                &v.doc,
+                ErrorPayload::new(StandardCode::MalformedRequest).with_message(format!(
+                    "`{}` is a git-ns/bridge/job 0.5 kind; send it as 0.5",
+                    payload.kind
+                )),
+            )
+            .await;
+            return;
+        }
         if let Err(msg) = wire::check_kind_members(&payload) {
             self.send_error(
                 &v.doc,
@@ -526,7 +540,7 @@ impl Bridge {
                 if existing.digest != digest {
                     self.send_error(
                         &v.doc,
-                        ErrorPayload::from(job::error_codes::JOB_ID_REUSED).with_message(
+                        wire::declared_error(job::error_codes::JOB_ID_REUSED).with_message(
                             "this bridge already holds a job with this jobId and other content",
                         ),
                     )
@@ -572,7 +586,7 @@ impl Bridge {
             return;
         }
 
-        let record = JobRecord::queued(
+        let mut record = JobRecord::queued(
             job_id.clone(),
             digest,
             payload.namespace.to_string(),
@@ -580,6 +594,9 @@ impl Bridge {
             v.doc.payload.clone(),
             now(),
         );
+        // When the VTC issued it: `closePullRequest` stands down for a
+        // reopen by someone else after this (job 0.5, request rule 7).
+        record.issued_at = v.doc.issued_at.map(|t| t.timestamp());
         // Durable before `accepted: true` (spec, request rule 4).
         match self.store.put_new(Table::Jobs, &job_id, &record) {
             Ok(true) => {}
@@ -786,7 +803,7 @@ impl Bridge {
                     (),
                 ))
             })?;
-        let report = crate::jobs::run(self, &payload).await;
+        let report = crate::jobs::run(self, &payload, record.issued_at).await;
         self.finish_job(job_id, report).await;
         Ok(())
     }
@@ -978,6 +995,23 @@ impl Bridge {
                 key,
                 "holding a result or event until the bridge's state is written to the VTA"
             );
+            return;
+        }
+        // A pull request queued while the bridge sent 0.4 is never sent
+        // under an older version after the configuration changed (event
+        // 0.4: a VTC below 0.4 is told of no pull requests). Dropped, not
+        // held: it is a fact about one moment, and a VTC that later takes
+        // 0.4 hears of the next opening or reopening.
+        if entry.kind == OutboxKind::Event
+            && !self.cfg.event_version.reports_pull_requests()
+            && entry.payload.pointer("/event/type").and_then(Value::as_str)
+                == Some("pullRequestOpened")
+        {
+            tracing::info!(
+                key,
+                "dropping a pending pull-request report: event_version is below 0.4"
+            );
+            let _ = self.store.delete(Table::Outbox, key);
             return;
         }
         let type_uri = match entry.kind {

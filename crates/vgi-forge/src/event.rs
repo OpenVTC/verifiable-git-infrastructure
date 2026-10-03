@@ -164,6 +164,29 @@ pub enum ForgeEventKind {
         /// audit log.
         action: String,
     },
+    /// A pull request was opened on a repository, or a closed, unmerged one
+    /// was reopened (`git-ns/bridge/event` 0.4 `pullRequestOpened`). Only
+    /// who and where: never its title, body, branches or contents.
+    PullRequestOpened {
+        /// The repository it targets.
+        repo: Resource,
+        /// Its forge id.
+        forge_id: u64,
+        /// The pull request's number in `repo`.
+        number: u64,
+        /// `true` for a reopen, `false` for an opening.
+        reopened: bool,
+        /// Who opened the pull request.
+        author: ForgeAccount,
+        /// Who performed this action, as the forge records it: the author
+        /// for an opening, whoever reopened it for a reopen.
+        actor: ForgeAccount,
+        /// Whether it is a draft, when the forge says.
+        draft: Option<bool>,
+        /// Whether its head branch lives in another repository, when the
+        /// forge says.
+        from_fork: Option<bool>,
+    },
     /// The automation installation on a namespace changed.
     InstallationChanged {
         /// The namespace.
