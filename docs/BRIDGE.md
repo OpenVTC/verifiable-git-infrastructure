@@ -58,7 +58,7 @@ Outbound:
   open), over HTTPS it goes to the `#rest` URL.
 
 Terminate TLS at the proxy; the bridge speaks plain HTTP/1 behind it and
-refuses to start with a `public_url` that is not `https`. That rule covers
+refuses to start with a `public_url` that is not `https` (plain `http` is accepted only for `localhost`, `127.0.0.1` and `[::1]`). That rule covers
 the proxy, not the socket: `listen` (default `0.0.0.0:8080`, right inside a
 container) is plain HTTP carrying OAuth codes, App-setup redirects and
 webhook bodies, so only the proxy may reach it. Publish the container port to
@@ -152,8 +152,8 @@ DID it bound, so those namespaces are no longer served; the registry's
 the new one re-signs fail the check; and with no re-attach yet, binding them
 again needs an unbind, which revokes every right in them.
 
-The admin commands (`init`, `identity`, `secret`) open the store directly,
-and redb allows one process at a time: stop the bridge first.
+`identity show` prints the current DID. The admin commands (`init`,
+`identity`, `secret`) open the store directly, and redb allows one process at a time: stop the bridge first.
 
 ### The container
 
@@ -166,7 +166,9 @@ docker run -d --name vgi-bridge \
   -p 127.0.0.1:8080:8080 vgi-bridge
 ```
 
-Run `init` / `identity import` / `identity export` with the same volumes and
+The image runs as the unprivileged user `vgi` (uid 10001), so what you mount
+must be readable (the data volume writable) by that uid, and it carries a `HEALTHCHECK` (`vgi-bridge healthcheck`, §7). Run
+`init` / `identity import` / `identity export` with the same volumes and
 `vgi-bridge init` as the command before the first `run`.
 
 ## 2a. VTA mode
@@ -195,7 +197,8 @@ and a `TSPTransport` (`#tsp`) and a `DIDCommMessaging` service naming
 scoped to that context only** — exporting the context's keys needs the VTA's
 `key-export` capability, which only `admin` carries — and hand it to the
 bridge host as a file (owner-only, JSON: `did`, `privateKeyMultibase`,
-`vtaDid`, `vtaUrl`):
+`vtaDid`, and optionally `vtaUrl`; the same base64-encoded is also read), or
+in an environment variable the bridge clears once read (`credential_env`):
 
 ```sh
 pnm auth-credential create --role admin --contexts vgi-bridge --recipient req.json
@@ -222,6 +225,11 @@ credential_file = "/run/secrets/vgi-bridge-vta-credential"
 # else DIDComm, through the bridge's `mediator_did` unless this names
 # another:
 # mediator_did = "did:web:mediator.acme-vtc.example"
+# The other keys (all optional): `url` (the VTA's REST URL when the credential
+# carries none, used only for the messaging client's unauthenticated calls;
+# https, or loopback), `did` (the
+# bridge's DID; default: the context's DID), `start_timeout_secs` (300),
+# `key_refresh_secs` (60, at least 30) and `signing_switch_after_secs` (86400).
 ```
 
 The bridge talks to the VTA over TSP when the VTA's DID document advertises
@@ -320,7 +328,7 @@ being listed first, the next key signs at once. A key the VTA no longer
 releases never signs. (When the VTA exposes key-role states with
 `activatesAt`, the bridge will switch at that time instead.)
 
-Every `key_refresh_secs` (default 60), or at once on `SIGHUP`, the bridge
+Every `key_refresh_secs` (default 60, at least 30), or at once on `SIGHUP`, the bridge
 compares the key list and the document. It reads public halves only and
 exports the secrets again only when something changed. Through a planned
 rotation that means:

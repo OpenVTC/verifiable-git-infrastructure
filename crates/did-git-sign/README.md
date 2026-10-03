@@ -12,7 +12,7 @@ git calls `did-git-sign` with the commit data on stdin. The tool:
 1. Loads its config (`.did-git-sign.json`) and retrieves the VTA credential from the OS keyring
 2. Authenticates with the VTA (or reuses a cached token)
 3. Fetches the Ed25519 signing key from the VTA on-the-fly
-4. Produces an SSH signature (PROTOCOL.sshsig format) and writes it to stdout
+4. Produces an SSH signature (PROTOCOL.sshsig format) and writes it to `<file>.sig`, as ssh-keygen does (to stdout when git passes no file)
 5. Zeroizes the key material from memory
 
 Your DID verification method ID (e.g. `did:webvh:abc:example.com#key-0`) is
@@ -116,8 +116,8 @@ did-git-sign init \
 
 The `init` command performs the following:
 
-1. **Saves config** to `.did-git-sign.json` (local) or `~/.config/did-git-sign/config.json` (global) — contains only `key_id`, `did_key_id`, and `user_name`
-2. **Stores VTA credentials** (URL, DIDs, private key) in the OS keyring (macOS Keychain / Linux Secret Service)
+1. **Saves config** to `.did-git-sign.json` (local) or `~/.config/did-git-sign/config.json` (global) — contains only `did_key_id` and `user_name`
+2. **Stores VTA credentials** (URL, DIDs, private key, signing key id) in the OS keyring (macOS Keychain / Linux Secret Service). The VTA URL must be `https://` — cleartext `http://` is accepted only to loopback (`localhost`, `127.0.0.0/8`, `[::1]`) — and must carry no `user:password@` part; anything else is refused
 3. **Verifies VTA connectivity** by authenticating and fetching the signing key
 4. **Configures git:**
    - `gpg.format = ssh`
@@ -150,7 +150,7 @@ The `init` command performs the following:
 `init` writes the hook once; installing a newer `did-git-sign` binary does not
 replace it. Each hook carries a version line (`# did-git-sign-hook-version:
 N`), and `did-git-sign health` reports `Commit-msg hook: OUTDATED` when the
-installed one is older than the binary's. Re-run `did-git-sign init` (with
+installed one is older than the binary's (the current hook is version 2). Re-run `did-git-sign init` (with
 `--global` if that is how you installed) to replace it; `init` overwrites only
 hooks it wrote.
 
@@ -176,11 +176,16 @@ git log --show-signature
 ```
 
 Check your configuration, the installed `commit-msg` hook, and VTA
-connectivity:
+connectivity (`--did-jsonl <path>` also checks the signing key against a
+`did.jsonl` log):
 
 ```bash
 did-git-sign health
 ```
+
+`did-git-sign verify` performs a test sign; `did-git-sign uninstall`
+(`--global` or `--local`) removes the config, the keyring entries, the
+`allowed_signers` line and the git config keys `init` set.
 
 ### Showing names instead of DIDs
 
@@ -286,6 +291,8 @@ it does not compile without debug assertions.
 
 ### Other properties
 
+- **Bounded input** — signing refuses input larger than 16 MiB; git's commit
+  and tag objects are far smaller.
 - **No key material on disk** — the VTA credential private key is stored in the
   OS keyring, and the Ed25519 signing key is fetched from the VTA at sign-time
   and held only in memory.
@@ -309,16 +316,16 @@ it does not compile without debug assertions.
 git commit
     |
     v
-git calls: did-git-sign -Y sign -f .did-git-sign.json -n git
-    |                                                (stdin: commit data)
+git calls: did-git-sign -Y sign -f .did-git-sign.json -n git <buffer file>
+    |                                                (commit data)
     v
 did-git-sign:
-    1. Load config from .did-git-sign.json (key_id + did_key_id only)
+    1. Load config from .did-git-sign.json (did_key_id + user_name only)
     2. Load VTA credentials from OS keyring
     3. Authenticate with VTA (or use cached token from keyring)
     4. Fetch Ed25519 key: VTA.get_key_secret(key_id)
     5. Sign commit data (PROTOCOL.sshsig format)
-    6. Output SSH signature to stdout
+    6. Write SSH signature to <buffer file>.sig
     7. Zeroize key material
     |
     v
@@ -342,7 +349,7 @@ service name `did-git-sign`:
 
 | Keyring Entry | Contents |
 |---------------|----------|
-| `{did_key_id}:vta` | VTA URL, VTA DID, credential DID, credential private key, signing key ID |
+| `{did_key_id}:vta` | VTA URL, VTA DID, credential DID, credential private key, signing key ID, and the VTA's mediator DID when it is reached over DIDComm |
 | `{did_key_id}:token` | Cached VTA access token and expiry |
 
 [verify-trust]: https://crates.io/crates/verify-trust

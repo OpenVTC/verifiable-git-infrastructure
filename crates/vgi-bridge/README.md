@@ -26,7 +26,8 @@ the bridge carries it out and reports back.
   per job; `git-ns/bridge/event`s for what happens on the forge. The payload
   types are generated from the normative specifications
   (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed
-  (`eddsa-jcs-2022`) and every inbound one checked — issuer, transport sender,
+  (`eddsa-jcs-2022`, proof purpose `authentication`; any other purpose is
+  refused) and every inbound one checked — issuer, transport sender,
   recipient, freshness, then proof — before its payload is read.
 - **Jobs.** `jobId` idempotency from a durable ledger (a repeat is answered,
   never run twice; a finished job repeated has its result sent again;

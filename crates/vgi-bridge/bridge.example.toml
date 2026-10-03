@@ -34,7 +34,7 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 # …or an environment variable instead:
 # master_key_env = "VGI_BRIDGE_MASTER_KEY"
 
-# VTA mode (recommended; BRIDGE.md §2): the bridge's DID, keys, secrets and
+# VTA mode (recommended; BRIDGE.md §2a): the bridge's DID, keys, secrets and
 # state live in its own trust context of the VTC's VTA, and this host holds
 # only a context-scoped credential. Losing the host then loses nothing: issue
 # a new credential and start the bridge on an empty data directory. Remove
@@ -53,7 +53,7 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 # # The bridge's DID; default: the context's DID.
 # # did = "did:webvh:…"
 # # How long start-up waits for an unreachable VTA, and how often the bridge
-# # asks it whether its keys were rotated (SIGHUP asks at once).
+# # asks it whether its keys were rotated (at least 30; SIGHUP asks at once).
 # # start_timeout_secs = 300
 # # key_refresh_secs = 60
 # # How long a newly listed signing key must be in the DID document before

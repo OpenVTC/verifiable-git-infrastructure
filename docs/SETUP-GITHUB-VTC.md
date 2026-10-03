@@ -49,8 +49,8 @@ Standing up the VTA, the registry and the VTC is documented in
 
 | Component | Needs |
 |---|---|
-| VGI (`vgi-bridge`, the `verify-trust` action and binary, `did-git-sign`) | **0.4.14** or later |
-| `trust-tasks-rs` on the VTC | **0.22.6** or later (VTI `main` resolves 0.22.7) |
+| VGI (`vgi-bridge`, the `verify-trust` action and binary, `did-git-sign`) | **0.11.0** or later |
+| `trust-tasks-rs` on the VTC | **0.26.1** or later (the bridge's own floor; VTI `main` resolves 0.26.3) |
 | VTC | `main` of verifiable-trust-infrastructure — the first with `[git_ns]`, `git-ns/bridge/event` 0.2, `drift/resolve` and `reseat` |
 | `openvtc` (members) | `main` — the first with the *Repos* view |
 | `git` on contributors' machines | 2.20+ (the commit-msg hook); 2.36+ for conditional includes by remote |
@@ -158,8 +158,9 @@ master_key_file    = "/run/secrets/vgi-bridge-master-key"
 [verify_trust]
 # What the bootstrap writes into workflows. The action must be pinned to a
 # 40-hex commit; `version` is the release the action downloads.
-action  = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of v0.4.14>"
-version = "v0.4.14"
+action  = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of v0.11.0>"
+version = "v0.11.0"
+# transport = "auto"       # tsp | didcomm | https; see below
 # required_check = "Verify commit trust"
 
 [[github]]
@@ -177,9 +178,17 @@ platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
 ```
 
 Get the commit for the tag with
-`gh api repos/OpenVTC/verifiable-git-infrastructure/commits/v0.4.14 --jq .sha`,
+`gh api repos/OpenVTC/verifiable-git-infrastructure/commits/v0.11.0 --jq .sha`,
 and GitHub's `web-flow` key with
 `curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc`.
+
+`transport` (default `auto`: TSP, then DIDComm, then HTTPS, whichever the
+registry advertises first, no fallback) is written into the workflows as the
+action's `transport` input and also governs the check the bridge posts. Over
+TSP or DIDComm the registry's mediator must admit the unknown DIDs a CI run
+(and the bridge) queries as — see *Registry discovery* in the
+[runbook](RUNBOOK.md#4-set-up-the-repository); until it does, set
+`transport = "https"`.
 
 `platform_keyring_file` is optional to *start*, but not to run well: the
 required-workflow and in-repo plans refuse to plan without it, the check the
@@ -429,7 +438,13 @@ cnm git grant --subject did:webvh:…:bob --right git.repo.create \
 
 Both are elevated or destructive, so under the default config they must be
 signed by a community administrator who also holds `git.ns.admin` there (the
-binder does). Namespace rights go to **current members only**, and every DID
+binder does). Separation of duties applies on top: nobody grants *themselves*
+`git.ns.admin`, `git.repo.create` or `git.repo.own`. The binder therefore
+cannot give themselves `repo.create`; another namespace admin grants it, or the
+binder uses `cnm git create --owner <other member>` (§7.1). The explicit
+escape is `cnm git break-glass` (passkey step-up, justified, announced to every
+other administrator), which another administrator then ratifies
+(`cnm git ratify`) or revokes; `cnm git break-glass-list` shows them. Namespace rights go to **current members only**, and every DID
 must be DID-core syntax (`did:<method>:<id>`, no fragment) — anything else is
 `malformedRequest`, and `cnm` refuses it before signing.
 
@@ -497,7 +512,10 @@ cnm git create --namespace ns_… widgets --visibility public \
   --description "Widgets"
 ```
 
-(or `n` in openvtc's *Repos* view; or the console). The VTC reserves the
+(or `n` in openvtc's *Repos* view; or the console). You own the repository
+only if you hold `git.repo.create` by an explicit record; a namespace admin
+whose right is only implied names another current member with `--owner <did>`
+(repeatable), since owning it themselves would be a self-grant. The VTC reserves the
 name, records the requester as its owner, and sends the bridge a
 `createRepo` job; the bridge creates the repository and runs the
 **bootstrap**, check-then-apply: files, then the ruleset. `cnm git repos`
@@ -661,7 +679,7 @@ The same VTC, the same bridge (another `[[forgejo]]` entry), another
 namespace. What changes:
 
 - **A bot instead of an App.** Create the bot user, its token (scopes
-  `write:organization`, `write:repository`), and an OAuth2 application with
+  `write:organization`, `write:repository`, `read:user`), and an OAuth2 application with
   redirect URIs `https://<public_url>/forgejo/<host>/bind` and `…/link`;
   store the secrets with `vgi-bridge secret set forgejo/<host>/…`
   (BRIDGE.md §4). Add the bridge's DID under the instance's host in the
@@ -669,7 +687,7 @@ namespace. What changes:
 - **Config:** `[verify_trust] sha256` is required (a Forgejo runner cannot
   verify the release's attestation; take the hash as in
   [runbook §4a](RUNBOOK.md#forgejo-actions-runners)). Workflows run on a
-  runner labelled **`docker`**; the bridge has no setting to change it.
+  runner labelled **`docker`** unless the `[[forgejo]]` entry sets `runs_on`.
 - **Bind:** `cnm git namespace bind --forge codeberg.org --owner acme --mode bridge`;
   an organisation owner signs in through the OAuth app at the printed URL.
   The bridge adds the bot to a `vgi-bridge` team and creates the org
@@ -677,8 +695,7 @@ namespace. What changes:
 - **Linking:** openvtc shows a URL (and its QR code) to authorise on the
   instance, not a device code.
 - **The bootstrap:** `.forgejo/workflows/verify-trust.yml` committed, with
-  the DIDs as Actions variables where the instance has the variables API and
-  as literals otherwise; **fast-forward-only merges** (Forgejo 7+, Gitea
+  the DIDs as literals (the bridge does not use Actions variables); **fast-forward-only merges** (Forgejo 7+, Gitea
   1.22+), so DID-signed commits land unchanged and no platform key is needed —
   `instance_signing_key_fallback = true` allows instance-signed merge commits
   on an older instance instead; a branch rule that lets nobody push, applies
