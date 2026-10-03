@@ -4,7 +4,8 @@ Running commit trust on a forge's repositories. Read this if you run the
 Trust Registry, the VTA, the VTC, or the repositories the check protects.
 
 The shape to hold in your head: **VGI verifies, the VTC decides.** A commit
-names its signer DID on its own `committer` header; `verify-trust` proves that
+names its signer DID in its own `Signed-by-DID:` trailer (older commits: on
+the `committer` header); `verify-trust` proves that
 DID signed it, then asks the registry whether that DID is authorized. Who may
 sign, key rotation, and revocation are registry and VTA concerns — nothing
 about them lives in the repository.
@@ -266,7 +267,12 @@ Outside a VTC-governed namespace, or to see what it writes, set it up by hand:
 **Workflow** — `.github/workflows/verify-trust.yml`:
 
 ```yaml
-on: pull_request
+on:
+  pull_request:
+  merge_group:                          # a merge queue; without it the check never reports there
+
+permissions:
+  contents: read
 
 jobs:
   verify:
@@ -274,17 +280,29 @@ jobs:
     if: vars.TRUST_REGISTRY_DID != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.6
+      # Pin actions to a commit, not a tag: a tag can be moved.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          range:        origin/${{ github.base_ref }}..HEAD
+          fetch-depth: 0                # so origin/<base>..HEAD resolves
+          persist-credentials: false
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of vX.Y.Z>
+        with:
+          # a merge_group event has no base_ref; the queue names its base commit
+          range: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || format('origin/{0}', github.base_ref) }}..HEAD
           registry-did: ${{ vars.TRUST_REGISTRY_DID }}
           vtc-did:      ${{ vars.VTC_DID }}
+          resource-format: qualified    # the default, and the only one since v0.8.0
           exempt-keyring: .github/trusted-platform-keys.asc
+          version:      vX.Y.Z          # the release the binary is downloaded from
           resolve-agent-names: true     # optional; one HTTPS fetch per claimed name
-          # resource-format: qualified  # once the grants are qualified (§2)
 ```
+
+Use a real release for `vX.Y.Z` (see the repository's releases), and the commit
+it points at for the action reference — `git rev-parse vX.Y.Z^{commit}`. `version`
+defaults to `latest`, which moves under you; pin it. The `vars.*` references are
+the simple form: *Protect the check from the pull request it checks*, below,
+replaces them with literals, because any repository admin can change a variable.
+This is the file `vgi repo init` and the bridge write, less that hardening.
 
 `fetch-depth: 0` is not optional — without the base ref present the range does
 not resolve.
@@ -347,7 +365,7 @@ yet, set `transport: https`** on the action (the registry must still publish
 for the workflows it writes:
 
 ```yaml
-      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
+      - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of vX.Y.Z>
         with:
           # …
           transport: https   # until the registry's mediator admits CI's throwaway DIDs
@@ -531,9 +549,13 @@ jobs:
     runs-on: docker                   # whatever label your runner registers
                                       # (the bridge: `runs_on` in [[forgejo]])
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
+      # By full URL and commit (v4.4.0): v4 runs on node20, which every
+      # forgejo-runner supports; v5+ needs node24.
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of vX.Y.Z>
         with:
           range:           origin/${{ github.base_ref }}..HEAD
           registry-did:    ${{ vars.TRUST_REGISTRY_DID }}
@@ -621,7 +643,7 @@ URL — Forgejo resolves a bare `owner/repo` against the instance's configured
 default actions URL, which is usually not GitHub:
 
 ```yaml
-      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z
+      - uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of vX.Y.Z>
         with:
           range:        origin/${{ github.base_ref }}..HEAD
           registry-did: ${{ vars.TRUST_REGISTRY_DID }}
@@ -686,6 +708,7 @@ the remediation is unambiguous:
 | Verdict | Cause | Fix |
 |---|---|---|
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
+| `malformed` | the signature did not parse as an Ed25519 sshsig, or uses another algorithm (RSA, ECDSA), or the commit object is malformed | the commit was not signed by `did-git-sign` — re-sign it with `did-git-sign` (below) |
 | `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
 | `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, the DID **deactivated** (a retired signer: re-sign its commits as a live identity), or lists no Ed25519 key under `assertionMethod` |
@@ -819,15 +842,27 @@ Where to do it:
 
 - **`cnm git …`** — each change is a signed `git-ns/*` Trust Task, authorized
   by the **profile DID's own git rights**. The listings (`cnm git namespace
-  list`, `cnm git repos`, `cnm git view --admin`) use an admin session.
+  list`, `cnm git repos`, `cnm git view --admin`) are signed `git-ns/*` reads
+  too: they answer a community administrator (every namespace) or a
+  namespace's admin (`git.ns.admin`, that namespace), and anyone else gets
+  `git-ns/view:notAdministrator`. `--json` prints the full answer.
 - **openvtc** — for members: *Communities* → the community → `r` opens
   *Repos*. On a repository: `a` grant, `x` revoke, `t` transfer, `A` archive;
   on the list: `n` new repository; anywhere: `l` link a forge account, `r`
   refresh.
 - **The admin console's Repos page** (`/admin/repos`) — every namespace,
   repository, right, drift item and job. Its changes are signed with the
-  browser's console key where one is enrolled, or handed over as the `cnm`
-  command.
+  browser's console key, which the console requires before it opens, or
+  handed over as the `cnm` command.
+
+There is no REST route for any of this: the git-namespace family is reached
+only as signed Trust Tasks, over HTTPS (`/v1/trust-tasks`), TSP or DIDComm
+(`cnm --transport rest|tsp|didcomm` pins one). Reads that have no `cnm`
+command — the rights list, bridge jobs, the registry projection, activity,
+linked accounts and *issued by departed members* — are panels on the console's
+Repos and Members pages. Rights, issued-by-departed, projection and accounts
+need a community administrator (`git-ns/…:notCommunityAdministrator`
+otherwise).
 
 Under the default `[git_ns] elevated_requires_admin = true`, **elevated**
 actions — granting or revoking `git.repo.own` or `git.repo.create`,
@@ -835,13 +870,13 @@ transfer, archive, adopt — and **destructive** ones — bind, unbind, granting
 or revoking `git.ns.admin` — are accepted only from a community
 administrator who also holds the git right that entitles them. Granting and
 revoking `maintain` and `git.commit.sign`, and creating a repository, are
-normal-class. (Why: SETUP-GITHUB-VTC.md §1.)
+normal-class. (Why: SETUP-GITHUB-VTC.md §1.) None of these lets anyone give
+themselves an elevated right: see §8l.
 
 A change reaches the registry within a projector pass (`tick_seconds`,
 default 5; at least once a minute regardless) and the forge when the bridge
-runs the job. `GET /v1/git-ns/projection` shows what is published and how many
-changes are pending; `GET /v1/git-ns/jobs` shows the bridge jobs. Both are on
-the console.
+runs the job. The console's Repos page shows what is published and how many
+changes are pending (the projection) and the bridge jobs.
 
 ### 8a. Add or remove a contributor
 
@@ -928,10 +963,19 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   its link — and the VTC re-projects those by itself; the console shows the map
   each right projects to. On a bridge set to `event_version = "0.2"`, or to
   force it anyway, re-project by hand:
-  `cnm git reproject --resource github.com/acme` (a namespace) or
-  `--resource github.com/acme/widgets` (one repository), or **Re-project
-  roles** on the console's Repos page. A community administrator or a
-  namespace admin may; no right changes.
+  `cnm git reproject github.com/acme` (a namespace) or
+  `cnm git reproject github.com/acme/widgets` (one repository; `--reason`
+  goes in the audit record), or **Re-project roles** on the console's Repos
+  page. A community administrator or a namespace admin may, and a repository's
+  owner may for that repository; no right changes. A manual-mode namespace is
+  refused `git-ns/roles/reproject:manualMode`, and one whose bridge lost its
+  forge access `:noForgeAccess`.
+- **Unlinking** is `cnm git unlink --forge github.com` (the member's own
+  account; `--account-id` guards against a stale read). The VTC drops the
+  binding and the bridge withdraws the roles it gave; no right changes, and a
+  role the bridge did not give stays and shows as drift. Nothing to unlink is
+  `git-ns/account/unlink:notLinked`. `cnm git link --list` shows your own
+  linked accounts.
 - **A repository keeps an owner.** Revoking the last one is
   `git-ns:lastOwner`; grant the replacement first. Only an owner record
   **without an expiry** counts for this, so an expiring grant cannot be the
@@ -969,7 +1013,7 @@ Remove them from the community as usual (the console's *Members* page,
 
 **Grants they issued stay** — they were made under the community's
 authority. Review them: the console lists *issued by departed members*
-(`GET /v1/git-ns/rights/issued-by-departed`); revoke with `cnm git revoke`
+(a community administrator's panel on the Repos page); revoke with `cnm git revoke`
 whatever should not outlive its granter. A community that wants them gone
 automatically sets `cascade_on_departure` in its `gitNamespace` policy's
 `settings`; the departure sweep then revokes them too.
@@ -987,7 +1031,7 @@ naming the team or the ownership: remove it on GitHub.
 The bridge compares each repository with what the VTC projects and reports
 every difference as a drift item. Members see them in
 `cnm git view --resource github.com/acme/widgets` (and openvtc); administrators
-on the console (`GET /v1/git-ns/drift`). An owner of the repository, or a
+on the console's Repos page. An owner of the repository, or a
 namespace admin over it, answers each one.
 
 | Item | Means | Adopt | Revert |
@@ -1018,12 +1062,20 @@ impact of revoking `own`, and is elevated.
 **Adopt** records the forge-side role as a right, evaluated exactly as a
 grant from you — the same fixed rules, policy (seen as `right.grant` with
 `via: "drift.adopt"`) and consent class. It needs the value you read, so a
-forge that changed since adopts nothing:
+forge that changed since adopts nothing, and it names the member the right
+goes to (`--subject`, the one linked to the account; a revert refuses it):
 
 ```sh
 cnm git drift resolve github.com/acme/widgets adopt --type roleAdded \
-  --account-id 5550124 --account-login dave --observed maintain
+  --account-id 5550124 --account-login dave --observed maintain \
+  --subject did:webvh:…:dave
 ```
+
+If the account was unlinked and linked to someone else since you read it, the
+adoption is refused `git-ns/drift/resolve:subjectChanged`: read it again with
+`cnm git view --admin`. You cannot adopt an elevated right for yourself
+(`git-ns:selfGrantNotAllowed`, §8l). While the bridge has not reported its role
+map the VTC assumes none, and an adoption is refused `git-ns:roleMapUnknown`.
 
 Adoptable: a `roleAdded`, or a `roleChanged` that raises the member, held by
 an account **linked to a current member**, at a role a right projects to —
@@ -1104,8 +1156,7 @@ The detail of each upgrade is in BRIDGE.md §3.
 
 A namespace whose every `git.ns.admin` has left the community or lapsed is
 **headless**: nobody can adopt, name an owner for an orphaned repository, or
-grant namespace rights. The console and `GET /v1/git-ns/namespaces` flag it
-(`headless`). A community administrator restores it:
+grant namespace rights. The console flags it (`headless`). A community administrator restores it:
 
 ```sh
 cnm git reseat ns_… --subject did:webvh:…:alice \
@@ -1270,6 +1321,14 @@ fix where one applies.
 | `git-ns:scopeViolation` | the resource lies outside what the right can cover (another namespace or forge, a namespace right on a repository) | name the right resource |
 | `git-ns:escalation` | granting more than you hold, or re-delegating `repo.create` | someone who holds it grants; `cnm git view` shows yours |
 | `git-ns:membersOnly` | a namespace right (`ns.admin`, `repo.create`) for a non-member | members only — a fixed rule |
+| `git-ns:selfGrantNotAllowed` | giving yourself `git.ns.admin`, `git.repo.create` or `git.repo.own` — in a grant, a create (`cnm git create` with no `--owner`, or naming yourself, when your `repo.create` is only implied by `ns.admin`), an adoption, or a reseat | another administrator does it; if nobody else can, break the glass (§8l) |
+| `git-ns/right/break-glass:disabled` / `notHeadless` | the policy turned break-glass off; or `git.ns.admin` while the namespace still has an admin | §8l |
+| `git-ns/right/ratify:selfRatification` / `recordChanged` / `notBreakGlass` | you ratified your own record; `--break-glass-at` is not the record's timestamp; the record is not a break-glass one | another administrator ratifies, with the timestamp `cnm git break-glass-list` shows |
+| `git-ns/drift/resolve:subjectChanged` | the account was linked to someone else since you read it | `cnm git view --admin`, then adopt with the current member |
+| `git-ns:roleMapUnknown` | the bridge has not reported its role map, so the VTC cannot say what an adoption would grant | start the bridge so it reports (§8b), then retry |
+| `git-ns/roles/reproject:manualMode` / `noForgeAccess` | no bridge governs the namespace; or the bridge lost its forge access | nothing to re-project in manual mode; restore the App's access (§8f) |
+| `git-ns/account/unlink:notLinked` | no account of yours is linked on that forge (or the id given is not yours) | `cnm git link --list` |
+| `git-ns/view:notAdministrator` / `…:notCommunityAdministrator` | a read answered only to a namespace's admin or to a community administrator | ask one, or use `cnm git view` for your own rights |
 | `git-ns:policyDenied` | the community's `gitNamespace` policy refused (`not-a-member`, `external-signers-not-enabled`, or its own code) | a policy change, if the community wants one |
 | `git-ns:lastOwner` / `git-ns:lastAdmin` | it would leave no owner / no admin without an expiry | grant the replacement first |
 | `git-ns/right/revoke:notGranted` | no live record matches — often an implied right | revoke the right that implies it |
@@ -1293,7 +1352,7 @@ which one it is*). No task resolves it today; the console's repository list
 shows both. Report it: events alone should not produce it.
 
 **Bridge job failures** — the console's job list and a repository's step
-outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
+outcomes (the Repos page).
 
 | Code | Cause | Fix |
 |---|---|---|
@@ -1312,5 +1371,74 @@ outcomes (`GET /v1/git-ns/jobs`, `GET /v1/git-ns/repos`).
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
 | events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default) | update the VTC, or `event_version = "0.2"` (or `"0.1"` for a VTC older than 0.2) meanwhile; the VTC is then not told the role map (BRIDGE.md §7) |
+
+### 8l. Separation of duties and break-glass
+
+**Nobody gives themselves an elevated right.** `git.ns.admin`,
+`git.repo.create` and `git.repo.own` cannot be granted to the person granting
+them, whether by a grant, a repository create, an adoption (of a repository or
+of drift) or a reseat; it is refused `git-ns:selfGrantNotAllowed`. Self-grants
+of `git.commit.sign` still work, and of `git.repo.maintain` too unless the
+bridge's role map projects `maintain` to the forge's `admin`, or has not been
+reported. Elevated rights also go only to current members.
+
+A namespace admin holds `git.repo.create` only by implication, which does not
+make them an owner of what they create. Name the owners:
+
+```sh
+cnm git create --namespace ns_… widgets --owner did:webvh:…:bob
+```
+
+(repeatable; naming someone else needs the authority to grant them `own`,
+else `git-ns:escalation`). Omitting `--owner`, or naming yourself, is
+`selfGrantNotAllowed`. The usual way out is another administrator granting the
+right.
+
+**Break-glass** is for when there is no other administrator. It gives you the
+right at once, announces it, and leaves it for a second administrator to
+ratify or revoke:
+
+```sh
+cnm git break-glass --right git.repo.own --resource github.com/acme/widgets \
+  --justification "the only owner left the project"
+```
+
+- Rights: `git.ns.admin` (a namespace), `git.repo.create` (a namespace) or
+  `git.repo.own` (a repository), and you must already hold the authority to
+  grant it. `git.ns.admin` only on a **headless** namespace (§8g), and only
+  from a community administrator: otherwise
+  `git-ns/right/break-glass:notHeadless`. A policy that sets `break_glass` to
+  `"disabled"` refuses it (`:disabled`); `break_glass_delay_seconds` and
+  `break_glass_min_justification_chars` in the `gitNamespace` policy's
+  `settings` tune it.
+- It always needs a **passkey step-up**, whatever `elevated_requires_admin`
+  says. The first send fails `permissionDenied` and `cnm` prints a
+  `<vtc>/admin/step-up#request=…` link; answer it there. A console
+  administrator's own passkey works. A member without a console passkey needs a
+  step-up passkey: a community administrator opens Members → the member →
+  *Step-up passkeys* → *Invite…*, and the member runs
+  `cnm git enrol-step-up-passkey '<link>'`, enters the claim code and opens the
+  link it prints.
+- The right never expires and carries a break-glass flag. It does **not**
+  count towards the last-owner and last-admin rules until ratified, so it does
+  not stop a namespace being headless. Every other administrator is told, the
+  console shows a banner and a *Break-glass grants* list, and openvtc's Repos
+  panel shows a banner.
+- **Ratify** with another administrator's profile, using the timestamp the list
+  shows; **revoke** is the ordinary `cnm git revoke`:
+
+  ```sh
+  cnm git break-glass-list
+  cnm git ratify --subject did:webvh:…:alice --right git.repo.own \
+    --resource github.com/acme/widgets --break-glass-at <rfc3339 timestamp>
+  ```
+
+**Policy changes need a second administrator.** Uploading or activating a
+`gitNamespace` policy (or rolling it back) is parked as an action: the
+requester gets an accepted answer and does not send it again, and another
+unrestricted administrator approves it (`cnm actions list`, then
+`cnm consent approve --action <id>`, or the console's Actions page), typing the
+code shown on the requester's screen, which approval never proceeds without.
+It takes effect on the approval that reaches the threshold.
 
 [vti]: https://github.com/OpenVTC/verifiable-trust-infrastructure

@@ -65,6 +65,17 @@ github.com, the `web-flow` key (`--platform-keyring`). The report says where
 each came from; the action commit and the SHA-256 are trust on first use, so
 pass the flags to pin values you verified.
 
+Other flags: `--registry`, `--owner <did>` (repeatable), `--forge
+auto|github|forgejo`, `--code-owner <login>` (repeatable), `--solo`,
+`--platform-keyring <file>`, `--verify-trust-transport
+auto|tsp|didcomm|https` (the action's `transport` input; `auto` writes none,
+so use `https` while the registry's mediator does not admit a CI run's
+throwaway DID), `--required-check <name>`, `--forgejo-url <url>`, `--runs-on
+<label>` (Forgejo runner label) and `--dry-run`. The workflow it writes pins
+checkout and the verify-trust action by commit, sets `permissions: contents:
+read` and `persist-credentials: false`, and passes `resource-format:
+qualified`; on GitHub it also triggers on `merge_group`.
+
 Upgrading to a new `--verify-trust-version` later: on GitHub, through a pull
 request (the ruleset has no bypass); on Forgejo, lift the default branch's
 protection and re-run, which writes the workflow and puts the protection

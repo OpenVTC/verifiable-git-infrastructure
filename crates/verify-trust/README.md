@@ -3,18 +3,21 @@
 The CI verifier of [Verifiable Git Infrastructure (VGI)][vgi]. For every commit
 in a range it answers two questions, and **fails closed** on any doubt:
 
-1. **Who signed it, cryptographically?** The commit names a signer DID on its
-   `committer` header; that DID is resolved, its document must publish the
+1. **Who signed it, cryptographically?** The commit names a signer DID — in its
+   `Signed-by-DID:` trailer, or, for older commits, on its `committer` header;
+   that DID is resolved, its document must publish the
    Ed25519 key embedded in the commit's PROTOCOL.sshsig blob, and the signature
-   must verify over the exact bytes git signed.
+   must verify over the exact bytes git signed. Only keys listed under the
+   document's `assertionMethod` count; a key agreement or other key that is
+   merely present in `verificationMethod` does not.
 2. **Is that DID trusted, right now?** The signer DID is checked against a Trust
    Registry with a TRQP authorization query.
 
-There is **no per-repository signer list**. The committer header is
-author-controlled text, so it is used strictly as a lookup hint whose answer is
-then checked: a commit claiming a DID it cannot sign for fails step 1 — the DID
-does not publish the signing key, and the signature covers the header making
-the claim — and a commit signed by a DID nobody enrolled fails step 2.
+There is **no per-repository signer list**. The trailer and the committer header are
+author-controlled text, so the named DID is used strictly as a lookup hint
+whose answer is then checked: a commit claiming a DID it cannot sign for fails
+step 1 — the DID does not publish the signing key, and the signature covers the
+text making the claim — and a commit signed by a DID nobody enrolled fails step 2.
 
 That leaves every question of *who may sign here* in the registry, where
 enrolment, rotation and revocation already live. Adding a contributor is one
@@ -36,7 +39,7 @@ Or use the prebuilt binary via the GitHub Action (no toolchain on the runner):
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.6
+- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.11.0
   with:
     range:        origin/${{ github.base_ref }}..HEAD
     registry-did: ${{ vars.TRUST_REGISTRY_DID }}
@@ -63,8 +66,10 @@ remediation applies:
 | Verdict | Cause |
 |---|---|
 | `unsigned` | no `gpgsig` header |
-| `noSignerDid` | signed, but the committer names no DID |
-| `unresolvedSigner` | the claimed DID did not resolve |
+| `malformed` | the signature did not parse as an Ed25519 sshsig (or is another algorithm), or the commit object is malformed |
+| `noSignerDid` | signed, but the commit names no DID (no `Signed-by-DID:` trailer, and the committer is not a DID) |
+| `conflictingSignerDids` | the `Signed-by-DID:` trailer and a DID committer name different DIDs |
+| `unresolvedSigner` | the claimed DID did not resolve, was deactivated (a deactivated `did:webvh` is unresolved, not served from its last keys), or lists no Ed25519 key under `assertionMethod` |
 | `unknownKey` | the claimed DID publishes no such key — usually rotated out since the commit was signed; re-sign it with the current key |
 | `badSignature` | the DID publishes the key, but the signature fails |
 | `unauthorized` | valid signature, registry says no |
@@ -73,6 +78,9 @@ remediation applies:
 | `platformSignedEdit` | platform-signed, but not a merge (web-UI or API edit, squash merge, Dependabot) — re-sign it with `did-git-sign` |
 | `platformMergeUnverifiedParent` | platform-signed merge with a parent that neither passes nor is on the base branch |
 | `platformMergeAltered` | platform-signed merge whose tree is not the clean merge of its parents (e.g. conflicts resolved in the web UI) |
+
+A range with no commits passes vacuously. An empty `--range` or repository is
+refused outright rather than read as the current directory.
 
 `--json` emits a machine-readable report, in which commits keep their full
 signer DIDs and `signerNames` maps each named signer to its name and that
@@ -244,7 +252,7 @@ registry authorizes nothing.
 **The removed `legacy` form.** Until v0.7.0 the default was `legacy`, the bare
 `owner/repo` slug; v0.7.0 made `qualified` the default, and **v0.8.0 removed
 `legacy`** (#109). `--resource-format legacy` (`resource-format: legacy` on the
-Action) is now refused with how to move over. The VTC writes grants only in the
+Action) is now refused with how to move over (a clap error, exit `2`). The VTC writes grants only in the
 qualified form (it never dual-wrote `owner/repo`), and the workflows a bridge
 bootstraps set `qualified`, so those are unaffected. A run that still depends
 on hand-issued `owner/repo` grants has them reissued as

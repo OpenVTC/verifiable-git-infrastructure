@@ -47,15 +47,25 @@ In a GitHub (or Forgejo) PR check, use the composite action instead — it downl
 prebuilt `verify-trust` binary (no Rust toolchain on the runner) and runs it:
 
 ```yaml
-- uses: actions/checkout@v4
-  with: { fetch-depth: 0 }        # so origin/<base>..HEAD resolves
-- uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@v0.4.6
-  with:
-    range:        origin/${{ github.base_ref }}..HEAD
-    registry-did: ${{ vars.TRUST_REGISTRY_DID }}
-    vtc-did:      ${{ vars.VTC_DID }}
-    exempt-keyring: .github/trusted-platform-keys.asc   # optional
+permissions:
+  contents: read
+steps:
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    with:
+      fetch-depth: 0              # so origin/<base>..HEAD resolves
+      persist-credentials: false
+  - uses: OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of v0.11.0>
+    with:
+      range:        origin/${{ github.base_ref }}..HEAD
+      registry-did: ${{ vars.TRUST_REGISTRY_DID }}
+      vtc-did:      ${{ vars.VTC_DID }}
+      version:      v0.11.0
+      exempt-keyring: .github/trusted-platform-keys.asc   # optional
 ```
+
+Pin actions by commit SHA, not a tag. `vgi repo init` and the bridge write this
+workflow for you, with the DIDs as literals rather than `vars.*` (any
+repository admin can change a variable) and a `merge_group` trigger on GitHub.
 
 Two DIDs, and nothing to commit: **who may sign is a registry grant**, not a
 file in the repository. Each commit names its signer DID on its own `committer`
@@ -84,7 +94,7 @@ grants must be written in that form, the only one the VTC writes. The bare
 [runbook](docs/RUNBOOK.md#2-enrol-the-signers) for moving over. `version` selects which release to download (default `latest`).
 
 The action also runs on **Forgejo Actions** runners, referenced by full URL
-(`uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@vX.Y.Z`).
+(`uses: https://github.com/OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>`).
 It downloads the release anonymously with `curl` — no `gh`, no token — so the
 runner needs only bash, curl, tar, `sha256sum` or `shasum`, and outbound HTTPS
 to github.com. Integrity differs by runner: on GitHub runners the tarball's
