@@ -995,28 +995,42 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
     println!("Credential DID:  {}", creds.credential_did);
     println!("Signing Key ID:  {}", creds.key_id);
 
-    // Token cache
-    match config::load_cached_token(&cfg.did_key_id) {
-        Some(_) => println!("Token cache:     valid"),
-        None => println!("Token cache:     empty or expired"),
+    // A VTA reached through its mediator (DIDComm or TSP) is asked over the
+    // authenticated session; one reached over REST over HTTPS. The stored URL
+    // of a mediator-only VTA is only its DID's host, which may well answer
+    // `/health` itself (a DID-hosting daemon does), so asking it there reports
+    // the wrong service as healthy.
+    let over_session = creds.mediator_did.is_some();
+
+    // Token cache: only a REST handshake issues a token to cache.
+    if over_session {
+        println!("Token cache:     not used (a mediator session authenticates itself)");
+    } else {
+        match config::load_cached_token(&cfg.did_key_id) {
+            Some(_) => println!("Token cache:     valid"),
+            None => println!("Token cache:     empty or expired"),
+        }
     }
     println!();
 
     print_commit_msg_hook_status();
 
-    // VTA connectivity
-    print!("VTA health:      ");
-    let vta_client = vta_sdk::client::VtaClient::new(&creds.vta_url);
-    match vta_client.health().await {
-        Ok(health) => {
-            println!("OK (v{})", health.version.as_deref().unwrap_or("unknown"));
-            if let Some(mediator_did) = &health.mediator_did {
-                println!("  Mediator DID:  {mediator_did}");
+    // VTA connectivity, REST: the VTA's public `/health`, which carries its
+    // version.
+    if !over_session {
+        print!("VTA health:      ");
+        let vta_client = vta_sdk::client::VtaClient::new(&creds.vta_url);
+        match vta_client.health().await {
+            Ok(health) => {
+                println!("OK (v{})", health.version.as_deref().unwrap_or("unknown"));
+                if let Some(mediator_did) = &health.mediator_did {
+                    println!("  Mediator DID:  {mediator_did}");
+                }
             }
-        }
-        Err(e) => {
-            println!("FAILED");
-            println!("  Error: {e}");
+            Err(e) => {
+                println!("FAILED");
+                println!("  Error: {e}");
+            }
         }
     }
 
@@ -1025,6 +1039,9 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
     match vta::authenticate(&cfg).await {
         Ok((client, creds)) => {
             println!("OK");
+            if over_session {
+                print_session_health(&client).await;
+            }
 
             // Fetch signing key and show public key
             print!("Signing key:     ");
@@ -1086,14 +1103,61 @@ async fn cmd_health(resolve_agent_names: bool, did_jsonl: Option<&std::path::Pat
                     println!("  Error: {e}");
                 }
             }
+            // A mediator session stays open until it is shut down.
+            client.shutdown().await;
+        }
+        Err(e) => {
+            println!("FAILED");
+            println!("  Error: {e}");
+            if over_session {
+                println!("VTA health:      not checked (no session to ask it over)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The VTA's own health, asked over the authenticated mediator session
+/// (`vta/health/details/0.1`, a signed answer verified against the VTA's DID).
+///
+/// It carries no software version: the VTA answers this for any caller and
+/// keeps its version to `vta/restore/status`, which only administrators of the
+/// whole VTA may read, and `did-git-sign`'s credential administers one context.
+async fn print_session_health(client: &vta_sdk::client::VtaClient) {
+    print!("VTA health:      ");
+    match client.health_details().await {
+        Ok(h) => {
+            println!(
+                "OK ({}, asked over the mediator; a VTA does not publish its version)",
+                h.status
+            );
+            if let Some(m) = &h.mediator_did {
+                println!("  Mediator DID:  {}", m.as_str());
+            }
+            println!(
+                "  TSP:           {}",
+                if h.tsp_enabled {
+                    "advertised"
+                } else {
+                    "not advertised"
+                }
+            );
+            println!("  Sealed:        {}", if h.sealed { "yes" } else { "no" });
+            println!(
+                "  Key storage:   {}",
+                if h.storage_encrypted {
+                    "encrypted at rest"
+                } else {
+                    "not encrypted at rest"
+                }
+            );
         }
         Err(e) => {
             println!("FAILED");
             println!("  Error: {e}");
         }
     }
-
-    Ok(())
 }
 
 /// Check whether a local did.jsonl file publishes the given Ed25519 key.
