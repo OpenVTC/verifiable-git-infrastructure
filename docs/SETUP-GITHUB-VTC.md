@@ -481,20 +481,26 @@ them.
 
 ### 6.2 Set up signing
 
-Each contributor, once per machine:
+Each contributor, once per machine, then once per repository (or directory of
+repositories) that should sign with it:
 
 ```sh
 cargo install did-git-sign
-did-git-sign init --global --vta-did did:webvh:…:your-vta.example.com
+did-git-sign init --vta-did did:webvh:…:your-vta.example.com
+did-git-sign enable --dir ~/code/acme/        # or `did-git-sign enable` inside one repository
 did-git-sign health
 ```
+
+`init` writes no git configuration, and `enable` adds only an include line, so
+a contributor's existing signing key keeps working everywhere else
+([runbook §3](RUNBOOK.md#3-set-up-a-contributors-machine)).
 
 `health` must show the signing key reachable and `Commit-msg hook: …` current.
 The hook writes the `Signed-by-DID:` trailer that names the signer, and is
 written once by `init` — an upgraded binary does not replace it, and a hook
 older than v2 puts the trailer where `verify-trust` cannot read it on some
 messages (`noSignerDid`). `OUTDATED` means re-run `init`. Contributors in
-more than one community use conditional includes instead of `--global`
+more than one community give each identity a profile
 ([runbook §3a](RUNBOOK.md#3a-contributors-in-more-than-one-community)).
 
 openvtc's *Repos* view shows the same health beside the member's repositories

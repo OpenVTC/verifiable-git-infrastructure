@@ -67,35 +67,40 @@ the CI verifier is the separate [`verify-trust`](https://crates.io/crates/verify
 
 ## Setup
 
-### Per-repository
+Setup is two steps, and neither replaces a signing setup you already have:
+`init` sets up an identity without writing any git configuration, and
+`enable` makes a repository (or a directory of them) sign with it.
 
 ```bash
 did-git-sign init --vta-did did:webvh:scid:your-vta.example.com
+cd your-repo && did-git-sign enable      # this repository signs with it
 ```
 
 `init` resolves the VTA, mints a temporary admin did:key, and prints a
 `pnm contexts create …` command. Run it in your Personal Network Manager to
 authorise the setup session, press Enter, then select the persona and signing
-key interactively. This writes `.did-git-sign.json` in the current directory
-and configures the local git repo.
+key interactively (or let `init` create a DID in an empty context).
 
-### Global (all repositories)
+`enable` adds one line to the repository's `.git/config`, an `include.path`
+naming did-git-sign's settings for that identity, and changes nothing else.
+`did-git-sign disable` removes that line. Every other repository keeps signing
+the way it did before.
+
+To sign in every repository under a directory instead, enable the directory:
+one `includeIf "gitdir:<dir>/"` line in your global git config, removed by
+`disable --dir` with the same path.
 
 ```bash
-did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
+did-git-sign enable --dir ~/code/
+did-git-sign disable --dir ~/code/
 ```
 
-Saves config to `~/.config/did-git-sign/` and sets global git config.
+`enable` refuses when `core.hooksPath` already belongs to another tool (husky,
+lefthook, pre-commit): the include would replace it and that tool's hooks would
+stop running.
 
-This also sets `did-git-sign.key` and `core.hooksPath` for **every repository
-on the machine** — that pair decides the identity your commits claim, and it
-must match the key that signs them. Right for one community; wrong for two, and
-quietly so, since commits in the other community would claim this DID. `init`
-prints the per-remote alternative when you use `--global`; see
-[Selecting which community persona signs](#selecting-which-community-persona-signs).
-
-`init` refuses to take `core.hooksPath` if something else already owns it
-(husky, lefthook, pre-commit), rather than silently stopping those hooks.
+`init --global` is refused since 0.14. It used to write these settings into
+your global git config, replacing any existing signing key.
 
 ### Non-interactive
 
@@ -107,7 +112,6 @@ did-git-sign init \
   --vta-did    did:webvh:scid:your-vta.example.com \
   --key-id     your-vta-key-id \
   --did-key-id did:webvh:scid:your-vta.example.com#key-0 \
-  --name       "Your Name" \
   --yes
 ```
 
@@ -119,52 +123,53 @@ did-git-sign init \
 | `--context` | Context id to provision into (default `did-git-sign`) |
 | `--key-id` | VTA key id for the signing key (skips interactive selection) |
 | `--did-key-id` | DID verification-method id to sign as (skips interactive selection) |
-| `--name` | Git `user.name` (optional) |
+| `--profile` | Save the identity under a name (see [Profiles](#profiles-more-than-one-identity)) |
+| `--default` | With `--profile`: also make it the default identity |
+| `--name` | Recorded in the config file; no longer written to git |
 | `--vta-url` | Override the VTA URL instead of resolving it from the DID |
-| `--global` | Configure global git instead of per-repo |
 | `--yes` | Assume the admin grant is already registered; skip the prompt |
 
-### What `init` configures
+### What `init` writes
 
-The `init` command performs the following:
+Everything goes under did-git-sign's own directory (`~/.config/did-git-sign/`,
+or `~/Library/Application Support/did-git-sign/` on macOS). No git
+configuration is written.
 
-1. **Saves config** to `.did-git-sign.json` (local) or `~/.config/did-git-sign/config.json` (global) — contains only `did_key_id` and `user_name`
-2. **Stores VTA credentials** (URL, DIDs, private key, signing key id) in the OS keyring (macOS Keychain / Linux Secret Service). The VTA URL must be `https://` — cleartext `http://` is accepted only to loopback (`localhost`, `127.0.0.0/8`, `[::1]`) — and must carry no `user:password@` part; anything else is refused
-3. **Verifies VTA connectivity** by authenticating and fetching the signing key
-4. **Configures git:**
-   - `gpg.format = ssh`
-   - `gpg.ssh.program = did-git-sign`
-   - `gpg.ssh.defaultKeyFile = <config path>`
-   - `commit.gpgsign = true`
-   - `user.signingKey = <config path>`
-   - `did-git-sign.key = <DID#key-id>` — selects the signing persona *and* is
-     the claim the `commit-msg` hook writes into the trailer; see below
-   - `core.hooksPath = <hook dispatcher>` — see below
-   - `user.name = <name>` (if provided)
+1. **`config.json`**: the default identity (`did_key_id`, `user_name`).
+2. **VTA credentials** (URL, DIDs, private key, signing key id) in the OS
+   keyring (macOS Keychain / Linux Secret Service). The VTA URL must be
+   `https://` (cleartext `http://` only to loopback) and carry no
+   `user:password@` part.
+3. **`allowed_signers`**: one line per identity, for `git log --show-signature`.
+4. **`hooks/`**: a `commit-msg` hook that appends the `Signed-by-DID:` trailer,
+   and for every other standard hook a stub that runs the repository's own
+   `.git/hooks/<name>`, so existing hooks keep running.
+5. **`gitconfig/<name>.gitconfig`**: the settings a repository needs to sign as
+   this identity, and the file `enable` includes (`<name>` is the profile, or
+   `default`):
+   - `gpg.format = ssh`, `gpg.ssh.program = did-git-sign`, `commit.gpgsign = true`
+   - `user.signingKey` and `gpg.ssh.defaultKeyFile` = `config.json`
+   - `gpg.ssh.allowedSignersFile` = `allowed_signers`
+   - `core.hooksPath` = `hooks/`
+   - `did-git-sign.key = <DID#key-id>`: selects the signing persona *and* is the
+     claim the `commit-msg` hook writes into the trailer
 
-   `user.email` is left alone: it stays an ordinary address so forges can
-   attribute your commits to your account.
-5. **Creates an `allowed_signers` file** for signature verification and sets `gpg.ssh.allowedSignersFile`
-6. **Installs a `commit-msg` hook** that appends the `Signed-by-DID:` trailer.
-   Because `core.hooksPath` is a single slot, the hook directory it installs
-   also carries a delegating stub for every other standard hook, each of which
-   execs the repository's own `.git/hooks/<name>` — so hooks you already have,
-   and hooks you add later, keep running. `uninstall` removes the directory and
-   unsets `core.hooksPath`.
+   `user.email` and `user.name` are never written: they stay what you set, so
+   forges attribute commits to your account.
 
-   The trailer always goes in the message's final paragraph — the trailer
-   block `git log --format='%(trailers)'` and `verify-trust` read — even when
-   the message contains a `---` line (every Dependabot commit does). The hook
-   uses `git interpret-trailers --no-divider`, which needs **git ≥ 2.20** (2.19.2 on the maint line).
+The trailer always goes in the message's final paragraph, the trailer block
+`git log --format='%(trailers)'` and `verify-trust` read, even when the message
+contains a `---` line (every Dependabot commit does). The hook uses
+`git interpret-trailers --no-divider`, which needs **git ≥ 2.20** (2.19.2 on
+the maint line).
 
 ### Upgrading: re-run `init` to refresh the hook
 
-`init` writes the hook once; installing a newer `did-git-sign` binary does not
-replace it. Each hook carries a version line (`# did-git-sign-hook-version:
+`init` writes the hooks; installing a newer `did-git-sign` binary does not
+replace them. Each hook carries a version line (`# did-git-sign-hook-version:
 N`), and `did-git-sign health` reports `Commit-msg hook: OUTDATED` when the
-installed one is older than the binary's (the current hook is version 2). Re-run `did-git-sign init` (with
-`--global` if that is how you installed) to replace it; `init` overwrites only
-hooks it wrote.
+installed one is older than the binary's (the current hook is version 2).
+Re-run `did-git-sign init` to replace them; it overwrites only hooks it wrote.
 
 Hooks from before the version line (v1) placed the trailer **above** any `---`
 line in a commit message. Commits made that way are signed but carry no claim
@@ -173,29 +178,31 @@ line in a commit message. Commits made that way are signed but carry no claim
 (for older commits in a branch, `reword` them in `git rebase -i`, which also
 runs the hook).
 
+An install made before 0.14 wrote its settings into git config directly.
+`did-git-sign uninstall` removes those, but only the ones that still hold
+did-git-sign's values, so a signing setup you have since restored is kept.
+
 ## Profiles: more than one identity
 
-Each identity `init` sets up keeps its credentials in the keyring under its
-own `did:…#key-N`, and signing signs as whichever one `DID_GIT_SIGN_KEY` or
-`git config did-git-sign.key` selects. A profile gives each a name, so
-switching is one command instead of copying a DID:
+Each identity keeps its credentials in the keyring under its own
+`did:…#key-N`. A profile gives it a name, and its own include file, so a
+repository picks who signs with one command:
 
 ```bash
-did-git-sign init --global --profile bob   --vta-did <VTA DID> --context bob
-did-git-sign init --global --profile carol --vta-did <VTA DID> --context carol
+did-git-sign init --profile bob   --vta-did <VTA DID> --context bob
+did-git-sign init --profile carol --vta-did <VTA DID> --context carol
 
-did-git-sign profiles          # list them; marks the default and the one this repo uses
-did-git-sign use bob           # this repository signs as bob
-did-git-sign use carol         # …now as carol
+did-git-sign profiles                 # list them; marks the default and the one this repo uses
+did-git-sign enable --profile bob     # this repository signs as bob
+did-git-sign use carol                # …now as carol (same as enable --profile carol)
 did-git-sign health --profile carol
 ```
 
-The first `init` sets the default as usual. A later `init --profile` adds the
-identity beside it without replacing it (pass `--default` to replace it).
-`use` sets this repository's `did-git-sign.key` (`--global` for every
-repository); the signer and the commit-msg hook both read it, so the key and
-the `Signed-by-DID:` claim always move together. Profiles are recorded in
-`profiles.json` beside the global config; it holds DIDs only, never secrets.
+The first `init` sets the default. A later `init --profile` adds the identity
+beside it without replacing it (`--default` replaces it). `enable --profile`
+swaps the repository's include for that profile's, so the key and the
+`Signed-by-DID:` claim always move together. Profiles are recorded in
+`profiles.json` beside the config; it holds DIDs only, never secrets.
 
 ## Usage
 
@@ -219,9 +226,10 @@ connectivity (`--did-jsonl <path>` also checks the signing key against a
 did-git-sign health
 ```
 
-`did-git-sign verify` performs a test sign; `did-git-sign uninstall`
-(`--global` or `--local`) removes the config, the keyring entries, the
-`allowed_signers` line and the git config keys `init` set.
+`did-git-sign verify` performs a test sign. `did-git-sign uninstall` removes an
+identity: its keyring entries, its `allowed_signers` line, its include file and
+the lines that include it, and the config file if it is the default. It never
+unsets your own signing settings.
 
 ### Showing names instead of DIDs
 

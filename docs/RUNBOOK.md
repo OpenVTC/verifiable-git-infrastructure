@@ -101,18 +101,22 @@ maintain, and nothing to commit to the repository.
 
 ## 3. Set up a contributor's machine
 
-Once per contributor:
+Once per contributor, then once per repository that should be checked:
 
 ```sh
 cargo install did-git-sign
-did-git-sign init --global --vta-did did:webvh:scid:your-vta.example.com
+did-git-sign init --vta-did did:webvh:scid:your-vta.example.com
+cd <repository> && did-git-sign enable
 did-git-sign health
 ```
 
 `init` resolves the VTA, mints a temporary admin did:key, and prints a
 `pnm contexts create …` command. Run that in your Personal Network Manager to
 authorise the setup session, press Enter, then pick the persona and signing
-key. It configures git:
+key. **It writes no git configuration.** Everything goes in did-git-sign's own
+directory (`~/.config/did-git-sign/`, `~/Library/Application Support/did-git-sign/`
+on macOS): the identity, the hook directory, an `allowed_signers` file, and
+`gitconfig/<name>.gitconfig` with every setting a repository needs to sign:
 
 - `gpg.format = ssh`, `gpg.ssh.program = did-git-sign`, `commit.gpgsign = true`
 - **`did-git-sign.key = <DID#key-id>`** — this is load-bearing. It selects the
@@ -121,30 +125,37 @@ key. It configures git:
 - **`core.hooksPath`** — points at the directory holding that hook. The
   directory also carries a delegating stub for every other standard hook, each
   execing the repo's own `.git/hooks/<name>`, so existing hooks keep running.
-  `init` refuses to take `core.hooksPath` from a tool that already owns it
-  (husky, lefthook, pre-commit) rather than silently disabling it.
   The hook needs git ≥ 2.20 (`interpret-trailers --no-divider`, also in 2.19.2).
 
-The hook is written once, by `init`; upgrading the binary does not replace it.
+**`enable`** turns those settings on where you choose, and is the only thing
+that touches git config: one `include.path` line in the repository's
+`.git/config`. `did-git-sign disable` removes it. Every other repository,
+and any signing key you already use for them, is left exactly as it was.
+`enable --dir ~/code/` does the same for every repository under a directory
+with one `includeIf "gitdir:…"` line in the global config (`disable --dir` to
+undo). `enable` refuses when `core.hooksPath` belongs to another tool (husky,
+lefthook, pre-commit), rather than silently disabling its hooks.
+
+`init --global` is refused since 0.14: it used to write these settings into
+the global git config and replace the contributor's existing signing key.
+`did-git-sign uninstall` removes what an older install wrote, but only the
+settings that still hold did-git-sign's values.
+
+The hooks are written by `init`; upgrading the binary does not replace them.
 `did-git-sign health` compares the hook's `# did-git-sign-hook-version:` line
 with the binary's and prints `Commit-msg hook: OUTDATED` when it is older —
-re-run `did-git-sign init` (same scope as the original install). Hooks before
-v2 put the trailer above any `---` line in the message (Dependabot-style
-messages, some templates), where neither `git log --format='%(trailers)'` nor
-`verify-trust` reads it, so those commits fail `noSignerDid`.
+re-run `did-git-sign init`. Hooks before v2 put the trailer above any `---`
+line in the message (Dependabot-style messages, some templates), where neither
+`git log --format='%(trailers)'` nor `verify-trust` reads it, so those commits
+fail `noSignerDid`.
 
-`user.email` is deliberately left alone: it stays an ordinary address so GitHub
-and GitLab can attribute commits to the author's account. A commit that reaches
-CI with no `Signed-by-DID:` trailer and a non-DID `user.email` fails
+`user.email` and `user.name` are never written: they stay ordinary values so
+GitHub and GitLab can attribute commits to the author's account. A commit that
+reaches CI with no `Signed-by-DID:` trailer and a non-DID `user.email` fails
 `noSignerDid` even with a valid signature — that means the hook did not run
-(`--no-verify`, or a `core.hooksPath` taken by something else).
-
-Use `--global` for all repositories, or plain `init` for one. Verify with
-`did-git-sign health` before the first push, not after the PR check fails.
-
-`--global` also sets `did-git-sign.key` and `core.hooksPath` machine-wide. Fine
-for a contributor in one community; if they are in two, use §3a instead — `init`
-prints that alternative when run with `--global`.
+(`--no-verify`, the repository not enabled, or a `core.hooksPath` taken by
+something else). `did-git-sign health` inside the repository says whether it is
+enabled; check it before the first push, not after the PR check fails.
 
 `did-git-sign` refuses to sign a commit whose DID claim differs from the key it
 is about to use, so a mismatch fails at `git commit` with both halves named
@@ -160,40 +171,40 @@ resolve it in the same order —
 2. `did-git-sign.key` in git config (per-repo),
 3. the `did_key_id` in the config file (the `init` default).
 
-**Do not hand-manage per-repo config.** `git config --local` works but does not
-survive a fresh clone, and when you forget it you get no error — you get a
-commit signed as the wrong community. Where the community *is* the
-authorization boundary, silent misattribution is the failure to design against.
+Give each community's identity a **profile**; each gets its own settings file,
+so the identity and the key selection travel together and cannot drift:
 
-Use git's **conditional includes**, one file per community, carrying the
-identity and the key selection together so they cannot drift:
+```sh
+did-git-sign init --profile openvtc --vta-did <VTA DID> --context <persona context>
+did-git-sign init --profile other   --vta-did <VTA DID> --context <persona context>
+did-git-sign profiles
+```
+
+Then choose per repository (`did-git-sign enable --profile openvtc`, or
+`did-git-sign use other` to switch), per directory (`enable --profile openvtc
+--dir ~/devel/openvtc/`), or by remote with a conditional include of the
+profile's file:
 
 ```ini
 # ~/.gitconfig
 [includeIf "hasconfig:remote.*.url:https://github.com/OpenVTC/**"]
-    path = ~/.config/git/community-openvtc
+    path = ~/Library/Application Support/did-git-sign/gitconfig/openvtc.gitconfig
 [includeIf "hasconfig:remote.*.url:https://github.com/OtherOrg/**"]
-    path = ~/.config/git/community-other
+    path = ~/Library/Application Support/did-git-sign/gitconfig/other.gitconfig
 ```
 
-```ini
-# ~/.config/git/community-openvtc
-[user]
-    email = you@openvtc.example
-    name  = Your Name
-[did-git-sign]
-    key = did:webvh:QmAbc:openvtc.example#key-0
-```
-
-`hasconfig:remote.*.url` (git ≥ 2.36) keys off the remote rather than the
-filesystem, so membership follows the repository rather than where you happened
-to clone it — and a throwaway clone outside your usual tree still gets the right
-persona. Use `includeIf "gitdir:~/devel/openvtc/"` instead if your layout is
-authoritative and you prefer path matching.
+(`~/.config/did-git-sign/gitconfig/` on Linux.) `hasconfig:remote.*.url`
+(git ≥ 2.36) keys off the remote rather than the filesystem, so membership
+follows the repository rather than where you happened to clone it — a
+throwaway clone outside your usual tree still gets the right persona. A plain
+`git config --local did-git-sign.key …` works too, but does not survive a fresh
+clone, and when you forget it you get no error, only a commit signed as the
+wrong community; where the community *is* the authorization boundary, that
+silent misattribution is the failure to design against.
 
 `did-git-sign.key` is the whole of it — there is no second setting to keep in
-step, which is what used to drift. Set `user.name` and `user.email` however you
-like alongside it; they affect forge attribution, not verifiability.
+step. Set `user.name` and `user.email` however you like; they affect forge
+attribution, not verifiability.
 
 `DID_GIT_SIGN_KEY` is fine for one-off overrides: the hook honours it too, so
 `DID_GIT_SIGN_KEY=… git commit` moves the key and the claim together.

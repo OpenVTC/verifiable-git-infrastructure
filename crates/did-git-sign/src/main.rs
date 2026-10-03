@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
-use did_git_sign::{config, init, names, profiles, sign, vta};
+use did_git_sign::{config, enable, init, names, profiles, sign, vta};
 use ed25519_dalek::SigningKey;
 use std::path::PathBuf;
 
@@ -138,10 +138,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize git configuration for DID-based signing
+    /// Set up a signing identity. Writes no git configuration: a repository
+    /// signs with it only after `did-git-sign enable`.
     Init {
-        /// Use global git config instead of repo-local
-        #[arg(long)]
+        /// Refused since 0.14: init no longer writes global git config. Use
+        /// `did-git-sign enable --dir <path>` to sign in every repository
+        /// under a directory.
+        #[arg(long, hide = true)]
         global: bool,
 
         /// VTA DID. The service URL is discovered from the DID document
@@ -202,15 +205,36 @@ enum Commands {
     /// repository signs as.
     Profiles,
 
-    /// Sign as a named profile in this repository (or, with --global, in
-    /// every repository): sets `git config did-git-sign.key`.
+    /// Sign as a named profile in this repository: `enable --profile <name>`.
     Use {
         /// The profile's name (`did-git-sign profiles` lists them).
         name: String,
 
-        /// Set it in the global git config instead of this repository's.
-        #[arg(long)]
+        /// Refused: use `did-git-sign enable --dir <path> --profile <name>`.
+        #[arg(long, hide = true)]
         global: bool,
+    },
+
+    /// Sign with did-git-sign in this repository, or in every repository
+    /// under a directory. Adds one include line and changes nothing else.
+    Enable {
+        /// The profile to sign as (default: the identity `init` set up
+        /// without --profile, or the only profile).
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Instead of this repository, every repository under this directory:
+        /// one `includeIf "gitdir:<dir>/"` line in the global git config.
+        #[arg(long)]
+        dir: Option<String>,
+    },
+
+    /// Stop signing with did-git-sign in this repository (or, with --dir,
+    /// under a directory). Removes only the line `enable` added.
+    Disable {
+        /// The directory given to `enable --dir`.
+        #[arg(long)]
+        dir: Option<String>,
     },
 
     /// Verify the signing setup by performing a test sign operation
@@ -333,6 +357,8 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Profiles) => cmd_profiles(),
         Some(Commands::Use { name, global }) => cmd_use(&name, global),
+        Some(Commands::Enable { profile, dir }) => cmd_enable(profile.as_deref(), dir.as_deref()),
+        Some(Commands::Disable { dir }) => cmd_disable(dir.as_deref()),
         Some(Commands::Verify) => cmd_verify().await,
         Some(Commands::Health {
             resolve_agent_names,
@@ -408,11 +434,15 @@ async fn cmd_init(
     }
     // A profile is added beside an existing install rather than replacing its
     // default; the first install, or --default, sets the default as before.
-    let target_config = if global {
-        SigningConfig::default_global_path()?
-    } else {
-        SigningConfig::repo_local_path()
-    };
+    if global {
+        bail!(
+            "`init --global` no longer writes your global git config, so it cannot replace an \
+             existing signing setup. Run `did-git-sign init …` without --global, then sign where \
+             you choose:\n  did-git-sign enable                 # this repository\n  \
+             did-git-sign enable --dir ~/code/   # every repository under a directory"
+        );
+    }
+    let target_config = SigningConfig::default_global_path()?;
     let add_beside_default = profile.is_some() && !make_default && target_config.exists();
 
     // 1. Resolve the VTA service URL (or take the override).
@@ -528,8 +558,9 @@ async fn cmd_init(
             let _ = config::cache_token(&did_key_id, &token.access_token, token.access_expires_at);
         }
 
+        let include_name = profile.as_deref().unwrap_or(enable::DEFAULT_NAME);
         let install_args = init::InstallArgs {
-            global,
+            global: false,
             did_key_id: did_key_id.clone(),
             vta_key_id: key_id,
             credential_did: admin.admin_did.clone(),
@@ -547,12 +578,14 @@ async fn cmd_init(
             let name = profile.as_deref().unwrap_or_default();
             let ssh_public_key = init::add_identity(install_args)?;
             save_profile(name, &did_key_id, &vta_did, &context)?;
+            let include = enable::write_include(include_name, &did_key_id)?;
             println!("VTA credentials stored in OS keyring");
-            println!("Allowed signers file updated");
+            println!("Signing settings: {}", include.display());
+            println!("No git configuration was changed.");
             println!();
             println!("Profile '{name}' saved. It does not replace the default identity;");
             println!("sign as it in a repository with:");
-            println!("  did-git-sign use {name}");
+            println!("  did-git-sign enable --profile {name}");
             println!();
             if let Some(n) = names::name_line(&book, &did_key_id) {
                 println!("  Name: {n}");
@@ -567,47 +600,14 @@ async fn cmd_init(
             save_profile(name, &did_key_id, &vta_did, &context)?;
             println!("Profile '{name}' saved (the default identity)");
         }
+        let include = enable::write_include(include_name, &did_key_id)?;
 
         println!("Config saved to: {}", result.config_path.display());
         println!("VTA credentials stored in OS keyring");
-        println!("Git configured for DID signing");
-        println!("Allowed signers file updated");
-
-        if let Some(prev) = result.overridden_global_signing_key {
-            println!();
-            println!("Note: your global user.signingKey ({prev}) has been overridden locally");
-            println!("      for this repository. did-git-sign uses its JSON config file as the");
-            println!("      signing key path. Your global signing configuration is unchanged.");
-        }
-
-        // A global install sets the committer identity machine-wide. That is right
-        // for one community and wrong for two, and the failure is quiet: commits in
-        // the other community claim this DID, are signed by its key, and are
-        // rejected as unauthorized rather than as misconfigured.
-        if let Some(did) = &result.global_committer_email {
-            println!();
-            println!("Note: {did}");
-            println!("      now signs in every repository on this machine (did-git-sign.key in");
-            println!("      your global git config), and the commit-msg hook names it as the");
-            println!("      signer. user.email is unchanged.");
-            println!();
-            println!("      Signing as more than one identity? Give each a profile and choose");
-            println!("      one per repository:");
-            println!("        did-git-sign init --global --profile <name> --vta-did <VTA DID>");
-            println!("        did-git-sign use <name>");
-            println!();
-            println!("      or scope it per remote in ~/.gitconfig:");
-            println!(
-                "        [includeIf \"hasconfig:remote.*.url:https://github.com/YourOrg/**\"]"
-            );
-            println!("            path = ~/.config/git/community-yourorg");
-            println!("        # ~/.config/git/community-yourorg");
-            println!("        [did-git-sign]");
-            println!("            key = {did}");
-        }
-
+        println!("Signing settings: {}", include.display());
+        println!("No git configuration was changed.");
         println!();
-        println!("Setup complete! Git commits will now be signed with:");
+        println!("Setup complete. This identity signs where you enable it:");
         // The DID stays whole here — this is the identity the operator has to be
         // able to recognise later, and abbreviating it is exactly what a summary
         // must not do. The name goes above it, never in place of it.
@@ -625,8 +625,17 @@ async fn cmd_init(
         println!("  3. Ensure git user.email matches your account email:");
         println!("       git config user.email");
         println!();
-        println!("To sign a commit: git commit -S -m \"your message\"");
-        println!("To verify: git log --show-signature");
+        match &profile {
+            Some(name) => {
+                println!("Enable it in a repository:   did-git-sign enable --profile {name}");
+                println!("or for a directory of them:  did-git-sign enable --profile {name} --dir ~/code/");
+            }
+            None => {
+                println!("Enable it in a repository:   did-git-sign enable");
+                println!("or for a directory of them:  did-git-sign enable --dir ~/code/");
+            }
+        }
+        println!("Stop at any time with `did-git-sign disable`; nothing else is changed.");
 
         Ok(())
     }
@@ -1122,35 +1131,99 @@ fn cmd_profiles() -> Result<()> {
 /// `did-git-sign use <name>`: make this repository (or, with `--global`,
 /// every repository) sign as the named profile.
 fn cmd_use(name: &str, global: bool) -> Result<()> {
+    if global {
+        bail!(
+            "`use --global` is gone: did-git-sign no longer writes your global git config. \
+             Sign as '{name}' in every repository under a directory with\n  \
+             did-git-sign enable --profile {name} --dir <directory>"
+        );
+    }
+    cmd_enable(Some(name), None)
+}
+
+/// Resolve which include file `enable` means: a named profile's, else the
+/// default identity's, else the only profile's.
+fn include_for(profile: Option<&str>) -> Result<(String, PathBuf)> {
     let all = profiles::Profiles::load()?;
-    let p = all.get(name)?;
-    config::load_vta_credentials(&p.did_key_id).with_context(|| {
-        format!(
-            "profile '{name}' has no credentials in the keyring; run \
+    let name = match profile {
+        Some(n) => {
+            all.get(n)?;
+            n.to_string()
+        }
+        None if enable::include_path(enable::DEFAULT_NAME)?.exists() => {
+            enable::DEFAULT_NAME.to_string()
+        }
+        None if all.profiles.len() == 1 => all.profiles.keys().next().cloned().unwrap_or_default(),
+        None if all.profiles.is_empty() => {
+            bail!("no identity is set up yet; run `did-git-sign init --vta-did <VTA DID>` first")
+        }
+        None => {
+            let names: Vec<&str> = all.profiles.keys().map(String::as_str).collect();
+            bail!(
+                "more than one profile; choose one with --profile ({})",
+                names.join(", ")
+            )
+        }
+    };
+    let path = enable::include_path(&name)?;
+    if !path.exists() {
+        bail!(
+            "no signing settings for '{name}' at {}; run `did-git-sign init --profile {name} …` \
+             again (installs before 0.14 did not write them)",
+            path.display()
+        );
+    }
+    if let Some(did) = enable::include_identity(&path)
+        && config::load_vta_credentials(&did).is_err()
+    {
+        bail!(
+            "'{name}' ({did}) has no credentials in the keyring; run \
              `did-git-sign init --profile {name} …` again"
-        )
-    })?;
-    if !global {
-        let inside = std::process::Command::new("git")
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !inside {
-            bail!("not inside a git repository; run this in one, or pass --global");
+        );
+    }
+    Ok((name, path))
+}
+
+/// `did-git-sign enable`: one include line in this repository's config, or one
+/// `includeIf` line in the global config with `--dir`.
+fn cmd_enable(profile: Option<&str>, dir: Option<&str>) -> Result<()> {
+    let (name, include) = include_for(profile)?;
+    let did = enable::include_identity(&include).unwrap_or_default();
+    match dir {
+        Some(dir) => {
+            let key = enable::enable_dir(dir, &include)?;
+            println!("Every repository under {dir} now signs as '{name}':");
+            println!("  {did}");
+            println!(
+                "Added to your global git config: {key} = {}",
+                include.display()
+            );
+            println!("Undo with: did-git-sign disable --dir {dir}");
+        }
+        None => {
+            enable::enable_repo(&include)?;
+            println!("This repository now signs as '{name}':");
+            println!("  {did}");
+            println!("Added to .git/config: include.path = {}", include.display());
+            println!("Undo with: did-git-sign disable");
         }
     }
-    init::set_signing_identity(global, &p.did_key_id)?;
-    if global {
-        println!("Every repository now signs as '{name}' unless it selects another:");
-    } else {
-        println!("This repository now signs as '{name}':");
-    }
-    println!("  {}", p.did_key_id);
-    // `use` only picks the identity; signing itself is set up by `init`.
-    if git_config_get("gpg.ssh.program").as_deref() != Some("did-git-sign") {
-        println!();
-        println!("Note: git here is not set up to sign with did-git-sign yet. Run");
-        println!("`did-git-sign init` in this repository (or with --global) first.");
+    Ok(())
+}
+
+/// `did-git-sign disable`: remove the line `enable` added, and nothing else.
+fn cmd_disable(dir: Option<&str>) -> Result<()> {
+    let removed = match dir {
+        Some(dir) => enable::disable_dir(dir)?,
+        None => enable::disable_repo()?,
+    };
+    match (removed, dir) {
+        (true, Some(dir)) => println!("Repositories under {dir} no longer sign with did-git-sign."),
+        (true, None) => println!("This repository no longer signs with did-git-sign."),
+        (false, Some(dir)) => println!("did-git-sign was not enabled for {dir}; nothing changed."),
+        (false, None) => {
+            println!("did-git-sign was not enabled in this repository; nothing changed.")
+        }
     }
     Ok(())
 }
@@ -1232,6 +1305,22 @@ async fn cmd_health(
     }
     println!();
 
+    // Whether this repository signs with did-git-sign at all, and as whom.
+    match enable::repo_include() {
+        Some(inc) => println!(
+            "This repository: enabled ({}) → {}",
+            inc.file_stem()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default(),
+            enable::include_identity(&inc).unwrap_or_else(|| "unreadable include".into())
+        ),
+        None => match git_config_get("gpg.ssh.program").as_deref() {
+            Some("did-git-sign") => {
+                println!("This repository: signs with did-git-sign (not via `enable`)")
+            }
+            _ => println!("This repository: not enabled (`did-git-sign enable` to sign here)"),
+        },
+    }
     print_commit_msg_hook_status();
 
     // VTA connectivity, REST: the VTA's public `/health`, which carries its
@@ -1454,10 +1543,19 @@ fn cmd_uninstall(
     if summary.allowed_signers_entry_removed {
         println!("Removed allowed_signers entry for {did_key_id}");
     }
+    for path in &summary.removed_include_files {
+        println!("Removed signing settings: {}", path.display());
+    }
+    if summary.removed_include_lines > 0 {
+        println!(
+            "Removed {} include line(s) that enabled it",
+            summary.removed_include_lines
+        );
+    }
     if !summary.git_config_keys_unset.is_empty() {
         let scope = if global { "--global" } else { "--local" };
         for key in &summary.git_config_keys_unset {
-            println!("Unset git config {scope} {key}");
+            println!("Unset git config {scope} {key} (left by an install before 0.14)");
         }
     }
     for w in &summary.warnings {
