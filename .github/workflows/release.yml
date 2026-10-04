@@ -1,9 +1,19 @@
 name: Release
 
-# Builds prebuilt `verify-trust` binaries for each supported platform and
-# attaches them to the GitHub Release for a `vX.Y.Z` tag. The download-based
-# GitHub Action (`.github/actions/verify-trust`) consumes these so CI runners
-# need neither a Rust toolchain nor a source build.
+# Builds prebuilt binaries for each supported platform and attaches them to
+# the GitHub Release for a `vX.Y.Z` tag:
+#
+#   - `verify-trust-<target>.tar.gz` — the download-based GitHub Action
+#     (`.github/actions/verify-trust`) fetches these *by name*, so CI runners
+#     need neither a Rust toolchain nor a source build. Keep the name stable.
+#   - `vgi-bridge-<target>.tar.gz` — the community's bridge service, for
+#     operators who run it without the container (bridge-image.yml builds
+#     that). Linux and macOS only: on Windows the bridge's owner-only checks
+#     on its master key and sealed credentials are no-ops (`seal.rs`), and a
+#     binary that silently accepts a world-readable key is not one to ship.
+#
+# Every tarball has a `.sha256` beside it and, for a tag, a build-provenance
+# attestation (`gh attestation verify <file> --repo <this repo>`).
 #
 # Trigger:
 #   - push a tag `vX.Y.Z`         → build + attest + publish a Release
@@ -23,11 +33,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN: verify-trust
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.bin }} ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -39,21 +48,38 @@ jobs:
       # One unsupported/flaky platform must not stop the others from
       # producing artifacts; the release job uploads whatever succeeded.
       fail-fast: false
+      # One leg per (binary, target). `bin` is both the cargo package and the
+      # binary name, and prefixes every asset and artifact name.
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - bin: verify-trust
+            target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           # Cross-compile the Intel-macOS binary on the Apple-Silicon runner:
           # the x86_64-apple-darwin target builds with the stock toolchain (no
           # extra tooling) and avoids the scarce, slow-to-schedule macos-13
           # (Intel) runners that otherwise stall the whole release.
-          - target: x86_64-apple-darwin
+          - bin: verify-trust
+            target: x86_64-apple-darwin
             os: macos-latest
-          - target: aarch64-apple-darwin
+          - bin: verify-trust
+            target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
+          - bin: verify-trust
+            target: x86_64-pc-windows-msvc
             os: windows-latest
+          # No Windows leg for the bridge: see the note at the top.
+          - bin: vgi-bridge
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - bin: vgi-bridge
+            target: x86_64-apple-darwin
+            os: macos-latest
+          - bin: vgi-bridge
+            target: aarch64-apple-darwin
+            os: macos-latest
     env:
+      BIN: ${{ matrix.bin }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,9 +97,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
 
-      - name: Build verify-trust
+      - name: Build ${{ matrix.bin }}
         shell: bash
-        run: cargo build --release --locked -p verify-trust --target "$TARGET"
+        run: cargo build --release --locked -p "$BIN" --target "$TARGET"
 
       # Package as a `.tar.gz` on every platform (git-bash on the Windows
       # runner provides tar + sha256sum), so downstream extraction is uniform.
@@ -87,6 +113,11 @@ jobs:
           mkdir "$stage"
           cp "target/${TARGET}/release/${bin}" "$stage/"
           cp README.md LICENSE "$stage/"
+          # The bridge's own README (as README.md, replacing the workspace's)
+          # and the annotated example config it is set up from.
+          if [ "$BIN" = "vgi-bridge" ]; then
+            cp crates/vgi-bridge/README.md crates/vgi-bridge/bridge.example.toml "$stage/"
+          fi
           tar czf "${stage}.tar.gz" "$stage"
           # macOS runners ship `shasum`, not coreutils `sha256sum`.
           if command -v sha256sum >/dev/null 2>&1; then
@@ -101,14 +132,16 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ env.BIN }}-${{ matrix.target }}.tar.gz
+          subject-path: ${{ matrix.bin }}-${{ matrix.target }}.tar.gz
 
+      # Named per (binary, target) so the legs never collide; the release job
+      # merges them all into one directory.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.bin }}-${{ matrix.target }}
           path: |
-            ${{ env.BIN }}-${{ matrix.target }}.tar.gz
-            ${{ env.BIN }}-${{ matrix.target }}.tar.gz.sha256
+            ${{ matrix.bin }}-${{ matrix.target }}.tar.gz
+            ${{ matrix.bin }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   release:

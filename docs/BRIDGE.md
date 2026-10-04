@@ -20,6 +20,37 @@ the bridge itself.
 
 ---
 
+## Installing
+
+One binary, `vgi-bridge`, three ways to get it:
+
+- **From crates.io:** `cargo install vgi-bridge --locked` (Rust
+  1.95 or later). On Linux the build links libdbus, so install its
+  headers first (`apt-get install libdbus-1-dev pkg-config`).
+- **A prebuilt binary** from the
+  [GitHub Release](https://github.com/OpenVTC/verifiable-git-infrastructure/releases)
+  for the tag: `vgi-bridge-<target>.tar.gz` for `x86_64-unknown-linux-gnu`,
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` (no Windows build: the
+  owner-only checks on the master key and sealed credentials are Unix-only).
+  Each has a `.sha256` beside it and a build-provenance attestation; verify
+  before running it:
+
+  ```sh
+  gh release download vX.Y.Z --repo OpenVTC/verifiable-git-infrastructure \
+    --pattern 'vgi-bridge-x86_64-unknown-linux-gnu.tar.gz*'
+  gh attestation verify vgi-bridge-x86_64-unknown-linux-gnu.tar.gz \
+    --repo OpenVTC/verifiable-git-infrastructure \
+    --signer-workflow OpenVTC/verifiable-git-infrastructure/.github/workflows/release.yml \
+    --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+  sha256sum -c vgi-bridge-x86_64-unknown-linux-gnu.tar.gz.sha256   # macOS: shasum -a 256 -c
+  ```
+
+  The tarball carries the binary, the crate README and `bridge.example.toml`.
+  The Linux binary needs `libdbus-1-3` and `git` at runtime.
+- **A container**, built from `crates/vgi-bridge/Dockerfile`:
+  `docker build -f crates/vgi-bridge/Dockerfile -t vgi-bridge .` from the
+  repository root. No image is published; build it from the tag you run.
+
 ## 1. What it needs
 
 | | Why |

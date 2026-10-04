@@ -10,12 +10,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-# A deployable service, not a library anyone should build on: it ships as a
-# container next to the community's VTC (design §5.7), the same call
-# vtc-service makes. Keeping it off crates.io also keeps its dependency
-# choices (a second trust-tasks-rs line, axum, redb) out of every consumer's
-# graph, and `publish.yml` never has to order it among the published crates.
-publish = false
+# Published so a community can `cargo install vgi-bridge` (or take a release
+# binary) instead of building the container. It is still a deployable service
+# rather than a library to build on: the `vgi_bridge` lib target serves the
+# binary and its integration tests, and nothing in this workspace depends on
+# it, so publishing it adds no edge to any other crate's graph.
+publish.workspace = true
 
 [lib]
 name = "vgi_bridge"
