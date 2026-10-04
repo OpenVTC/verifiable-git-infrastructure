@@ -110,10 +110,22 @@ cd <repository> && did-git-sign enable
 did-git-sign health
 ```
 
-`init` resolves the VTA, mints a temporary admin did:key, and prints a
-`pnm contexts create …` command. Run that in your Personal Network Manager to
-authorise the setup session, press Enter, then pick the persona and signing
-key. **It writes no git configuration.** Everything goes in did-git-sign's own
+`init` resolves the VTA, mints a temporary admin did:key, and prints two ways to
+authorise it in the Personal Network Manager: `pnm contexts create --id <ctx> …
+--admin-did <setup> --admin-expires 1h --admin-handoff` if the context does not
+exist yet, or `pnm acl create --did <setup> --role admin --contexts <ctx>
+--expires 1h --handoff` if it does — an openvtc contributor's account context
+always does, and `pnm contexts create` refuses it. Run the one that applies,
+press Enter, then pick the persona and signing key.
+
+The DID is looked for in the chosen context **and its sub-contexts**. openvtc
+keeps each persona in a sub-context of the account context (`openvtc-bob/<slug>`,
+the slug from the persona label or the community's name) and pins no primary DID
+to any of them, so `--context openvtc-bob` finds every persona and the picker
+shows which sub-context each lives in. The key offered is one of that DID's own
+`assertionMethod` keys. Only an empty subtree is offered a new DID, defaulting to
+No — a new DID has no git rights in any community until granted — and `--yes`
+never creates one. **It writes no git configuration.** Everything goes in did-git-sign's own
 directory (`~/.config/did-git-sign/`, `~/Library/Application Support/did-git-sign/`
 on macOS): the identity, the hook directory, an `allowed_signers` file, and
 `gitconfig/<name>.gitconfig` with every setting a repository needs to sign:
