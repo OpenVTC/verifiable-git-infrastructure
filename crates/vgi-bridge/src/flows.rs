@@ -741,6 +741,13 @@ pub(crate) async fn manifest_callback(
         })
         .map(|u| u.to_string())
         .unwrap_or_default();
+    tracing::info!(
+        %host,
+        owner = %g.app_owner,
+        app_id = creds.app_id,
+        "{}",
+        app_registered_line(&creds.slug, &g.app_owner, host, creds.app_id, &settings)
+    );
     let warning = if persisted {
         ""
     } else {
@@ -752,6 +759,22 @@ pub(crate) async fn manifest_callback(
          page ({settings}) so members can link their accounts.{warning}",
         creds.slug
     ))
+}
+
+/// The log line that tells the operator a manifest registration worked
+/// (no secret in it: the slug, id and settings page are public).
+#[cfg(feature = "forge-github")]
+pub(crate) fn app_registered_line(
+    slug: &str,
+    owner: &str,
+    host: &str,
+    app_id: u64,
+    settings: &str,
+) -> String {
+    format!(
+        "the GitHub App `{slug}` is registered for `{owner}` on {host} and in service \
+         (app_id {app_id}); enable Device Flow at {settings}"
+    )
 }
 
 /// Minimal HTML escaping for text put into an attribute or element.
@@ -850,6 +873,32 @@ mod tests {
         assert_eq!(
             html_escape(r#"{"a":"<x>&'"}"#),
             "{&quot;a&quot;:&quot;&lt;x&gt;&amp;&#39;&quot;}"
+        );
+    }
+
+    #[cfg(feature = "forge-github")]
+    #[test]
+    fn the_start_line_names_the_app_in_service() {
+        assert_eq!(
+            crate::registry::app_in_service_line("acme-vgi", "acme", "github.com"),
+            "the GitHub App `acme-vgi` for `acme` on github.com is in service"
+        );
+    }
+
+    #[cfg(feature = "forge-github")]
+    #[test]
+    fn the_registration_line_names_the_app_and_where_to_finish() {
+        assert_eq!(
+            app_registered_line(
+                "acme-vgi",
+                "acme",
+                "github.com",
+                42,
+                "https://github.com/organizations/acme/settings/apps/acme-vgi"
+            ),
+            "the GitHub App `acme-vgi` is registered for `acme` on github.com and in service \
+             (app_id 42); enable Device Flow at \
+             https://github.com/organizations/acme/settings/apps/acme-vgi"
         );
     }
 
