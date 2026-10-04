@@ -149,7 +149,7 @@ fn register(
         )
             .into_response(),
         Err(e) => {
-            tracing::warn!(%host, error = %e, "refused a registration page");
+            tracing::warn!(%host, %owner, error = format!("{e:#}"), "refused a registration page");
             page(
                 StatusCode::NOT_FOUND,
                 "This registration link is unknown or expired.",
@@ -186,7 +186,7 @@ async fn registered(
     match flows::manifest_callback(&bridge, &host, &owner, code, state).await {
         Ok(msg) => page(StatusCode::OK, &msg),
         Err(e) => {
-            tracing::warn!(%host, error = %e, "App registration failed");
+            tracing::warn!(%host, %owner, error = format!("{e:#}"), "the GitHub App registration failed");
             page(
                 StatusCode::BAD_REQUEST,
                 "The App could not be registered; the bridge's log says why.",

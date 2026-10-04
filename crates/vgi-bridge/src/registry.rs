@@ -373,6 +373,13 @@ pub fn build_github(
     Ok(Some(Arc::new(forge)))
 }
 
+/// The startup log line for a `[[github]]` entry whose App's credentials
+/// loaded.
+#[cfg(feature = "forge-github")]
+pub(crate) fn app_in_service_line(slug: &str, owner: &str, host: &str) -> String {
+    format!("the GitHub App `{slug}` for `{owner}` on {host} is in service")
+}
+
 /// Connect the Forgejo adapter for `f` with its sealed bot credentials.
 /// `None` if the bot token is not stored yet.
 #[cfg(feature = "forge-forgejo")]

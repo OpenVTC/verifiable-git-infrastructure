@@ -82,11 +82,19 @@ pub async fn build_adapters(cfg: &BridgeConfig, store: &Store) -> Result<registr
             None => None,
         };
         match registry::build_github(store, g)? {
-            Some(forge) => adapters.insert(
-                registry::Adapter::GitHub(forge),
-                Some(&g.app_owner),
-                registry::vgi_config(cfg, keyring),
-            ),
+            Some(forge) => {
+                tracing::info!(
+                    host = %g.host,
+                    owner = %g.app_owner,
+                    "{}",
+                    registry::app_in_service_line(&forge.config().app_slug, &g.app_owner, &g.host)
+                );
+                adapters.insert(
+                    registry::Adapter::GitHub(forge),
+                    Some(&g.app_owner),
+                    registry::vgi_config(cfg, keyring),
+                )
+            }
             None => {
                 tracing::warn!(host = %g.host, owner = %g.app_owner, "no GitHub App registered yet")
             }

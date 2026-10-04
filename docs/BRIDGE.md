@@ -425,7 +425,14 @@ VTC still maps the host to this one bridge.
    a public App, or one with any permission beyond the reviewed set. If the
    exchange fails (GitHub unavailable, say), open the same link again: it is
    spent only once the App is registered. In VTA mode the credentials go to
-   the context's app-state (sealed), not to the local store.
+   the context's app-state (sealed), not to the local store. The log says
+   so at INFO: ``the GitHub App `<slug>` is registered for `<owner>` on
+   <host> and in service (app_id <id>); enable Device Flow at <settings
+   url>``; a refusal or failure is a WARN (`refused a registration page`,
+   `the GitHub App registration failed`) with the host, owner and reason.
+   On each later start, every entry whose App loads logs ``the GitHub App
+   `<slug>` for `<owner>` on <host> is in service``; one without an App
+   logs the registration URL instead.
 4. **Enable Device Flow** on the App's settings page (the manifest format
    cannot): *Settings → Developer settings → GitHub Apps → the App → Enable
    Device Flow*. Members link their accounts with it.

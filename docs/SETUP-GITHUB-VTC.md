@@ -304,9 +304,25 @@ For the **pull-request gate** (RUNBOOK §8m), set `event_version = "0.4"`
 once your VTC lists `git-ns/bridge/event/0.4` in its discovery answer. It is
 never the default: a VTC that does not take 0.4 would refuse every event.
 
-**Success looks like:** the bridge's log says the adapter for `github.com` is
-in service; the App appears under the organisation's *Settings → Developer
-settings → GitHub Apps*; its settings page shows Device Flow enabled.
+**Success looks like:** when GitHub redirects back, the bridge's log says, at
+INFO:
+
+```
+the GitHub App `<slug>` is registered for `acme` on github.com and in service
+(app_id <id>); enable Device Flow at https://github.com/organizations/acme/settings/apps/<slug>
+```
+
+and on every later start, for each `[[github]]` entry whose App loads:
+
+```
+the GitHub App `<slug>` for `acme` on github.com is in service
+```
+
+The App appears under the organisation's *Settings → Developer settings →
+GitHub Apps*; its settings page shows Device Flow enabled. A refused link or
+a failed exchange is logged at WARN instead — `refused a registration page`
+or `the GitHub App registration failed`, with the host, the owner and the
+reason (never the link's `state` or GitHub's `code`).
 
 ## 4. Bind the organisation
 
