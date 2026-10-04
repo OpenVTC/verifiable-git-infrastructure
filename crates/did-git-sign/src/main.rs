@@ -149,13 +149,15 @@ enum Commands {
 
         /// VTA DID. The service URL is discovered from the DID document
         /// (overridable with `--vta-url`). did-git-sign mints a temporary
-        /// admin did:key for this setup session and prints a `pnm contexts
-        /// create` command for you to run before bootstrapping.
+        /// admin did:key for this setup session and prints the `pnm` command
+        /// that grants it (`pnm contexts create` for a new context, `pnm acl
+        /// create` for an existing one) for you to run before bootstrapping.
         #[arg(long)]
         vta_did: String,
 
-        /// Context id to provision into. Pass the same value to
-        /// `pnm contexts create --id <ctx>`.
+        /// Context id to provision into. The signing DID is looked for in it
+        /// and its sub-contexts, so an openvtc account context (whose personas
+        /// each live in a `<ctx>/<slug>` sub-context) finds them all.
         #[arg(long, default_value = "did-git-sign")]
         context: String,
 
@@ -401,16 +403,27 @@ async fn main() -> Result<()> {
     }
 }
 
-/// The `pnm` command that authorises the setup session's temporary admin DID.
+/// The `pnm` commands that authorise the setup session's temporary admin DID:
+/// one for a context that does not exist yet, one for a context that does.
 ///
-/// `--admin-handoff` is required, not decoration: `init` rolls the setup DID
-/// over to a long-term admin (`ProvisionAsk::vta_admin_rotated`), and the VTA
-/// refuses that rollover for an entry created without the one-time hand-off
-/// (VTI-ACL-053, VTI-ACL-054). It in turn requires `--admin-expires`.
+/// `pnm contexts create` refuses a context that already exists — an openvtc
+/// account or persona context, say — and there the grant is a plain ACL entry
+/// scoped to it instead. Both are printed because `init` cannot tell which
+/// applies before it is authorised to look.
+///
+/// The hand-off (`--admin-handoff` / `--handoff`) is required, not decoration:
+/// `init` rolls the setup DID over to a long-term admin
+/// (`ProvisionAsk::vta_admin_rotated`), and the VTA refuses that rollover for an
+/// entry created without the one-time hand-off (VTI-ACL-053, VTI-ACL-054). It in
+/// turn requires an expiry.
 fn pnm_grant_command(context: &str, setup_did: &str) -> String {
     format!(
-        "    pnm contexts create --id {context} --name \"did-git-sign\" \\\n        \
-         --admin-did {setup_did} --admin-expires 1h --admin-handoff"
+        "  If {context} does not exist yet:\n    \
+         pnm contexts create --id {context} --name \"did-git-sign\" \\\n        \
+         --admin-did {setup_did} --admin-expires 1h --admin-handoff\n\n  \
+         If it already exists (e.g. an openvtc persona context):\n    \
+         pnm acl create --did {setup_did} --role admin --contexts {context} \\\n        \
+         --expires 1h --handoff"
     )
 }
 
@@ -479,8 +492,8 @@ async fn cmd_init(
     let setup_key = vta_sdk::provision_client::EphemeralSetupKey::generate()
         .map_err(|e| anyhow::anyhow!("failed to generate setup did:key: {e}"))?;
 
-    // 3. Show the operator the matching `pnm contexts create` command and
-    //    wait for them to confirm it has run (skippable with --yes).
+    // 3. Show the operator the matching `pnm` grant commands and wait for
+    //    them to confirm one has run (skippable with --yes).
     println!();
     println!("did-git-sign has minted a temporary admin DID for this setup session:");
     println!("  {}", setup_key.did);
@@ -491,7 +504,7 @@ async fn cmd_init(
     println!();
     if !yes {
         println!("The admin grant is short-lived (1h) and can hand off once to a long-term");
-        println!("admin DID (--admin-handoff). Once the command above has run,");
+        println!("admin DID (the hand-off). Once one of the commands above has run,");
         print!("press Enter to continue (or Ctrl+C to abort)... ");
         use std::io::Write;
         std::io::stdout().flush().ok();
@@ -644,6 +657,108 @@ async fn cmd_init(
     outcome
 }
 
+/// Whether `context` is `root` or lies beneath it.
+///
+/// Segment-aware, as the VTA's own ancestry check is: `openvtc-bob/x` is under
+/// `openvtc-bob`, `openvtc-bob-old` is not.
+fn in_subtree(root: &str, context: &str) -> bool {
+    context == root
+        || context
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The DIDs held in `root` or any of its sub-contexts, ordered by context and
+/// then DID so the picker is stable.
+fn dids_in_subtree(
+    dids: &[vta_sdk::webvh::WebvhDidRecord],
+    root: &str,
+) -> Vec<vta_sdk::webvh::WebvhDidRecord> {
+    let mut found: Vec<_> = dids
+        .iter()
+        .filter(|d| in_subtree(root, &d.context_id))
+        .cloned()
+        .collect();
+    found.sort_by(|a, b| (&a.context_id, &a.did).cmp(&(&b.context_id, &b.did)));
+    found
+}
+
+/// "no DIDs", "1 DID", "3 DIDs".
+fn did_count(n: usize) -> String {
+    match n {
+        0 => "no DIDs".to_string(),
+        1 => "1 DID".to_string(),
+        n => format!("{n} DIDs"),
+    }
+}
+
+/// A context in the picker: how many DIDs its subtree holds, which is what the
+/// operator is choosing by. Its primary DID is shown after that only when one
+/// is pinned: openvtc pins none, so leading with it read "no DID" for contexts
+/// that hold the operator's personas.
+fn context_label(id: &str, name: &str, dids: usize, primary: Option<&str>) -> String {
+    let mut label = format!("{id} — {name} ({})", did_count(dids));
+    if let Some(primary) = primary {
+        label.push_str(&format!(" · primary {primary}"));
+    }
+    label
+}
+
+/// A DID in the picker: its name when the book has one, and the context it
+/// lives in, since the candidates now span a subtree.
+fn did_label(
+    book: &vta_sdk::display_name::NameBook,
+    did: &vta_sdk::webvh::WebvhDidRecord,
+) -> String {
+    format!("{} — in {}", names::inline(book, &did.did), did.context_id)
+}
+
+/// Whether a missing DID is created when the operator just presses Enter. No:
+/// a new DID has no git rights anywhere, so creating one by default turns a
+/// wrong `--context` into a working-looking setup that signs as nobody.
+const CREATE_DID_DEFAULT: bool = false;
+
+fn no_did_prompt(context: &str) -> String {
+    format!(
+        "No DID found in {context} or its sub-contexts. A new DID has no git rights in \
+         any community until granted. Create one?"
+    )
+}
+
+/// What to do when there is no DID to sign with: point at the two real causes
+/// — the persona lives in another context, or there is none yet.
+fn no_did_guidance(context: &str) -> String {
+    format!(
+        "no DID found in context '{context}' or its sub-contexts.\n\n\
+         If your persona was created elsewhere (openvtc keeps each persona in a \
+         sub-context of the account context), run `did-git-sign init` again with \
+         --context pointing at the context that holds it.\n\
+         To create a DID for signing instead:\n  \
+         pnm did-mgmt dids create --context {context} --server <id>\n\
+         A new DID has no git rights in any community until one grants them."
+    )
+}
+
+/// Decide whether to create a DID in `context`, whose subtree holds none.
+///
+/// Under `--yes` the answer is never yes: creating an identity nobody has
+/// granted anything is not a step to take unattended. Otherwise `ask` is put
+/// the question with [`CREATE_DID_DEFAULT`] as its default.
+fn confirm_create_did(
+    context: &str,
+    yes: bool,
+    ask: impl FnOnce(&str, bool) -> Result<bool>,
+) -> Result<()> {
+    if yes {
+        bail!("{}\n(--yes never creates a DID.)", no_did_guidance(context));
+    }
+    if ask(&no_did_prompt(context), CREATE_DID_DEFAULT)? {
+        Ok(())
+    } else {
+        bail!("{}", no_did_guidance(context))
+    }
+}
+
 /// Interactive flow: select context → DID → signing key.
 /// Returns (vta_key_id, did_key_id).
 async fn interactive_select(
@@ -662,15 +777,28 @@ async fn interactive_select(
         bail!("no contexts found in VTA — create a context first");
     }
 
+    // Every DID the caller can see, in one round trip. `webvh/dids/list`
+    // filters `contextId` exactly, so asking per context would miss a persona
+    // in a sub-context (where openvtc puts every one); with no filter it
+    // returns each DID whose context the caller's ACL covers, and that check
+    // is subtree-aware. The subtree is then selected here.
+    let all_dids = client
+        .list_dids_webvh(None, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
+        .dids;
+
     let context_labels: Vec<String> = contexts
         .contexts
         .iter()
         .map(|c| {
-            let did_info = c
-                .did
-                .as_deref()
-                .map_or_else(|| "no DID".to_string(), |d| names::inline(book, d));
-            format!("{} — {} ({})", c.id, c.name, did_info)
+            let primary = c.did.as_deref().map(|d| names::inline(book, d));
+            context_label(
+                &c.id,
+                &c.name,
+                dids_in_subtree(&all_dids, &c.id).len(),
+                primary.as_deref(),
+            )
         })
         .collect();
 
@@ -687,23 +815,30 @@ async fn interactive_select(
     let context = &contexts.contexts[ctx_idx];
     println!();
 
-    // 2. List and select DID in this context
-    let dids = client
-        .list_dids_webvh(Some(&context.id), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?;
-
-    // A context `init` just created (`pnm contexts create`) holds no DID yet.
-    // Create one there rather than send the operator away to do it.
-    let dids = if dids.dids.is_empty() {
-        create_context_did(client, &context.id, yes).await?;
-        client
+    // 2. Select a DID from the context and its sub-contexts. Only a subtree
+    //    with no DID at all is offered a new one, and never by default.
+    let mut dids = dids_in_subtree(&all_dids, &context.id);
+    if dids.is_empty() {
+        confirm_create_did(&context.id, yes, |prompt, default| {
+            Ok(Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(prompt)
+                .default(default)
+                .interact()?)
+        })?;
+        create_context_did(client, &context.id).await?;
+        let listed = client
             .list_dids_webvh(Some(&context.id), None)
             .await
             .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
-    } else {
-        dids
-    };
+            .dids;
+        dids = dids_in_subtree(&listed, &context.id);
+        if dids.is_empty() {
+            bail!(
+                "created a DID in '{}' but the VTA does not list it",
+                context.id
+            );
+        }
+    }
 
     // A DID is what the operator is choosing between here, so this is the
     // picker that most needs a name. `list_dids_webvh` carries no label of
@@ -711,58 +846,58 @@ async fn interactive_select(
     // one, otherwise an agent name when asked for.
     names::resolve_agent_names_into(
         book,
-        dids.dids.iter().map(|d| d.did.as_str()),
+        dids.iter().map(|d| d.did.as_str()),
         resolve_agent_names,
     )
     .await;
 
-    let did_labels: Vec<String> = dids
-        .dids
-        .iter()
-        .map(|d| names::inline(book, &d.did))
-        .collect();
+    let did_labels: Vec<String> = dids.iter().map(|d| did_label(book, d)).collect();
 
-    let did_idx = if dids.dids.len() == 1 {
-        println!("Using DID: {}", did_labels[0]);
+    let did_idx = if dids.len() == 1 {
+        println!(
+            "Using DID: {} (the only DID in {} or its sub-contexts)",
+            did_labels[0], context.id
+        );
         0
     } else {
         Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select a DID")
+            .with_prompt(format!(
+                "Select a DID ({} in {} and its sub-contexts)",
+                did_count(dids.len()),
+                context.id
+            ))
             .items(&did_labels)
             .default(0)
             .interact()?
     };
-    let selected_did = &dids.dids[did_idx].did;
+    let selected = &dids[did_idx];
     println!();
 
-    // 3. List Ed25519 keys in this context
-    let keys = client
-        .list_keys(0, 100, Some("active"), Some(&context.id))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to list keys: {e}"))?;
+    // 3. The DID's own signing keys: active Ed25519 keys in the DID's context
+    //    (not the chosen one — a persona's keys live beside it in its
+    //    sub-context) that its document lists under assertionMethod.
+    let doc = current_did_document(client, &selected.did).await?;
+    let keys = list_active_keys(client, &selected.context_id).await?;
+    let candidates = signing_keys_of_did(&keys, &doc);
 
-    let ed25519_keys: Vec<_> = keys
-        .keys
-        .iter()
-        .filter(|k| k.key_type == vta_sdk::keys::KeyType::Ed25519)
-        .collect();
-
-    if ed25519_keys.is_empty() {
+    if candidates.is_empty() {
         bail!(
-            "no active Ed25519 keys found in context '{}' — create signing keys first",
-            context.id
+            "none of the active Ed25519 keys in context '{}' is a signing key \
+             (assertionMethod) of {}. The VTA holds no key this DID can sign with.",
+            selected.context_id,
+            selected.did
         );
     }
 
-    let key_labels: Vec<String> = ed25519_keys
+    let key_labels: Vec<String> = candidates
         .iter()
-        .map(|k| {
+        .map(|(k, vm)| {
             let label = k.label.as_deref().unwrap_or("unlabeled");
-            format!("{} ({})", label, k.key_id)
+            format!("{vm} — {label} ({})", k.key_id)
         })
         .collect();
 
-    let key_idx = if ed25519_keys.len() == 1 {
+    let key_idx = if candidates.len() == 1 {
         println!("Using key: {}", key_labels[0]);
         0
     } else {
@@ -772,32 +907,150 @@ async fn interactive_select(
             .default(0)
             .interact()?
     };
-    let selected_key = ed25519_keys[key_idx];
+    let (selected_key, did_key_id) = &candidates[key_idx];
     println!();
-
-    // 4. Determine the DID#key-id by matching the key's public key against
-    //    the DID document's verification methods
-    let did_key_id = resolve_did_key_fragment(client, selected_did, selected_key).await?;
 
     println!("Signing identity: {did_key_id}");
     println!();
 
-    Ok((selected_key.key_id.clone(), did_key_id))
+    Ok((selected_key.key_id.clone(), did_key_id.clone()))
+}
+
+/// Every active key in `context` (exactly that context: `keys/list` filters
+/// `contextId` exactly), across pages.
+async fn list_active_keys(
+    client: &vta_sdk::client::VtaClient,
+    context: &str,
+) -> Result<Vec<vta_sdk::keys::KeyRecord>> {
+    const PAGE: u64 = 100;
+    let mut keys = Vec::new();
+    loop {
+        let page = client
+            .list_keys(keys.len() as u64, PAGE, Some("active"), Some(context))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list keys in '{context}': {e}"))?;
+        let got = page.keys.len();
+        keys.extend(page.keys);
+        if got == 0 || keys.len() as u64 >= page.total {
+            return Ok(keys);
+        }
+    }
+}
+
+/// The DID's current document: the `state` of the last entry of its log.
+async fn current_did_document(
+    client: &vta_sdk::client::VtaClient,
+    did: &str,
+) -> Result<serde_json::Value> {
+    let log = client
+        .get_did_webvh_log(did)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get the DID log of {did}: {e}"))?
+        .log
+        .with_context(|| format!("the VTA holds no log for {did}"))?;
+    let last = log
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .with_context(|| format!("the log of {did} is empty"))?;
+    let mut entry: serde_json::Value = serde_json::from_str(last)
+        .with_context(|| format!("the last log entry of {did} is not JSON"))?;
+    entry
+        .get_mut("state")
+        .map(serde_json::Value::take)
+        .with_context(|| format!("the last log entry of {did} has no state"))
+}
+
+/// An Ed25519 public key in either form the stack writes: multicodec
+/// (`0xED01` + 32 bytes, as in a DID document) or bare 32 bytes.
+fn ed25519_raw(multibase_key: &str) -> Option<[u8; 32]> {
+    let (_base, bytes) = multibase::decode(multibase_key).ok()?;
+    let raw = bytes
+        .strip_prefix(&vgi_core::ED25519_MULTICODEC_PREFIX)
+        .unwrap_or(&bytes);
+    <[u8; 32]>::try_from(raw).ok()
+}
+
+/// The keys in `keys` that sign as the DID `doc` describes, each with the
+/// verification method id it is published under (`did:…#key-0`).
+///
+/// Which keys may sign is decided by [`vgi_core::ed25519_signing_keys_from_doc`]
+/// — the rule the verifier applies, so a key picked here is one a commit can
+/// verify against. This only finds the id each authorised key is listed
+/// under, walking `assertionMethod` in order: a reference to one of the
+/// document's methods (absolute or relative), or an embedded method.
+fn signing_keys_of_did<'a>(
+    keys: &'a [vta_sdk::keys::KeyRecord],
+    doc: &serde_json::Value,
+) -> Vec<(&'a vta_sdk::keys::KeyRecord, String)> {
+    use serde_json::Value;
+
+    let authorised = vgi_core::ed25519_signing_keys_from_doc(doc);
+    let did = doc.get("id").and_then(Value::as_str).unwrap_or_default();
+    let absolute = |id: &str| {
+        if id.starts_with('#') {
+            format!("{did}{id}")
+        } else {
+            id.to_string()
+        }
+    };
+    let methods: Vec<&Value> = doc
+        .get("verificationMethod")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut published: Vec<([u8; 32], String)> = Vec::new();
+    for entry in doc
+        .get("assertionMethod")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let method = match entry {
+            Value::String(reference) => {
+                let id = absolute(reference);
+                methods.iter().copied().find(|m| {
+                    m.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mid| absolute(mid) == id)
+                })
+            }
+            embedded => Some(embedded),
+        };
+        if let Some(method) = method
+            && let Some(id) = method.get("id").and_then(Value::as_str)
+            && let Some(raw) = method
+                .get("publicKeyMultibase")
+                .and_then(Value::as_str)
+                .and_then(ed25519_raw)
+            && authorised.contains(&raw)
+            && !published.iter().any(|(r, _)| *r == raw)
+        {
+            published.push((raw, absolute(id)));
+        }
+    }
+
+    keys.iter()
+        .filter(|k| k.key_type == vta_sdk::keys::KeyType::Ed25519)
+        .filter_map(|k| {
+            let raw = ed25519_raw(&k.public_key)?;
+            let (_, id) = published.iter().find(|(r, _)| *r == raw)?;
+            Some((k, id.clone()))
+        })
+        .collect()
 }
 
 /// Create a `did:webvh` for `context`, on a DID-hosting server the VTA has
-/// registered, and return it.
+/// registered, and return it. The caller has already had the operator confirm
+/// it ([`confirm_create_did`]).
 ///
 /// The request is the one `pnm contexts provision --server` makes: portable,
 /// no pre-rotation keys, set as the context's primary DID, the VTA choosing
 /// the path and domain. With one server it is used; with several the operator
-/// picks (or, under `--yes`, is told to create the DID themselves); with none
-/// there is nowhere to publish the DID, and the error says how to make one.
-async fn create_context_did(
-    client: &vta_sdk::client::VtaClient,
-    context: &str,
-    yes: bool,
-) -> Result<String> {
+/// picks; with none there is nowhere to publish the DID, and the error says
+/// how to make one.
+async fn create_context_did(client: &vta_sdk::client::VtaClient, context: &str) -> Result<String> {
     let servers = client
         .list_webvh_servers()
         .await
@@ -809,46 +1062,22 @@ async fn create_context_did(
     };
     let server = match servers.len() {
         0 => bail!(
-            "context '{context}' has no DID, and the VTA has no DID-hosting server to \
-             create one on.\n\nRegister one (`pnm did-mgmt servers add …`), or create the \
-             DID yourself:\n  pnm did-mgmt dids create --context {context} --did-url <url>\n\
+            "the VTA has no DID-hosting server to create a DID on.\n\nRegister one \
+             (`pnm did-mgmt servers add …`), or create the DID yourself:\n  \
+             pnm did-mgmt dids create --context {context} --did-url <url>\n\
              then run `did-git-sign init` again."
         ),
         1 => &servers[0],
-        n if yes => bail!(
-            "context '{context}' has no DID, and the VTA has {n} DID-hosting servers to \
-             create one on. Run without --yes to choose, or create it yourself:\n  \
-             pnm did-mgmt dids create --context {context} --server <id>"
-        ),
         _ => {
             let labels: Vec<String> = servers.iter().map(label).collect();
             let idx = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!(
-                    "Context '{context}' has no DID. Create one on which server?"
-                ))
+                .with_prompt(format!("Create the DID for '{context}' on which server?"))
                 .items(&labels)
                 .default(0)
                 .interact()?;
             &servers[idx]
         }
     };
-
-    if !yes
-        && servers.len() == 1
-        && !Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!(
-                "Context '{context}' has no DID. Create a did:webvh for it on {}?",
-                label(server)
-            ))
-            .default(true)
-            .interact()?
-    {
-        bail!(
-            "no DID to sign with. Create one with\n  pnm did-mgmt dids create --context \
-             {context} --server {}\nand run `did-git-sign init` again.",
-            server.id
-        );
-    }
 
     println!(
         "Creating a did:webvh in context '{context}' on {}…",
@@ -886,48 +1115,6 @@ async fn create_context_did(
     );
     println!();
     Ok(created.did)
-}
-
-/// Match a VTA key's public key against a DID document's verification methods
-/// to find the corresponding DID#key-N fragment.
-async fn resolve_did_key_fragment(
-    client: &vta_sdk::client::VtaClient,
-    did: &str,
-    key: &vta_sdk::keys::KeyRecord,
-) -> Result<String> {
-    // Try to get the DID document from VTA
-    let _did_record = client
-        .get_did_webvh(did)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to get DID record: {e}"))?;
-
-    // Try to get the DID log to extract the document
-    let log_resp = client
-        .get_did_webvh_log(did)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to get DID log: {e}"))?;
-
-    if let Some(log) = &log_resp.log
-        && let Some(last_line) = log.lines().last()
-        && let Ok(entry) = serde_json::from_str::<serde_json::Value>(last_line)
-        && let Some(state) = entry.get("state")
-        && let Some(vms) = state.get("verificationMethod")
-        && let Some(vms_arr) = vms.as_array()
-    {
-        for vm in vms_arr {
-            if let Some(pub_key_mb) = vm.get("publicKeyMultibase")
-                && pub_key_mb.as_str() == Some(&key.public_key)
-                && let Some(id) = vm.get("id").and_then(|v| v.as_str())
-            {
-                return Ok(id.to_string());
-            }
-        }
-    }
-
-    // Fallback: if we can't match, use the DID + #key-0 convention
-    // (the first signing key is typically #key-0 for VTA-created DIDs)
-    eprintln!("Warning: could not match key against DID document, using default fragment #key-0");
-    Ok(format!("{did}#key-0"))
 }
 
 /// Find and load the signing config (repo-local first, then global).
@@ -1626,15 +1813,178 @@ mod tests {
 
     #[test]
     fn grant_command_carries_the_one_time_handoff() {
-        let cmd = pnm_grant_command("did-git-sign", "did:key:z6MkExample");
+        let cmd = pnm_grant_command("openvtc-bob", "did:key:z6MkExample");
         assert_eq!(
             cmd,
-            "    pnm contexts create --id did-git-sign --name \"did-git-sign\" \\\n        \
-             --admin-did did:key:z6MkExample --admin-expires 1h --admin-handoff"
+            "  If openvtc-bob does not exist yet:\n    \
+             pnm contexts create --id openvtc-bob --name \"did-git-sign\" \\\n        \
+             --admin-did did:key:z6MkExample --admin-expires 1h --admin-handoff\n\n  \
+             If it already exists (e.g. an openvtc persona context):\n    \
+             pnm acl create --did did:key:z6MkExample --role admin --contexts openvtc-bob \\\n        \
+             --expires 1h --handoff"
         );
-        // The VTA refuses the rollover without the hand-off, which needs the expiry.
-        assert!(cmd.contains("--admin-handoff"));
-        assert!(cmd.contains("--admin-expires"));
+        // The VTA refuses the rollover without the hand-off, which needs the
+        // expiry — on both paths.
+        assert!(cmd.contains("--admin-handoff") && cmd.contains("--admin-expires 1h"));
+        assert!(cmd.contains("--handoff") && cmd.contains("--expires 1h"));
+        // `pnm contexts create` fails on an existing context, so the
+        // existing-context path must not depend on it.
+        let existing = cmd.split("If it already exists").nth(1).unwrap_or_default();
+        assert!(existing.contains("pnm acl create") && !existing.contains("contexts create"));
+    }
+
+    fn did_record(did: &str, context: &str) -> vta_sdk::webvh::WebvhDidRecord {
+        serde_json::from_value(serde_json::json!({
+            "did": did, "serverId": "s", "mnemonic": "m", "scid": "Qm", "contextId": context,
+            "portable": true, "logEntryCount": 1,
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+        }))
+        .expect("record")
+    }
+
+    #[test]
+    fn subtree_is_segment_aware() {
+        assert!(in_subtree("openvtc-bob", "openvtc-bob"));
+        assert!(in_subtree("openvtc-bob", "openvtc-bob/qme5theer1qr"));
+        assert!(in_subtree("openvtc-bob", "openvtc-bob/a/b"));
+        assert!(!in_subtree("openvtc-bob", "openvtc-bob-other"));
+        assert!(!in_subtree("openvtc-bob", "openvtc-bobby/x"));
+        assert!(!in_subtree("openvtc-bob/x", "openvtc-bob"));
+        assert!(!in_subtree("openvtc-bob", "openvtc"));
+    }
+
+    #[test]
+    fn dids_are_collected_across_the_subtree_only() {
+        let all = vec![
+            did_record("did:webvh:Qm3:h:z", "openvtc-bob/zeta"),
+            did_record("did:webvh:Qm1:h:a", "openvtc-bob/alpha"),
+            did_record("did:webvh:Qm9:h:o", "openvtc-bob-other"),
+            did_record("did:webvh:Qm2:h:t", "openvtc-bob"),
+        ];
+        let found: Vec<(String, String)> = dids_in_subtree(&all, "openvtc-bob")
+            .into_iter()
+            .map(|d| (d.context_id, d.did))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("openvtc-bob".into(), "did:webvh:Qm2:h:t".into()),
+                ("openvtc-bob/alpha".into(), "did:webvh:Qm1:h:a".into()),
+                ("openvtc-bob/zeta".into(), "did:webvh:Qm3:h:z".into()),
+            ]
+        );
+        assert!(dids_in_subtree(&all, "openvtc-bob/beta").is_empty());
+        assert_eq!(dids_in_subtree(&all, "openvtc-bob/zeta").len(), 1);
+    }
+
+    #[test]
+    fn labels_count_dids_and_show_where_each_lives() {
+        assert_eq!(did_count(0), "no DIDs");
+        assert_eq!(did_count(1), "1 DID");
+        assert_eq!(did_count(3), "3 DIDs");
+        assert_eq!(
+            context_label("openvtc-bob", "OpenVTC BOB", 2, None),
+            "openvtc-bob — OpenVTC BOB (2 DIDs)"
+        );
+        assert_eq!(
+            context_label("ops", "Ops", 1, Some("did:webvh:Qm…:x")),
+            "ops — Ops (1 DID) · primary did:webvh:Qm…:x"
+        );
+        let book = vta_sdk::display_name::NameBook::new();
+        let label = did_label(&book, &did_record("did:webvh:Qm1:h:a", "openvtc-bob/alpha"));
+        assert!(label.ends_with(" — in openvtc-bob/alpha"), "{label}");
+    }
+
+    #[test]
+    fn creation_is_never_automatic_and_defaults_to_no() {
+        // --yes refuses without asking, and says where to look instead.
+        let err = confirm_create_did("openvtc-bob", true, |_, _| panic!("--yes must not ask"))
+            .expect_err("--yes must not create");
+        let msg = err.to_string();
+        assert!(msg.contains("or its sub-contexts"), "{msg}");
+        assert!(msg.contains("--context"), "{msg}");
+        assert!(
+            msg.contains("pnm did-mgmt dids create --context openvtc-bob"),
+            "{msg}"
+        );
+
+        // Interactively the question is asked with No as the default.
+        let mut seen = None;
+        let declined = confirm_create_did("openvtc-bob", false, |prompt, default| {
+            seen = Some((prompt.to_string(), default));
+            Ok(default)
+        });
+        assert!(declined.is_err(), "pressing Enter must not create");
+        let (prompt, default) = seen.expect("asked");
+        assert!(!default);
+        assert_eq!(
+            prompt,
+            "No DID found in openvtc-bob or its sub-contexts. A new DID has no git rights \
+             in any community until granted. Create one?"
+        );
+
+        assert!(confirm_create_did("openvtc-bob", false, |_, _| Ok(true)).is_ok());
+    }
+
+    fn ed25519_mb(seed: u8) -> (String, String) {
+        let public = ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut multicodec = vgi_core::ED25519_MULTICODEC_PREFIX.to_vec();
+        multicodec.extend_from_slice(&public);
+        (
+            multibase::encode(multibase::Base::Base58Btc, multicodec),
+            multibase::encode(multibase::Base::Base58Btc, public),
+        )
+    }
+
+    fn key_record(id: &str, key_type: &str, public_key: &str) -> vta_sdk::keys::KeyRecord {
+        serde_json::from_value(serde_json::json!({
+            "keyId": id, "derivationPath": "m/0", "keyType": key_type, "status": "active",
+            "publicKey": public_key, "contextId": "openvtc-bob/alpha",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+        }))
+        .expect("key")
+    }
+
+    #[test]
+    fn only_the_dids_own_assertion_keys_are_offered() {
+        const DID: &str = "did:webvh:Qm1:h:a";
+        let (signing, signing_bare) = ed25519_mb(1);
+        let (auth_only, _) = ed25519_mb(2);
+        let (other_did, _) = ed25519_mb(3);
+        let (embedded, _) = ed25519_mb(4);
+        let doc = serde_json::json!({
+            "id": DID,
+            "verificationMethod": [
+                { "id": "#key-0", "controller": DID, "publicKeyMultibase": signing },
+                { "id": format!("{DID}#key-1"), "controller": DID, "publicKeyMultibase": auth_only }
+            ],
+            "authentication": [format!("{DID}#key-1")],
+            "assertionMethod": [
+                format!("{DID}#key-0"),
+                { "id": "#key-2", "controller": DID, "publicKeyMultibase": embedded }
+            ]
+        });
+        let keys = vec![
+            // The VTA may report the key bare or multicodec; both match.
+            key_record("k-sign", "ed25519", &signing_bare),
+            key_record("k-auth", "ed25519", &auth_only),
+            key_record("k-other", "ed25519", &other_did),
+            key_record("k-emb", "ed25519", &embedded),
+            key_record("k-x", "x25519", &signing),
+        ];
+        let picked: Vec<(String, String)> = signing_keys_of_did(&keys, &doc)
+            .into_iter()
+            .map(|(k, vm)| (k.key_id.clone(), vm))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![
+                ("k-sign".to_string(), format!("{DID}#key-0")),
+                ("k-emb".to_string(), format!("{DID}#key-2")),
+            ]
+        );
     }
 
     /// Sets an env var on construction, removes it on drop (panic-safe).

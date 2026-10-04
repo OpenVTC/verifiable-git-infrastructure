@@ -76,10 +76,31 @@ did-git-sign init --vta-did did:webvh:scid:your-vta.example.com
 cd your-repo && did-git-sign enable      # this repository signs with it
 ```
 
-`init` resolves the VTA, mints a temporary admin did:key, and prints a
-`pnm contexts create …` command. Run it in your Personal Network Manager to
-authorise the setup session, press Enter, then select the persona and signing
-key interactively (or let `init` create a DID in an empty context).
+`init` resolves the VTA, mints a temporary admin did:key, and prints the
+`pnm` command that authorises it: `pnm contexts create … --admin-handoff` for a
+context that does not exist yet, or `pnm acl create … --contexts <ctx>
+--handoff` for one that does (an openvtc persona context, say —
+`pnm contexts create` refuses an existing context). Run the one that applies in
+your Personal Network Manager, press Enter, then pick the persona and signing
+key:
+
+- **Context.** Each is shown with the number of DIDs in it *and its
+  sub-contexts* (`openvtc-bob — OpenVTC BOB (2 DIDs)`). openvtc keeps every
+  persona in a sub-context of the account context (`<account>/<slug>`) and pins
+  no primary DID, so pointing `--context` at the account context finds them all.
+- **DID.** Every DID in the chosen context and its sub-contexts, each with its
+  name (when one is known) and the context it lives in. With exactly one, it is
+  used and named.
+- **Key.** Only the chosen DID's own signing keys: active Ed25519 keys in the
+  DID's context that its document lists under `assertionMethod`, shown with the
+  `DID#key-N` each signs as.
+
+Only when the context and all its sub-contexts hold no DID does `init` offer to
+create one, and the default answer is **No**: a new DID has no git rights in any
+community until one grants them. Under `--yes` it never creates one; it stops
+and says to point `--context` at the context holding your persona, or to create
+a DID with `pnm did-mgmt dids create --context <ctx> …`. (0.12.1 to 0.15 created
+one by default, and under `--yes`.)
 
 `enable` adds one line to the repository's `.git/config`, an `include.path`
 naming did-git-sign's settings for that identity, and changes nothing else.
@@ -120,7 +141,7 @@ did-git-sign init \
 | Flag | Description |
 |------|-------------|
 | `--vta-did` | VTA DID; the service URL is discovered from its document (required) |
-| `--context` | Context id to provision into (default `did-git-sign`) |
+| `--context` | Context to provision into; the DID is looked for in it and its sub-contexts (default `did-git-sign`) |
 | `--key-id` | VTA key id for the signing key (skips interactive selection) |
 | `--did-key-id` | DID verification-method id to sign as (skips interactive selection) |
 | `--profile` | Save the identity under a name (see [Profiles](#profiles-more-than-one-identity)) |
