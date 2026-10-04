@@ -1,5 +1,14 @@
 # VGI bridge configuration — one community, one bridge (design §5.7).
 #
+# You rarely need to start from this file: `vgi-bridge setup --vtc <VTC DID>
+# --vta <VTA DID> --dir <folder> …` writes a complete bridge.toml in VTA mode
+# — the registry and mediator read from the VTC's DID document, the
+# verify-trust action pinned to its release commit, the web-flow key fetched,
+# the VTA credential provisioned — plus a service file (docs/BRIDGE.md §2).
+# This file documents every key, for editing that config or writing one by
+# hand (docs/BRIDGE.md §8). Use absolute paths; the examples below use a
+# folder in the operator's home, /home/ops/vgi-bridge.
+#
 # Nothing secret belongs in this file: keys, tokens and passwords live in the
 # sealed store — or, in VTA mode (the `[vta]` section below), in the bridge's
 # trust context of the VTC's VTA (`vgi-bridge secret set …`, the GitHub
@@ -15,26 +24,31 @@ vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
 # pull-request gate decides on (BRIDGE.md §6d). Below 0.4 no pull request
 # is reported.
 # event_version = "0.3"
-# The community's Trust Registry (for the bootstrap and the bridge's check).
+# The community's Trust Registry (for the bootstrap and the bridge's check):
+# the TrustRegistry service of the VTC's DID document (setup reads it there).
 trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"
 # The mediator the bridge's DID is reachable through (the VTC's), for TSP
-# and DIDComm alike.
+# and DIDComm alike: the TSPTransport / DIDCommMessaging service of the VTC's
+# DID document (setup reads it there).
 # The did:peer `vgi-bridge init` mints names it in the identifier: changing
 # it later means minting a new identity and registering it at the VTC.
 mediator_did = "did:web:mediator.acme-vtc.example"
 
 # Where the forges reach the bridge, through the TLS proxy in front of it.
 public_url = "https://bridge.acme-vtc.example/"
-# Plain HTTP behind the proxy: only the proxy may reach it. All interfaces is
-# right inside a container (publish the port to the proxy's network only);
-# with the proxy on the same host, use "127.0.0.1:8080".
-listen = "0.0.0.0:8080"
-data_dir = "/var/lib/vgi-bridge"
+# Plain HTTP behind the proxy or tunnel: only it may reach this. Loopback
+# with the proxy on the same host (what setup writes); all interfaces,
+# "0.0.0.0:8080" (the built-in default), is right only inside a container
+# whose port is published to the proxy alone.
+listen = "127.0.0.1:8080"
+# The state store (the built-in default, /var/lib/vgi-bridge, is the
+# container image's volume).
+data_dir = "/home/ops/vgi-bridge/data"
 
-# The master key that seals every secret: a mounted, owner-only file
-# (a Kubernetes/Docker secret). Back it up apart from the data directory.
-# Not used (and refused) in VTA mode.
-master_key_file = "/run/secrets/vgi-bridge-master-key"
+# Self-contained mode (`setup --self-contained`): the master key that seals
+# every secret, an owner-only file (`init` creates it). Back it up apart from
+# the data directory. Not used (and refused) in VTA mode.
+master_key_file = "/home/ops/vgi-bridge/master-key"
 # …or an environment variable instead:
 # master_key_env = "VGI_BRIDGE_MASTER_KEY"
 
@@ -45,8 +59,9 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 # `master_key_file` / `master_key_env` when you turn it on.
 # [vta]
 # context = "vgi-bridge"
-# # The credential bundle the VTA issued (JSON; owner-only file).
-# credential_file = "/run/secrets/vgi-bridge-vta-credential"
+# # The credential bundle the VTA issued (JSON; owner-only file). setup
+# # provisions it into the folder.
+# credential_file = "/home/ops/vgi-bridge/vta-credential.json"
 # # …or an environment variable (cleared once read):
 # # credential_env = "VGI_BRIDGE_VTA_CREDENTIAL"
 # # The bridge reaches the VTA over TSP when the VTA advertises it, else
@@ -80,6 +95,8 @@ master_key_file = "/run/secrets/vgi-bridge-master-key"
 
 [verify_trust]
 # What the bootstrap writes into repositories (and the required workflow).
+# setup pins this to the commit of its own release tag; by hand:
+#   gh api repos/OpenVTC/verifiable-git-infrastructure/commits/<version> --jq .sha
 action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>"
 version = "v0.15.1"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
@@ -140,8 +157,9 @@ app_owner = "acme"
 # it (such commits then fail); the in-repo and required-workflow plans need it,
 # and the Dependabot re-sign checks Dependabot's commits against it (without
 # it, nothing is re-signed).
-# curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc
-platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
+# setup fetches it; by hand:
+#   curl -fsSL https://github.com/web-flow.gpg > /home/ops/vgi-bridge/web-flow.asc
+platform_keyring_file = "/home/ops/vgi-bridge/web-flow.asc"
 # Post the check from the bridge where no org required workflow is
 # available (personal accounts, orgs without org rulesets). Leave on.
 # bridge_checks = true

@@ -31,6 +31,8 @@ vgi-forge-forgejo = { workspace = true }
 # Only for `build_resolver`: the verifier's public-hosts-only DID resolver,
 # used to read the VTC's TrustRegistry referral when `--registry` is omitted.
 verify-trust = { workspace = true }
+# The TrustRegistry referral reader, shared with `vgi-bridge setup`.
+vgi-core = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

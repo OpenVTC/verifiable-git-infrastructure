@@ -58,27 +58,9 @@ pub fn resource_from_remote(url: &str) -> Result<Resource> {
     Ok(r)
 }
 
-/// The registry DID a DID document refers to: a service whose `type` is (or
-/// includes) `TrustRegistry` and whose endpoint `uri` is a DID.
-pub fn registry_referral(doc: &Value) -> Option<String> {
-    let services = doc.get("service")?.as_array()?;
-    services.iter().find_map(|s| {
-        let is_registry = match s.get("type")? {
-            Value::String(t) => t == "TrustRegistry",
-            Value::Array(ts) => ts.iter().any(|t| t == "TrustRegistry"),
-            _ => false,
-        };
-        if !is_registry {
-            return None;
-        }
-        let uri = match s.get("serviceEndpoint")? {
-            Value::String(u) => u.as_str(),
-            Value::Object(o) => o.get("uri")?.as_str()?,
-            _ => return None,
-        };
-        uri.starts_with("did:").then(|| uri.to_string())
-    })
-}
+/// The registry DID a DID document refers to (shared with `vgi-bridge
+/// setup`, which reads the same referral).
+pub use vgi_core::registry_referral;
 
 /// Resolve `vtc_did` and take its `TrustRegistry` referral.
 pub async fn resolve_registry(vtc_did: &str) -> Result<String> {

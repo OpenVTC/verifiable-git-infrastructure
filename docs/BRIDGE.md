@@ -94,113 +94,134 @@ the proxy, not the socket: `listen` (default `0.0.0.0:8080`, right inside a
 container) is plain HTTP carrying OAuth codes, App-setup redirects and
 webhook bodies, so only the proxy may reach it. Publish the container port to
 the proxy's network only; on a VM or bare metal with the proxy on the same
-host, set `listen = "127.0.0.1:8080"`. The bridge logs a warning at startup
+host, set `listen = "127.0.0.1:8080"` (what `vgi-bridge setup` writes). The bridge logs a warning at startup
 whenever `listen` is not a loopback address. Keep the proxy's
 own body limit at or above `max_body_bytes` (default 2 MiB), so the bridge's
 limit is the one that answers.
 
-## 2. First start
+## 2. First start: `vgi-bridge setup`
 
-Two ways to run a bridge:
+One command writes a complete, runnable bridge folder in VTA mode (§2a) —
+the config, the bridge's VTA credential, a service file — in a folder you
+own. No root, no Docker, no values copied by hand.
 
-- **VTA mode (recommended; §2a).** Like every companion service around a
-  VTC, the bridge's DID, keys, secrets and state live in its own trust context
-  of the VTC's VTA; the host holds only a context-scoped credential. A lost
-  host costs nothing: issue a new credential, start the bridge.
-- **Self-contained** (below): a sealed store and a locally held identity
-  (`did:peer`, or an imported bundle). For development and testing, or where
-  there is no VTA.
+**1. Install the binary.** See the README for the release binaries and
+`cargo install`; from a checkout, `cargo install --locked --path
+crates/vgi-bridge`.
 
-### Self-contained
-
-```sh
-# 1. Config: start from crates/vgi-bridge/bridge.example.toml.
-cp bridge.example.toml /etc/vgi-bridge/bridge.toml
-
-# 2. The master key and the bridge's identity. `init` writes the key file
-#    named by `master_key_file` (0600, never overwritten) and, if the store
-#    has no identity, mints a did:peer whose document names `mediator_did`.
-#    It prints the DID.
-vgi-bridge --config /etc/vgi-bridge/bridge.toml init
-
-# 3. Back the identity up apart from the store (see §5).
-vgi-bridge --config /etc/vgi-bridge/bridge.toml identity export /secure/bridge-identity.json
-```
-
-**A `did:webvh` identity instead** (recommended for production, the same way
-the VTC's is provisioned): provision a DID for the bridge from the
-community's VTA with a DID template that has an Ed25519 signing key and an
-X25519 key-agreement key, export its secrets bundle, and import it:
+**2. Run setup.** You need the VTC's DID, the DID of the VTC's VTA, an
+administrator of that VTA to run one `pnm` command, and the HTTPS URL the
+bridge will be reached at:
 
 ```sh
-vgi-bridge --config /etc/vgi-bridge/bridge.toml identity import bundle.json
-shred -u bundle.json
+vgi-bridge setup \
+  --vtc did:webvh:…:acme-vtc.example \
+  --vta did:webvh:…:vta.acme-vtc.example \
+  --dir ~/vgi-bridge \
+  --public-url https://bridge.acme-vtc.example/ \
+  --owner acme
 ```
 
-Register the printed DID at the VTC as the bridge serving its namespaces:
-the VTC's `[git_ns] bridges` maps each forge host to it.
+What it does, in order:
 
-The VTC reaches the bridge through a transport the bridge's DID document
-advertises: it resolves the DID and takes the first of a `TSPTransport` and a
-`DIDCommMessaging` service naming the mediator the bridge listens at. The
-bridge answers each job over the transport it came in on, and sends results
-and events over the first of the two the VTC's own document advertises. Both
-identities carry the services:
+1. **Resolves the VTC's DID document** and reads the Trust Registry (its
+   `TrustRegistry` referral) and the mediator (its `TSPTransport`, else
+   `DIDCommMessaging`, service), printing both. `--registry` and
+   `--mediator` override them.
+2. **Asks for what it cannot find**: `--public-url` (https, or plain http to
+   `localhost` only) and, for GitHub, `--owner` (the organisation, or with
+   `--user-account` your personal account). With `--yes` it asks nothing and
+   fails on a missing value instead.
+3. **Fetches GitHub's `web-flow` key** into `<dir>/web-flow.asc`, and
+   **pins verify-trust**: the action is pinned to the commit of this
+   binary's own release tag (`v<version>`), looked up with the GitHub API.
+   If GitHub cannot be reached, `bridge.toml` carries a commented TODO with
+   the one command that fills it in.
+4. **Provisions the bridge's VTA credential** the way `did-git-sign init`
+   does: it mints a temporary setup `did:key`, prints the two `pnm` commands
+   that authorise it (one for a new context, one for an existing one — run
+   whichever applies, as an admin of the VTA), waits for Enter, then
+   authenticates over TSP or DIDComm and has the VTA roll the setup key over
+   to a long-term admin **scoped to the bridge's context** (`--context`,
+   default `vgi-bridge`). The credential goes to `<dir>/vta-credential.json`
+   (0600). Already have one? `--credential <file>` uses it instead; a
+   credential left in the folder by an earlier run is reused.
+5. **Writes `<dir>/bridge.toml`** with absolute paths only, checks it with
+   the bridge's own parser, and creates `<dir>/data` (0700). It never
+   replaces an existing `bridge.toml` without `--force`.
+6. **Writes the service file** for `--service` (default: launchd on macOS,
+   systemd on Linux): a systemd `--user` unit (`<dir>/vgi-bridge.service`),
+   a launchd agent (`<dir>/org.openvtc.vgi-bridge.plist`), a Compose file
+   (`<dir>/compose.yml`, `docker`), or nothing (`none`: it prints the plain
+   `vgi-bridge --config <dir>/bridge.toml run`). Logs go to
+   `<dir>/bridge.log` (Compose: `docker compose logs`).
+7. **Mints and checks the bridge's DID.** If the context has no DID yet, it
+   mints a `did:webvh` into it on the VTA's did:webvh hosting server
+   (`--webvh-server <id>` when the VTA has several), with a `TSPTransport`
+   and a `DIDCommMessaging` service naming the VTA's mediator. Then it runs
+   `vta setup`'s checks (§2a) and prints the DID.
 
-- **The `did:peer:2` `init` mints** encodes its keys *and* both services in
-  the identifier, so there is nothing to host. The flip side: the mediator is
-  part of the DID. Change `mediator_did` and the bridge refuses to start
-  rather than have the VTC deliver jobs where it no longer listens. For a
-  bridge serving bound namespaces the fix is to set `mediator_did` back: a new
-  DID is a different bridge (below). Each service carries the mediator's
-  DID, so a mediator with a long DID (a `did:peer` of its own) may leave room
-  for only one: `init` then mints a `did:peer` advertising DIDComm only, with
-  a warning, and the VTC reaches the bridge over DIDComm. It refuses a
-  mediator whose DID would make even that longer than the 1000 bytes DID
-  resolvers accept. For TSP there, use a mediator with a short DID
-  (`did:web`/`did:webvh`) or a `did:webvh` for the bridge.
-- **A `did:webvh`** publishes the services in its document (the VTA template
-  adds them), and can move mediators without changing DID.
-
-A `did:peer` minted by an earlier release advertises DIDComm only: the VTC
-keeps reaching it over DIDComm. Mint a new one (below) to have it reached over
-TSP.
-
-A store from an earlier release may hold a `did:key`, which advertises no
-service: no VTC can send it jobs (they fail `noMatchingProtocol`). `run` warns
-about it at start; mint a `did:peer` in its place (`identity mint --replace
---backup <file>`) and register that.
-
-**Replacing the identity is not a key rotation.** `identity mint --replace`
-and an `identity import` of a different DID write the current identity to
-`--backup <file>` first (required), and refuse — listing them — while the
-store holds namespaces bound or being bound to it, or when the current DID
-is one the bridge did not mint (a VTA-provisioned `did:webvh`), unless given
-`--abandon-current-did`. What a new DID breaks: the VTC's `[git_ns] bridges`
-must name it; the VTC accepts a namespace's results and events only from the
-DID it bound, so those namespaces are no longer served; the registry's
-`git.commit.sign` service grant is held by the old DID, so Dependabot commits
-the new one re-signs fail the check; and with no re-attach yet, binding them
-again needs an unbind, which revokes every right in them.
-
-`identity show` prints the current DID. The admin commands (`init`,
-`identity`, `secret`) open the store directly, and redb allows one process at a time: stop the bridge first.
-
-### The container
+**3. Start the service** with the commands setup prints, for example:
 
 ```sh
-docker build -f crates/vgi-bridge/Dockerfile -t vgi-bridge .
-docker run -d --name vgi-bridge \
-  -v /etc/vgi-bridge:/etc/vgi-bridge:ro \
-  -v vgi-bridge-data:/var/lib/vgi-bridge \
-  -v /run/secrets/vgi-bridge-master-key:/run/secrets/vgi-bridge-master-key:ro \
-  -p 127.0.0.1:8080:8080 vgi-bridge
+systemctl --user enable --now ~/vgi-bridge/vgi-bridge.service
+loginctl enable-linger "$USER"     # keep running while logged out
+
+# macOS
+cp ~/vgi-bridge/org.openvtc.vgi-bridge.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openvtc.vgi-bridge.plist
+
+# Compose (build the image from a checkout first:
+#   docker build -f crates/vgi-bridge/Dockerfile -t vgi-bridge .)
+cd ~/vgi-bridge && docker compose up -d
 ```
 
-The image runs as the unprivileged user `vgi` (uid 10001), so what you mount
-must be readable (the data volume writable) by that uid, and it carries a `HEALTHCHECK` (`vgi-bridge healthcheck`, §7). Run
-`init` / `identity import` / `identity export` with the same volumes and
-`vgi-bridge init` as the command before the first `run`.
+The Compose file mounts the folder at its own path inside the container
+(read-only, `data/` writable), so `bridge.toml`'s paths hold there too, and
+runs the container as you so it can read the owner-only credential. The
+image's own user is uid 10001: to run as that instead on Linux, drop the
+`user:` line and `chown -R 10001:10001` the folder.
+
+**4. Make the public URL reach it.** The bridge listens on
+`127.0.0.1:8080`, plain HTTP. Put HTTPS in front: a TLS-terminating proxy on
+the same host, or a tunnel such as cloudflared, ngrok or Tailscale Funnel.
+Prefer a stable hostname — GitHub's callback and webhook URLs are built from
+`public_url`, and changing it means re-registering the App.
+
+**5. Tell the VTC.** On the VTC host, add the line setup printed to the
+VTC's config, then restart the VTC (the section is read at start):
+
+```toml
+[git_ns]
+bridges = { "github.com" = "did:webvh:…" }   # the bridge's DID
+```
+
+**6. Register the GitHub App** (§3): once running, the bridge logs a
+one-time link, `<public_url>/github/<host>/<owner>/register?state=…`, which
+an owner of the organisation opens.
+
+If a check fails at step 7 the folder is otherwise complete: fix what it
+names and check again with `vgi-bridge --config ~/vgi-bridge/bridge.toml vta
+setup`. Re-running setup with `--force` regenerates `bridge.toml` and the
+service file and keeps the credential and the state store. Run
+`vgi-bridge setup --help` for every flag (Forgejo: `--forge forgejo
+--forgejo-url … --bot-login … --oauth-client-id …`; GHES: `--github-host`).
+
+**Self-contained mode** (`--self-contained`): instead of `[vta]`, setup
+writes an owner-only master key to `<dir>/master-key` and mints a local
+`did:peer` (§8). For development and testing, or where there is no VTA.
+
+**How the VTC reaches the bridge.** The VTC resolves the bridge's DID and
+takes the first of a `TSPTransport` and a `DIDCommMessaging` service naming
+the mediator the bridge listens at. The bridge answers each job over the
+transport it came in on, and sends results and events over the first of the
+two the VTC's own document advertises. A `did:webvh` publishes the services
+in its document, and can move mediators without changing DID. If the DID
+setup minted advertises a different mediator from `mediator_did`, setup says
+so: set `mediator_did` to the one the DID names.
+
+The admin commands (`init`, `identity`, `secret`, `vta setup`) open the store
+directly, and redb allows one process at a time: stop the bridge first.
 
 ## 2a. VTA mode
 
@@ -218,26 +239,25 @@ Every signature the bridge makes is its own: it signs its Trust Task
 documents, results and Dependabot re-signs with its own Ed25519 key, never as
 the VTC.
 
-**1. The context and the DID.** In the VTA, create a context for the bridge
-(`vgi-bridge`, say) and provision a `did:webvh` into it from a DID template
-with an Ed25519 signing key (`#key-0`), an X25519 key-agreement key (`#key-1`)
-and a `TSPTransport` (`#tsp`) and a `DIDCommMessaging` service naming
-`mediator_did` (the VTC prefers TSP; DIDComm alone also works).
+**Setting it up.** `vgi-bridge setup` (§2) does all of this: it provisions
+the context-scoped credential, mints the `did:webvh` into the context,
+writes the `[vta]` section and runs `vta setup`'s checks. Doing it by hand is
+§8, "VTA mode by hand".
 
-**2. The credential.** Issue a `did:key` credential that is an **admin
-scoped to that context only** — exporting the context's keys needs the VTA's
-`key-export` capability, which only `admin` carries — and hand it to the
-bridge host as a file (owner-only, JSON: `did`, `privateKeyMultibase`,
-`vtaDid`, and optionally `vtaUrl`; the same base64-encoded is also read), or
-in an environment variable the bridge clears once read (`credential_env`):
+**`vta setup`** verifies the context has a DID with both keys, the
+credential can fetch them and read, write and delete app-state, creates the
+sealing key, warns if the credential reaches any other context, and prints
+the DID to register at the VTC. Run it again at any time:
 
 ```sh
-pnm auth-credential create --role admin --contexts vgi-bridge --recipient req.json
-# (or `pnm acl create --did <did:key> --role admin --contexts vgi-bridge`)
-# open the sealed bundle into the credential JSON:
-pnm bootstrap open --bundle bundle.armor --expect-digest <digest> --out /run/secrets/vgi-bridge-vta-credential
-chmod 600 /run/secrets/vgi-bridge-vta-credential
+vgi-bridge --config ~/vgi-bridge/bridge.toml vta setup
 ```
+
+The bridge starts on an **empty** `data_dir` the first time (a store left by
+a self-contained bridge is refused: the state of VTA mode comes from the
+VTA). `secret set` / `secret list` work on the context's app-state in VTA
+mode (restart the bridge after a `secret set`); `identity import`, `export`
+and `mint` are refused — the identity is the context's.
 
 A context-scoped admin reaches that context (and any context below it) and
 nothing else: every key, sign and app-state operation checks the key's or
@@ -245,45 +265,12 @@ record's own context, so the credential can read neither the VTC's keys nor
 any other context's. It can administer its own context (create keys and ACL
 entries in it), which is why it is issued to the bridge host alone.
 
-**3. The config.** Add a `[vta]` section and remove `master_key_file` /
-`master_key_env` (the bridge refuses both together):
-
-```toml
-[vta]
-context = "vgi-bridge"
-credential_file = "/run/secrets/vgi-bridge-vta-credential"
-# The VTA is reached over TSP when its DID document advertises `#tsp`,
-# else DIDComm, through the bridge's `mediator_did` unless this names
-# another:
-# mediator_did = "did:web:mediator.acme-vtc.example"
-# The other keys (all optional): `url` (the VTA's REST URL when the credential
-# carries none, used only for the messaging client's unauthenticated calls;
-# https, or loopback), `did` (the
-# bridge's DID; default: the context's DID), `start_timeout_secs` (300),
-# `key_refresh_secs` (60, at least 30) and `signing_switch_after_secs` (86400).
-```
-
 The bridge talks to the VTA over TSP when the VTA's DID document advertises
 it (a DIDComm session holds the mediator socket and the Trust Tasks go over
 TSP), else over DIDComm; a TSP leg that cannot be established falls back to
 DIDComm with a warning in the log. Never REST: the VTA releases a private key
 only over a channel confidential end to end, never over REST, where the key
 would exist wherever TLS terminates.
-
-**4. Check it.** `vta setup` verifies the context has a DID with both keys,
-the credential can fetch them and read, write and delete app-state, creates
-the sealing key, warns if the credential reaches any other context, and
-prints the DID to register at the VTC:
-
-```sh
-vgi-bridge --config /etc/vgi-bridge/bridge.toml vta setup
-```
-
-Then `run` as usual, with an **empty** `data_dir` the first time (a store left
-by a self-contained bridge is refused: the state of VTA mode comes from the
-VTA). `secret set` / `secret list` work on the context's app-state in VTA mode
-(restart the bridge after a `secret set`); `identity import`, `export` and
-`mint` are refused — the identity is the context's.
 
 **Start-up and an unreachable VTA.** The bridge cannot run without its keys:
 start-up retries an unreachable VTA with capped backoff for
@@ -409,8 +396,8 @@ VTC still maps the host to this one bridge.
 
 1. Set `app_owner` (required) to the organisation that will own the App —
    or to your account, with `app_owner_is_user = true`. Optionally put
-   GitHub's `web-flow` key where `platform_keyring_file` says:
-   `curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc`.
+   GitHub's `web-flow` key where `platform_keyring_file` says (`setup`
+   fetches it): `curl -fsSL https://github.com/web-flow.gpg > ~/vgi-bridge/web-flow.asc`.
    It is the exempt keyring for commits GitHub signs (web-UI merges, merge
    queues). The in-repo and required-workflow plans refuse to plan without
    it; the bridge-posted check works without it, and then fails any
@@ -1145,3 +1132,171 @@ has detached the repository and reports it there as unmanaged — so jobs the
 VTC sends for it in the new namespace act on a repository the bridge does
 not manage until it is adopted. Update the VTC to 0.2 before relying on
 transfers between namespaces.
+
+## 8. Manual configuration
+
+Everything `vgi-bridge setup` (§2) writes can be written by hand, starting
+from [`bridge.example.toml`](../crates/vgi-bridge/bridge.example.toml).
+Every path in the config should be absolute; the examples use a folder in
+the operator's home, `~/vgi-bridge` (`/home/ops/vgi-bridge` in TOML, which
+does not expand `~`). The config's built-in defaults (`listen =
+"0.0.0.0:8080"`, `data_dir = "/var/lib/vgi-bridge"`) suit the container
+image; setup always writes both explicitly.
+
+What you fill in by hand that setup finds for you: `trust_registry_did` (the
+`TrustRegistry` service of the VTC's DID document), `mediator_did` (its
+`TSPTransport` or `DIDCommMessaging` service), the `[verify_trust]` action's
+commit (`gh api repos/OpenVTC/verifiable-git-infrastructure/commits/<tag>
+--jq .sha`) and GitHub's web-flow key (`curl -fsSL
+https://github.com/web-flow.gpg > ~/vgi-bridge/web-flow.asc`).
+
+### VTA mode by hand
+
+**1. The context and the DID.** In the VTA, create a context for the bridge
+(`vgi-bridge`, say) and provision a `did:webvh` into it from a DID template
+with an Ed25519 signing key (`#key-0`), an X25519 key-agreement key (`#key-1`)
+and a `TSPTransport` (`#tsp`) and a `DIDCommMessaging` service naming
+`mediator_did` (the VTC prefers TSP; DIDComm alone also works).
+
+**2. The credential.** Issue a `did:key` credential that is an **admin
+scoped to that context only** — exporting the context's keys needs the VTA's
+`key-export` capability, which only `admin` carries — and hand it to the
+bridge host as a file (owner-only, JSON: `did`, `privateKeyMultibase`,
+`vtaDid`, and optionally `vtaUrl`; the same base64-encoded is also read), or
+in an environment variable the bridge clears once read (`credential_env`):
+
+```sh
+pnm auth-credential create --role admin --contexts vgi-bridge --recipient req.json
+# (or `pnm acl create --did <did:key> --role admin --contexts vgi-bridge`)
+# open the sealed bundle into the credential JSON:
+pnm bootstrap open --bundle bundle.armor --expect-digest <digest> --out ~/vgi-bridge/vta-credential.json
+chmod 600 ~/vgi-bridge/vta-credential.json
+```
+
+**3. The config.** Add a `[vta]` section and remove `master_key_file` /
+`master_key_env` (the bridge refuses both together):
+
+```toml
+[vta]
+context = "vgi-bridge"
+credential_file = "/home/ops/vgi-bridge/vta-credential.json"   # absolute
+# The VTA is reached over TSP when its DID document advertises `#tsp`,
+# else DIDComm, through the bridge's `mediator_did` unless this names
+# another:
+# mediator_did = "did:web:mediator.acme-vtc.example"
+# The other keys (all optional): `url` (the VTA's REST URL when the credential
+# carries none, used only for the messaging client's unauthenticated calls;
+# https, or loopback), `did` (the
+# bridge's DID; default: the context's DID), `start_timeout_secs` (300),
+# `key_refresh_secs` (60, at least 30) and `signing_switch_after_secs` (86400).
+```
+
+**4. Check it.** `vta setup` verifies the context has a DID with both keys,
+the credential can fetch them and read, write and delete app-state, creates
+the sealing key, warns if the credential reaches any other context, and
+prints the DID to register at the VTC:
+
+```sh
+vgi-bridge --config ~/vgi-bridge/bridge.toml vta setup
+```
+
+Then start the bridge (§2, step 3).
+
+### Self-contained
+
+`vgi-bridge setup --self-contained` does the first two steps. By hand:
+
+```sh
+# 1. Config: start from crates/vgi-bridge/bridge.example.toml.
+mkdir -m 700 -p ~/vgi-bridge
+cp bridge.example.toml ~/vgi-bridge/bridge.toml   # then edit it: absolute paths
+
+# 2. The master key and the bridge's identity. `init` writes the key file
+#    named by `master_key_file` (0600, never overwritten) and, if the store
+#    has no identity, mints a did:peer whose document names `mediator_did`.
+#    It prints the DID.
+vgi-bridge --config ~/vgi-bridge/bridge.toml init
+
+# 3. Back the identity up apart from the store (see §5).
+vgi-bridge --config ~/vgi-bridge/bridge.toml identity export /somewhere/else/bridge-identity.json
+```
+
+**A `did:webvh` identity instead** (recommended for production, the same way
+the VTC's is provisioned): provision a DID for the bridge from the
+community's VTA with a DID template that has an Ed25519 signing key and an
+X25519 key-agreement key, export its secrets bundle, and import it:
+
+```sh
+vgi-bridge --config ~/vgi-bridge/bridge.toml identity import bundle.json
+shred -u bundle.json
+```
+
+Register the printed DID at the VTC as the bridge serving its namespaces:
+the VTC's `[git_ns] bridges` maps each forge host to it.
+
+The VTC reaches the bridge through a transport the bridge's DID document
+advertises: it resolves the DID and takes the first of a `TSPTransport` and a
+`DIDCommMessaging` service naming the mediator the bridge listens at. The
+bridge answers each job over the transport it came in on, and sends results
+and events over the first of the two the VTC's own document advertises. Both
+identities carry the services:
+
+- **The `did:peer:2` `init` mints** encodes its keys *and* both services in
+  the identifier, so there is nothing to host. The flip side: the mediator is
+  part of the DID. Change `mediator_did` and the bridge refuses to start
+  rather than have the VTC deliver jobs where it no longer listens. For a
+  bridge serving bound namespaces the fix is to set `mediator_did` back: a new
+  DID is a different bridge (below). Each service carries the mediator's
+  DID, so a mediator with a long DID (a `did:peer` of its own) may leave room
+  for only one: `init` then mints a `did:peer` advertising DIDComm only, with
+  a warning, and the VTC reaches the bridge over DIDComm. It refuses a
+  mediator whose DID would make even that longer than the 1000 bytes DID
+  resolvers accept. For TSP there, use a mediator with a short DID
+  (`did:web`/`did:webvh`) or a `did:webvh` for the bridge.
+- **A `did:webvh`** publishes the services in its document (the VTA template
+  adds them), and can move mediators without changing DID.
+
+A `did:peer` minted by an earlier release advertises DIDComm only: the VTC
+keeps reaching it over DIDComm. Mint a new one (below) to have it reached over
+TSP.
+
+A store from an earlier release may hold a `did:key`, which advertises no
+service: no VTC can send it jobs (they fail `noMatchingProtocol`). `run` warns
+about it at start; mint a `did:peer` in its place (`identity mint --replace
+--backup <file>`) and register that.
+
+**Replacing the identity is not a key rotation.** `identity mint --replace`
+and an `identity import` of a different DID write the current identity to
+`--backup <file>` first (required), and refuse — listing them — while the
+store holds namespaces bound or being bound to it, or when the current DID
+is one the bridge did not mint (a VTA-provisioned `did:webvh`), unless given
+`--abandon-current-did`. What a new DID breaks: the VTC's `[git_ns] bridges`
+must name it; the VTC accepts a namespace's results and events only from the
+DID it bound, so those namespaces are no longer served; the registry's
+`git.commit.sign` service grant is held by the old DID, so Dependabot commits
+the new one re-signs fail the check; and with no re-attach yet, binding them
+again needs an unbind, which revokes every right in them.
+
+`identity show` prints the current DID. The admin commands (`init`,
+`identity`, `secret`) open the store directly, and redb allows one process at a time: stop the bridge first.
+
+### The container by hand
+
+`vgi-bridge setup --service docker` writes a Compose file. Without it:
+
+```sh
+docker build -f crates/vgi-bridge/Dockerfile -t vgi-bridge .
+# The folder at its own path, so bridge.toml's absolute paths hold inside.
+docker run -d --name vgi-bridge --user "$(id -u):$(id -g)" \
+  -v "$HOME/vgi-bridge:$HOME/vgi-bridge:ro" \
+  -v "$HOME/vgi-bridge/data:$HOME/vgi-bridge/data" \
+  -e VGI_BRIDGE_CONFIG="$HOME/vgi-bridge/bridge.toml" \
+  -e VGI_BRIDGE_LISTEN=0.0.0.0:8080 \
+  -p 127.0.0.1:8080:8080 vgi-bridge
+```
+
+The image's own user is the unprivileged `vgi` (uid 10001); `--user` runs it
+as you instead, so it can read your owner-only files (or drop `--user` and
+`chown -R 10001:10001` the folder). The image carries a `HEALTHCHECK` (`vgi-bridge healthcheck`, §7). In
+self-contained mode, run `init` / `identity import` / `identity export` with
+the same volumes, and `init` as the command before the first `run`.

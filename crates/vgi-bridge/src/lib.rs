@@ -50,6 +50,7 @@ pub mod registry_channel;
 pub mod resign;
 pub mod rolemap;
 pub mod seal;
+pub mod setup;
 pub mod status;
 pub mod store;
 pub mod transport;

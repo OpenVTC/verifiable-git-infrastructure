@@ -30,7 +30,7 @@ path = "src/main.rs"
 # container serves whichever forges its config names. A build without one
 # drops that adapter's code and HTTP routes.
 default = ["forge-github", "forge-forgejo"]
-forge-github = ["dep:vgi-forge-github", "dep:verify-trust", "dep:vgi-core", "dep:trql-client"]
+forge-github = ["dep:vgi-forge-github", "dep:verify-trust", "dep:trql-client"]
 forge-forgejo = ["dep:vgi-forge-forgejo"]
 
 [dependencies]
@@ -43,8 +43,9 @@ verify-trust = { workspace = true, optional = true }
 # The Dependabot re-sign signs commits with the bridge's DID key (the shared
 # PROTOCOL.sshsig encoder and trailer reader), and warns at start when the
 # registry does not grant that DID `git.commit.sign` (a TRQP query, through
-# the same client verify-trust uses).
-vgi-core = { workspace = true, optional = true }
+# the same client verify-trust uses). `setup` reads the VTC's registry and
+# mediator from its DID document with its service discovery.
+vgi-core = { workspace = true }
 trql-client = { workspace = true, optional = true }
 
 # Wire types (generated from the git-ns specifications) and their proofs.
@@ -68,12 +69,18 @@ affinidi-messaging-core = { workspace = true }
 # VTA mode (`crate::vta`): the client, the session transports (DIDComm, with
 # a TSP leg when the VTA advertises TSP) and `connect_auto`; `tsp` also
 # brings the `trust-tasks-tsp` binding envelope the VTC link uses.
-vta-sdk = { workspace = true, features = ["didcomm", "client", "session", "tsp"] }
+# `provision-client`: `setup` provisions the bridge's context credential the
+# way `did-git-sign init` does (a setup did:key rolled over to a long-term
+# admin).
+vta-sdk = { workspace = true, features = ["didcomm", "client", "session", "tsp", "provision-client"] }
 ed25519-dalek = { workspace = true }
 
 axum = { workspace = true }
 redb = { workspace = true }
 toml = { workspace = true }
+# `setup`: the verify-trust release's commit (GitHub API) and GitHub's
+# web-flow key. Already in the graph through the adapters and vta-sdk.
+reqwest = { workspace = true }
 aws-lc-rs = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -100,8 +107,6 @@ wiremock = { workspace = true }
 # Signs the web-flow (PGP) fixture commits for the Dependabot re-sign tests.
 pgp = { workspace = true }
 rand = { workspace = true }
-# Signs real commits for the verify-trust path test.
-vgi-core = { workspace = true }
 tower = { workspace = true }
 # The bridge's DIDComm registry query against an in-process mediator
 # (tests/registry_didcomm.rs), including a forged-envelope regression test.

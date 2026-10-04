@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 )]
 struct Cli {
     /// The config file. Default: `$VGI_BRIDGE_CONFIG`, else
-    /// `/etc/vgi-bridge/bridge.toml`.
+    /// `/etc/vgi-bridge/bridge.toml`. Not read by `setup`, which writes one.
     #[arg(long, short)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -31,6 +31,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Write a complete, runnable bridge folder: the config, the VTA
+    /// credential (provisioned here) and a service file. No root needed.
+    Setup(Box<SetupArgs>),
     /// Serve: TSP or DIDComm to the VTC, HTTP for the forges.
     Run,
     /// First start: create the master key file (if the config names one and
@@ -316,7 +319,7 @@ fn open_store(cfg: &BridgeConfig) -> Result<Store> {
     Store::open(&cfg.store_path(), key)
 }
 
-fn init(cfg: &BridgeConfig) -> Result<()> {
+fn init(cfg: &BridgeConfig) -> Result<String> {
     if let Some(path) = cfg.master_key_file.as_deref()
         && !Path::new(path).exists()
     {
@@ -336,7 +339,7 @@ fn init(cfg: &BridgeConfig) -> Result<()> {
         eprintln!("warning: {warning}");
     }
     eprintln!("register this DID at the VTC as the bridge serving its namespaces");
-    Ok(())
+    Ok(identity.did().to_string())
 }
 
 /// Mint and seal a `did:peer` that names the configured mediator.
@@ -474,6 +477,535 @@ fn healthcheck(listen: std::net::SocketAddr) -> Result<()> {
     }
 }
 
+/// `vgi-bridge setup`.
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// The VTC this bridge serves. Its DID document names the Trust Registry
+    /// and the mediator.
+    #[arg(long, value_name = "DID")]
+    vtc: String,
+    /// The folder to write: the config, the credential, the state store and
+    /// the service file. Created owner-only if missing.
+    #[arg(long, value_name = "FOLDER")]
+    dir: PathBuf,
+    /// Where the forges reach the bridge: https (a TLS proxy or tunnel in
+    /// front of `--listen`). Asked for when not given.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+    /// The forge of the first entry.
+    #[arg(long, value_enum, default_value_t = vgi_bridge::setup::ForgeChoice::Github)]
+    forge: vgi_bridge::setup::ForgeChoice,
+    /// GitHub: the organisation (or, with --user-account, the personal
+    /// account) the App is registered under. Asked for when not given.
+    #[arg(long, value_name = "LOGIN")]
+    owner: Option<String>,
+    /// GitHub: --owner is a personal account, not an organisation.
+    #[arg(long)]
+    user_account: bool,
+    /// GitHub: the App's name (unique on the GitHub instance). Default
+    /// `<owner>-vgi-bridge`.
+    #[arg(long, value_name = "NAME")]
+    app_name: Option<String>,
+    /// GitHub: the host (a GHES instance's, for GitHub Enterprise Server).
+    #[arg(long, value_name = "HOST", default_value = "github.com")]
+    github_host: String,
+    /// Forgejo: the instance's root URL (`https://codeberg.org/`).
+    #[arg(long, value_name = "URL")]
+    forgejo_url: Option<String>,
+    /// Forgejo: the bot user's login.
+    #[arg(long, value_name = "LOGIN")]
+    bot_login: Option<String>,
+    /// Forgejo: the bridge's OAuth2 application's client id.
+    #[arg(long, value_name = "ID")]
+    oauth_client_id: Option<String>,
+    /// How the bridge is started. Default: launchd on macOS, systemd
+    /// elsewhere on Linux, otherwise none.
+    #[arg(long, value_enum)]
+    service: Option<vgi_bridge::setup::ServiceKind>,
+    /// The Trust Registry's DID, instead of the VTC document's referral.
+    #[arg(long, value_name = "DID")]
+    registry: Option<String>,
+    /// The mediator's DID, instead of the VTC document's.
+    #[arg(long, value_name = "DID")]
+    mediator: Option<String>,
+    /// The VTC's VTA, where the bridge's context lives. Required unless
+    /// --credential names a credential that carries it.
+    #[arg(long, value_name = "DID")]
+    vta: Option<String>,
+    /// The bridge's context in the VTA.
+    #[arg(long, value_name = "ID", default_value = vgi_bridge::setup::DEFAULT_CONTEXT)]
+    context: String,
+    /// Use this context credential (JSON, or base64 JSON) instead of
+    /// provisioning one. It is copied into the folder owner-only.
+    #[arg(long, value_name = "FILE")]
+    credential: Option<PathBuf>,
+    /// The VTA's did:webvh hosting server to mint the bridge's DID on, when
+    /// the context has no DID and the VTA has several.
+    #[arg(long, value_name = "ID")]
+    webvh_server: Option<String>,
+    /// Where the bridge listens (plain HTTP, for the proxy or tunnel).
+    #[arg(long, value_name = "ADDR", default_value = vgi_bridge::setup::DEFAULT_LISTEN)]
+    listen: std::net::SocketAddr,
+    /// Self-contained mode instead of VTA mode: a master key in the folder
+    /// and a locally minted did:peer. For development and testing.
+    #[arg(long, conflicts_with_all = ["vta", "credential", "webvh_server"])]
+    self_contained: bool,
+    /// Ask nothing: fail on a missing value instead, and do not wait after
+    /// printing the `pnm` grant.
+    #[arg(long)]
+    yes: bool,
+    /// Replace an existing bridge.toml and service file.
+    #[arg(long)]
+    force: bool,
+}
+
+/// Ask on the terminal for a value not given as `flag`; with `--yes`, fail.
+fn ask(yes: bool, flag: &str, question: &str) -> Result<String> {
+    use std::io::Write;
+    if yes {
+        bail!("{flag} is required with --yes");
+    }
+    print!("{question}: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading from the terminal")?;
+    let v = line.trim().to_string();
+    if v.is_empty() {
+        bail!("no answer; pass {flag}");
+    }
+    Ok(v)
+}
+
+fn require_did(what: &str, did: &str) -> Result<()> {
+    if !did.starts_with("did:") || did.chars().any(char::is_whitespace) {
+        bail!("{what} must be a DID, got `{did}`");
+    }
+    Ok(())
+}
+
+fn cmd_setup(args: SetupArgs) -> Result<()> {
+    use vgi_bridge::setup::{self, ForgeChoice, ForgeEntry, Mode, ServiceKind};
+
+    require_did("--vtc", &args.vtc)?;
+    let layout = setup::prepare_dir(&args.dir)?;
+    if layout.config().exists() && !args.force {
+        bail!(
+            "{} already exists; pass --force to replace it (the credential, the master key and \
+             the state store are kept either way)",
+            layout.config().display()
+        );
+    }
+    if !args.self_contained
+        && args.vta.is_none()
+        && args.credential.is_none()
+        && !layout.credential().exists()
+    {
+        bail!(
+            "pass --vta <DID>: the VTC's VTA, where the bridge's context lives (a VTC's DID \
+             document does not name its VTA); or --credential <file> for a credential you \
+             already have; or --self-contained for a bridge without a VTA"
+        );
+    }
+    let service = args.service.unwrap_or_else(ServiceKind::for_this_os);
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("finding this binary's path (for the service file)")?;
+    println!("Setting up a VGI bridge in {}", layout.dir().display());
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (inputs, cred) = rt.block_on(async {
+        // 1. The community, from the VTC's DID document.
+        let mut found = setup::Discovered::default();
+        if args.registry.is_none() || args.mediator.is_none() {
+            println!("Resolving the VTC {} …", args.vtc);
+            let doc = setup::resolve_document(&args.vtc).await?;
+            found = setup::discover(&doc);
+        }
+        let registry = match (&args.registry, &found.registry) {
+            (Some(r), _) => r.clone(),
+            (None, Some(r)) => {
+                println!(
+                    "  registry  {r}  (the VTC's TrustRegistry referral; --registry overrides)"
+                );
+                r.clone()
+            }
+            (None, None) => bail!(
+                "the VTC's DID document names no TrustRegistry; pass --registry <DID> (the \
+                 community's Trust Registry)"
+            ),
+        };
+        let mediator = match (&args.mediator, &found.mediator) {
+            (Some(m), _) => m.clone(),
+            (None, Some(m)) => {
+                println!("  mediator  {m}  (the VTC's messaging service; --mediator overrides)");
+                m.clone()
+            }
+            (None, None) => bail!(
+                "the VTC's DID document names no mediator (no TSPTransport or DIDCommMessaging \
+                 service with a DID endpoint); pass --mediator <DID>"
+            ),
+        };
+        require_did("the registry", &registry)?;
+        require_did("the mediator", &mediator)?;
+
+        // 2. Where the forges reach it.
+        let public_url = match &args.public_url {
+            Some(u) => u.clone(),
+            None => ask(
+                args.yes,
+                "--public-url",
+                "The bridge's public HTTPS URL (e.g. https://bridge.example.org/)",
+            )?,
+        };
+        let public_url = setup::check_public_url(&public_url)?;
+
+        // 3. The forge entry.
+        let forge = match args.forge {
+            ForgeChoice::Github => {
+                let owner = match &args.owner {
+                    Some(o) => o.clone(),
+                    None => ask(
+                        args.yes,
+                        "--owner",
+                        "The GitHub organisation (or account) the App is registered under",
+                    )?,
+                };
+                println!("Fetching GitHub's web-flow key …");
+                let keyring = match setup::fetch_web_flow(setup::WEB_FLOW_URL).await {
+                    Ok(key) => {
+                        setup::write_file(&layout.web_flow(), key.as_bytes(), 0o644, true)?;
+                        println!("  wrote {}", layout.web_flow().display());
+                        true
+                    }
+                    Err(e) => {
+                        println!(
+                            "  warning: {e:#}; bridge.toml leaves `platform_keyring_file` \
+                             commented with how to fetch it"
+                        );
+                        false
+                    }
+                };
+                ForgeEntry::GitHub {
+                    host: args.github_host.to_ascii_lowercase(),
+                    app_name: args
+                        .app_name
+                        .clone()
+                        .unwrap_or_else(|| setup::default_app_name(&owner)),
+                    owner,
+                    owner_is_user: args.user_account,
+                    keyring,
+                }
+            }
+            ForgeChoice::Forgejo => {
+                let base = match &args.forgejo_url {
+                    Some(u) => u.clone(),
+                    None => ask(args.yes, "--forgejo-url", "The Forgejo instance's URL")?,
+                };
+                let base_url: url::Url = base
+                    .parse()
+                    .with_context(|| format!("`{base}` is not a URL"))?;
+                ForgeEntry::Forgejo {
+                    base_url,
+                    bot_login: match &args.bot_login {
+                        Some(b) => b.clone(),
+                        None => ask(args.yes, "--bot-login", "The bot user's login")?,
+                    },
+                    oauth_client_id: match &args.oauth_client_id {
+                        Some(c) => c.clone(),
+                        None => ask(
+                            args.yes,
+                            "--oauth-client-id",
+                            "The bridge's OAuth2 application's client id",
+                        )?,
+                    },
+                }
+            }
+        };
+
+        // 4. This release's verify-trust, pinned to its commit.
+        let version = setup::release_tag();
+        println!("Pinning verify-trust {version} …");
+        let action = match setup::resolve_tag_commit(setup::GITHUB_API, &version).await {
+            Ok(sha) => {
+                println!("  {version} is commit {sha}");
+                Some(setup::action_ref(&sha))
+            }
+            Err(e) => {
+                println!(
+                    "  warning: {e:#}; bridge.toml carries a TODO for the action's commit — fill \
+                     it in before binding a namespace"
+                );
+                None
+            }
+        };
+
+        // 5. The identity: a context credential in the VTC's VTA.
+        let (mode, cred) = if args.self_contained {
+            (Mode::SelfContained, None)
+        } else {
+            let cred = obtain_credential(&args, &layout).await?;
+            let vta_mediator = match vta_sdk::session::resolve_mediator_did(&cred.vta_did).await {
+                Ok(Some(m)) if m != mediator => {
+                    println!("  the VTA is reached through its own mediator {m}");
+                    Some(m)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    println!(
+                        "  warning: could not read the VTA's mediator ({e}); reaching it through \
+                         {mediator}"
+                    );
+                    None
+                }
+            };
+            (
+                Mode::Vta {
+                    context: args.context.clone(),
+                    vta_mediator,
+                },
+                Some(cred),
+            )
+        };
+        anyhow::Ok((
+            setup::ConfigInputs {
+                layout: layout.clone(),
+                vtc_did: args.vtc.clone(),
+                trust_registry_did: registry,
+                mediator_did: mediator,
+                public_url,
+                listen: args.listen,
+                mode,
+                verify_trust_version: version,
+                verify_trust_action: action,
+                forge,
+            },
+            cred,
+        ))
+    })?;
+
+    // 6. The config, checked by the bridge's own parser before and after it
+    //    is written.
+    let text = setup::render_config(&inputs);
+    BridgeConfig::parse(&text).context("the rendered config does not load (a bug in setup)")?;
+    setup::write_file(&layout.config(), text.as_bytes(), 0o644, args.force)?;
+    setup::create_private_dir(&layout.data())?;
+    let cfg = BridgeConfig::load(&layout.config())?;
+    println!("Wrote {}", layout.config().display());
+
+    // 7. The service file.
+    match service {
+        ServiceKind::Systemd => write_service(
+            &layout,
+            service,
+            &setup::render_systemd(&exe, &layout),
+            args.force,
+        )?,
+        ServiceKind::Launchd => write_service(
+            &layout,
+            service,
+            &setup::render_launchd(&exe, &layout),
+            args.force,
+        )?,
+        ServiceKind::Docker => {
+            let (uid, gid) = owner_ids(layout.dir())?;
+            write_service(
+                &layout,
+                service,
+                &setup::render_compose(&layout, args.listen, uid, gid),
+                args.force,
+            )?
+        }
+        ServiceKind::None => {}
+    }
+
+    // 8. The bridge's DID.
+    let did = match cred {
+        None => init(&cfg)?,
+        Some(cred) => rt.block_on(vta_did_ready(&cfg, cred, args.webvh_server.as_deref()))?,
+    };
+
+    let start = setup::service_steps(service, &exe, &layout);
+    println!(
+        "{}",
+        setup::summary(
+            &did,
+            &inputs.forge,
+            &inputs.public_url,
+            args.listen,
+            &start,
+            &layout.config()
+        )
+    );
+    Ok(())
+}
+
+fn write_service(
+    layout: &vgi_bridge::setup::Layout,
+    kind: vgi_bridge::setup::ServiceKind,
+    text: &str,
+    force: bool,
+) -> Result<()> {
+    let path = layout.service_file(kind).context("no service file")?;
+    vgi_bridge::setup::write_file(&path, text.as_bytes(), 0o644, force)?;
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
+/// The owner of `dir`, for the container's `user:`.
+#[cfg(unix)]
+fn owner_ids(dir: &Path) -> Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(dir)?;
+    Ok((m.uid(), m.gid()))
+}
+
+#[cfg(not(unix))]
+fn owner_ids(_dir: &Path) -> Result<(u32, u32)> {
+    Ok((10001, 10001))
+}
+
+/// The context credential: `--credential`, else the folder's own from an
+/// earlier run, else provisioned now the way `did-git-sign init` does.
+async fn obtain_credential(
+    args: &SetupArgs,
+    layout: &vgi_bridge::setup::Layout,
+) -> Result<vta_sdk::credentials::CredentialBundle> {
+    use vgi_bridge::setup;
+    let path = layout.credential();
+    let check_vta = |cred: &vta_sdk::credentials::CredentialBundle| -> Result<()> {
+        if let Some(vta) = &args.vta
+            && *vta != cred.vta_did
+        {
+            bail!(
+                "the credential is for the VTA `{}`, not --vta `{vta}`",
+                cred.vta_did
+            );
+        }
+        Ok(())
+    };
+    if let Some(file) = &args.credential {
+        let text = Zeroizing::new(
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?,
+        );
+        let cred = vgi_bridge::vta::parse_credential(&text)?;
+        check_vta(&cred)?;
+        if file.canonicalize().ok() != path.canonicalize().ok() {
+            setup::write_credential(&path, &cred, args.force)?;
+        }
+        println!("Using the credential {} (VTA {})", cred.did, cred.vta_did);
+        return Ok(cred);
+    }
+    if path.exists() {
+        vgi_bridge::seal::check_owner_only(&path)?;
+        let text = Zeroizing::new(std::fs::read_to_string(&path)?);
+        let cred = vgi_bridge::vta::parse_credential(&text)?;
+        check_vta(&cred)?;
+        println!(
+            "Using the credential already in {} ({}, VTA {})",
+            path.display(),
+            cred.did,
+            cred.vta_did
+        );
+        return Ok(cred);
+    }
+    let vta_did = args.vta.clone().context(
+        "pass --vta <DID>: the VTC's VTA, where the bridge's context lives (a VTC's DID \
+         document does not name its VTA), or --credential <file> for a credential you already have",
+    )?;
+    require_did("--vta", &vta_did)?;
+    let setup_key = vta_sdk::provision_client::EphemeralSetupKey::generate()
+        .map_err(|e| anyhow::anyhow!("generating the setup did:key: {e}"))?;
+    println!();
+    println!("A temporary admin DID for this setup (held in memory only):");
+    println!("  {}", setup_key.did);
+    println!();
+    println!(
+        "Authorise it on the VTA {vta_did} with your Personal Network Manager (an admin of the VTA):"
+    );
+    println!();
+    println!(
+        "{}",
+        setup::pnm_grant_commands(&args.context, &setup_key.did)
+    );
+    println!();
+    if !args.yes {
+        use std::io::Write;
+        println!(
+            "The grant lasts an hour and hands off once, to the bridge's long-term credential."
+        );
+        print!("Press Enter once one of them has run (Ctrl+C to stop)… ");
+        std::io::stdout().flush().ok();
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .context("reading from the terminal")?;
+    }
+    println!(
+        "Provisioning the bridge's credential in `{}` …",
+        args.context
+    );
+    let cred = setup::provision_credential(&vta_did, &args.context, &setup_key).await?;
+    setup::write_credential(&path, &cred, false)?;
+    println!("  wrote {} (0600): {}", path.display(), cred.did);
+    Ok(cred)
+}
+
+/// VTA mode: connect with the new credential, mint the bridge's DID if the
+/// context has none, and run `vta setup`'s checks.
+async fn vta_did_ready(
+    cfg: &BridgeConfig,
+    cred: vta_sdk::credentials::CredentialBundle,
+    webvh_server: Option<&str>,
+) -> Result<String> {
+    let v = cfg.vta.as_ref().context("no `[vta]` section")?;
+    println!("Connecting to the VTA {} …", cred.vta_did);
+    let session = vta_session(cfg, cred).await?;
+    let out = async {
+        let (did, minted) = vgi_bridge::setup::ensure_bridge_did(&session, webvh_server).await?;
+        if minted {
+            println!("  minted the bridge's DID {did}");
+        }
+        let resolver = vgi_bridge::vta::Resolver::new().await?;
+        let report = vgi_bridge::vta::setup(&session, v, &cfg.mediator_did, &resolver).await;
+        for l in &report.lines {
+            println!("  {l}");
+        }
+        if report.failed {
+            bail!(
+                "the VTA context is not ready for the bridge (see above); fix it and check again \
+                 with `vgi-bridge --config {} vta setup` — the folder is otherwise complete",
+                cfg_path_hint(cfg)
+            );
+        }
+        // The VTA's mediator is what a DID it mints advertises: say so if
+        // that is not the one the bridge listens at.
+        if let Ok(doc) = vgi_bridge::vta::DidDocuments::current(&resolver, &report.did).await
+            && let Some(m) = vgi_core::messaging_mediator(&doc)
+            && m != cfg.mediator_did
+        {
+            println!(
+                "  warning: the bridge's DID advertises the mediator {m}, but bridge.toml listens \
+                 at {}; set `mediator_did = \"{m}\"` so the VTC's jobs arrive where the bridge is",
+                cfg.mediator_did
+            );
+        }
+        anyhow::Ok(report.did)
+    }
+    .await;
+    session.shutdown().await;
+    out
+}
+
+/// The config's folder, for messages (the data directory's parent).
+fn cfg_path_hint(cfg: &BridgeConfig) -> String {
+    cfg.data_dir
+        .parent()
+        .map(|d| d.join("bridge.toml").display().to_string())
+        .unwrap_or_else(|| "bridge.toml".into())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -482,6 +1014,9 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    if let Cmd::Setup(args) = cli.command {
+        return cmd_setup(*args);
+    }
     let path = cli
         .config
         .or_else(|| std::env::var_os("VGI_BRIDGE_CONFIG").map(PathBuf::from))
@@ -515,7 +1050,8 @@ fn main() -> Result<()> {
             tokio::runtime::Runtime::new()?
                 .block_on(vgi_bridge::run(cfg, vgi_bridge::Keys::Sealed(key)))
         }
-        Cmd::Init => init(&cfg),
+        Cmd::Init => init(&cfg).map(drop),
+        Cmd::Setup(_) => unreachable!("answered before the config is read"),
         Cmd::Vta { .. } => bail!("the config has no `[vta]` section (VTA mode is off)"),
         Cmd::Healthcheck => unreachable!("answered before the mode is chosen"),
         Cmd::Identity { command } => {
