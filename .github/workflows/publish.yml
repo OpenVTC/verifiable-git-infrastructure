@@ -1,6 +1,6 @@
 name: Publish
 
-# Publish the three crates to crates.io in dependency order. Runs on a
+# Publish the workspace's crates to crates.io in dependency order. Runs on a
 # `vX.Y.Z` tag push (alongside release.yml), or manually via workflow_dispatch.
 #
 # The tag push — not `release: published` — is the trigger on purpose: a
@@ -12,8 +12,9 @@ name: Publish
 #
 # Auth is crates.io Trusted Publishing (OIDC) — no long-lived token. Setup per
 # crate on crates.io: add this repo + this workflow (`publish.yml`) + the
-# `crates-io` environment as a Trusted Publisher for `vgi-core`,
-# `verify-trust`, and `did-git-sign`.
+# `crates-io` environment as a Trusted Publisher for every crate the publish
+# loop below lists: `vgi-core`, `verify-trust`, `did-git-sign`, `vgi-forge`,
+# `vgi-forge-github`, `vgi-forge-forgejo`, `vgi-cli` and `vgi-bridge`.
 #
 # Two jobs, so dependency code never runs next to the publishing credential:
 #
@@ -29,7 +30,7 @@ name: Publish
 # partial publish is retried.
 #
 # The run is resumable: each crate already on crates.io at the workspace version
-# is skipped rather than re-published. Publishing is not atomic across three
+# is skipped rather than re-published. Publishing is not atomic across the
 # crates — an earlier one uploads, a later one can fail (a `git` dependency with
 # no version requirement will do it, which is how v0.4.7 left `vgi-core` 0.4.7
 # published against `verify-trust`/`did-git-sign` 0.4.6). Without the skip, the
@@ -60,7 +61,7 @@ jobs:
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
 
-      # Packages all three crates and compiles each from its tarball. cargo
+      # Packages every publishable crate and compiles each from its tarball. cargo
       # resolves the workspace's own crates from the local packages, so this
       # works before vgi-core's new version is on crates.io.
       - name: Package and verify all crates
@@ -118,18 +119,31 @@ jobs:
             printf '%s\n' "$body" | jq -se --arg v "$version" 'any(.[]; .vers == $v)' >/dev/null
           }
 
+          # True unless the index answers 404 for <name>: a crate with no
+          # version on crates.io at all. Any other answer (including a network
+          # failure) is not proof of absence, so it falls through to `cargo
+          # publish`, which reports the real error.
+          ever_published() {
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://index.crates.io/$(index_path "$1")") || return 0
+            [ "$code" != "404" ]
+          }
+
           # vgi-core has no internal deps; verify-trust, did-git-sign and
           # vgi-forge depend on it, and both forge adapters depend on
-          # vgi-forge. vgi-cli (the `vgi` command) depends on both adapters
-          # and verify-trust, so it goes last. `cargo publish` waits for each
-          # crate to appear in the index before returning, so the next one
-          # resolves it. vgi-bridge is a service (`publish = false`) and ships
-          # only as a release artifact. Every crate listed has a Trusted
-          # Publishing config for this workflow on crates.io — except that a
-          # crate's *first* version cannot be published this way (crates.io
-          # configures Trusted Publishing on an existing crate), so a new
-          # crate is published once by hand, then configured, then listed.
-          for crate in vgi-core verify-trust did-git-sign vgi-forge vgi-forge-github vgi-forge-forgejo vgi-cli; do
+          # vgi-forge. vgi-cli (the `vgi` command) and vgi-bridge (the
+          # community's bridge service) each depend on both adapters and
+          # verify-trust, and nothing depends on either, so they go last.
+          # `cargo publish` waits for each crate to appear in the index before
+          # returning, so the next one resolves it. Every crate listed has a
+          # Trusted Publishing config for this workflow on crates.io — except
+          # that a crate's *first* version cannot be published this way
+          # (crates.io configures Trusted Publishing only on an existing crate
+          # and has no "pending publisher"), so a new crate is published once
+          # by hand, then configured. A listed crate that has never been
+          # published fails here with that instruction rather than with an
+          # opaque auth error, after everything before it has gone up.
+          for crate in vgi-core verify-trust did-git-sign vgi-forge vgi-forge-github vgi-forge-forgejo vgi-cli vgi-bridge; do
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')
             if [ -z "$version" ]; then
@@ -140,6 +154,11 @@ jobs:
             if already_published "$crate" "$version"; then
               echo "::notice::${crate} ${version} is already on crates.io — skipping"
               continue
+            fi
+
+            if ! ever_published "$crate"; then
+              echo "::error::${crate} has never been published, so Trusted Publishing cannot cover it yet. Publish ${version} once by hand from this tag (cargo publish -p ${crate} --locked, with a crates.io token), add this workflow as its Trusted Publisher, then re-run."
+              exit 1
             fi
 
             # The `package` job already compiled this exact commit's tarballs;
