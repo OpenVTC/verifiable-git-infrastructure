@@ -140,143 +140,109 @@ namespace.
 
 ## 2. Deploy the bridge
 
-### 2.1 Config
+The bridge runs in **VTA mode**: its DID, keys, secrets and state live in its
+own trust context of the VTC's VTA, and its host holds only a context-scoped
+credential, so a lost host is recovered by issuing a new one (BRIDGE.md §2a).
+`vgi-bridge setup` writes the whole thing into one folder you own — no root,
+no Docker needed. The details of each step are BRIDGE.md §2.
 
-Start from [`crates/vgi-bridge/bridge.example.toml`](../crates/vgi-bridge/bridge.example.toml).
-For one organisation on github.com:
+### 2.1 Install and run setup
 
-```toml
-vtc_did            = "did:webvh:…:acme-vtc.example"          # the only DID it takes jobs from
-trust_registry_did = "did:webvh:…:registry.acme-vtc.example"
-mediator_did       = "did:web:mediator.acme-vtc.example"     # the VTC's mediator
-public_url         = "https://bridge.acme-vtc.example/"      # must be https
-listen             = "0.0.0.0:8080"
-data_dir           = "/var/lib/vgi-bridge"
-master_key_file    = "/run/secrets/vgi-bridge-master-key"
-# event_version = "0.3"   # the default; "0.4" for the pull-request gate (step 3.3)
+Install the `vgi-bridge` binary (the README has the release binaries and
+`cargo install`; from a checkout, `cargo install --locked --path
+crates/vgi-bridge`). Then, with the VTC's DID, the DID of the VTC's VTA, and
+the HTTPS URL the bridge will be reached at:
 
-[verify_trust]
-# What the bootstrap writes into workflows. The action must be pinned to a
-# 40-hex commit; `version` is the release the action downloads.
-action  = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit of v0.11.0>"
-version = "v0.11.0"
-# transport = "auto"       # tsp | didcomm | https; see below
-# required_check = "Verify commit trust"
-
-[[github]]
-host         = "github.com"
-app_name     = "acme-vgi-bridge"
-app_owner    = "acme"                                        # the organisation
-platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
-
-# Another organisation of the same community: its own App, same bridge.
-# [[github]]
-# host         = "github.com"
-# app_name     = "acme-labs-vgi-bridge"                       # unique on GitHub
-# app_owner    = "acme-labs"
-# platform_keyring_file = "/etc/vgi-bridge/web-flow.asc"
+```sh
+vgi-bridge setup \
+  --vtc did:webvh:…:acme-vtc.example \
+  --vta did:webvh:…:vta.acme-vtc.example \
+  --dir ~/vgi-bridge \
+  --public-url https://bridge.acme-vtc.example/ \
+  --owner acme            # the organisation; --user-account for a personal one
 ```
 
-Get the commit for the tag with
-`gh api repos/OpenVTC/verifiable-git-infrastructure/commits/v0.11.0 --jq .sha`,
-and GitHub's `web-flow` key with
-`curl -fsSL https://github.com/web-flow.gpg > /etc/vgi-bridge/web-flow.asc`.
+Setup reads the Trust Registry and the mediator from the VTC's DID document
+(and prints them; `--registry` / `--mediator` override), pins the
+verify-trust action to the commit of this release's tag, fetches GitHub's
+`web-flow` key, and asks for anything it cannot find unless given `--yes`.
 
-`transport` (default `auto`: TSP, then DIDComm, then HTTPS, whichever the
-registry advertises first, no fallback) is written into the workflows as the
-action's `transport` input and also governs the check the bridge posts. Over
-TSP or DIDComm the registry's mediator must admit the unknown DIDs a CI run
-(and the bridge) queries as — see *Registry discovery* in the
-[runbook](RUNBOOK.md#4-set-up-the-repository); until it does, set
+It then prints two `pnm` commands for a temporary setup DID. **An
+administrator of the VTA runs one of them** — `pnm contexts create … --admin-handoff`
+if the bridge's context (`vgi-bridge`) is new, `pnm acl create … --handoff`
+if it exists — and you press Enter. Setup rolls that grant over to the
+bridge's long-term credential, scoped to its context, saves it in
+`~/vgi-bridge/vta-credential.json` (0600), mints the bridge's `did:webvh`
+into the context if it has none, checks it, and writes:
+
+| File | What |
+|---|---|
+| `bridge.toml` | the config, absolute paths only; `listen = "127.0.0.1:8080"` |
+| `vta-credential.json` | the context credential (owner-only) |
+| `web-flow.asc` | GitHub's web-flow key, the exempt keyring for commits GitHub signs |
+| `data/` | the state store (a cache of what the VTA holds) |
+| `vgi-bridge.service`, `org.openvtc.vgi-bridge.plist` or `compose.yml` | the service, per `--service systemd\|launchd\|docker\|none` (default: your OS's) |
+
+It finishes by printing the bridge's DID and the next steps below.
+
+Another organisation of the same community gets its own App in the same
+bridge: add a second entry to `bridge.toml` and restart the bridge.
+
+```toml
+[[github]]
+host         = "github.com"
+app_name     = "acme-labs-vgi-bridge"                       # unique on GitHub
+app_owner    = "acme-labs"
+platform_keyring_file = "/home/ops/vgi-bridge/web-flow.asc"
+```
+
+`transport` under `[verify_trust]` (default `auto`: TSP, then DIDComm, then
+HTTPS, whichever the registry advertises first, no fallback) is written into
+the workflows as the action's `transport` input and also governs the check
+the bridge posts. Over TSP or DIDComm the registry's mediator must admit the
+unknown DIDs a CI run (and the bridge) queries as — see *Registry discovery*
+in the [runbook](RUNBOOK.md#4-set-up-the-repository); until it does, set
 `transport = "https"`.
 
-`platform_keyring_file` is optional to *start*, but not to run well: the
-required-workflow and in-repo plans refuse to plan without it, the check the
-bridge posts fails every GitHub-signed merge without it, and the Dependabot
-re-sign does nothing without it. Set it.
+Keep `platform_keyring_file`: the required-workflow and in-repo plans refuse
+to plan without it, the check the bridge posts fails every GitHub-signed
+merge without it, and the Dependabot re-sign does nothing without it. If
+setup could not fetch it, `bridge.toml` says how.
 
 `[checks]`, `[resign]`, `bridge_checks`, `dependabot_*` and the per-namespace
 `[github.namespaces.<owner>]` table have working defaults; they are described
 in [BRIDGE.md](BRIDGE.md) §6–6a. Leave `bridge_checks` on: without it, an
 organisation without org rulesets falls back to a check any writer can forge.
 
-### 2.2 Master key and identity
+Writing the config, the credential or the container by hand, and the
+self-contained mode (a master key and a local `did:peer`, for development),
+are BRIDGE.md §8.
 
-**Recommended: VTA mode.** Give the bridge its own trust context in the VTC's
-VTA and a context-scoped credential instead of a master key and a local
-identity — the steps are BRIDGE.md §2a (context and `did:webvh`, credential,
-`[vta]` config, `vgi-bridge vta setup`). A lost bridge host is then recovered
-by issuing a new credential. The rest of this section is the self-contained
-mode.
+### 2.2 Start it
 
-The master key seals every secret the bridge stores. It is 32 bytes, base64,
-in a file only its owner can read (the bridge refuses a file readable by group
-or others):
+Run the commands setup printed for your service, for example
+`systemctl --user enable --now ~/vgi-bridge/vgi-bridge.service` on Linux or
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.openvtc.vgi-bridge.plist`
+on macOS (after copying the plist there). The log is
+`~/vgi-bridge/bridge.log`.
 
-```sh
-head -c 32 /dev/urandom | base64 > /run/secrets/vgi-bridge-master-key
-chmod 600 /run/secrets/vgi-bridge-master-key
+Then make `public_url` reach `127.0.0.1:8080` over HTTPS: a TLS proxy on the
+same host, or a tunnel such as cloudflared, ngrok or Tailscale Funnel. Use a
+stable hostname: the App's callback and webhook URLs are built from it.
+Forward the paths in BRIDGE.md §1 and keep `/healthz` internal.
+
+### 2.3 Tell the VTC which bridge serves github.com
+
+On the VTC host, put the line setup printed into the VTC's config (step 1)
+and restart the VTC:
+
+```toml
+[git_ns]
+bridges = { "github.com" = "did:webvh:…" }   # the bridge's DID
 ```
 
-(`vgi-bridge init` writes one itself when the file does not exist, but a
-secret mounted read-only into a container has to exist first.) Back it up
-**apart from** the data directory — the store is useless without it, and the
-two together are every credential the community has on GitHub.
-
-**The bridge's DID.** `vgi-bridge init` mints a `did:peer:2` whose
-identifier carries the bridge's keys and a `TSPTransport` and a
-`DIDCommMessaging` service naming `mediator_did` — enough for the VTC to
-reach it, with nothing to host
-(BRIDGE.md §2). The mediator is fixed in that DID: moving mediators means a
-new identity, registered again. To avoid that, provision a `did:webvh` from
-the VTA instead. Use a DID
-template with an Ed25519 signing key, an X25519 key-agreement key, and a
-`TSPTransport` and a `DIDCommMessaging` service naming `mediator_did`. Export its secrets bundle
-and import it (bridge stopped — the admin commands take the store's lock):
-
-```sh
-vgi-bridge --config /etc/vgi-bridge/bridge.toml identity import bundle.json
-shred -u bundle.json
-vgi-bridge --config /etc/vgi-bridge/bridge.toml identity show
-```
-
-**Why not a `did:key`.** The VTC reaches a bridge the way it reaches any
-peer: it resolves the bridge's DID and uses a transport the document
-advertises (TSP, then DIDComm). A `did:key` document advertises no service,
-so the VTC has no transport to it: the bind fails `unavailable` (*the bridge
-… refused the job (noMatchingProtocol)*), and so would every job after it.
-Earlier releases of `init` minted one; `vgi-bridge identity mint --replace --backup <file>`
-swaps it for a `did:peer` (register the new DID).
-
-Whichever identity it is, back it up apart from the store:
-`vgi-bridge identity export <file>` (BRIDGE.md §5).
-
-The Ed25519 key in the bundle must be a verification method of the DID's
-document (VTA templates publish it): the bridge signs its re-signed
-Dependabot commits with it, and `verify-trust` accepts the signature only
-from a key the DID publishes.
-
-### 2.3 Run it
-
-```sh
-docker build -f crates/vgi-bridge/Dockerfile -t vgi-bridge .
-docker run -d --name vgi-bridge \
-  -v /etc/vgi-bridge:/etc/vgi-bridge:ro \
-  -v vgi-bridge-data:/var/lib/vgi-bridge \
-  -v /run/secrets/vgi-bridge-master-key:/run/secrets/vgi-bridge-master-key:ro \
-  -p 127.0.0.1:8080:8080 vgi-bridge
-```
-
-The image runs as uid 10001: the key file and the data volume must be
-readable (and the volume writable) by it. Run `identity import` in the same
-container setup with the bundle mounted and `identity import <path>` as the
-command, before the first `run`. Put the TLS proxy in front, forwarding the
-paths in BRIDGE.md §1 and keeping `/healthz` internal.
-
-### 2.4 Tell the VTC which bridge serves github.com
-
-Put the DID from `identity show` (VTA mode: from `vta setup`) into the VTC's `[git_ns] bridges` under
-`"github.com"` (step 1) and restart the VTC.
+(`vgi-bridge --config ~/vgi-bridge/bridge.toml identity show` prints the DID
+again.)
 
 **Success looks like:** `curl http://127.0.0.1:8080/healthz` answers `ok`;
 the bridge's log shows the link to the mediator up, and — since no

@@ -8,7 +8,8 @@
 //!   sshsig namespace ([`GIT_SSHSIG_NAMESPACE`]),
 //! - git commit-object handling ([`split_signed_commit`],
 //!   [`normalize_sshsig_armor`], [`committer_did`]),
-//! - DID-document Ed25519 key extraction ([`ed25519_signing_keys_from_doc`]),
+//! - DID-document Ed25519 key extraction ([`ed25519_signing_keys_from_doc`])
+//!   and service discovery ([`registry_referral`], [`messaging_mediator`]),
 //! - the forge-qualified resource grammar ([`normalize_resource`],
 //!   [`resource_contains`]) that the verifier, the VTC projection and the
 //!   forge adapters must all agree on byte for byte.
@@ -19,6 +20,7 @@
 mod commit;
 mod did;
 pub mod resource;
+mod services;
 mod sshsig;
 
 pub use commit::{
@@ -30,4 +32,5 @@ pub use resource::{
     ResourceError, ResourceErrorKind, normalize_resource, normalize_resource_with_depth,
     resource_contains,
 };
+pub use services::{messaging_mediator, registry_referral};
 pub use sshsig::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
