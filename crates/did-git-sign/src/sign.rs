@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Read;
 use std::path::Path;
-use vgi_core::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
+use vgi_core::{
+    GIT_SSHSIG_NAMESPACE, assemble_ssh_signature, create_ssh_signature, sshsig_message_hash,
+};
 
 use crate::config::{self, SigningConfig};
 use crate::policy;
@@ -33,6 +35,97 @@ pub const SIGNING_KEY_ENV: &str = "DID_GIT_SIGN_KEY";
 /// Per-repo git config key that selects which persona signs (R-G-1):
 /// `git config did-git-sign.key did:webvh:…#key-N`.
 pub const SIGNING_KEY_GIT_CONFIG: &str = "did-git-sign.key";
+
+/// Environment variable choosing where the signature is made — see [`SignerMode`].
+pub const SIGNER_ENV: &str = "DID_GIT_SIGN_SIGNER";
+
+/// Git config key choosing where the signature is made — see [`SignerMode`].
+pub const SIGNER_GIT_CONFIG: &str = "did-git-sign.signer";
+
+/// Where the signature is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerMode {
+    /// The VTA signs (`keys/sign-sshsig`) and the key never leaves it. A VTA
+    /// that does not serve the task is an error, never a reason to export.
+    Vta,
+    /// The VTA signs where it can; against a VTA that predates
+    /// `keys/sign-sshsig`, the key is exported for the one signature, with a
+    /// warning. The default, so existing installs keep signing.
+    Auto,
+    /// The key is exported and the signature made here — the behaviour before
+    /// `keys/sign-sshsig` existed.
+    Export,
+}
+
+impl std::fmt::Display for SignerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SignerMode::Vta => "vta",
+            SignerMode::Auto => "auto",
+            SignerMode::Export => "export",
+        })
+    }
+}
+
+impl SignerMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "vta" => Ok(SignerMode::Vta),
+            "auto" | "" => Ok(SignerMode::Auto),
+            "export" => Ok(SignerMode::Export),
+            other => anyhow::bail!(
+                "did-git-sign: unknown signer {other:?} (from {SIGNER_ENV} or \
+                 `git config {SIGNER_GIT_CONFIG}`); expected vta, auto or export"
+            ),
+        }
+    }
+}
+
+/// The signer mode: [`SIGNER_ENV`] over [`SIGNER_GIT_CONFIG`] over
+/// [`SignerMode::Auto`].
+pub fn resolve_signer_mode() -> Result<SignerMode> {
+    if let Ok(v) = std::env::var(SIGNER_ENV)
+        && !v.trim().is_empty()
+    {
+        return SignerMode::parse(&v);
+    }
+    match git_config_get(SIGNER_GIT_CONFIG) {
+        Some(v) => SignerMode::parse(&v),
+        None => Ok(SignerMode::Auto),
+    }
+}
+
+/// Sign `data` with the persona's key: by the VTA where `mode` allows it,
+/// otherwise by exporting the key for this one signature.
+pub async fn sign_with_vta(
+    client: &vta_sdk::client::VtaClient,
+    key_id: &str,
+    namespace: &str,
+    data: &[u8],
+    mode: SignerMode,
+) -> Result<String> {
+    if mode != SignerMode::Export {
+        match vta::sign_sshsig(client, key_id, &sshsig_message_hash(data)).await? {
+            vta::RemoteSignature::Signed(raw) => {
+                let verifying_key = vta::signing_public_key(client, key_id).await?;
+                return assemble_ssh_signature(&verifying_key, namespace, data, &raw);
+            }
+            vta::RemoteSignature::Unsupported if mode == SignerMode::Vta => anyhow::bail!(
+                "did-git-sign: this VTA does not serve keys/sign-sshsig, and {SIGNER_GIT_CONFIG} \
+                 is `vta`, so the key will not be exported to sign locally. Upgrade the VTA, or \
+                 set `git config {SIGNER_GIT_CONFIG} auto` to allow the export."
+            ),
+            vta::RemoteSignature::Unsupported => eprintln!(
+                "did-git-sign: warning: this VTA does not serve keys/sign-sshsig; exporting the \
+                 key to sign locally. Set `git config {SIGNER_GIT_CONFIG} vta` to refuse instead."
+            ),
+        }
+    }
+    let seed = vta::get_signing_key(client, key_id).await?;
+    let signing_key = SigningKey::from_bytes(seed.as_bytes());
+    let verifying_key = signing_key.verifying_key();
+    create_ssh_signature(&signing_key, &verifying_key, namespace, data)
+}
 
 /// Where the effective signing-key selection came from (for clear diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +174,13 @@ fn select_signing_key(
 /// Read the per-repo git config selector (`did-git-sign.key`), if set. Runs in
 /// the current directory — git sets the signer's cwd to the repo.
 fn git_config_signing_key() -> Option<String> {
+    git_config_get(SIGNING_KEY_GIT_CONFIG)
+}
+
+/// `git config --get <key>` in the current directory, if set and non-empty.
+fn git_config_get(key: &str) -> Option<String> {
     let out = std::process::Command::new("git")
-        .args(["config", "--get", SIGNING_KEY_GIT_CONFIG])
+        .args(["config", "--get", key])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -258,16 +356,11 @@ pub async fn handle_sign(
         user_name: cfg.user_name,
     };
 
-    // Authenticate with VTA and fetch signing key
+    // Read before any I/O, so a mistyped setting fails without touching the VTA.
+    let mode = resolve_signer_mode()?;
+
     let (client, creds) = vta::authenticate(&cfg).await?;
-    let seed = vta::get_signing_key(&client, &creds.key_id).await?;
-
-    // Create Ed25519 signing key from seed
-    let signing_key = SigningKey::from_bytes(seed.as_bytes());
-    let verifying_key = signing_key.verifying_key();
-
-    // Build the SSH signature
-    let signature = create_ssh_signature(&signing_key, &verifying_key, namespace, &data)?;
+    let signature = sign_with_vta(&client, &creds.key_id, namespace, &data, mode).await?;
 
     // Write the signature to <file>.sig, mirroring ssh-keygen -Y sign behaviour.
     // Git reads the signature back from that path after the signing program exits.
@@ -283,20 +376,6 @@ pub async fn handle_sign(
         print!("{signature}");
     }
 
-    Ok(())
-}
-
-/// Test that signing works by creating a signature and verifying the output format.
-/// Used by the `verify` subcommand.
-pub fn test_sign(
-    signing_key: &SigningKey,
-    verifying_key: &ed25519_dalek::VerifyingKey,
-    data: &[u8],
-) -> Result<()> {
-    let signature = create_ssh_signature(signing_key, verifying_key, "git", data)?;
-    if !signature.starts_with("-----BEGIN SSH SIGNATURE-----") {
-        anyhow::bail!("signature output has invalid format");
-    }
     Ok(())
 }
 
@@ -497,6 +576,16 @@ mod tests {
     }
 
     #[test]
+    fn signer_mode_parses_the_three_settings_and_refuses_others() {
+        assert_eq!(SignerMode::parse("vta").unwrap(), SignerMode::Vta);
+        assert_eq!(SignerMode::parse(" auto\n").unwrap(), SignerMode::Auto);
+        assert_eq!(SignerMode::parse("").unwrap(), SignerMode::Auto);
+        assert_eq!(SignerMode::parse("export").unwrap(), SignerMode::Export);
+        let error = SignerMode::parse("remote").unwrap_err().to_string();
+        assert!(error.contains(SIGNER_GIT_CONFIG), "{error}");
+    }
+
+    #[test]
     fn only_the_git_namespace_may_sign() {
         assert!(check_namespace("git").is_ok());
         for namespace in ["file", "email", "", "Git", "git ", "git\0"] {
@@ -522,14 +611,6 @@ mod tests {
             error.contains("refusing to sign in sshsig namespace \"file\""),
             "{error}"
         );
-    }
-
-    #[test]
-    fn test_test_sign_accepts_valid_key() {
-        let seed = [0xAA; 32];
-        let signing_key = SigningKey::from_bytes(&seed);
-        let verifying_key = signing_key.verifying_key();
-        assert!(test_sign(&signing_key, &verifying_key, b"test data").is_ok());
     }
 
     /// Regression guard: the .sig path must be formed by appending ".sig" to the full

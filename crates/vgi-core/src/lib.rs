@@ -33,4 +33,7 @@ pub use resource::{
     resource_contains,
 };
 pub use services::{messaging_mediator, registry_referral};
-pub use sshsig::{GIT_SSHSIG_NAMESPACE, create_ssh_signature};
+pub use sshsig::{
+    GIT_SSHSIG_NAMESPACE, assemble_ssh_signature, create_ssh_signature, sshsig_message_hash,
+    sshsig_signed_data,
+};

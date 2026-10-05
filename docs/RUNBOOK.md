@@ -30,7 +30,7 @@ These are outside VGI, and standing them up is the long pole.
 
 | What | Why VGI needs it | What you take away |
 |---|---|---|
-| A **VTA** with a persona and Ed25519 signing key per contributor | `did-git-sign` fetches the key at sign time; no private key touches disk | each contributor's `did:webvh:…#key-N` |
+| A **VTA** with a persona and Ed25519 signing key per contributor | the VTA signs each commit (`keys/sign-sshsig`); the private key never leaves it | each contributor's `did:webvh:…#key-N` |
 | A **Trust Registry** speaking TRQP | answers "is this DID authorized, right now" | `TRUST_REGISTRY_DID` |
 | Your **VTC's DID** | the community whose authority each trust tuple is evaluated under — TRQP's `authority_id` | `VTC_DID` |
 
@@ -172,6 +172,25 @@ enabled; check it before the first push, not after the PR check fails.
 `did-git-sign` refuses to sign a commit whose DID claim differs from the key it
 is about to use, so a mismatch fails at `git commit` with both halves named
 rather than in CI as `unknownKey`.
+
+**The VTA signs; the key stays there.** Since 0.17, `did-git-sign` sends the VTA
+the commit's SHA-512 and asks it to sign an SSHSIG statement
+(`keys/sign-sshsig/0.1`); the private key never reaches the contributor's
+machine. A VTA that predates the task gets the old behaviour — the key is
+fetched for that one signature — with a warning on every commit. Once the VTA is
+upgraded, make it strict and take the export right away from the credential:
+
+```sh
+git config --global did-git-sign.signer vta     # never fall back to exporting
+did-git-sign verify                             # a test signature, made by the VTA
+pnm acl update <credential DID> --capabilities sign-sshsig
+```
+
+The last line narrows the credential `init` provisioned to SSHSIG signing alone:
+a stolen credential can then sign commits until it is revoked, and can neither
+take the key nor sign anything that is not an SSHSIG statement. The credential
+DID is the one `init` printed (`did-git-sign health` shows it). The VTA audits
+each signature as `keys.sign-sshsig` with the namespace and the commit digest.
 
 ## 3a. Contributors in more than one community
 
