@@ -246,6 +246,14 @@ pub enum ProtectionGap {
     },
     /// CI is disabled on the repository: the required check can never report.
     CiDisabled,
+    /// The rule asks for fewer approving reviews than the community requires,
+    /// so a pull request can merge with less review than it should.
+    ApprovalsBelow {
+        /// What the community requires.
+        required: u8,
+        /// What the rule asks for.
+        observed: u8,
+    },
 }
 
 /// A difference between forge state and the VTC projection (§5.6 table).
@@ -409,7 +417,17 @@ pub fn default_diff(observed: &RepoState, desired: &Projection) -> Vec<Drift> {
         });
     }
     if let Some(check) = &desired.required_check {
-        let gaps = protection_gaps(&observed.protection, check);
+        let mut gaps = protection_gaps(&observed.protection, check);
+        // Only a shortfall: a rule asking for more review is not weaker. A
+        // missing rule is already a gap of its own.
+        if observed.protection.present
+            && observed.protection.required_approvals < desired.required_approvals
+        {
+            gaps.push(ProtectionGap::ApprovalsBelow {
+                required: desired.required_approvals,
+                observed: observed.protection.required_approvals,
+            });
+        }
         if !gaps.is_empty() {
             drift.push(Drift::ProtectionWeakened { gaps });
         }
@@ -482,6 +500,34 @@ mod tests {
     }
     fn bob() -> ForgeAccount {
         ForgeAccount::new(2, "bob")
+    }
+
+    /// Fewer required approvals than the community asks for is drift; more is
+    /// not (a stricter rule is not weaker), and none is asked of a repository
+    /// whose projection requires none.
+    #[test]
+    fn fewer_approvals_than_required_is_drift_and_more_is_not() {
+        let mut state = RepoState::new(res("github.com/acme/w"), 9);
+        state.protection = protected("Verify commit trust");
+        let mut want = Projection::new(res("github.com/acme/w"));
+        want.forge_id = Some(9);
+        want.required_check = Some("Verify commit trust".into());
+        assert_eq!(default_diff(&state, &want), vec![]);
+
+        want.required_approvals = 2;
+        state.protection.required_approvals = 1;
+        assert_eq!(
+            default_diff(&state, &want),
+            vec![Drift::ProtectionWeakened {
+                gaps: vec![ProtectionGap::ApprovalsBelow {
+                    required: 2,
+                    observed: 1
+                }]
+            }]
+        );
+
+        state.protection.required_approvals = 3;
+        assert_eq!(default_diff(&state, &want), vec![]);
     }
 
     #[test]

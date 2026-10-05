@@ -97,6 +97,18 @@ pub struct BridgeConfig {
     /// How long a bind or link waits for the person, in seconds.
     #[serde(default = "default_flow_ttl")]
     pub flow_ttl_secs: u64,
+    /// Approving reviews a pull request on every governed repository needs
+    /// before it can merge (0–10; default 0, none). Approvals count only from
+    /// accounts the forge lets write to the repository, which under this
+    /// bridge are the ones the community's rights project to — owners and
+    /// maintainers, never a committer or an outside contributor. A later push
+    /// dismisses them, and the last push needs someone other than its pusher,
+    /// so a repository with a single owner and no maintainer cannot merge its
+    /// own pull requests while this is above 0. Applied by the bootstrap; on a
+    /// repository already governed, a rule asking for fewer is drift when the
+    /// bridge next inspects it.
+    #[serde(default)]
+    pub required_approvals: u8,
     /// What the bootstrap plan writes.
     pub verify_trust: VerifyTrustConfig,
     /// The bridge-posted check.
@@ -854,6 +866,13 @@ impl BridgeConfig {
 
     /// The checks a bad value would otherwise fail late on.
     pub fn validate(&self) -> Result<()> {
+        // GitHub's ruleset limit, and Forgejo's practical one.
+        if self.required_approvals > 10 {
+            bail!(
+                "`required_approvals` is at most 10 (GitHub's limit); got {}",
+                self.required_approvals
+            );
+        }
         for (what, did) in [
             ("vtc_did", &self.vtc_did),
             ("trust_registry_did", &self.trust_registry_did),
@@ -1029,6 +1048,26 @@ base_url = "https://codeberg.org/"
 bot_login = "acme-vgi-bot"
 oauth_client_id = "0b6e3a0c"
 "#;
+
+    /// `required_approvals` defaults to none, carries into the bootstrap
+    /// inputs, and is refused past GitHub's limit of 10.
+    #[test]
+    fn required_approvals_default_to_none_and_are_bounded() {
+        let c = BridgeConfig::parse(EXAMPLE).unwrap();
+        assert_eq!(c.required_approvals, 0);
+
+        let two = EXAMPLE.replace("[verify_trust]", "required_approvals = 2\n\n[verify_trust]");
+        let c = BridgeConfig::parse(&two).unwrap();
+        assert_eq!(c.required_approvals, 2);
+        assert_eq!(crate::registry::vgi_config(&c, None).required_approvals, 2);
+
+        let eleven = EXAMPLE.replace(
+            "[verify_trust]",
+            "required_approvals = 11\n\n[verify_trust]",
+        );
+        let e = BridgeConfig::parse(&eleven).unwrap_err().to_string();
+        assert!(e.contains("required_approvals"), "{e}");
+    }
 
     #[test]
     fn a_listener_beyond_loopback_is_warned_about() {

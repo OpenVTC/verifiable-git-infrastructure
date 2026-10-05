@@ -93,6 +93,15 @@ master_key_file = "/home/ops/vgi-bridge/master-key"
 # How long a bind or account link waits for the person.
 # flow_ttl_secs = 900
 
+# Approving reviews every governed repository's pull requests need before
+# they merge (0-10; default 0). They count only from accounts the community's
+# rights give write access — owners and maintainers — are dismissed by a later
+# push, and the last push needs someone other than its pusher. A repository
+# with one owner and no maintainer cannot merge its own pull requests while
+# this is above 0. Applied when a repository is created or adopted
+# (BRIDGE.md §6e).
+# required_approvals = 1
+
 [verify_trust]
 # What the bootstrap writes into repositories (and the required workflow).
 # setup pins this to the commit of its own release tag; by hand:

@@ -230,7 +230,9 @@ pub fn check_enforced(gaps: &[ProtectionGap]) -> bool {
     !gaps.iter().any(|g| {
         !matches!(
             g,
-            ProtectionGap::ForcePushAllowed | ProtectionGap::DeletionAllowed
+            ProtectionGap::ForcePushAllowed
+                | ProtectionGap::DeletionAllowed
+                | ProtectionGap::ApprovalsBelow { .. }
         )
     })
 }
@@ -328,6 +330,9 @@ fn gap_text(g: &ProtectionGap) -> String {
         }
         ProtectionGap::MergeMethodAllowed { method } => format!("merge method allowed: {method:?}"),
         ProtectionGap::CiDisabled => "CI disabled".into(),
+        ProtectionGap::ApprovalsBelow { required, observed } => {
+            format!("approving reviews required: {observed} (the community requires {required})")
+        }
         ProtectionGap::CheckSourceUnprotected { detail } => {
             format!("check source unprotected: {detail}")
         }

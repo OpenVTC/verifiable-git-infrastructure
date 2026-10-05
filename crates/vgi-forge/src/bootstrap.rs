@@ -115,6 +115,10 @@ pub struct VgiConfig {
     /// input); the default writes no input.
     #[serde(default, skip_serializing_if = "VerifyTransport::is_auto")]
     pub verify_trust_transport: VerifyTransport,
+    /// Approving reviews every governed repository's pull requests need
+    /// ([`ProtectionSpec::required_approvals`]). `0`: none required.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub required_approvals: u8,
 }
 
 impl VgiConfig {
@@ -135,7 +139,14 @@ impl VgiConfig {
             platform_keyring: None,
             extra_files: Vec::new(),
             verify_trust_transport: VerifyTransport::Auto,
+            required_approvals: 0,
         }
+    }
+
+    /// Require `n` approving reviews on every governed repository.
+    pub fn with_required_approvals(mut self, n: u8) -> Self {
+        self.required_approvals = n;
+        self
     }
 
     /// Pin the registry binding the workflow uses.
@@ -221,6 +232,15 @@ pub struct ProtectionSpec {
     /// files that have one ([`StepAction::RequireOwnerReview`]).
     #[serde(default)]
     pub require_code_owner_review: bool,
+    /// Approving reviews a pull request needs before it can merge, from
+    /// people the forge lets write to the repository — which, under a bridge,
+    /// are the accounts its rights project to (owners and maintainers). An
+    /// approval is dismissed by a later push, and the last push must be
+    /// approved by someone other than its pusher, so a reviewed change cannot
+    /// be swapped after review or approved by its own author. `0`: none
+    /// beyond what [`ProtectionSpec::require_code_owner_review`] asks.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub required_approvals: u8,
     /// Paths (forge glob syntax) a pull request may not change and still
     /// merge: the workflows and the exempt keyring. Without this a PR could
     /// rewrite the check it is judged by — CI runs the PR's own copy of the
@@ -232,6 +252,10 @@ pub struct ProtectionSpec {
 
 fn yes() -> bool {
     true
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl ProtectionSpec {
@@ -246,6 +270,7 @@ impl ProtectionSpec {
             block_deletion: true,
             require_status_check: true,
             require_code_owner_review: false,
+            required_approvals: 0,
             protected_paths: Vec::new(),
         }
     }
@@ -271,6 +296,19 @@ impl ProtectionSpec {
     pub fn with_code_owner_review(mut self) -> Self {
         self.require_code_owner_review = true;
         self
+    }
+
+    /// Require `n` approving reviews ([`ProtectionSpec::required_approvals`]).
+    pub fn with_required_approvals(mut self, n: u8) -> Self {
+        self.required_approvals = n;
+        self
+    }
+
+    /// The approving reviews a pull request needs: the configured count, and
+    /// at least one where an owner's review is required.
+    pub fn approvals_needed(&self) -> u8 {
+        self.required_approvals
+            .max(u8::from(self.require_code_owner_review))
     }
 }
 
