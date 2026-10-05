@@ -492,6 +492,18 @@ messages (`noSignerDid`). `OUTDATED` means re-run `init`. Contributors in
 more than one community give each identity a profile
 ([runbook §3a](RUNBOOK.md#3a-contributors-in-more-than-one-community)).
 
+The VTA signs each commit (`keys/sign-sshsig`) and the private key never
+reaches the contributor's machine. A VTA older than that task gets the key
+exported for each signature, with a warning. Once the VTA is upgraded, make it
+strict and narrow the credential to commit signing
+([runbook §3](RUNBOOK.md#3-set-up-a-contributors-machine)):
+
+```sh
+git config --global did-git-sign.signer vta
+did-git-sign verify
+pnm acl update <credential DID from `did-git-sign health`> --capabilities sign-sshsig
+```
+
 openvtc's *Repos* view shows the same health beside the member's repositories
 — whether `did-git-sign` is set up for this persona, and the hook's version
 at each scope, with the fix.
