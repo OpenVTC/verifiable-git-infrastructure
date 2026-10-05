@@ -624,6 +624,7 @@ impl ForgejoForge {
         p.blocks_force_push = rule.enable_force_push != Some(true);
         p.blocks_deletion = true;
         p.protected_paths = patterns(&rule.protected_file_patterns);
+        p.required_approvals = approvals_of(rule);
         p.bypass_actors = rule.bypass_actors();
         p.bypass_actors
             .extend(shadowing.iter().map(|n| format!("shadowing-rule:{n}")));
@@ -2608,7 +2609,7 @@ fn protection_request(
             paths.push(p);
         }
     }
-    json!({
+    let mut body = json!({
         "enable_push": !spec.require_pull_request,
         "enable_push_whitelist": false,
         "push_whitelist_usernames": [],
@@ -2622,7 +2623,17 @@ fn protection_request(
         "protected_file_patterns": paths.join(";"),
         "unprotected_file_patterns": "",
         "apply_to_admins": true,
-    })
+    });
+    // Approvals from anyone with write access (no approvals whitelist), which
+    // under the bridge is who its rights project to; dismissed by a later push
+    // so an approval cannot outlive what it approved. Sent only when asked
+    // for, so a bridge without `required_approvals` asks what it always has.
+    if spec.approvals_needed() > 0 {
+        body["required_approvals"] = json!(spec.approvals_needed());
+        body["enable_approvals_whitelist"] = json!(false);
+        body["dismiss_stale_approvals"] = json!(true);
+    }
+    body
 }
 
 // ── the same shapes, for a client acting as the repository's admin ───────
@@ -2729,6 +2740,7 @@ fn satisfies_protection(rule: &ProtectionJson, spec: &ProtectionSpec) -> bool {
         // `None`: an instance without the setting, where it cannot be had.
         && rule.apply_to_admins != Some(false)
         && rule.enable_force_push != Some(true)
+        && approvals_of(rule) >= spec.approvals_needed()
         && spec
             .protected_paths
             .iter()
@@ -2959,6 +2971,20 @@ struct ProtectionJson {
     /// Gitea 1.23+; Forgejo refuses force-pushes to protected branches
     /// without a setting.
     enable_force_push: Option<bool>,
+    #[serde(default)]
+    required_approvals: Option<i64>,
+    #[serde(default)]
+    dismiss_stale_approvals: Option<bool>,
+}
+
+/// The approvals a rule requires, counted only when a later push dismisses
+/// them (otherwise an approval can outlive the change it approved).
+fn approvals_of(rule: &ProtectionJson) -> u8 {
+    if rule.dismiss_stale_approvals != Some(true) {
+        return 0;
+    }
+    rule.required_approvals
+        .map_or(0, |n| u8::try_from(n.max(0)).unwrap_or(u8::MAX))
 }
 
 impl ProtectionJson {
@@ -3017,6 +3043,27 @@ impl ProtectionJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The community's `required_approvals` reaches Forgejo's protection (no
+    /// approvals whitelist, so they count from anyone with write access, and
+    /// dismissed by a later push), and a rule asking for fewer, or keeping
+    /// stale approvals, does not satisfy it.
+    #[test]
+    fn required_approvals_reach_forgejo_protection() {
+        let spec = ProtectionSpec::standard("c / verify (pull_request)").with_required_approvals(2);
+        let body = protection_body(None, &["alice".to_string()], &spec).unwrap();
+        assert_eq!(body["required_approvals"], 2);
+        assert_eq!(body["dismiss_stale_approvals"], true);
+        assert_eq!(body["enable_approvals_whitelist"], false);
+        assert!(protection_satisfies(&body, &spec).unwrap());
+
+        let mut stale = body.clone();
+        stale["dismiss_stale_approvals"] = json!(false);
+        assert!(!protection_satisfies(&stale, &spec).unwrap());
+        let mut fewer = body;
+        fewer["required_approvals"] = json!(1);
+        assert!(!protection_satisfies(&fewer, &spec).unwrap());
+    }
 
     #[test]
     fn roles_map_both_ways() {

@@ -232,7 +232,8 @@ pub fn github_plan(
                 BootstrapComponent::RequiredCheck,
                 StepAction::ProtectDefaultBranch(
                     ProtectionSpec::standard(cfg.required_check.clone())
-                        .with_check_enforced_by_namespace(),
+                        .with_check_enforced_by_namespace()
+                        .with_required_approvals(cfg.required_approvals),
                 ),
             ));
             // A repository that had the owner-review guard before its org
@@ -282,7 +283,9 @@ pub fn github_plan(
                 "ruleset",
                 BootstrapComponent::RequiredCheck,
                 StepAction::ProtectDefaultBranch(
-                    ProtectionSpec::standard(cfg.required_check.clone()).with_code_owner_review(),
+                    ProtectionSpec::standard(cfg.required_check.clone())
+                        .with_code_owner_review()
+                        .with_required_approvals(cfg.required_approvals),
                 ),
             ));
             steps.extend(cleanup_variables());
@@ -291,9 +294,10 @@ pub fn github_plan(
             steps.push(BootstrapStep::new(
                 "ruleset",
                 BootstrapComponent::RequiredCheck,
-                StepAction::ProtectDefaultBranch(ProtectionSpec::standard(
-                    cfg.required_check.clone(),
-                )),
+                StepAction::ProtectDefaultBranch(
+                    ProtectionSpec::standard(cfg.required_check.clone())
+                        .with_required_approvals(cfg.required_approvals),
+                ),
             ));
             steps.extend(cleanup_variables());
         }
@@ -304,9 +308,10 @@ pub fn github_plan(
             steps.push(BootstrapStep::new(
                 "ruleset",
                 BootstrapComponent::RequiredCheck,
-                StepAction::ProtectDefaultBranch(ProtectionSpec::standard(
-                    cfg.required_check.clone(),
-                )),
+                StepAction::ProtectDefaultBranch(
+                    ProtectionSpec::standard(cfg.required_check.clone())
+                        .with_required_approvals(cfg.required_approvals),
+                ),
             ));
             steps.extend(cleanup_variables());
             // A workflow from an earlier guard would still run and post an
@@ -762,6 +767,29 @@ mod tests {
 
     fn ids(plan: &[BootstrapStep]) -> Vec<&str> {
         plan.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    /// The community's `required_approvals` goes into the ruleset step of
+    /// every guard, not only owner review.
+    #[test]
+    fn every_guard_carries_the_required_approvals() {
+        let cfg = cfg().with_required_approvals(2);
+        for guard in [
+            CheckGuard::RequiredWorkflow,
+            owner_review(),
+            CheckGuard::SoloOwner,
+            CheckGuard::BridgePosted,
+        ] {
+            let plan = github_plan(&spec(), &cfg, CHECKOUT, &guard).unwrap();
+            let protection = plan
+                .iter()
+                .find_map(|s| match &s.action {
+                    StepAction::ProtectDefaultBranch(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .expect("a ruleset step");
+            assert_eq!(protection.required_approvals, 2, "{guard:?}");
+        }
     }
 
     #[test]

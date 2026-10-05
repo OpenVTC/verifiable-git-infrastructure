@@ -1038,6 +1038,47 @@ what keeps untrusted commits out. If the VTC or the bridge is down, or the
 App lacks the permission, a pull request simply stays open, and nothing the
 check refuses can be merged through it.
 
+## 6e. Required approvals
+
+The pull-request gate decides who may *open* a pull request. Who may
+*merge* one is the forge's permission model, which the bridge drives from
+the community's rights: only accounts it gives write access — a
+repository's owners (`admin`) and maintainers (`maintain`) under the default
+role map — can merge, and only their reviews count as approvals. A
+committer's right is to sign commits the check accepts, not to merge, so a
+committer gets no forge role.
+
+To require review as well, set
+
+```toml
+required_approvals = 1   # 0-10; 0 (the default) requires none
+```
+
+and every governed repository's ruleset (`VGI commit trust`; on Forgejo, its
+branch protection) asks for that many approving reviews, **dismissed by a
+later push** and, on GitHub, with **the last push approved by someone other
+than its pusher** — so a reviewed change cannot be swapped after approval,
+nor approved by its own author. Owner review (§9's guard for two or more
+owners) still asks for a code owner's approval on workflow changes; the
+larger of the two counts applies.
+
+It reaches a repository when its bootstrap runs (it is created or adopted).
+An already-governed repository whose rule asks for fewer is drift
+(`protectionWeakened`, "approving reviews required: …") whenever the bridge
+inspects it — Forgejo's scheduled sweep, or an `inspect` job from the VTC on
+GitHub, which has no timed sweep — and a namespace with ruleset drift set to
+`enforce` then puts the rule back. So set it before adopting, where you can.
+
+**A repository needs a second person to merge.** With approvals required,
+nobody can approve their own pull request, so a repository with a single
+owner and no maintainer cannot merge its owner's changes. Grant a second
+member `git.repo.maintain` (or `own`) on it first.
+
+For it to mean "only the community's approved members", the organisation's
+**base permission** must give members no write access (GitHub: *Settings →
+Member privileges → Base permissions*: `Read` or `No permission`) — otherwise
+every organisation member can approve and merge whatever the bridge projects.
+
 ## 7. Operating it
 
 - **Logs** go to standard error (`RUST_LOG=info` by default). They never

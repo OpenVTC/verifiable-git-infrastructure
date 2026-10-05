@@ -1931,7 +1931,19 @@ fn protection_of(
 
     for rule in &rs.rules {
         match rule.kind.as_str() {
-            "pull_request" => p.requires_pull_request = true,
+            "pull_request" => {
+                p.requires_pull_request = true;
+                // Approvals count only as the bridge sets them: dismissed by
+                // a later push and not the last pusher's own. Without those,
+                // an approval can outlive the change it approved.
+                let param = |k: &str| rule.parameters.as_ref().and_then(|v| v.get(k));
+                let on = |k: &str| param(k).and_then(Value::as_bool) == Some(true);
+                if on("dismiss_stale_reviews_on_push") && on("require_last_push_approval") {
+                    p.required_approvals = param("required_approving_review_count")
+                        .and_then(Value::as_u64)
+                        .map_or(0, |n| u8::try_from(n).unwrap_or(u8::MAX));
+                }
+            }
             "non_fast_forward" => p.blocks_force_push = true,
             "deletion" => p.blocks_deletion = true,
             "required_status_checks" => {
@@ -2001,14 +2013,15 @@ pub fn ruleset_body(spec: &ProtectionSpec, actions_id: Option<u64>) -> Value {
         rules.push(json!({
             "type": "pull_request",
             "parameters": {
-                // Owner review (§9): one approval, a code owner's where one
-                // is named, dismissed by any later push, and not the last
-                // pusher's own — or a reviewed change could be swapped after
-                // approval.
-                "required_approving_review_count": u8::from(spec.require_code_owner_review),
-                "dismiss_stale_reviews_on_push": spec.require_code_owner_review,
+                // Owner review (§9), or a community's required approvals:
+                // approvals (a code owner's where one is named and owner
+                // review is on), dismissed by any later push, and not the
+                // last pusher's own — or a reviewed change could be swapped
+                // after approval, or approved by its author.
+                "required_approving_review_count": spec.approvals_needed(),
+                "dismiss_stale_reviews_on_push": spec.approvals_needed() > 0,
                 "require_code_owner_review": spec.require_code_owner_review,
-                "require_last_push_approval": spec.require_code_owner_review,
+                "require_last_push_approval": spec.approvals_needed() > 0,
                 "required_review_thread_resolution": false,
             }
         }));
@@ -2072,6 +2085,7 @@ fn check_variable_name(var: &str) -> Result<()> {
 fn rules_match(rs: &RulesetJson, spec: &ProtectionSpec) -> bool {
     let has_status = rs.rules.iter().any(|r| r.kind == "required_status_checks");
     let review = spec.require_code_owner_review;
+    let approvals = spec.approvals_needed();
     let pr_ok = !spec.require_pull_request
         || rs.rules.iter().any(|r| {
             let param = |k: &str| r.parameters.as_ref().and_then(|p| p.get(k)).cloned();
@@ -2080,10 +2094,10 @@ fn rules_match(rs: &RulesetJson, spec: &ProtectionSpec) -> bool {
                 && param("required_approving_review_count")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0)
-                    == u64::from(review)
+                    == u64::from(approvals)
                 && flag("require_code_owner_review") == review
-                && flag("dismiss_stale_reviews_on_push") == review
-                && flag("require_last_push_approval") == review
+                && flag("dismiss_stale_reviews_on_push") == (approvals > 0)
+                && flag("require_last_push_approval") == (approvals > 0)
         });
     has_status == spec.require_status_check && pr_ok
 }
@@ -2403,6 +2417,81 @@ impl std::fmt::Debug for TokenPollJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pr_rule(body: &Value) -> Value {
+        body["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "pull_request")
+            .cloned()
+            .expect("a pull_request rule")
+    }
+
+    /// `required_approvals` asks GitHub for that many approvals, dismissed by
+    /// a later push and not the last pusher's own — without turning on code-
+    /// owner review — and a ruleset that asks for fewer does not satisfy it.
+    #[test]
+    fn required_approvals_reach_the_ruleset_and_its_comparison() {
+        let spec = ProtectionSpec::standard("Verify commit trust").with_required_approvals(2);
+        let body = ruleset_body(&spec, Some(15368));
+        let p = &pr_rule(&body)["parameters"];
+        assert_eq!(p["required_approving_review_count"], 2);
+        assert_eq!(p["dismiss_stale_reviews_on_push"], true);
+        assert_eq!(p["require_last_push_approval"], true);
+        assert_eq!(p["require_code_owner_review"], false);
+
+        let as_read = |mut b: Value| -> RulesetJson {
+            b["id"] = json!(1);
+            serde_json::from_value(b).unwrap()
+        };
+        assert!(rules_match(&as_read(body.clone()), &spec));
+        let fewer = ruleset_body(
+            &ProtectionSpec::standard("Verify commit trust"),
+            Some(15368),
+        );
+        assert!(
+            !rules_match(&as_read(fewer), &spec),
+            "a ruleset without the approvals is rewritten"
+        );
+
+        // Owner review needs one at least; a larger community count wins.
+        let both = ProtectionSpec::standard("c")
+            .with_code_owner_review()
+            .with_required_approvals(3);
+        assert_eq!(
+            pr_rule(&ruleset_body(&both, None))["parameters"]["required_approving_review_count"],
+            3
+        );
+        let owner_only = ProtectionSpec::standard("c").with_code_owner_review();
+        assert_eq!(owner_only.approvals_needed(), 1);
+    }
+
+    /// The observed count is read back for the drift comparison — but only
+    /// when approvals are dismissed by a later push and not the pusher's own,
+    /// the shape the bridge writes; otherwise an approval can outlive what it
+    /// approved, and it counts as none.
+    #[test]
+    fn observed_approvals_count_only_in_the_shape_the_bridge_writes() {
+        let spec = ProtectionSpec::standard("c").with_required_approvals(2);
+        let mut body = ruleset_body(&spec, Some(15368));
+        body["id"] = json!(1);
+        let rs: RulesetJson = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(
+            protection_of(&rs, Some("main"), Some(15368)).required_approvals,
+            2
+        );
+
+        let rules = body["rules"].as_array_mut().unwrap();
+        for r in rules.iter_mut().filter(|r| r["type"] == "pull_request") {
+            r["parameters"]["dismiss_stale_reviews_on_push"] = json!(false);
+        }
+        let rs: RulesetJson = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            protection_of(&rs, Some("main"), Some(15368)).required_approvals,
+            0
+        );
+    }
 
     fn poll(error: &str, interval: Option<u64>) -> TokenPollJson {
         TokenPollJson {

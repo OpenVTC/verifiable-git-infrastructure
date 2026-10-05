@@ -174,7 +174,8 @@ pub fn forgejo_plan(
         BootstrapComponent::RequiredCheck,
         StepAction::ProtectDefaultBranch(
             ProtectionSpec::standard(opts.status_context.clone())
-                .with_protected_paths(PROTECTED_PATHS),
+                .with_protected_paths(PROTECTED_PATHS)
+                .with_required_approvals(cfg.required_approvals),
         ),
     ));
     Ok(steps)

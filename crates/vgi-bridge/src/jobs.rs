@@ -917,12 +917,12 @@ fn projection(
         p.roles = r.roles.clone();
         p.owners = r.owners.clone();
         p.archived = r.archived;
-        p.required_check = r.required_check.clone().or_else(|| {
-            bridge
-                .adapters
-                .vgi_for(&ctx.ns.resource)
-                .map(|v| v.required_check)
-        });
+        let vgi = bridge.adapters.vgi_for(&ctx.ns.resource);
+        p.required_check = r
+            .required_check
+            .clone()
+            .or_else(|| vgi.as_ref().map(|v| v.required_check.clone()));
+        p.required_approvals = vgi.map(|v| v.required_approvals).unwrap_or(0);
     }
     p
 }

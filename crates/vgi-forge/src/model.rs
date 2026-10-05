@@ -469,6 +469,13 @@ pub struct ProtectionState {
     /// that reads it. `None`: not observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_enabled: Option<bool>,
+    /// Approving reviews the rule requires before a pull request merges.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub required_approvals: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 /// A repository as observed on the forge.
@@ -533,6 +540,11 @@ pub struct Projection {
     /// reviewers; one owner is a solo repository with no review guard.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<ForgeAccount>,
+    /// Approving reviews a pull request must have before it merges (the
+    /// bridge's `required_approvals`). Fewer on the forge is drift; `0` asks
+    /// for none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub required_approvals: u8,
 }
 
 impl Projection {
@@ -546,6 +558,7 @@ impl Projection {
             archived: false,
             visibility: None,
             owners: Vec::new(),
+            required_approvals: 0,
         }
     }
 }
