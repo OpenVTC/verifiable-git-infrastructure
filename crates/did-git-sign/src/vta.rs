@@ -212,8 +212,101 @@ pub fn client_with_identity(
     VtaClient::new(vta_url).with_identity(identity)
 }
 
+/// `keys/sign-sshsig/0.1` — the VTA signs an SSHSIG statement and the key
+/// never leaves it.
+pub const TASK_KEYS_SIGN_SSHSIG: &str = "https://trusttasks.org/spec/keys/sign-sshsig/0.1";
+
+/// What the VTA answered to a `keys/sign-sshsig` request.
+#[derive(Debug)]
+pub enum RemoteSignature {
+    /// The raw Ed25519 signature over the SSHSIG signed data.
+    Signed(Vec<u8>),
+    /// The VTA does not serve `keys/sign-sshsig` (it predates the task).
+    Unsupported,
+}
+
+/// Ask the VTA to sign an SSHSIG statement in the `git` namespace over
+/// `message_hash` (SHA-512 of what git asked us to sign). Only the digest
+/// travels; the VTA builds the signed data itself and signs that.
+///
+/// A VTA that does not know the task answers `methodNotFound`, which comes back
+/// as [`RemoteSignature::Unsupported`] so the caller can decide whether falling
+/// back to exporting the key is acceptable. Every other refusal is an error.
+pub async fn sign_sshsig(
+    client: &VtaClient,
+    key_id: &str,
+    message_hash: &[u8; 64],
+) -> Result<RemoteSignature> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload = serde_json::json!({
+        "keyId": key_id,
+        "algorithm": "EdDSA",
+        "namespace": vgi_core::GIT_SSHSIG_NAMESPACE,
+        "hashAlgorithm": "sha512",
+        "messageHash": b64.encode(message_hash),
+    });
+    let reply = client
+        .dispatch_trust_task_document(TASK_KEYS_SIGN_SSHSIG, payload, 30)
+        .await
+        .map_err(|e| anyhow::anyhow!("keys/sign-sshsig: {e}"))?;
+    let body = reply.get("payload").cloned().unwrap_or_default();
+    let is_response = reply
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.ends_with("#response"));
+    if !is_response {
+        let code = body
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        let message = body
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        if code == "methodNotFound" {
+            return Ok(RemoteSignature::Unsupported);
+        }
+        bail!("the VTA refused to sign: {code}: {message}");
+    }
+    let signature = body
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .context("keys/sign-sshsig response carries no signature")?;
+    let signature = b64
+        .decode(signature)
+        .context("keys/sign-sshsig signature is not base64url")?;
+    Ok(RemoteSignature::Signed(signature))
+}
+
+/// The public half of the signing key, from the VTA's `keys/show`. It goes
+/// into the SSHSIG blob, and the remote signature is checked against it before
+/// anything is written.
+pub async fn signing_public_key(
+    client: &VtaClient,
+    key_id: &str,
+) -> Result<ed25519_dalek::VerifyingKey> {
+    let record = client
+        .get_key(key_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read signing key {key_id}: {e}"))?;
+    if record.key_type != vta_sdk::keys::KeyType::Ed25519 {
+        bail!(
+            "signing key {key_id} is {:?}, expected Ed25519",
+            record.key_type
+        );
+    }
+    let bytes = vta_sdk::did_key::decode_ed25519_public_key_multibase(&record.public_key)
+        .with_context(|| format!("signing key {key_id} has an unreadable public key"))?;
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .with_context(|| format!("signing key {key_id} has an invalid Ed25519 public key"))
+}
+
 /// Fetch the Ed25519 signing key seed from VTA. Returns 32-byte seed.
 /// The seed is zeroized on drop via the returned wrapper.
+///
+/// The fallback for a VTA without `keys/sign-sshsig`: the key leaves the VTA
+/// for the length of one signature. [`sign_sshsig`] is preferred.
 pub async fn get_signing_key(client: &VtaClient, key_id: &str) -> Result<SeedMaterial> {
     let resp = client
         .get_key_secret(key_id)

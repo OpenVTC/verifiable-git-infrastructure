@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use did_git_sign::{config, enable, init, names, profiles, sign, vta};
-use ed25519_dalek::SigningKey;
 use std::path::PathBuf;
 
 use config::SigningConfig;
@@ -559,11 +558,9 @@ async fn cmd_init(
         names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names)
             .await;
 
-        // Fetch the persona signing key so we know its public bytes for the
-        // allowed_signers entry. Uses the freshly-issued admin token.
-        let seed = vta::get_signing_key(&client, &key_id).await?;
-        let signing_key = SigningKey::from_bytes(seed.as_bytes());
-        let verifying_key = signing_key.verifying_key();
+        // The persona key's public bytes, for the allowed_signers entry. Read,
+        // not exported: the private half stays in the VTA.
+        let verifying_key = vta::signing_public_key(&client, &key_id).await?;
 
         // Cache the REST token we already have so the very next sign operation
         // doesn't have to re-auth. A DIDComm session has none to cache.
@@ -1149,18 +1146,23 @@ async fn cmd_verify() -> Result<()> {
     let (client, creds) = vta::authenticate(&cfg).await?;
     println!("OK");
 
-    // Fetch signing key
-    print!("Fetch key:  ");
-    let seed = vta::get_signing_key(&client, &creds.key_id).await?;
-    println!("OK");
-
-    // Test sign
+    // Test sign, the way a commit is signed: by the VTA where the signer mode
+    // allows it. The signature is checked against the key's public half.
     print!("Test sign:  ");
-    let signing_key = SigningKey::from_bytes(seed.as_bytes());
-    let verifying_key = signing_key.verifying_key();
+    let mode = sign::resolve_signer_mode()?;
     let test_data = b"did-git-sign verification test";
-    sign::test_sign(&signing_key, &verifying_key, test_data)?;
-    println!("OK");
+    let signature = sign::sign_with_vta(
+        &client,
+        &creds.key_id,
+        vgi_core::GIT_SSHSIG_NAMESPACE,
+        test_data,
+        mode,
+    )
+    .await?;
+    if !signature.starts_with("-----BEGIN SSH SIGNATURE-----") {
+        anyhow::bail!("signature output has invalid format");
+    }
+    println!("OK (signer: {mode})");
 
     println!();
     println!("All checks passed. Signing is operational.");
@@ -1472,6 +1474,10 @@ async fn cmd_health(
     println!("VTA DID:         {}", creds.vta_did);
     named("Credential name:", &creds.credential_did);
     println!("Credential DID:  {}", creds.credential_did);
+    match sign::resolve_signer_mode() {
+        Ok(mode) => println!("Signer:          {mode}"),
+        Err(e) => println!("Signer:          INVALID ({e})"),
+    }
     println!("Signing Key ID:  {}", creds.key_id);
 
     // A VTA reached through its mediator (DIDComm or TSP) is asked over the
@@ -1540,10 +1546,8 @@ async fn cmd_health(
 
             // Fetch signing key and show public key
             print!("Signing key:     ");
-            match vta::get_signing_key(&client, &creds.key_id).await {
-                Ok(seed) => {
-                    let signing_key = SigningKey::from_bytes(seed.as_bytes());
-                    let verifying_key = signing_key.verifying_key();
+            match vta::signing_public_key(&client, &creds.key_id).await {
+                Ok(verifying_key) => {
                     println!("OK");
                     println!();
                     println!("SSH Public Key (for signature verification):");

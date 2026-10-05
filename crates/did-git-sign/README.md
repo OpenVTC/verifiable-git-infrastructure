@@ -2,7 +2,7 @@
 
 A standalone CLI tool that signs git commits using DID Ed25519 keys managed by a
 [Verifiable Trust Agent (VTA)](https://github.com/LF-Decentralized-Trust-labs/verifiable-trust-infrastructure).
-It acts as a git SSH signing proxy — no private key material ever touches disk.
+It acts as a git SSH signing proxy: the VTA signs, and the private key never leaves it.
 
 ## How It Works
 
@@ -11,9 +11,16 @@ git calls `did-git-sign` with the commit data on stdin. The tool:
 
 1. Loads its config (`.did-git-sign.json`) and retrieves the VTA credential from the OS keyring
 2. Authenticates with the VTA (or reuses a cached token)
-3. Fetches the Ed25519 signing key from the VTA on-the-fly
-4. Produces an SSH signature (PROTOCOL.sshsig format) and writes it to `<file>.sig`, as ssh-keygen does (to stdout when git passes no file)
-5. Zeroizes the key material from memory
+3. Sends the VTA the SHA-512 of the commit and asks it to sign an SSHSIG statement
+   (`keys/sign-sshsig`). Only the digest travels; the VTA builds the signed data
+   itself, signs it, and returns the signature
+4. Checks the signature against the key's public half, wraps it in the SSH
+   signature format (PROTOCOL.sshsig) and writes it to `<file>.sig`, as ssh-keygen
+   does (to stdout when git passes no file)
+
+Against a VTA too old to serve `keys/sign-sshsig`, it falls back to fetching the
+key for that one signature, with a warning — see
+[Where the signature is made](#where-the-signature-is-made).
 
 Your DID verification method ID (e.g. `did:webvh:abc:example.com#key-0`) is
 recorded in a `Signed-by-DID:` git trailer, linking every commit to your
@@ -331,6 +338,37 @@ by the access the VTA grants that credential. Anything that can read that
 keyring entry can ask the VTA for what the credential allows, with or without
 `did-git-sign`.
 
+### Where the signature is made
+
+By default the VTA makes the signature (`keys/sign-sshsig/0.1`) and the key never
+leaves it. The VTA builds the bytes it signs from the digest and the namespace,
+so what it returns verifies as an SSHSIG signature in the `git` namespace and as
+nothing else — it is not a general signing oracle. The setting is
+`did-git-sign.signer` (git config) or `DID_GIT_SIGN_SIGNER` (environment, wins):
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | The VTA signs. A VTA that does not serve `keys/sign-sshsig` gets the old behaviour — the key is fetched for one signature — with a warning on every commit. |
+| `vta` | The VTA signs, or signing fails. The key is never exported. Use this once your VTA is upgraded. |
+| `export` | The key is fetched and the signature made locally, as before `keys/sign-sshsig` existed. |
+
+```sh
+git config --global did-git-sign.signer vta
+did-git-sign verify     # makes a test signature the way a commit is signed
+```
+
+With `vta`, the signing credential needs no export right at all. Narrow its ACL
+entry to the SSHSIG capability, so a stolen credential can sign commits until it
+is revoked and can never take the key:
+
+```sh
+pnm acl update <credential DID> --capabilities sign-sshsig
+```
+
+The VTA records every signature in its audit trail as `keys.sign-sshsig`, with
+the namespace and the digest — the digest of a commit names it, so the trail
+answers "who signed this commit" without holding the commit.
+
 ### The signing gate is an accident guard, not a boundary
 
 `did-git-sign` signs only when its parent process is git (`git` or a `git-*`
@@ -359,8 +397,9 @@ it does not compile without debug assertions.
 - **Bounded input** — signing refuses input larger than 16 MiB; git's commit
   and tag objects are far smaller.
 - **No key material on disk** — the VTA credential private key is stored in the
-  OS keyring, and the Ed25519 signing key is fetched from the VTA at sign-time
-  and held only in memory.
+  OS keyring. The Ed25519 signing key stays in the VTA; only under
+  `signer = export` (or `auto` against an old VTA) is it fetched at sign-time,
+  and then held only in memory.
 - **Token caching** — the VTA access token is cached in the OS keyring to avoid
   re-authentication on every commit. Tokens are validated with a 30-second
   safety margin before reuse.
@@ -388,10 +427,10 @@ did-git-sign:
     1. Load config from .did-git-sign.json (did_key_id + user_name only)
     2. Load VTA credentials from OS keyring
     3. Authenticate with VTA (or use cached token from keyring)
-    4. Fetch Ed25519 key: VTA.get_key_secret(key_id)
-    5. Sign commit data (PROTOCOL.sshsig format)
-    6. Write SSH signature to <buffer file>.sig
-    7. Zeroize key material
+    4. VTA keys/sign-sshsig(key_id, "git", sha512, H(commit))
+         -> the VTA signs the SSHSIG signed data; the key stays there
+    5. Check the signature against the key's public half (keys/show)
+    6. Write the SSH signature (PROTOCOL.sshsig) to <buffer file>.sig
     |
     v
 git stores signature in commit

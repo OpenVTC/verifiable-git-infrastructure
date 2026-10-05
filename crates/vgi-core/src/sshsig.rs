@@ -15,14 +15,78 @@ pub const GIT_SSHSIG_NAMESPACE: &str = "git";
 /// Magic preamble for SSH signatures (PROTOCOL.sshsig).
 const SSHSIG_MAGIC: &[u8; 6] = b"SSHSIG";
 
-/// Create an armored SSH signature following the PROTOCOL.sshsig format.
+/// Create an armored SSH signature following the PROTOCOL.sshsig format,
+/// signing locally with `signing_key`: [`sshsig_signed_data`] over the SHA-512
+/// of `message`, wrapped as [`armor_ssh_signature`] describes.
+pub fn create_ssh_signature(
+    signing_key: &SigningKey,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    namespace: &str,
+    message: &[u8],
+) -> Result<String> {
+    use ed25519_dalek::Signer;
+
+    let message_hash = sshsig_message_hash(message);
+    let sig = signing_key.sign(&sshsig_signed_data(namespace, &message_hash));
+    Ok(armor_ssh_signature(verifying_key, namespace, &sig))
+}
+
+/// `H(message)` for an SSHSIG signature: SHA-512, the hash git and
+/// `ssh-keygen -Y sign` use.
+pub fn sshsig_message_hash(message: &[u8]) -> [u8; 64] {
+    Sha512::digest(message).into()
+}
+
+/// The bytes an SSHSIG signature is made over, for a SHA-512 `message_hash`
+/// (PROTOCOL.sshsig §4):
 ///
-/// The signed data structure is:
-///   MAGIC_PREAMBLE (6 bytes: "SSHSIG")
+///   MAGIC_PREAMBLE ("SSHSIG")
 ///   namespace (string)
 ///   reserved (empty string)
 ///   hash_algorithm (string: "sha512")
-///   H(message) (string: SHA-512 hash of the message)
+///   H(message) (string)
+///
+/// A VTA serving `keys/sign-sshsig/0.1` builds the same bytes from the digest
+/// and signs them; [`assemble_ssh_signature`] checks the answer against them.
+pub fn sshsig_signed_data(namespace: &str, message_hash: &[u8; 64]) -> Vec<u8> {
+    let mut signed_data = Vec::new();
+    signed_data.extend_from_slice(SSHSIG_MAGIC);
+    write_ssh_string(&mut signed_data, namespace.as_bytes());
+    write_ssh_string(&mut signed_data, b""); // reserved
+    write_ssh_string(&mut signed_data, b"sha512");
+    write_ssh_string(&mut signed_data, message_hash);
+    signed_data
+}
+
+/// Armor a signature made elsewhere — by a VTA that holds the key — as an
+/// SSHSIG signature over `message`.
+///
+/// The signature is verified against `verifying_key` over the SSHSIG signed
+/// data before it is armored, so a wrong key, a wrong namespace or a signature
+/// over anything else is refused here rather than written into a commit that
+/// would fail verification later.
+pub fn assemble_ssh_signature(
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    namespace: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<String> {
+    use ed25519_dalek::Verifier;
+
+    let sig = ed25519_dalek::Signature::from_slice(signature)
+        .map_err(|e| anyhow::anyhow!("remote signature is not an Ed25519 signature: {e}"))?;
+    let signed_data = sshsig_signed_data(namespace, &sshsig_message_hash(message));
+    verifying_key.verify(&signed_data, &sig).map_err(|_| {
+        anyhow::anyhow!(
+            "remote signature does not verify as an SSHSIG signature by this key in namespace \
+             {namespace:?}"
+        )
+    })?;
+    Ok(armor_ssh_signature(verifying_key, namespace, &sig))
+}
+
+/// Wrap a signature over [`sshsig_signed_data`] in the SSHSIG blob and its
+/// armor.
 ///
 /// The signature blob structure is:
 ///   MAGIC_PREAMBLE
@@ -32,35 +96,14 @@ const SSHSIG_MAGIC: &[u8; 6] = b"SSHSIG";
 ///   reserved (empty string)
 ///   hash_algorithm (string)
 ///   signature (SSH wire format)
-pub fn create_ssh_signature(
-    signing_key: &SigningKey,
+fn armor_ssh_signature(
     verifying_key: &ed25519_dalek::VerifyingKey,
     namespace: &str,
-    message: &[u8],
-) -> Result<String> {
-    use ed25519_dalek::Signer;
-
-    // Hash the message with SHA-512
-    let message_hash = Sha512::digest(message);
-
-    // Build the data to sign (PROTOCOL.sshsig §4)
-    let mut signed_data = Vec::new();
-    signed_data.extend_from_slice(SSHSIG_MAGIC);
-    write_ssh_string(&mut signed_data, namespace.as_bytes());
-    write_ssh_string(&mut signed_data, b""); // reserved
-    write_ssh_string(&mut signed_data, b"sha512");
-    write_ssh_string(&mut signed_data, &message_hash);
-
-    // Sign the structured data
-    let sig = signing_key.sign(&signed_data);
-
-    // Build the public key in SSH wire format
+    sig: &ed25519_dalek::Signature,
+) -> String {
     let pubkey_blob = encode_ssh_ed25519_pubkey(verifying_key);
+    let sig_blob = encode_ssh_ed25519_signature(sig);
 
-    // Build the signature blob in SSH wire format
-    let sig_blob = encode_ssh_ed25519_signature(&sig);
-
-    // Build the full SSHSIG blob
     let mut sshsig_blob = Vec::new();
     sshsig_blob.extend_from_slice(SSHSIG_MAGIC);
     write_u32(&mut sshsig_blob, 1); // version
@@ -83,8 +126,7 @@ pub fn create_ssh_signature(
         armored.push('\n');
     }
     armored.push_str("-----END SSH SIGNATURE-----\n");
-
-    Ok(armored)
+    armored
 }
 
 /// Encode an Ed25519 public key in SSH wire format:
@@ -127,6 +169,45 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signature made over [`sshsig_signed_data`] by whoever holds the key —
+    /// a VTA serving `keys/sign-sshsig` — armors to exactly what signing
+    /// locally produces. Ed25519 is deterministic, so the two are byte-equal.
+    #[test]
+    fn a_remote_signature_assembles_to_the_local_one() {
+        use ed25519_dalek::Signer;
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let message = b"tree 4b825dc6\nauthor A <a@x> 1 +0000\n\nmsg\n";
+
+        // What the VTA signs, from the digest alone.
+        let remote = signing_key.sign(&sshsig_signed_data("git", &sshsig_message_hash(message)));
+        let assembled =
+            assemble_ssh_signature(&verifying_key, "git", message, &remote.to_bytes()).unwrap();
+        let local = create_ssh_signature(&signing_key, &verifying_key, "git", message).unwrap();
+        assert_eq!(assembled, local);
+    }
+
+    /// Anything but an SSHSIG signature by this key, in this namespace, over
+    /// this message is refused before it is armored.
+    #[test]
+    fn a_remote_signature_that_does_not_verify_is_refused() {
+        use ed25519_dalek::Signer;
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let message = b"a commit";
+        let hash = sshsig_message_hash(message);
+
+        let other_namespace = signing_key.sign(&sshsig_signed_data("file", &hash));
+        let raw_digest = signing_key.sign(&hash);
+        let other_key = SigningKey::from_bytes(&[7u8; 32]).sign(&sshsig_signed_data("git", &hash));
+        for sig in [other_namespace, raw_digest, other_key] {
+            assert!(
+                assemble_ssh_signature(&verifying_key, "git", message, &sig.to_bytes()).is_err()
+            );
+        }
+        assert!(assemble_ssh_signature(&verifying_key, "git", message, &[0u8; 12]).is_err());
+    }
 
     #[test]
     fn test_ssh_string_encoding() {
