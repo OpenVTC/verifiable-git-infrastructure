@@ -107,7 +107,7 @@ master_key_file = "/home/ops/vgi-bridge/master-key"
 # setup pins this to the commit of its own release tag; by hand:
 #   gh api repos/OpenVTC/verifiable-git-infrastructure/commits/<version> --jq .sha
 action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>"
-version = "v0.17.0"
+version = "v0.18.0"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
 # sha256 = "<64 hex>"
 # required_check = "Verify commit trust"
