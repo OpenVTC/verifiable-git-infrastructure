@@ -119,6 +119,22 @@ pub async fn sign_with_vta(
                 "did-git-sign: warning: this VTA does not serve keys/sign-sshsig; exporting the \
                  key to sign locally. Set `git config {SIGNER_GIT_CONFIG} vta` to refuse instead."
             ),
+            vta::RemoteSignature::NotPermitted(why) if mode == SignerMode::Vta => anyhow::bail!(
+                "did-git-sign: the VTA will not sign with this credential ({why}), and \
+                 {SIGNER_GIT_CONFIG} is `vta`, so the key will not be exported to sign locally. \
+                 Give the credential the sign-sshsig capability (`pnm acl update <credential DID> \
+                 --capabilities sign-sshsig`; `did-git-sign health` names the credential), or set \
+                 `git config {SIGNER_GIT_CONFIG} auto` to allow the export."
+            ),
+            // A credential provisioned before keys/sign-sshsig existed may hold
+            // only `key-export`. `auto` keeps it signing, as it was, and says
+            // how to stop the key leaving the VTA.
+            vta::RemoteSignature::NotPermitted(why) => eprintln!(
+                "did-git-sign: warning: this credential may not ask the VTA to sign ({why}); \
+                 exporting the key to sign locally. Give it the sign-sshsig capability \
+                 (`pnm acl update <credential DID> --capabilities sign-sshsig,key-export`) so the \
+                 key stays in the VTA."
+            ),
         }
     }
     let seed = vta::get_signing_key(client, key_id).await?;

@@ -223,6 +223,11 @@ pub enum RemoteSignature {
     Signed(Vec<u8>),
     /// The VTA does not serve `keys/sign-sshsig` (it predates the task).
     Unsupported,
+    /// The VTA serves it, but this credential may not use it
+    /// (`permissionDenied`): it holds neither `sign-sshsig` nor `sign`. A
+    /// credential narrowed to `key-export` alone — what openvtc provisioned
+    /// before `keys/sign-sshsig` existed — answers this way. The VTA's message.
+    NotPermitted(String),
 }
 
 /// Ask the VTA to sign an SSHSIG statement in the `git` namespace over
@@ -230,7 +235,9 @@ pub enum RemoteSignature {
 /// travels; the VTA builds the signed data itself and signs that.
 ///
 /// A VTA that does not know the task answers `methodNotFound`, which comes back
-/// as [`RemoteSignature::Unsupported`] so the caller can decide whether falling
+/// as [`RemoteSignature::Unsupported`], and a credential that may not use it
+/// answers `permissionDenied`, which comes back as
+/// [`RemoteSignature::NotPermitted`], so the caller can decide whether falling
 /// back to exporting the key is acceptable. Every other refusal is an error.
 pub async fn sign_sshsig(
     client: &VtaClient,
@@ -264,8 +271,10 @@ pub async fn sign_sshsig(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or_default();
-        if code == "methodNotFound" {
-            return Ok(RemoteSignature::Unsupported);
+        match code {
+            "methodNotFound" => return Ok(RemoteSignature::Unsupported),
+            "permissionDenied" => return Ok(RemoteSignature::NotPermitted(message.to_string())),
+            _ => {}
         }
         bail!("the VTA refused to sign: {code}: {message}");
     }
