@@ -118,10 +118,32 @@ pub fn load_vta_credentials(did_key_id: &str) -> Result<VtaCredentials> {
     let key = format!("{did_key_id}:vta");
     let entry = keyring_core::Entry::new(KEYRING_SERVICE, &key)
         .context("failed to create keyring entry")?;
-    let data = entry
-        .get_password()
-        .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
-    serde_json::from_str(&data).context("failed to parse VTA credentials from keyring")
+    // Name the store in every failure (R6.4): "missing from the Secret
+    // Service" and "missing from the kernel keyring" are different fixes, and
+    // an unreachable store is not a missing credential.
+    let data = match entry.get_password() {
+        Ok(data) => data,
+        Err(keyring_core::Error::NoEntry) => {
+            match crate::store::recover_legacy(KEYRING_SERVICE, &key) {
+                Some(data) => data,
+                None => anyhow::bail!(
+                    "no VTA credentials for {did_key_id} in the {} — run `did-git-sign init` \
+                     first (or, if OpenVTC set this identity up, re-run git signing setup there)",
+                    crate::store::describe_active()
+                ),
+            }
+        }
+        Err(e) => anyhow::bail!(
+            "could not read VTA credentials for {did_key_id} from the {}: {e}",
+            crate::store::describe_active()
+        ),
+    };
+    serde_json::from_str(&data).with_context(|| {
+        format!(
+            "failed to parse VTA credentials from the {}",
+            crate::store::describe_active()
+        )
+    })
 }
 
 /// Store a cached VTA access token in the keyring.

@@ -574,7 +574,10 @@ async fn cmd_init(
             let ssh_public_key = init::add_identity(install_args)?;
             save_profile(name, &did_key_id, &vta_did, &context)?;
             let include = enable::write_include(include_name, &did_key_id)?;
-            println!("VTA credentials stored in OS keyring");
+            println!(
+                "VTA credentials stored in the {}",
+                did_git_sign::store::describe_active()
+            );
             println!("Signing settings: {}", include.display());
             println!("No git configuration was changed.");
             println!();
@@ -598,7 +601,10 @@ async fn cmd_init(
         let include = enable::write_include(include_name, &did_key_id)?;
 
         println!("Config saved to: {}", result.config_path.display());
-        println!("VTA credentials stored in OS keyring");
+        println!(
+        "VTA credentials stored in the {}",
+        did_git_sign::store::describe_active()
+    );
         println!("Signing settings: {}", include.display());
         println!("No git configuration was changed.");
         println!();
@@ -1122,8 +1128,7 @@ async fn cmd_verify() -> Result<()> {
 
     // Check keyring
     print!("Keyring:    ");
-    let creds = config::load_vta_credentials(&cfg.did_key_id)
-        .context("VTA credentials not found in keyring")?;
+    let creds = config::load_vta_credentials(&cfg.did_key_id)?;
     println!("OK (VTA: {})", creds.vta_url);
 
     // Authenticate with VTA
@@ -1287,10 +1292,9 @@ fn cmd_profiles() -> Result<()> {
         if let Some(ctx) = &p.context {
             println!("  Context:  {ctx}");
         }
-        if config::load_vta_credentials(&p.did_key_id).is_err() {
-            println!(
-                "  Credentials: MISSING from the keyring; run `did-git-sign init --profile {name} …` again"
-            );
+        if let Err(e) = config::load_vta_credentials(&p.did_key_id) {
+            println!("  Credentials: {e:#}");
+            println!("  Fix: run `did-git-sign init --profile {name} …` again");
         }
     }
     if let Some(sel) = &here
@@ -1348,10 +1352,10 @@ fn include_for(profile: Option<&str>) -> Result<(String, PathBuf)> {
         );
     }
     if let Some(did) = enable::include_identity(&path)
-        && config::load_vta_credentials(&did).is_err()
+        && let Err(e) = config::load_vta_credentials(&did)
     {
         bail!(
-            "'{name}' ({did}) has no credentials in the keyring; run \
+            "'{name}' ({did}) cannot sign: {e:#}. Run \
              `did-git-sign init --profile {name} …` again"
         );
     }
@@ -1419,8 +1423,7 @@ async fn cmd_health(
 
     // Keyring — read before the identity block so every DID this install
     // holds can be named in one pass.
-    let creds = config::load_vta_credentials(&cfg.did_key_id)
-        .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
+    let creds = config::load_vta_credentials(&cfg.did_key_id)?;
 
     // Health is a diagnostic: it prints every DID in full and puts the name
     // above, never in place of it. Nothing here talks to the VTA yet, so the

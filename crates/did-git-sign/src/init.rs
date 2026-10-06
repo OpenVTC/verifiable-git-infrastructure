@@ -177,12 +177,18 @@ pub fn uninstall(global: bool, did_key_id: &str) -> Result<UninstallResult> {
         let key = format!("{did_key_id}{suffix}");
         if let Ok(entry) = keyring_core::Entry::new(config::KEYRING_SERVICE, &key) {
             match entry.delete_credential() {
-                Ok(()) => summary.removed_keyring_entries.push(key),
+                Ok(()) => summary.removed_keyring_entries.push(key.clone()),
                 Err(keyring_core::Error::NoEntry) => {}
                 Err(e) => summary
                     .warnings
                     .push(format!("could not remove keyring entry '{key}': {e}")),
             }
+        }
+        // A copy an older did-git-sign left in the Linux kernel keyring.
+        if crate::store::remove_legacy(config::KEYRING_SERVICE, &key)
+            && !summary.removed_keyring_entries.contains(&key)
+        {
+            summary.removed_keyring_entries.push(key);
         }
     }
 
