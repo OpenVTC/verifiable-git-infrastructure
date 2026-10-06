@@ -13,4 +13,5 @@ pub mod names;
 pub mod policy;
 pub mod profiles;
 pub mod sign;
+pub mod store;
 pub mod vta;
