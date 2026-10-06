@@ -2202,7 +2202,6 @@ name = "did-git-sign"
 version = "0.18.1"
 dependencies = [
  "anyhow",
- "apple-native-keyring-store",
  "base64 0.23.1",
  "chrono",
  "clap",
@@ -2227,7 +2226,6 @@ dependencies = [
  "url",
  "vgi-core",
  "vta-sdk",
- "windows-native-keyring-store",
  "zeroize",
 ]
 
@@ -6983,16 +6981,19 @@ dependencies = [
  "affinidi-tdk",
  "affinidi-vc",
  "agent-names",
+ "apple-native-keyring-store",
  "async-trait",
  "base64 0.23.1",
  "chrono",
  "ciborium",
  "curve25519-dalek 5.0.0",
+ "dbus-secret-service-keyring-store",
  "dirs",
  "ed25519-dalek 3.0.0",
  "futures-util",
  "getrandom 0.4.3",
  "hpke",
+ "keyring-core",
  "multibase",
  "reqwest",
  "serde",
@@ -7005,6 +7006,7 @@ dependencies = [
  "trust-tasks-tsp",
  "url",
  "uuid",
+ "windows-native-keyring-store",
  "x25519-dalek 3.0.0",
  "zeroize",
 ]

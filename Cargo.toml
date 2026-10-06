@@ -350,9 +350,10 @@ chrono = "0.4"
 hex = "0.4"
 # Message ids for the registry queries verify-trust sends over a mediator.
 uuid = { version = "1", features = ["v4"] }
-apple-native-keyring-store = { version = "1", features = ["keychain"] }
+# did-git-sign takes the platform store from vta-sdk's `keyring` feature (the
+# same selection OpenVTC, pnm and cnm make); the kernel keyring stays only to
+# read credentials an older did-git-sign left there.
 linux-keyutils-keyring-store = "1"
-windows-native-keyring-store = "1"
 # Pinned to 0.8 by pgp 0.20, which takes rand_core 0.6 RNGs in its
 # key-builder/signing APIs (used only by the PGP-exemption test fixtures).
 rand = "0.8"

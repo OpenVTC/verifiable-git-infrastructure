@@ -80,22 +80,6 @@ async fn run_provision(
     admin_reply.context("provisioning ended without an admin credential")
 }
 
-/// Register the platform-specific keyring-core credential store as the
-/// process default. Must run before any `keyring_core::Entry::new` call.
-fn init_default_keyring_store() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let store = apple_native_keyring_store::keychain::Store::new()
-        .map_err(|e| anyhow::anyhow!("init macOS keychain store: {e}"))?;
-    #[cfg(target_os = "linux")]
-    let store = linux_keyutils_keyring_store::Store::new()
-        .map_err(|e| anyhow::anyhow!("init linux keyutils store: {e}"))?;
-    #[cfg(target_os = "windows")]
-    let store = windows_native_keyring_store::Store::new()
-        .map_err(|e| anyhow::anyhow!("init Windows credential manager store: {e}"))?;
-    keyring_core::set_default_store(store);
-    Ok(())
-}
-
 #[derive(Parser)]
 #[command(
     name = "did-git-sign",
@@ -286,12 +270,13 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Register the platform's keyring-core credential store before any
-    // Entry::new call. Same backend choice as openvtc so credential
-    // namespaces line up across both binaries.
-    init_default_keyring_store()?;
-
     let cli = Cli::parse();
+
+    // Register the credential store before any Entry::new call — the same
+    // store OpenVTC registers (store.rs), so the credential it writes through
+    // this crate is the one found here. After parsing, so `--help` and
+    // `--version` work on a host with no reachable store.
+    did_git_sign::store::install()?;
 
     // Handle SSH-keygen-compatible invocation:
     // git calls: did-git-sign -Y sign -f <config> -n <namespace> <file_to_sign>
@@ -589,7 +574,10 @@ async fn cmd_init(
             let ssh_public_key = init::add_identity(install_args)?;
             save_profile(name, &did_key_id, &vta_did, &context)?;
             let include = enable::write_include(include_name, &did_key_id)?;
-            println!("VTA credentials stored in OS keyring");
+            println!(
+                "VTA credentials stored in the {}",
+                did_git_sign::store::describe_active()
+            );
             println!("Signing settings: {}", include.display());
             println!("No git configuration was changed.");
             println!();
@@ -613,7 +601,10 @@ async fn cmd_init(
         let include = enable::write_include(include_name, &did_key_id)?;
 
         println!("Config saved to: {}", result.config_path.display());
-        println!("VTA credentials stored in OS keyring");
+        println!(
+        "VTA credentials stored in the {}",
+        did_git_sign::store::describe_active()
+    );
         println!("Signing settings: {}", include.display());
         println!("No git configuration was changed.");
         println!();
@@ -1137,8 +1128,7 @@ async fn cmd_verify() -> Result<()> {
 
     // Check keyring
     print!("Keyring:    ");
-    let creds = config::load_vta_credentials(&cfg.did_key_id)
-        .context("VTA credentials not found in keyring")?;
+    let creds = config::load_vta_credentials(&cfg.did_key_id)?;
     println!("OK (VTA: {})", creds.vta_url);
 
     // Authenticate with VTA
@@ -1302,10 +1292,9 @@ fn cmd_profiles() -> Result<()> {
         if let Some(ctx) = &p.context {
             println!("  Context:  {ctx}");
         }
-        if config::load_vta_credentials(&p.did_key_id).is_err() {
-            println!(
-                "  Credentials: MISSING from the keyring; run `did-git-sign init --profile {name} …` again"
-            );
+        if let Err(e) = config::load_vta_credentials(&p.did_key_id) {
+            println!("  Credentials: {e:#}");
+            println!("  Fix: run `did-git-sign init --profile {name} …` again");
         }
     }
     if let Some(sel) = &here
@@ -1363,10 +1352,10 @@ fn include_for(profile: Option<&str>) -> Result<(String, PathBuf)> {
         );
     }
     if let Some(did) = enable::include_identity(&path)
-        && config::load_vta_credentials(&did).is_err()
+        && let Err(e) = config::load_vta_credentials(&did)
     {
         bail!(
-            "'{name}' ({did}) has no credentials in the keyring; run \
+            "'{name}' ({did}) cannot sign: {e:#}. Run \
              `did-git-sign init --profile {name} …` again"
         );
     }
@@ -1434,8 +1423,7 @@ async fn cmd_health(
 
     // Keyring — read before the identity block so every DID this install
     // holds can be named in one pass.
-    let creds = config::load_vta_credentials(&cfg.did_key_id)
-        .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
+    let creds = config::load_vta_credentials(&cfg.did_key_id)?;
 
     // Health is a diagnostic: it prints every DID in full and puts the name
     // above, never in place of it. Nothing here talks to the VTA yet, so the

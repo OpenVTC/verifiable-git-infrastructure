@@ -42,6 +42,10 @@ vta-sdk = { workspace = true, features = [
     "provision-client",
     # DID → human name for the setup pickers and `health`.
     "agent-names",
+    # The platform credential store, chosen exactly as OpenVTC chooses it
+    # (`keyring_init::install_default_store`), so the credential OpenVTC
+    # writes through this crate is the one this binary reads.
+    "keyring",
 ] }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -64,16 +68,11 @@ sysinfo = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 
-# Per-platform keyring-core stores. did-git-sign uses the same backend as
-# openvtc on each platform so credentials line up.
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { workspace = true }
-
+# The kernel keyring: did-git-sign <= 0.18.1 kept its credentials here on Linux.
+# Read on a miss in the platform store and copied across (store.rs), and
+# selectable with OPENVTC_SECURE_STORE=keyutils to match OpenVTC.
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
