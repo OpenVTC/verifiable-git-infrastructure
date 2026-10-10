@@ -402,7 +402,7 @@ wiremock = "0.6"
 # registry on the same mediator really answers, and an `ExplicitAllow`
 # mediator really refuses. Dev-only. 0.11 is the line on the messaging SDK
 # 0.30 / TDK 0.20 that verify-trust's transports and the bridge use.
-affinidi-messaging-test-mediator = { version = "0.16", features = ["tsp"] }
+affinidi-messaging-test-mediator = { version = "0.17", features = ["tsp"] }
 
 # ── the bridge (vgi-bridge) ─────────────────────────────────────────────────
 # The per-community service that holds the forge credentials and runs the
