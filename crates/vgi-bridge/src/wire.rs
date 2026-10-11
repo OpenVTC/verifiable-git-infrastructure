@@ -1,7 +1,7 @@
 //! Trust Task documents on the VTC ↔ bridge link.
 //!
 //! The payload types are the ones generated from the normative
-//! `git-ns/bridge/*` specifications (`trust_tasks_git_ns::specs::git_ns`); this
+//! `git-ns/bridge/*` specifications (`trust_tasks_rs::specs::git_ns`); this
 //! module adds only behaviour: checking an inbound document before anything
 //! reads its payload, the rules JSON Schema cannot state (which members each
 //! job `kind` carries), and building signed outbound documents.
@@ -38,20 +38,14 @@ use trust_tasks_rs::{
 
 use crate::identity::BridgeIdentity;
 
-// The git-ns payload types come from `trust_tasks_git_ns`, the
-// trust-tasks-rs line that generates event 0.4 and job 0.5, while
-// everything else here (`TrustTask`, errors, freshness, proofs) stays on the
-// line vta-sdk and trql-client share (see the workspace manifest). The two
-// meet only as JSON. When vta-sdk and trql-client are on the 0.27 line too,
-// `trust_tasks_git_ns` becomes `trust_tasks_rs` again.
-use trust_tasks_git_ns::Payload as GitNsPayload;
+use trust_tasks_rs::Payload as GitNsPayload;
 
 /// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
-pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_1 as event_v0_1;
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
 /// `git-ns/bridge/event` 0.2, still sent to a VTC configured for it.
-pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_2 as event_v0_2;
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event_v0_2;
 /// `git-ns/bridge/event` 0.3, still sent to a VTC configured for it.
-pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_3 as event_v0_3;
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_3 as event_v0_3;
 /// `git-ns/bridge/event` 0.4, the type every event is built as. Each version
 /// is wire-identical for every event the older ones carry (0.2 changes only
 /// what the VTC does with a transfer, a reused name, and a resource outside
@@ -60,10 +54,10 @@ pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_3 as event_v0_3;
 /// is the same payload under the older type URI: see [`event_type_uri`].
 /// `roleMapReported` is never sent under 0.1 or 0.2, and
 /// `pullRequestOpened` never under anything before 0.4.
-pub use trust_tasks_git_ns::specs::git_ns::bridge::event::v0_4 as event;
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_4 as event;
 /// `git-ns/bridge/job` 0.4, still taken (job 0.5: a bridge that takes 0.5
 /// SHOULD go on accepting 0.4).
-pub use trust_tasks_git_ns::specs::git_ns::bridge::job::v0_4 as job_v0_4;
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_4 as job_v0_4;
 /// The payload types of `git-ns/bridge/job` 0.5, which every job is read
 /// as: a 0.4 job is a valid 0.5 job with the same meaning (0.5 only adds
 /// `closePullRequest`, which a 0.4 job cannot carry — [`job_kind_allowed`]).
@@ -71,8 +65,8 @@ pub use trust_tasks_git_ns::specs::git_ns::bridge::job::v0_4 as job_v0_4;
 /// [`check_kind_members`]: a namespace admin with no right of their own on
 /// a repository is listed at `git.ns.admin` and gets no role; there is no
 /// namespace-level `projectRoles`; each account appears once.
-pub use trust_tasks_git_ns::specs::git_ns::bridge::job::v0_5 as job;
-pub use trust_tasks_git_ns::specs::git_ns::bridge::result::v0_1 as result;
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_5 as job;
+pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
 
 /// `git-ns/bridge/job/0.5`'s type URI.
 pub const JOB_TYPE: &str = <job::Payload as GitNsPayload>::TYPE_URI;
@@ -131,9 +125,9 @@ pub fn discovery_answer(patterns: &[String]) -> Value {
 /// An error response carrying a code a git-ns specification declares (the
 /// generated `error_codes`), with the retryability it declares. Built from
 /// the code's wire form because the declaration comes from
-/// `trust_tasks_git_ns` and the error payload from `trust_tasks_rs`; when the
+/// `trust_tasks_rs` and the error payload from `trust_tasks_rs`; when the
 /// two are one crate again this is `ErrorPayload::from(code)`.
-pub fn declared_error(code: trust_tasks_git_ns::DeclaredErrorCode) -> ErrorPayload {
+pub fn declared_error(code: trust_tasks_rs::DeclaredErrorCode) -> ErrorPayload {
     let parsed: trust_tasks_rs::TrustTaskCode = code
         .code
         .parse()
