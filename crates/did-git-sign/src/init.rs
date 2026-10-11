@@ -925,6 +925,33 @@ mod tests {
         hook
     }
 
+    /// Spawn a hook this test just wrote, retrying while Linux reports it busy.
+    ///
+    /// `#[serial]` only keeps the hook tests apart from each other. Every other
+    /// test in this binary still runs in parallel and forks (`Command::spawn`),
+    /// and a child forked while the hook was open for writing holds that
+    /// descriptor until it execs — so the hook's own exec can still see
+    /// `ETXTBSY`. The window is brief; a short retry closes it, as cargo does.
+    #[cfg(unix)]
+    fn spawn_hook(cmd: &mut Command) -> std::process::Child {
+        let mut attempts = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
+
+    /// Run a hook this test just wrote to completion; see [`spawn_hook`].
+    #[cfg(unix)]
+    fn run_hook(cmd: &mut Command) -> std::process::ExitStatus {
+        spawn_hook(cmd).wait().unwrap()
+    }
+
     /// Ask git — not our own parser — which trailers it can see in HEAD.
     #[cfg(unix)]
     fn git_trailer(dir: &Path, key: &str) -> String {
@@ -996,7 +1023,8 @@ mod tests {
     // (any `Command::spawn`) while another still holds its hook open for
     // writing, the child inherits that descriptor for the moment before it
     // execs, and Linux refuses to exec a file any process holds open for
-    // writing. Serialising the hook tests removes the overlap.
+    // writing. Serialising the hook tests removes most of the overlap; the
+    // rest — forks from the non-serial tests — is retried by `spawn_hook`.
     //
     // Production is unaffected: there, git execs the hook long after install.
     #[test]
@@ -1010,11 +1038,7 @@ mod tests {
         let msg = dir.path().join("MSG");
         std::fs::write(&msg, "a message\n\n\n\n").unwrap();
 
-        let mut child = Command::new(&hook)
-            .arg(&msg)
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_hook(Command::new(&hook).arg(&msg).current_dir(dir.path()));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let status = loop {
@@ -1273,14 +1297,7 @@ mod tests {
         let msg = dir.path().join("MSG");
         std::fs::write(&msg, "subject\n").unwrap();
         for _ in 0..2 {
-            assert!(
-                Command::new(&hook)
-                    .arg(&msg)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(run_hook(Command::new(&hook).arg(&msg).current_dir(dir.path())).success());
         }
 
         let body = std::fs::read_to_string(&msg).unwrap();
@@ -1305,11 +1322,7 @@ mod tests {
         let msg = dir.path().join("MSG");
 
         std::fs::write(&msg, "subject\n").unwrap();
-        Command::new(&hook)
-            .arg(&msg)
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
+        run_hook(Command::new(&hook).arg(&msg).current_dir(dir.path()));
         assert!(
             !std::fs::read_to_string(&msg)
                 .unwrap()
@@ -1331,11 +1344,7 @@ mod tests {
                 .success()
         );
         std::fs::write(&msg, "subject\n").unwrap();
-        Command::new(&hook)
-            .arg(&msg)
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
+        run_hook(Command::new(&hook).arg(&msg).current_dir(dir.path()));
         assert!(
             std::fs::read_to_string(&msg)
                 .unwrap()
