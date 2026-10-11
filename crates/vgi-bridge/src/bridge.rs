@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Value, json};
-use trust_tasks_git_ns::Payload as _;
+use trust_tasks_rs::Payload as _;
 use trust_tasks_rs::{ErrorPayload, StandardCode, TrustTask};
 use vgi_forge::Resource;
 
