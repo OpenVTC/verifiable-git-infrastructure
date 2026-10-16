@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6200,7 +6200,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6586,9 +6586,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.31.8"
+version = "0.31.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35236525fee58518308ee488be199e01e301287863538d9fb8ce5ad38073a145"
+checksum = "3761848144105f80ee6c8d0a27fe1fed68742b2a17e160b6fcf03f7e0b5d696b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6810,7 +6810,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -6853,7 +6853,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -6904,7 +6904,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6924,7 +6924,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6938,7 +6938,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "http",
@@ -6950,7 +6950,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6970,7 +6970,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6996,9 +6996,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.69.0"
+version = "0.70.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a650d882a79338f827d72ae27f96d857561f6050b0cca883c4703f6364569115"
+checksum = "497fa75894604be6783df56198d4927b1a0380506c6bfccad14ccf394fe14bfd"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
