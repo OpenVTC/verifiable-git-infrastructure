@@ -990,7 +990,17 @@ async fn swagger_covers_the_adapter(fj: &Forgejo) {
                 .find(|r| !r.is_null())
                 .unwrap();
             let schema = match r["$ref"].as_str() {
-                Some(re) => def_of(&responses[re.rsplit('/').next().unwrap()]["schema"]),
+                Some(re) => {
+                    let name = re.rsplit('/').next().unwrap();
+                    // Forgejo 17's swagger lost the body schema of some named
+                    // responses (`AccessToken`, `OAuth2Application`), listing
+                    // the fields as headers; the same-named definition is
+                    // what the endpoint still returns.
+                    match def_of(&responses[name]["schema"]) {
+                        d if d.is_empty() && !defs[name].is_null() => name.to_string(),
+                        d => d,
+                    }
+                }
                 None => def_of(&r["schema"]),
             };
             for f in *resp {
