@@ -354,7 +354,7 @@ multibase = "0.9"
 # Test-only: build real did:webvh logs (verify-trust's deactivated-signer test).
 didwebvh-rs = "0.8"
 affinidi-secrets-resolver = "0.5"
-pgp = "0.20"
+pgp = "0.21"
 clap = { version = "4.6", features = ["derive"] }
 tokio = "1.53"
 serde = "1.0"
