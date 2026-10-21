@@ -1192,8 +1192,14 @@ async fn query_registry(
     for did in signer_dids {
         let mut decision: Result<Option<String>, String> = Ok(None);
         for resource in &resources {
-            // The VTC's DID is TRQP's `authority_id`.
-            let query = TrqpQuery::new(did, &args.vtc_did, &args.action, resource);
+            // The VTC's DID is TRQP's `authority_id`. A registry records
+            // identities: a did:scid without its `?src=` locator (VTI-KEY-160).
+            let query = TrqpQuery::new(
+                vgi_core::signer_identity(did),
+                vgi_core::signer_identity(&args.vtc_did),
+                &args.action,
+                resource,
+            );
             match client.authorization(query).await {
                 Ok(response) if response.authorized => {
                     decision = Ok(Some(resource.clone()));
