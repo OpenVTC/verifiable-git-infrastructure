@@ -848,9 +848,9 @@ mod tests {
     /// proof's verificationMethod both carry its `?src=` (VTI-KEY-163), and a
     /// verifier holding its native document (keys under the bare DID) accepts
     /// it.
+    // Needs trust-tasks-proof with dtgwg-trust-tasks-tf 6c893c09e, whose
+    // CachedDidResolver ignores a did:scid `src`.
     #[tokio::test]
-    #[ignore = "needs a trust-tasks-proof whose CachedDidResolver ignores a did:scid `src` \
-                (dtgwg-trust-tasks-tf 6c893c09e); 0.32.10 compares the reference exactly"]
     async fn a_did_scid_bridge_signs_what_a_verifier_accepts() {
         use affinidi_tdk::did_resolver::{DIDCacheClient, config::DIDCacheConfigBuilder};
         use trust_tasks_proof::affinidi::CachedDidResolver;
