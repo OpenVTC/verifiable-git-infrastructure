@@ -310,8 +310,11 @@ impl BridgeIdentity {
     /// message encrypted to any of them — during a rotation's overlap —
     /// still opens).
     pub fn from_secrets(did: &str, signing: Secret, secrets: Vec<Secret>) -> Result<Self> {
+        // A did:scid `?src=` is a locator: the identity's keys are under the
+        // bare DID (VTI-KEY-160).
+        let identity = vta_sdk::did_scid::identity(did);
         for s in &secrets {
-            if !s.id.starts_with(&format!("{did}#")) {
+            if !s.id.starts_with(&format!("{identity}#")) {
                 bail!("key `{}` does not belong to `{did}`", s.id);
             }
         }
@@ -370,7 +373,7 @@ impl BridgeIdentity {
     pub async fn sign(&self, doc: &Value) -> Result<Value> {
         sign_trust_task(
             doc,
-            &self.signing,
+            &self.presented_signing(),
             SignOptions::new().with_proof_purpose("authentication"),
         )
         .await
@@ -547,7 +550,8 @@ impl BridgeIdentity {
         if key.verifying_key().as_bytes().as_slice() != self.signing.get_public_bytes() {
             bail!("the signing key's public half does not match the identity");
         }
-        if !self.signing.id.starts_with(&format!("{}#", self.did)) {
+        let identity = vta_sdk::did_scid::identity(&self.did);
+        if !self.signing.id.starts_with(&format!("{identity}#")) {
             bail!(
                 "the signing key `{}` is not a verification method of `{}`",
                 self.signing.id,
@@ -555,9 +559,28 @@ impl BridgeIdentity {
             );
         }
         Ok(GitSigningKey {
-            verification_method: self.signing.id.clone(),
+            verification_method: self.presented_key_id(&self.signing.id),
             key,
         })
+    }
+
+    /// A key id as the bridge gives it out: under the DID it is addressed as.
+    /// A did:scid identity's document lists its keys under the bare DID, but a
+    /// verifier meeting it for the first time needs the `?src=` to resolve
+    /// it, and a Trust Task binds its proof's verificationMethod to its
+    /// `issuer` exactly, so the two are written in the same form (VTI-KEY-163).
+    fn presented_key_id(&self, key_id: &str) -> String {
+        match vta_sdk::did_scid::src(&self.did) {
+            Some(src) => affinidi_tdk::did_common::scid::with_scid_src(key_id, src),
+            None => key_id.to_string(),
+        }
+    }
+
+    /// The signing key, named as [`Self::presented_key_id`] names it.
+    fn presented_signing(&self) -> Secret {
+        let mut signing = self.signing.clone();
+        signing.id = self.presented_key_id(&signing.id);
+        signing
     }
 
     /// Sign with a chosen `proofPurpose` — for tests of the purpose check
@@ -566,7 +589,7 @@ impl BridgeIdentity {
     pub async fn sign_with_purpose(&self, doc: &Value, purpose: &str) -> Result<Value> {
         sign_trust_task(
             doc,
-            &self.signing,
+            &self.presented_signing(),
             SignOptions::new().with_proof_purpose(purpose),
         )
         .await
@@ -820,5 +843,74 @@ mod tests {
         let (id, _) = BridgeIdentity::generate_did_key().unwrap();
         let doc = serde_json::json!({ "id": "x", "issuer": "did:key:z6MkOther", "payload": {} });
         assert!(id.sign(&doc).await.is_err());
+    }
+    /// A did:scid bridge signs a Trust Task as itself: `issuer` and the
+    /// proof's verificationMethod both carry its `?src=` (VTI-KEY-163), and a
+    /// verifier holding its native document (keys under the bare DID) accepts
+    /// it.
+    #[tokio::test]
+    #[ignore = "needs a trust-tasks-proof whose CachedDidResolver ignores a did:scid `src` \
+                (dtgwg-trust-tasks-tf 6c893c09e); 0.32.10 compares the reference exactly"]
+    async fn a_did_scid_bridge_signs_what_a_verifier_accepts() {
+        use affinidi_tdk::did_resolver::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        use trust_tasks_proof::affinidi::CachedDidResolver;
+
+        const SCID: &str = "did:scid:vh:1:QmScid";
+        const URL: &str = "did:scid:vh:1:QmScid?src=bridge.acme.example";
+        let mut sign = Secret::generate_ed25519(None, None);
+        sign.id = format!("{SCID}#key-1");
+        let mut agree = Secret::generate_x25519(None, None).unwrap();
+        agree.id = format!("{SCID}#key-2");
+        let id =
+            BridgeIdentity::from_secrets(URL, sign.clone(), vec![sign.clone(), agree]).unwrap();
+
+        let doc: affinidi_tdk::did_common::Document = serde_json::from_value(serde_json::json!({
+            "id": SCID,
+            "verificationMethod": [{
+                "id": format!("{SCID}#key-1"),
+                "type": "Multikey",
+                "controller": SCID,
+                "publicKeyMultibase": sign.get_public_keymultibase().unwrap(),
+            }],
+            "authentication": [format!("{SCID}#key-1")],
+        }))
+        .unwrap();
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        client.add_did_document(URL, doc).await;
+        let verifier = Verifier::with_resolver(std::sync::Arc::new(CachedDidResolver::new(
+            std::sync::Arc::new(client),
+        )));
+
+        let signed = id
+            .sign(&serde_json::json!({
+                "id": "urn:uuid:1",
+                "type": "https://trusttasks.org/spec/git-ns/bridge/result/0.1",
+                "issuer": id.did(),
+                "issuedAt": "2026-01-01T00:00:00Z",
+                "payload": { "jobId": "j", "outcome": "succeeded" },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            signed["proof"]["verificationMethod"],
+            format!("{URL}#key-1")
+        );
+        verifier.verify_raw(&signed).await.unwrap();
+    }
+
+    #[test]
+    fn a_did_scid_bridge_refuses_another_identity_s_keys() {
+        let mut sign = Secret::generate_ed25519(None, None);
+        sign.id = "did:scid:vh:1:QmOther#key-1".into();
+        assert!(
+            BridgeIdentity::from_secrets(
+                "did:scid:vh:1:QmScid?src=b.example",
+                sign.clone(),
+                vec![sign]
+            )
+            .is_err()
+        );
     }
 }
