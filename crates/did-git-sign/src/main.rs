@@ -59,6 +59,7 @@ async fn run_provision(
                 }
                 DiagStatus::Failed(detail) => println!("  ✗ {} — {detail}", check.label()),
                 DiagStatus::Pending | DiagStatus::Running => {}
+                _ => {}
             },
             VtaEvent::Resolved(_)
             | VtaEvent::AttemptCompleted { .. }
@@ -71,6 +72,7 @@ async fn run_provision(
             VtaEvent::Failed(reason) => {
                 failure = Some(reason);
             }
+            _ => {}
         }
     }
 
@@ -184,6 +186,20 @@ enum Commands {
         /// the current one.
         #[arg(long = "default", requires = "profile")]
         make_default: bool,
+
+        /// Sign as the DID's `did:webvh` or its `did:scid` identity
+        /// (`webvh` or `scid`). For a DID created here it is also how the VTA
+        /// presents it. Absent: a DID the VTA presents as did:scid (its
+        /// context's primary DID is the did:scid) signs as one, any other as
+        /// did:webvh, and a new DID takes the VTA's configured form.
+        #[arg(long, value_parser = parse_did_method)]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+
+        /// For a DID created here: whether its log lists its did:scid alias
+        /// in `alsoKnownAs`. Absent: the VTA's configuration (listed by
+        /// default). Required for signing as did:scid.
+        #[arg(long)]
+        scid_also_known_as: Option<bool>,
     },
 
     /// List the named profiles, marking the default and the one this
@@ -325,7 +341,16 @@ async fn main() -> Result<()> {
             resolve_agent_names,
             profile,
             make_default,
+            did_method,
+            scid_also_known_as,
         }) => {
+            let mut presentation = vta_sdk::client::DidPresentation::default();
+            if let Some(method) = did_method {
+                presentation = presentation.did_method(method);
+            }
+            if let Some(listed) = scid_also_known_as {
+                presentation = presentation.scid_also_known_as(listed);
+            }
             cmd_init(
                 global,
                 vta_did,
@@ -338,6 +363,7 @@ async fn main() -> Result<()> {
                 resolve_agent_names,
                 profile,
                 make_default,
+                presentation,
             )
             .await
         }
@@ -424,6 +450,7 @@ async fn cmd_init(
     resolve_agent_names: bool,
     profile: Option<String>,
     make_default: bool,
+    presentation: vta_sdk::client::DidPresentation,
 ) -> Result<()> {
     // A bad profile name is refused before anything is provisioned.
     if let Some(name) = &profile {
@@ -538,7 +565,8 @@ async fn cmd_init(
                 (kid, dkid)
             } else {
                 // Interactive: select context, DID, and signing key
-                interactive_select(&client, &mut book, resolve_agent_names, yes).await?
+                interactive_select(&client, &mut book, resolve_agent_names, yes, presentation)
+                    .await?
             };
         names::resolve_agent_names_into(&mut book, [did_key_id.as_str()], resolve_agent_names)
             .await;
@@ -754,6 +782,7 @@ async fn interactive_select(
     book: &mut vta_sdk::display_name::NameBook,
     resolve_agent_names: bool,
     yes: bool,
+    presentation: vta_sdk::client::DidPresentation,
 ) -> Result<(String, String)> {
     // 1. List and select context
     let contexts = client
@@ -813,7 +842,7 @@ async fn interactive_select(
                 .default(default)
                 .interact()?)
         })?;
-        create_context_did(client, &context.id).await?;
+        create_context_did(client, &context.id, presentation).await?;
         let listed = client
             .list_dids_webvh(Some(&context.id), None)
             .await
@@ -866,7 +895,26 @@ async fn interactive_select(
     //    sub-context) that its document lists under assertionMethod.
     let doc = current_did_document(client, &selected.did).await?;
     let keys = list_active_keys(client, &selected.context_id).await?;
-    let candidates = signing_keys_of_did(&keys, &doc);
+    // Re-list the contexts: a DID created above may have set its context's
+    // primary DID, which is what says how the VTA presents it.
+    let primary = client
+        .list_contexts()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list contexts: {e}"))?
+        .contexts
+        .into_iter()
+        .find(|c| c.id == selected.context_id)
+        .and_then(|c| c.did);
+    let signer = signing_identity(
+        &selected.did,
+        &doc,
+        primary.as_deref(),
+        presentation.did_method,
+    )?;
+    let candidates: Vec<_> = signing_keys_of_did(&keys, &doc)
+        .into_iter()
+        .map(|(k, vm)| (k, signer.key_id(&vm)))
+        .collect();
 
     if candidates.is_empty() {
         bail!(
@@ -1029,6 +1077,91 @@ fn signing_keys_of_did<'a>(
         .collect()
 }
 
+/// The identity a commit is signed as: the DID's did:webvh, or its
+/// `did:scid:vh:1` identity given with its `?src=` locator, which a stranger
+/// verifying the commit needs to find the log (VTI-KEY-163).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SigningIdentity {
+    Webvh,
+    /// The did:webvh DID of the log and the did:scid DID URL that replaces it
+    /// in key ids.
+    Scid {
+        webvh: String,
+        scid_url: String,
+    },
+}
+
+impl SigningIdentity {
+    /// The key id a verification method `vm` (under the did:webvh DID) is
+    /// signed as.
+    fn key_id(&self, vm: &str) -> String {
+        match self {
+            SigningIdentity::Webvh => vm.to_string(),
+            SigningIdentity::Scid { webvh, scid_url } => match vm
+                .strip_prefix(webvh.as_str())
+                .and_then(|rest| rest.strip_prefix('#'))
+            {
+                Some(fragment) => format!("{scid_url}#{fragment}"),
+                None => vm.to_string(),
+            },
+        }
+    }
+}
+
+/// Decide whether `webvh_did` (whose current document is `doc`) signs as its
+/// did:scid identity: as asked (`method`), or else when its context's primary
+/// DID (`primary`) is that did:scid. A log presented as did:scid must list the
+/// alias (VTI-KEY-166); asking for did:scid on one that does not is refused.
+fn signing_identity(
+    webvh_did: &str,
+    doc: &serde_json::Value,
+    primary: Option<&str>,
+    method: Option<vta_sdk::did_scid::DidMethod>,
+) -> Result<SigningIdentity> {
+    use vta_sdk::did_scid::{DidMethod, scid_forms, webvh_did as log_of};
+    let Some((bare, scid_url)) = scid_forms(webvh_did) else {
+        if method == Some(DidMethod::Scid) {
+            bail!("{webvh_did} is not a did:webvh, so it has no did:scid identity to sign as");
+        }
+        return Ok(SigningIdentity::Webvh);
+    };
+    let presented_as_scid = primary.is_some_and(|p| {
+        vta_sdk::did_scid::identity(p) == bare && log_of(p).is_none_or(|log| log == webvh_did)
+    });
+    let wants_scid = match method {
+        Some(DidMethod::Scid) => true,
+        Some(_) => false,
+        None => presented_as_scid,
+    };
+    if !wants_scid {
+        return Ok(SigningIdentity::Webvh);
+    }
+    let lists_alias = doc
+        .get("alsoKnownAs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|aliases| {
+            aliases
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|a| vta_sdk::did_scid::identity(a) == bare)
+        });
+    if !lists_alias {
+        bail!(
+            "{webvh_did} does not list its did:scid identity {bare} in alsoKnownAs, so it \
+             cannot sign as it; publish the alias first, or sign as the did:webvh \
+             (--did-method webvh)"
+        );
+    }
+    Ok(SigningIdentity::Scid {
+        webvh: webvh_did.to_string(),
+        scid_url,
+    })
+}
+
+fn parse_did_method(s: &str) -> std::result::Result<vta_sdk::did_scid::DidMethod, String> {
+    s.parse()
+}
+
 /// Create a `did:webvh` for `context`, on a DID-hosting server the VTA has
 /// registered, and return it. The caller has already had the operator confirm
 /// it ([`confirm_create_did`]).
@@ -1038,7 +1171,11 @@ fn signing_keys_of_did<'a>(
 /// the path and domain. With one server it is used; with several the operator
 /// picks; with none there is nowhere to publish the DID, and the error says
 /// how to make one.
-async fn create_context_did(client: &vta_sdk::client::VtaClient, context: &str) -> Result<String> {
+async fn create_context_did(
+    client: &vta_sdk::client::VtaClient,
+    context: &str,
+    presentation: vta_sdk::client::DidPresentation,
+) -> Result<String> {
     let servers = client
         .list_webvh_servers()
         .await
@@ -1068,7 +1205,7 @@ async fn create_context_did(client: &vta_sdk::client::VtaClient, context: &str) 
     };
 
     println!(
-        "Creating a did:webvh in context '{context}' on {}…",
+        "Creating a DID in context '{context}' on {}…",
         label(server)
     );
     let req = vta_sdk::client::CreateDidWebvhRequest {
@@ -1094,7 +1231,7 @@ async fn create_context_did(client: &vta_sdk::client::VtaClient, context: &str) 
         template_vars: std::collections::HashMap::new(),
     };
     let created = client
-        .create_did_webvh(req)
+        .create_did_webvh_presented(req, presentation)
         .await
         .map_err(|e| anyhow::anyhow!("failed to create a DID in context '{context}': {e}"))?;
     println!(
@@ -1102,7 +1239,8 @@ async fn create_context_did(client: &vta_sdk::client::VtaClient, context: &str) 
         created.did, created.signing_key_id
     );
     println!();
-    Ok(created.did)
+    // The did:webvh handle the rest of the webvh/dids family is listed under.
+    Ok(created.log_did().to_string())
 }
 
 /// Find and load the signing config (repo-local first, then global).
@@ -2079,5 +2217,65 @@ mod tests {
         assert!(lines.contains(&"buffer.diff.sig"), "missing sig_file");
         assert!(lines.contains(&"-O"), "missing -O flag");
         assert!(lines.contains(&"hashalg=sha512"), "missing sig_option");
+    }
+    // ─── did:scid signing identity ─────────────────────────────────────
+
+    const LOG: &str = "did:webvh:QmScid:dids.example.org:bob";
+    const SCID: &str = "did:scid:vh:1:QmScid";
+    const SCID_URL: &str = "did:scid:vh:1:QmScid?src=dids.example.org/bob";
+
+    fn doc_with_aliases(aliases: &[&str]) -> serde_json::Value {
+        serde_json::json!({ "id": LOG, "alsoKnownAs": aliases })
+    }
+
+    #[test]
+    fn a_did_presented_as_did_scid_signs_with_its_src_form() {
+        let doc = doc_with_aliases(&[SCID_URL]);
+        let signer = signing_identity(LOG, &doc, Some(SCID_URL), None).unwrap();
+        assert_eq!(
+            signer.key_id(&format!("{LOG}#key-0")),
+            format!("{SCID_URL}#key-0")
+        );
+        // The bare did:scid as the context's primary DID says the same.
+        assert_eq!(
+            signing_identity(LOG, &doc, Some(SCID), None).unwrap(),
+            signer
+        );
+    }
+
+    #[test]
+    fn a_did_presented_as_did_webvh_signs_as_it() {
+        let doc = doc_with_aliases(&[SCID_URL]);
+        for primary in [Some(LOG), None, Some("did:scid:vh:1:QmOther?src=x.example")] {
+            let signer = signing_identity(LOG, &doc, primary, None).unwrap();
+            assert_eq!(signer, SigningIdentity::Webvh, "{primary:?}");
+            assert_eq!(
+                signer.key_id(&format!("{LOG}#key-0")),
+                format!("{LOG}#key-0")
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_chooses_the_identity() {
+        use vta_sdk::did_scid::DidMethod;
+        let doc = doc_with_aliases(&[SCID_URL]);
+        assert!(matches!(
+            signing_identity(LOG, &doc, None, Some(DidMethod::Scid)).unwrap(),
+            SigningIdentity::Scid { .. }
+        ));
+        assert_eq!(
+            signing_identity(LOG, &doc, Some(SCID_URL), Some(DidMethod::Webvh)).unwrap(),
+            SigningIdentity::Webvh
+        );
+    }
+
+    #[test]
+    fn signing_as_did_scid_needs_the_alias() {
+        use vta_sdk::did_scid::DidMethod;
+        let doc = doc_with_aliases(&["did:web:dids.example.org:bob"]);
+        let err = signing_identity(LOG, &doc, None, Some(DidMethod::Scid)).unwrap_err();
+        assert!(err.to_string().contains("alsoKnownAs"), "{err}");
+        assert!(signing_identity(LOG, &doc, Some(SCID_URL), None).is_err());
     }
 }
