@@ -560,12 +560,10 @@ async fn fingerprint(
         .list_keys(0, 1000, Some("active"), Some(&session.context))
         .await
         .map_err(|e| explain(e, &session.context, "listing the context's keys"))?;
-    let prefix = format!("{did}#");
     let mut keys: Vec<(String, String)> = listed
         .keys
         .into_iter()
-        .filter(|k| k.key_id.starts_with(&prefix))
-        .map(|k| (k.key_id, k.public_key))
+        .filter_map(|k| Some((key_id_of(did, &k.key_id)?, k.public_key)))
         .collect();
     keys.sort();
     Ok((keys, listed_keys(did, &docs.current(did).await?)?))
@@ -578,13 +576,24 @@ async fn key_ages(session: &Session, did: &str) -> Result<BTreeMap<String, i64>>
         .list_keys(0, 1000, Some("active"), Some(&session.context))
         .await
         .map_err(|e| explain(e, &session.context, "listing the context's keys"))?;
-    let prefix = format!("{did}#");
     Ok(listed
         .keys
         .into_iter()
-        .filter(|k| k.key_id.starts_with(&prefix))
-        .map(|k| (k.key_id, k.created_at.timestamp_millis()))
+        .filter_map(|k| Some((key_id_of(did, &k.key_id)?, k.created_at.timestamp_millis())))
         .collect())
+}
+
+/// The id the DID `did` uses a VTA key record under, if the record is one of
+/// its keys: the record's own id when it is under `did`, or, for a did:scid
+/// identity, the did:scid id of a record the VTA names by the identity's
+/// did:webvh log (VTI-KEY-161). A did:scid `?src=` on `did` is ignored: the
+/// identity's keys are under the bare DID.
+fn key_id_of(did: &str, record_key_id: &str) -> Option<String> {
+    let did = vta_sdk::did_scid::identity(did);
+    if record_key_id.starts_with(&format!("{did}#")) {
+        return Some(record_key_id.to_string());
+    }
+    vta_sdk::did_scid::presented_reference(&did, record_key_id)
 }
 
 /// Serve until `stop`: every `cfg.key_refresh_secs`, compare the DID's keys
@@ -693,6 +702,9 @@ pub(crate) struct Listed {
 /// Read [`Listed`] from `doc` (ids made absolute against `did`; references
 /// and embedded methods both; `publicKeyMultibase` keys only).
 pub(crate) fn listed_keys(did: &str, doc: &Value) -> Result<Listed> {
+    // A relative reference is under the document's DID, which for a did:scid
+    // is the bare DID, not the DID URL with `?src=` it was resolved through.
+    let did = vta_sdk::did_scid::identity(did);
     let abs = |id: &str| {
         if id.starts_with('#') {
             format!("{did}{id}")
@@ -753,7 +765,10 @@ fn reconcile(
 ) -> Result<(BridgeIdentity, SigningPolicy)> {
     use affinidi_tdk::affinidi_crypto::KeyType;
     use affinidi_tdk::secrets_resolver::secrets::Secret;
-    let did = fetched.did.as_str();
+    // The identity's keys are under the bare DID, whatever `?src=` the bundle
+    // names it with (VTI-KEY-160).
+    let did = vta_sdk::did_scid::identity(&fetched.did);
+    let did = did.as_str();
     let listed = listed_keys(did, doc)?;
     let prefix = format!("{did}#");
     let exported: Vec<Secret> = vta_sdk::did_key::secrets_from_bundle(fetched)
@@ -762,7 +777,7 @@ fn reconcile(
         exported.iter().map(|s| s.id.clone()).collect();
     let mut candidates: BTreeMap<String, Secret> = BTreeMap::new();
     if let Some(h) = held
-        && h.did() == did
+        && vta_sdk::did_scid::same_reference(h.did(), did)
     {
         for s in h.secrets() {
             candidates.insert(s.id.clone(), s.clone());
@@ -828,7 +843,12 @@ fn reconcile(
              key for; DIDComm needs one"
         );
     }
-    Ok((BridgeIdentity::from_secrets(did, signing, keep)?, policy))
+    // The bridge is addressed as the bundle names it: a did:scid keeps the
+    // `?src=` a peer meeting it for the first time needs (VTI-KEY-163).
+    Ok((
+        BridgeIdentity::from_secrets(&fetched.did, signing, keep)?,
+        policy,
+    ))
 }
 
 /// Overwrite a bundle's key material.
@@ -2231,5 +2251,93 @@ version = "v0.5.0"
             "below the 60 s DID cache"
         );
         assert!(with("signing_switch_after_secs = 60").is_ok());
+    }
+    // ─── did:scid ───────────────────────────────────────────────────────
+
+    const SCID: &str = "did:scid:vh:1:QmScid";
+    const SCID_URL: &str = "did:scid:vh:1:QmScid?src=bridge.acme.example";
+    const LOG: &str = "did:webvh:QmScid:bridge.acme.example";
+
+    #[test]
+    fn a_did_scid_bridge_finds_its_keys_among_the_log_named_records() {
+        // The VTA names key records by the did:webvh log's method ids; the
+        // did:scid identity uses them under the bare DID (VTI-KEY-161).
+        for did in [SCID, SCID_URL] {
+            assert_eq!(
+                key_id_of(did, &format!("{LOG}#key-1")).as_deref(),
+                Some("did:scid:vh:1:QmScid#key-1")
+            );
+            assert_eq!(
+                key_id_of(did, "did:scid:vh:1:QmScid#key-2").as_deref(),
+                Some("did:scid:vh:1:QmScid#key-2")
+            );
+            assert_eq!(key_id_of(did, "did:webvh:QmOther:x.example#key-1"), None);
+        }
+        // A did:webvh bridge is unchanged, and does not take did:scid ids.
+        assert_eq!(
+            key_id_of(LOG, &format!("{LOG}#key-1")).as_deref(),
+            Some(format!("{LOG}#key-1").as_str())
+        );
+        assert_eq!(key_id_of(LOG, "did:scid:vh:1:QmScid#key-1"), None);
+    }
+
+    #[test]
+    fn a_did_scid_document_lists_its_keys_under_the_bare_did() {
+        let doc = json!({
+            "id": SCID,
+            "verificationMethod": [
+                { "id": "#key-1", "type": "Multikey",
+                  "publicKeyMultibase": "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" }
+            ],
+            "assertionMethod": ["#key-1"],
+        });
+        let listed = listed_keys(SCID_URL, &doc).unwrap();
+        assert!(
+            listed.signing.contains_key("did:scid:vh:1:QmScid#key-1"),
+            "{:?}",
+            listed.signing.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_did_scid_bundle_reconciles_and_keeps_its_src() {
+        use affinidi_tdk::secrets_resolver::secrets::Secret;
+        let mut sign = Secret::generate_ed25519(None, None);
+        sign.id = format!("{SCID}#key-1");
+        let mut agree = Secret::generate_x25519(None, None).unwrap();
+        agree.id = format!("{SCID}#key-2");
+        let entry = |s: &Secret, key_type| vta_sdk::did_secrets::SecretEntry {
+            key_id: s.id.clone(),
+            key_type,
+            private_key_multibase: s.get_private_keymultibase().unwrap(),
+        };
+        let bundle = DidSecretsBundle {
+            did: SCID_URL.to_string(),
+            secrets: vec![
+                entry(&sign, vta_sdk::keys::KeyType::Ed25519),
+                entry(&agree, vta_sdk::keys::KeyType::X25519),
+            ],
+        };
+        let doc = json!({
+            "id": SCID,
+            "verificationMethod": [
+                { "id": format!("{SCID}#key-1"), "type": "Multikey",
+                  "publicKeyMultibase": sign.get_public_keymultibase().unwrap() },
+                { "id": format!("{SCID}#key-2"), "type": "Multikey",
+                  "publicKeyMultibase": agree.get_public_keymultibase().unwrap() }
+            ],
+            "assertionMethod": [format!("{SCID}#key-1")],
+            "keyAgreement": [format!("{SCID}#key-2")],
+        });
+        let (id, _) = reconcile(&bundle, None, &doc, &BTreeMap::new(), &policy()).unwrap();
+        // Addressed with its src; keys under the bare DID.
+        assert_eq!(id.did(), SCID_URL);
+        assert_eq!(id.signing_key_id(), format!("{SCID}#key-1"));
+        assert_eq!(id.messaging_secrets().len(), 2);
+        // The git trailer names the key with the src a verifier needs.
+        assert_eq!(
+            id.git_signing_key().unwrap().verification_method,
+            format!("{SCID_URL}#key-1")
+        );
     }
 }
