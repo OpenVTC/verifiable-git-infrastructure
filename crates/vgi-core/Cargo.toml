@@ -12,6 +12,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# did:scid references: `src` is a locator, the identity is the DID.
+affinidi-did-common = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

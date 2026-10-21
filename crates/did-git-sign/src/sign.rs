@@ -246,7 +246,7 @@ fn bare_did(did_key_id: &str) -> &str {
 /// requires — signing with `#key-1` while the claim says `#key-0` verifies
 /// fine, since the check is that the DID publishes the key, not which one.
 fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
-    use vgi_core::{committer_identity, conflicting_signer_dids, signer_did};
+    use vgi_core::{committer_identity, conflicting_signer_dids, same_signer, signer_did};
 
     let signing_did = bare_did(did_key_id);
 
@@ -261,7 +261,7 @@ fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource)
     }
 
     match signer_did(data) {
-        Some(claimed) if claimed == signing_did => Ok(()),
+        Some(claimed) if same_signer(&claimed, signing_did) => Ok(()),
         Some(claimed) => anyhow::bail!(
             "did-git-sign: this commit claims signer '{claimed}' but would be signed with a key \
              held by '{signing_did}' (selected via {source}), so it would fail verification as \
