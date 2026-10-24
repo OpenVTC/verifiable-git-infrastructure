@@ -15,4 +15,18 @@ ignore = [
     # with Ed25519, and RSA secret-key use is confined to tests. Re-evaluate
     # if any crate here starts signing or decrypting with RSA.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0387, `crypto-bigint` 0.5 (timing variability in
+    # operations intended to be constant-time). Fixed only on the 0.7 line
+    # (>=0.7.6, which the workspace's 0.7 node already resolves to); 0.5 has
+    # no fixed release.
+    #
+    # 0.5 reaches the workspace only through elliptic-curve 0.13 under `pgp`
+    # 0.21 and `ssh-key` 0.6, both in verify-trust, which uses them to
+    # *verify* signatures with public keys (the exempt PGP keyring, P-256
+    # sshsig). A timing leak over public inputs reveals nothing secret; no
+    # crate here holds a NIST-curve, secp256k1 or Ed448 private key outside
+    # tests. Re-evaluate if any crate here signs or does ECDH with those
+    # curves, and drop this when `pgp` and `ssh-key` move to elliptic-curve
+    # 0.14 (ssh-key 0.7 is still a release candidate).
+    "RUSTSEC-2026-0387",
 ]
