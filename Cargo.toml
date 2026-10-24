@@ -460,11 +460,11 @@ affinidi-messaging-test-mediator = { version = "0.43", features = ["tsp"] }
 # 0.28 carries `git-ns/bridge/event` 0.4 and `git-ns/bridge/job` 0.5 (first in
 # 0.27.3, dtgwg-trust-tasks-tf#723), so the bridge's payload types come from
 # this one line again.
-trust-tasks-rs = { version = "0.32.1", default-features = false, features = ["git-ns"] }
+trust-tasks-rs = { version = "0.32.10", default-features = false, features = ["git-ns"] }
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
-trust-tasks-proof = "0.32.1"
+trust-tasks-proof = "0.32.10"
 # The DIDComm delivery layer over the mediator websocket — the stack
 # vtc-service uses. Both are already in the graph through affinidi-tdk's
 # messaging SDK; they are named so the bridge keeps the proven sender of each
