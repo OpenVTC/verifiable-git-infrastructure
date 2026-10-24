@@ -1200,6 +1200,17 @@ async fn query_registry(
                     break;
                 }
                 Ok(_) => {}
+                Err(
+                    e @ TrqlError::Rejected {
+                        retryable: true, ..
+                    },
+                ) => {
+                    // The registry answered but could not decide (e.g. its
+                    // data is stale): an availability problem, not a denial.
+                    // Fail closed as for an unreachable registry.
+                    decision = Err(e.to_string());
+                    break;
+                }
                 Err(e @ TrqlError::Rejected { .. }) => {
                     // The registry answered and said no (e.g. unknown tuple
                     // rejected rather than answered false) — a denial, not
@@ -2167,10 +2178,12 @@ mod tests {
     // --- querying through a Registry ---
 
     /// A transport standing in for a mediator session: answers every query
-    /// with `authorized`, or fails every exchange with `failure`, recording
-    /// what it was sent.
+    /// with `authorized`, rejects it with a `trust-task-error` carrying
+    /// `rejection`, or fails every exchange with `failure`, recording what it
+    /// was sent.
     struct FakeChannel {
         authorized: bool,
+        rejection: Option<trust_tasks_rs::ErrorPayload>,
         failure: Option<TrqlError>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
     }
@@ -2179,6 +2192,7 @@ mod tests {
         fn answering(authorized: bool) -> Self {
             Self {
                 authorized,
+                rejection: None,
                 failure: None,
                 seen: std::sync::Mutex::new(Vec::new()),
             }
@@ -2187,6 +2201,13 @@ mod tests {
         fn failing(failure: TrqlError) -> Self {
             Self {
                 failure: Some(failure),
+                ..Self::answering(false)
+            }
+        }
+
+        fn rejecting(rejection: trust_tasks_rs::ErrorPayload) -> Self {
+            Self {
+                rejection: Some(rejection),
                 ..Self::answering(false)
             }
         }
@@ -2202,9 +2223,15 @@ mod tests {
             &self,
             request: trust_tasks_rs::TrustTask<serde_json::Value>,
         ) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, TrqlError> {
-            let request = serde_json::to_value(&request).unwrap();
+            let typed = request;
+            let request = serde_json::to_value(&typed).unwrap();
             assert_eq!(request["recipient"], "did:example:registry");
             self.seen.lock().unwrap().push(request.clone());
+            if let Some(rejection) = &self.rejection {
+                let error = typed.reject_with("urn:uuid:error", rejection.clone());
+                // Reserialize like a wire hop: the seam carries untyped documents.
+                return Ok(serde_json::from_value(serde_json::to_value(&error).unwrap()).unwrap());
+            }
             if let Some(failure) = &self.failure {
                 // TrqlError is not Clone; rebuild the one variant tests use.
                 return Err(match failure {
@@ -2388,6 +2415,57 @@ mod tests {
             CommitStatus::Unauthorized { .. }
         ));
         // The repository, then the namespace.
+        assert_eq!(channel.seen.lock().unwrap().len(), 2);
+    }
+
+    /// A registry that answers with a retryable `trust-task-error` (e.g. its
+    /// data is stale) could not decide: UNAVAILABLE, failing closed, and the
+    /// fallback is not asked — not a denial blamed on the signer.
+    #[tokio::test]
+    async fn a_retryable_rejection_fails_closed_as_unavailable() {
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
+        for rejection in [
+            ErrorPayload::new(StandardCode::Unavailable),
+            ErrorPayload::new(StandardCode::PermissionDenied).with_retryable(true),
+        ] {
+            let channel = Arc::new(FakeChannel::rejecting(rejection));
+            let registry = Registry::with_transport(channel.clone(), "did:example:registry");
+            let (commits, signers) = one_signed_commit();
+            let report =
+                verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                    .await
+                    .unwrap();
+            assert!(!report.ok);
+            assert!(
+                matches!(
+                    report.commits[0].status,
+                    CommitStatus::RegistryUnavailable { .. }
+                ),
+                "{:?}",
+                report.commits[0].status
+            );
+            assert_eq!(channel.seen.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// A non-retryable `trust-task-error` is the registry saying no: a denial,
+    /// after the fallback resource has been asked too.
+    #[tokio::test]
+    async fn a_final_rejection_is_unauthorized_after_the_fallback() {
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
+        let channel = Arc::new(FakeChannel::rejecting(ErrorPayload::new(
+            StandardCode::PermissionDenied,
+        )));
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
+        let (commits, signers) = one_signed_commit();
+        let report =
+            verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                .await
+                .unwrap();
+        assert!(matches!(
+            report.commits[0].status,
+            CommitStatus::Unauthorized { .. }
+        ));
         assert_eq!(channel.seen.lock().unwrap().len(), 2);
     }
 
