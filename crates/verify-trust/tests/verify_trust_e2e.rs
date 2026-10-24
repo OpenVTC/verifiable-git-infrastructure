@@ -1867,7 +1867,7 @@ async fn a_deactivated_webvh_signer_is_unresolved() {
 
     assert_eq!(
         signers.keys.get(&live),
-        Some(&vec![live_key]),
+        Some(&vec![live_key.into()]),
         "the live DID resolves to its assertionMethod key (unresolved: {:?})",
         signers.unresolved
     );

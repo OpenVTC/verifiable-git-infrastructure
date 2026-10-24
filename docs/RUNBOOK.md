@@ -750,10 +750,10 @@ the remediation is unambiguous:
 | Verdict | Cause | Fix |
 |---|---|---|
 | `unsigned` | no `gpgsig` header | signing is off — `did-git-sign health` |
-| `malformed` | the signature did not parse as an Ed25519 sshsig, or uses another algorithm (RSA, ECDSA), or the commit object is malformed | the commit was not signed by `did-git-sign` — re-sign it with `did-git-sign` (below) |
+| `malformed` | the signature did not parse as an sshsig, uses an algorithm other than Ed25519 or P-256 (RSA, P-384, P-521), is a FIDO (`sk-`) signature made without a touch or under an application other than `ssh:`, or the commit object is malformed | the commit was not signed by `did-git-sign` — re-sign it with `did-git-sign` (below) |
 | `noSignerDid` | signed, but no DID in the trailer or committer | the `commit-msg` hook did not run — `--no-verify`, or `core.hooksPath` taken by another tool — or an outdated (pre-v2) hook put the trailer above a `---` line; check `did-git-sign health`, re-run `init`, then amend |
 | `conflictingSignerDids` | `Signed-by-DID:` trailer and DID committer name different identities | a hand-written trailer, or a rebase carrying an old one; amend so one claim remains |
-| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, the DID **deactivated** (a retired signer: re-sign its commits as a live identity), or lists no Ed25519 key under `assertionMethod` |
+| `unresolvedSigner` | the claimed DID would not resolve | DID document unreachable, the DID **deactivated** (a retired signer: re-sign its commits as a live identity), or lists no Ed25519 or P-256 key under `assertionMethod` |
 | `unknownKey` | the claimed DID lists no such key under `assertionMethod` | a key the document holds for another purpose (key agreement, recovery) does not count: list the signing key under `assertionMethod`. Otherwise, usually the signer **rotated their key** after signing — the DID no longer publishes the old one, so re-sign the commit with the current key (below). Otherwise it was signed by a key that identity never held: `did-git-sign init` for the right key |
 | `badSignature` | key is published, signature fails | the commit was altered after signing |
 | `unauthorized` | valid signature, registry says no | no grant — issue one, or the signer was revoked |
@@ -1336,7 +1336,7 @@ are in §5; this is what they usually mean here.
 |---|---|---|
 | `trusted`, `exempt` | passes | — |
 | `unsigned` | signing not set up on that machine | `did-git-sign health`; commit again |
-| `malformed` | the signature is not an Ed25519 sshsig (an RSA or ECDSA SSH key, or corrupt) | sign with `did-git-sign`; amend |
+| `malformed` | the signature is not an Ed25519 or P-256 sshsig (an RSA, P-384 or P-521 SSH key, an untouched FIDO key, or corrupt) | sign with `did-git-sign`; amend |
 | `noSignerDid` | the commit-msg hook did not run, or is older than v2 | `did-git-sign health`, re-run `init`; amend |
 | `conflictingSignerDids` | a carried-over `Signed-by-DID:` trailer | amend so one claim remains |
 | `unresolvedSigner` | the signer's DID document is unreachable, names a non-public host (refused, never fetched), or the DID is deactivated | fix the DID's hosting; a deactivated signer is retired — re-sign as a live identity |
