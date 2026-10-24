@@ -13,9 +13,10 @@ cannot drift.
 - **`committer_did` / `committer_identity`** — read the signer DID a commit
   claims on its `committer` header. A claim, not a fact: safe only as a lookup
   hint whose answer the caller then checks against the signature.
-- **`ed25519_signing_keys_from_doc`** — extract the Ed25519 keys a DID
-  document authorizes for signing: those its `assertionMethod` relationship
-  lists (`publicKeyMultibase`, multicodec `0xED01`), controlled by the DID.
+- **`signing_keys_from_doc` / `ed25519_signing_keys_from_doc`** — extract the
+  keys a DID document authorizes for signing: those its `assertionMethod`
+  relationship lists (`publicKeyMultibase`, multicodec `0xED01` for Ed25519 or
+  `0x1200` for compressed P-256), controlled by the DID.
 - **`normalize_resource` / `resource_contains`** — the forge-qualified
   resource grammar (`github.com/acme/widgets`): lowercase, forge host first,
   no empty or dot segments, with errors that say what to write instead; and

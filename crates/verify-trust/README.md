@@ -6,7 +6,9 @@ in a range it answers two questions, and **fails closed** on any doubt:
 1. **Who signed it, cryptographically?** The commit names a signer DID — in its
    `Signed-by-DID:` trailer, or, for older commits, on its `committer` header;
    that DID is resolved, its document must publish the
-   Ed25519 key embedded in the commit's PROTOCOL.sshsig blob, and the signature
+   key embedded in the commit's PROTOCOL.sshsig blob (Ed25519 or P-256, as a
+   software key or a FIDO `sk-` security key — which must have been touched),
+   and the signature
    must verify over the exact bytes git signed. Only keys listed under the
    document's `assertionMethod` count; a key agreement or other key that is
    merely present in `verificationMethod` does not.
@@ -66,10 +68,10 @@ remediation applies:
 | Verdict | Cause |
 |---|---|
 | `unsigned` | no `gpgsig` header |
-| `malformed` | the signature did not parse as an Ed25519 sshsig (or is another algorithm), or the commit object is malformed |
+| `malformed` | the signature did not parse as an sshsig, uses an algorithm other than Ed25519 or P-256 (e.g. RSA), is a FIDO signature made without user presence or under an application other than `ssh:`, or the commit object is malformed |
 | `noSignerDid` | signed, but the commit names no DID (no `Signed-by-DID:` trailer, and the committer is not a DID) |
 | `conflictingSignerDids` | the `Signed-by-DID:` trailer and a DID committer name different DIDs |
-| `unresolvedSigner` | the claimed DID did not resolve, was deactivated (a deactivated `did:webvh` is unresolved, not served from its last keys), or lists no Ed25519 key under `assertionMethod` |
+| `unresolvedSigner` | the claimed DID did not resolve, was deactivated (a deactivated `did:webvh` is unresolved, not served from its last keys), or lists no Ed25519 or P-256 key under `assertionMethod` |
 | `unknownKey` | the claimed DID publishes no such key — usually rotated out since the commit was signed; re-sign it with the current key |
 | `badSignature` | the DID publishes the key, but the signature fails |
 | `unauthorized` | valid signature, registry says no |

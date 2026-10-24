@@ -6905,6 +6905,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "multibase",
+ "p256 0.13.2",
  "pgp",
  "rand 0.8.8",
  "serde",

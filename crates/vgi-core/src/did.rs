@@ -9,9 +9,54 @@ use serde_json::Value;
 /// Multicodec prefix for an Ed25519 public key in `publicKeyMultibase`.
 pub const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xED, 0x01];
 
-/// Extract the Ed25519 public keys a DID document authorizes for signing: the
-/// methods its `assertionMethod` relationship lists (`publicKeyMultibase`,
-/// multicodec `0xED01`).
+/// Multicodec prefix for a P-256 public key in `publicKeyMultibase`
+/// (`p256-pub`, `0x1200` as a varint), carried as a 33-byte compressed SEC1
+/// point.
+pub const P256_MULTICODEC_PREFIX: [u8; 2] = [0x80, 0x24];
+
+/// A signing key a DID document publishes, in the encoding the multicodec
+/// names. Compared byte for byte against the key a signature embeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublishedKey {
+    /// An Ed25519 public key.
+    Ed25519([u8; 32]),
+    /// A P-256 public key as a compressed SEC1 point.
+    P256([u8; 33]),
+}
+
+impl PublishedKey {
+    /// The raw key bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Ed25519(key) => key,
+            Self::P256(key) => key,
+        }
+    }
+}
+
+impl From<[u8; 32]> for PublishedKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self::Ed25519(key)
+    }
+}
+
+/// Extract the Ed25519 public keys a DID document authorizes for signing —
+/// [`signing_keys_from_doc`] restricted to Ed25519, for the callers that sign
+/// with an Ed25519 key.
+pub fn ed25519_signing_keys_from_doc(doc: &Value) -> Vec<[u8; 32]> {
+    signing_keys_from_doc(doc)
+        .into_iter()
+        .filter_map(|key| match key {
+            PublishedKey::Ed25519(key) => Some(key),
+            PublishedKey::P256(_) => None,
+        })
+        .collect()
+}
+
+/// Extract the public keys a DID document authorizes for signing: the methods
+/// its `assertionMethod` relationship lists (`publicKeyMultibase`, multicodec
+/// `0xED01` for Ed25519 or `0x1200` for compressed P-256).
 ///
 /// A commit signature is an assertion made as the DID, so a key the document
 /// merely *contains* is not enough: a key agreement, recovery or custodian key
@@ -23,7 +68,7 @@ pub const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xED, 0x01];
 /// or a method embedded in the relationship. A reference to a method the
 /// document does not contain is not followed. A method whose `controller`
 /// names a different DID is skipped: its key is someone else's to use.
-pub fn ed25519_signing_keys_from_doc(doc: &Value) -> Vec<[u8; 32]> {
+pub fn signing_keys_from_doc(doc: &Value) -> Vec<PublishedKey> {
     let did = doc.get("id").and_then(Value::as_str).unwrap_or_default();
     let absolute = |id: &str| {
         if id.starts_with('#') {
@@ -32,7 +77,7 @@ pub fn ed25519_signing_keys_from_doc(doc: &Value) -> Vec<[u8; 32]> {
             id.to_string()
         }
     };
-    let own_key = |method: &Value| -> Option<[u8; 32]> {
+    let own_key = |method: &Value| -> Option<PublishedKey> {
         if let Some(controller) = method.get("controller")
             && controller.as_str() != Some(did)
         {
@@ -40,8 +85,12 @@ pub fn ed25519_signing_keys_from_doc(doc: &Value) -> Vec<[u8; 32]> {
         }
         let encoded = method.get("publicKeyMultibase")?.as_str()?;
         let (_base, bytes) = multibase::decode(encoded).ok()?;
-        let raw = bytes.strip_prefix(&ED25519_MULTICODEC_PREFIX)?;
-        <[u8; 32]>::try_from(raw).ok()
+        if let Some(raw) = bytes.strip_prefix(&ED25519_MULTICODEC_PREFIX) {
+            return <[u8; 32]>::try_from(raw).ok().map(PublishedKey::Ed25519);
+        }
+        let raw = bytes.strip_prefix(&P256_MULTICODEC_PREFIX)?;
+        let point = <[u8; 33]>::try_from(raw).ok()?;
+        matches!(point[0], 0x02 | 0x03).then_some(PublishedKey::P256(point))
     };
     let methods: Vec<(String, &Value)> = doc
         .get("verificationMethod")
@@ -51,7 +100,7 @@ pub fn ed25519_signing_keys_from_doc(doc: &Value) -> Vec<[u8; 32]> {
         .filter_map(|method| Some((absolute(method.get("id")?.as_str()?), method)))
         .collect();
 
-    let mut keys: Vec<[u8; 32]> = Vec::new();
+    let mut keys: Vec<PublishedKey> = Vec::new();
     for entry in doc
         .get("assertionMethod")
         .and_then(Value::as_array)
@@ -181,6 +230,37 @@ mod tests {
             ]
         });
         assert!(ed25519_signing_keys_from_doc(&doc).is_empty());
+    }
+
+    fn p256_encoded(prefix: u8) -> ([u8; 33], String) {
+        let mut point = [0x5A; 33];
+        point[0] = prefix;
+        let mut multicodec = P256_MULTICODEC_PREFIX.to_vec();
+        multicodec.extend_from_slice(&point);
+        (
+            point,
+            multibase::encode(multibase::Base::Base58Btc, &multicodec),
+        )
+    }
+
+    #[test]
+    fn compressed_p256_keys_are_extracted_alongside_ed25519() {
+        let (ed25519, ed25519_key) = encoded(1);
+        let (p256, p256_key) = p256_encoded(0x03);
+        let (_, uncompressed_tag) = p256_encoded(0x04);
+        let doc = json!({
+            "id": DID,
+            "assertionMethod": [
+                { "id": "#key-0", "controller": DID, "publicKeyMultibase": ed25519_key },
+                { "id": "#key-1", "controller": DID, "publicKeyMultibase": p256_key },
+                { "id": "#key-2", "controller": DID, "publicKeyMultibase": uncompressed_tag }
+            ]
+        });
+        assert_eq!(
+            signing_keys_from_doc(&doc),
+            vec![PublishedKey::Ed25519(ed25519), PublishedKey::P256(p256)]
+        );
+        assert_eq!(ed25519_signing_keys_from_doc(&doc), vec![ed25519]);
     }
 
     #[test]

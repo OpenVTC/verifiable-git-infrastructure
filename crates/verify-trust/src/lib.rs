@@ -61,11 +61,14 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use ssh_key::{SshSig, public::KeyData};
+use ssh_key::{
+    SshSig,
+    public::{EcdsaPublicKey, KeyData},
+};
 use trql_client::{TransportKind, TrqlClient, TrqlError, TrqpQuery};
 use vgi_core::{
-    GIT_SSHSIG_NAMESPACE, committer_identity, conflicting_signer_dids,
-    ed25519_signing_keys_from_doc, normalize_sshsig_armor, signer_did, split_signed_commit,
+    GIT_SSHSIG_NAMESPACE, PublishedKey, committer_identity, conflicting_signer_dids,
+    normalize_sshsig_armor, signer_did, signing_keys_from_doc, split_signed_commit,
 };
 use vta_sdk::display_name::{DisplayName, NameBook, NameSource};
 
@@ -253,10 +256,10 @@ pub struct TrustReport {
 /// which tests construct directly via [`ResolvedSigners::from_keys`].
 #[derive(Debug, Default)]
 pub struct ResolvedSigners {
-    /// DID → the Ed25519 keys its document publishes. Keyed by DID rather
+    /// DID → the signing keys its document publishes. Keyed by DID rather
     /// than by key so a commit is checked against *the identity it claims*,
     /// not against whatever identity happens to publish the signing key.
-    pub keys: BTreeMap<String, Vec<[u8; 32]>>,
+    pub keys: BTreeMap<String, Vec<PublishedKey>>,
     /// Claimed DID → why it did not resolve.
     pub unresolved: BTreeMap<String, String>,
     /// DID → display name, for every signer whose document names it.
@@ -267,19 +270,23 @@ impl ResolvedSigners {
     /// A signer set with keys but no names — the shape a test wants when it
     /// supplies keys directly instead of resolving DID documents.
     #[must_use]
-    pub fn from_keys<I, D>(keys: I) -> Self
+    pub fn from_keys<I, D, K>(keys: I) -> Self
     where
-        I: IntoIterator<Item = (D, Vec<[u8; 32]>)>,
+        I: IntoIterator<Item = (D, Vec<K>)>,
         D: Into<String>,
+        K: Into<PublishedKey>,
     {
         Self {
-            keys: keys.into_iter().map(|(did, k)| (did.into(), k)).collect(),
+            keys: keys
+                .into_iter()
+                .map(|(did, k)| (did.into(), k.into_iter().map(Into::into).collect()))
+                .collect(),
             ..Self::default()
         }
     }
 
     /// The keys `did` publishes, or `None` if it never resolved.
-    fn published(&self, did: &str) -> Option<&[[u8; 32]]> {
+    fn published(&self, did: &str) -> Option<&[PublishedKey]> {
         self.keys.get(did).map(Vec::as_slice)
     }
 }
@@ -942,13 +949,10 @@ pub fn check_commit_signature(
         Ok(sig) => sig,
         Err(e) => return SignatureCheck::Malformed(format!("sshsig did not parse: {e}")),
     };
-    let KeyData::Ed25519(embedded) = sig.public_key() else {
-        return SignatureCheck::Malformed(format!(
-            "unsupported signature algorithm: {}",
-            sig.algorithm()
-        ));
+    let key = match signing_key(&sig) {
+        Ok(key) => key,
+        Err(detail) => return SignatureCheck::Malformed(detail),
     };
-    let key_bytes: [u8; 32] = embedded.0;
 
     // The identity is read from the payload — the bytes the signature covers —
     // so a claim that survives verification is one the signer committed to.
@@ -971,10 +975,10 @@ pub fn check_commit_signature(
             error,
         };
     };
-    if !published.contains(&key_bytes) {
+    if !published.contains(&key) {
         return SignatureCheck::UnknownKey {
             did: claimed,
-            fingerprint: hex::encode(key_bytes),
+            fingerprint: hex::encode(key.as_bytes()),
         };
     }
     let public_key = ssh_key::PublicKey::from(sig.public_key().clone());
@@ -986,6 +990,64 @@ pub fn check_commit_signature(
             signer_did: claimed,
         },
     }
+}
+
+/// The FIDO application every OpenSSH security key is enrolled under unless
+/// the user overrides it.
+const FIDO_SSH_APPLICATION: &str = "ssh:";
+
+/// FIDO authenticator-data flag: the user was present (touched the key).
+const FIDO_USER_PRESENT: u8 = 0x01;
+
+/// The key `sig` was made with, in the form a DID document publishes it.
+///
+/// OpenSSH's four signing types are accepted: Ed25519 and P-256, each either
+/// as a software key or as a FIDO security key (`sk-`). A FIDO signature must
+/// carry the user-presence flag — OpenSSH's own default, so a key that signs
+/// without a touch cannot sign as its DID — and its key must be enrolled under
+/// the `ssh:` application.
+fn signing_key(sig: &SshSig) -> Result<PublishedKey, String> {
+    let p256 = |key: &EcdsaPublicKey| match key {
+        EcdsaPublicKey::NistP256(point) => <[u8; 33]>::try_from(point.compress().as_bytes())
+            .map(PublishedKey::P256)
+            .map_err(|_| "P-256 public key is not a curve point".to_string()),
+        other => Err(format!(
+            "unsupported signature algorithm: {}",
+            other.algorithm()
+        )),
+    };
+    let (key, application) = match sig.public_key() {
+        KeyData::Ed25519(key) => return Ok(PublishedKey::Ed25519(key.0)),
+        KeyData::Ecdsa(key) => return p256(key),
+        KeyData::SkEd25519(sk) => (PublishedKey::Ed25519(sk.public_key().0), sk.application()),
+        KeyData::SkEcdsaSha2NistP256(sk) => (
+            p256(&EcdsaPublicKey::NistP256(*sk.ec_point()))?,
+            sk.application(),
+        ),
+        _ => {
+            return Err(format!(
+                "unsupported signature algorithm: {}",
+                sig.algorithm()
+            ));
+        }
+    };
+    if application != FIDO_SSH_APPLICATION {
+        return Err(format!(
+            "FIDO key enrolled under application {application:?}, not {FIDO_SSH_APPLICATION:?}"
+        ));
+    }
+    // The signature ends with the authenticator's flags byte and a 4-byte
+    // counter (PROTOCOL.u2f).
+    let bytes = sig.signature_bytes();
+    let flags = bytes
+        .len()
+        .checked_sub(5)
+        .map(|at| bytes[at])
+        .ok_or_else(|| "FIDO signature is truncated".to_string())?;
+    if flags & FIDO_USER_PRESENT == 0 {
+        return Err("FIDO signature was made without user presence (no touch)".to_string());
+    }
+    Ok(key)
 }
 
 /// Load the exempt keyring named by the args, resolving relative to the repo.
@@ -1119,15 +1181,16 @@ pub async fn resolve_signer_keys(
 
                 let doc = serde_json::to_value(&response.doc)
                     .with_context(|| format!("DID document for {did} did not serialize"))?;
-                let published = ed25519_signing_keys_from_doc(&doc);
+                let published = signing_keys_from_doc(&doc);
                 if published.is_empty() {
                     // Left out of `keys` deliberately: a document with no
-                    // Ed25519 signing key can verify nothing, and recording it as
+                    // signing key can verify nothing, and recording it as
                     // resolved-but-empty would report its commits as an
                     // unknown key rather than as this, the actual cause.
                     signers.unresolved.insert(
                         did.clone(),
-                        "DID document lists no Ed25519 key under assertionMethod".to_string(),
+                        "DID document lists no Ed25519 or P-256 key under assertionMethod"
+                            .to_string(),
                     );
                 } else {
                     signers.keys.insert(did.clone(), published);
@@ -1567,7 +1630,10 @@ mod tests {
         .unwrap();
 
         let reserialized = serde_json::to_value(&doc).unwrap();
-        assert_eq!(ed25519_signing_keys_from_doc(&reserialized), vec![signing]);
+        assert_eq!(
+            signing_keys_from_doc(&reserialized),
+            vec![PublishedKey::Ed25519(signing)]
+        );
     }
 
     /// An unsigned commit whose committer claims `SIGNER`, as `did-git-sign`
@@ -1604,6 +1670,243 @@ mod tests {
             sig_header.push_str(line);
         }
         format!("{headers}\n{sig_header}\n\n{body}")
+    }
+
+    // --- the four OpenSSH signing key types ---
+
+    const FIDO_UP: u8 = 0x01;
+
+    fn p256_key() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap()
+    }
+
+    fn p256_published(key: &p256::ecdsa::SigningKey) -> PublishedKey {
+        let point = key.verifying_key().to_encoded_point(true);
+        PublishedKey::P256(point.as_bytes().try_into().unwrap())
+    }
+
+    fn p256_key_data(key: &p256::ecdsa::SigningKey) -> EcdsaPublicKey {
+        EcdsaPublicKey::from_sec1_bytes(key.verifying_key().to_encoded_point(false).as_bytes())
+            .unwrap()
+    }
+
+    /// The bytes a FIDO authenticator signs over (PROTOCOL.u2f).
+    fn fido_signed_data(application: &str, flags: u8, message: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let mut data = sha2::Sha256::digest(application.as_bytes()).to_vec();
+        data.push(flags);
+        data.extend(7u32.to_be_bytes());
+        data.extend(sha2::Sha256::digest(message));
+        data
+    }
+
+    fn fido_trailer(mut signature: Vec<u8>, flags: u8) -> Vec<u8> {
+        signature.push(flags);
+        signature.extend(7u32.to_be_bytes());
+        signature
+    }
+
+    enum TestKey {
+        Ed25519,
+        P256,
+        SkEd25519 {
+            application: &'static str,
+            flags: u8,
+        },
+        SkP256 {
+            application: &'static str,
+            flags: u8,
+        },
+    }
+
+    /// Sign `payload` as git would with an OpenSSH key of `kind`, returning
+    /// the signed commit and the key as the signer's DID publishes it.
+    fn sign_commit_as(payload: &str, kind: &TestKey) -> (String, PublishedKey) {
+        use p256::ecdsa::signature::Signer as _;
+        use ssh_key::public::{Ed25519PublicKey, SkEcdsaSha2NistP256, SkEd25519};
+        use ssh_key::{Algorithm, HashAlg, Signature};
+
+        let message =
+            SshSig::signed_data(GIT_SSHSIG_NAMESPACE, HashAlg::Sha512, payload.as_bytes()).unwrap();
+        let (ed25519, ed25519_public) = test_key();
+        let p256 = p256_key();
+        let (key_data, signature, published) = match *kind {
+            TestKey::Ed25519 => {
+                return (sign_commit(payload, &ed25519), ed25519_public.into());
+            }
+            TestKey::P256 => {
+                let sig: p256::ecdsa::Signature = p256.sign(&message);
+                (
+                    KeyData::Ecdsa(p256_key_data(&p256)),
+                    Signature::try_from(sig).unwrap(),
+                    p256_published(&p256),
+                )
+            }
+            TestKey::SkEd25519 { application, flags } => {
+                use ed25519_dalek::Signer as _;
+                let sig = ed25519.sign(&fido_signed_data(application, flags, &message));
+                (
+                    KeyData::SkEd25519(SkEd25519::new(
+                        Ed25519PublicKey(ed25519_public),
+                        application,
+                    )),
+                    Signature::new(
+                        Algorithm::SkEd25519,
+                        fido_trailer(sig.to_bytes().to_vec(), flags),
+                    )
+                    .unwrap(),
+                    ed25519_public.into(),
+                )
+            }
+            TestKey::SkP256 { application, flags } => {
+                let sig: p256::ecdsa::Signature =
+                    p256.sign(&fido_signed_data(application, flags, &message));
+                let EcdsaPublicKey::NistP256(point) = p256_key_data(&p256) else {
+                    unreachable!()
+                };
+                (
+                    KeyData::SkEcdsaSha2NistP256(SkEcdsaSha2NistP256::new(point, application)),
+                    Signature::new(
+                        Algorithm::SkEcdsaSha2NistP256,
+                        fido_trailer(Signature::try_from(sig).unwrap().as_bytes().to_vec(), flags),
+                    )
+                    .unwrap(),
+                    p256_published(&p256),
+                )
+            }
+        };
+        let is_sk_p256 = signature.algorithm() == Algorithm::SkEcdsaSha2NistP256;
+        let data_len = signature.as_bytes().len();
+        let mut sshsig = SshSig::new(key_data, GIT_SSHSIG_NAMESPACE, HashAlg::Sha512, signature)
+            .unwrap()
+            .to_pem(ssh_key::LineEnding::LF)
+            .unwrap();
+        if is_sk_p256 {
+            sshsig = openssh_sk_p256_armor(&sshsig, data_len);
+        }
+        (signed_commit(payload, &sshsig), published)
+    }
+
+    /// ssh-key 0.6.7 encodes an `sk-ecdsa` signature with the FIDO flags and
+    /// counter inside the signature string; OpenSSH (and ssh-key's own
+    /// decoder) puts them after it. The signature is the blob's last field,
+    /// so rewrite its length to exclude the 5-byte trailer — the bytes
+    /// OpenSSH would have written.
+    fn openssh_sk_p256_armor(pem: &str, data_len: usize) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        let mut blob = STANDARD.decode(body).unwrap();
+        let at = blob.len() - data_len - 4;
+        assert_eq!(blob[at..at + 4], (data_len as u32).to_be_bytes());
+        blob[at..at + 4].copy_from_slice(&(data_len as u32 - 5).to_be_bytes());
+        let encoded = STANDARD.encode(blob);
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(70)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n",
+            lines.join("\n")
+        )
+    }
+
+    #[test]
+    fn every_openssh_signing_key_type_verifies() {
+        for kind in [
+            TestKey::Ed25519,
+            TestKey::P256,
+            TestKey::SkEd25519 {
+                application: "ssh:",
+                flags: FIDO_UP,
+            },
+            TestKey::SkP256 {
+                application: "ssh:",
+                flags: FIDO_UP | 0x04,
+            },
+        ] {
+            let (commit, published) = sign_commit_as(&unsigned_commit(), &kind);
+            let signers = ResolvedSigners::from_keys([(SIGNER, vec![published])]);
+            assert_eq!(
+                check_commit_signature(commit.as_bytes(), &signers, None),
+                SignatureCheck::Valid {
+                    signer_did: SIGNER.to_string()
+                }
+            );
+        }
+    }
+
+    /// A security key that signed without a touch is refused, as OpenSSH
+    /// refuses it by default — even though the signature itself verifies.
+    #[test]
+    fn a_fido_signature_without_user_presence_is_refused() {
+        for kind in [
+            TestKey::SkEd25519 {
+                application: "ssh:",
+                flags: 0,
+            },
+            TestKey::SkP256 {
+                application: "ssh:",
+                flags: 0x04,
+            },
+        ] {
+            let (commit, published) = sign_commit_as(&unsigned_commit(), &kind);
+            let signers = ResolvedSigners::from_keys([(SIGNER, vec![published])]);
+            match check_commit_signature(commit.as_bytes(), &signers, None) {
+                SignatureCheck::Malformed(detail) => {
+                    assert!(detail.contains("user presence"), "{detail}");
+                }
+                other => panic!("expected Malformed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fido_key_enrolled_for_another_application_is_refused() {
+        let (commit, published) = sign_commit_as(
+            &unsigned_commit(),
+            &TestKey::SkEd25519 {
+                application: "ssh:other",
+                flags: FIDO_UP,
+            },
+        );
+        let signers = ResolvedSigners::from_keys([(SIGNER, vec![published])]);
+        match check_commit_signature(commit.as_bytes(), &signers, None) {
+            SignatureCheck::Malformed(detail) => {
+                assert!(detail.contains("application"), "{detail}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    /// A P-256 key is matched to the DID's published key, and a signature
+    /// over other bytes does not verify.
+    #[test]
+    fn p256_keys_are_checked_against_the_did_and_the_payload() {
+        let (commit, _) = sign_commit_as(&unsigned_commit(), &TestKey::P256);
+        let (_, ed25519) = test_key();
+        let signers = ResolvedSigners::from_keys([(SIGNER, vec![ed25519])]);
+        assert!(matches!(
+            check_commit_signature(commit.as_bytes(), &signers, None),
+            SignatureCheck::UnknownKey { .. }
+        ));
+
+        let (commit, published) = sign_commit_as(
+            &unsigned_commit(),
+            &TestKey::SkP256 {
+                application: "ssh:",
+                flags: FIDO_UP,
+            },
+        );
+        let tampered = commit.replace("a message", "another message");
+        let signers = ResolvedSigners::from_keys([(SIGNER, vec![published])]);
+        assert_eq!(
+            check_commit_signature(tampered.as_bytes(), &signers, None),
+            SignatureCheck::BadSignature {
+                signer_did: SIGNER.to_string()
+            }
+        );
     }
 
     fn sign_commit(payload: &str, key: &SigningKey) -> String {

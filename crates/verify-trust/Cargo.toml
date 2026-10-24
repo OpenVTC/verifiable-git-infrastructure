@@ -66,6 +66,7 @@ hex = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
 # Encodes publicKeyMultibase values for the signing-key extraction test.
 multibase = { workspace = true }
 # Build and serve real did:webvh logs for the deactivated-signer test.
