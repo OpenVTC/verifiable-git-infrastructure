@@ -2492,7 +2492,7 @@ mod tests {
     /// was sent.
     struct FakeChannel {
         authorized: bool,
-        rejection: Option<trust_tasks_trql::ErrorPayload>,
+        rejection: Option<trust_tasks_rs::ErrorPayload>,
         failure: Option<TrqlError>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
     }
@@ -2514,7 +2514,7 @@ mod tests {
             }
         }
 
-        fn rejecting(rejection: trust_tasks_trql::ErrorPayload) -> Self {
+        fn rejecting(rejection: trust_tasks_rs::ErrorPayload) -> Self {
             Self {
                 rejection: Some(rejection),
                 ..Self::answering(false)
@@ -2530,8 +2530,8 @@ mod tests {
 
         async fn exchange(
             &self,
-            request: trust_tasks_trql::TrustTask<serde_json::Value>,
-        ) -> Result<trust_tasks_trql::TrustTask<serde_json::Value>, TrqlError> {
+            request: trust_tasks_rs::TrustTask<serde_json::Value>,
+        ) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, TrqlError> {
             let typed = request;
             let request = serde_json::to_value(&typed).unwrap();
             assert_eq!(request["recipient"], "did:example:registry");
@@ -2732,7 +2732,7 @@ mod tests {
     /// fallback is not asked — not a denial blamed on the signer.
     #[tokio::test]
     async fn a_retryable_rejection_fails_closed_as_unavailable() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         for rejection in [
             ErrorPayload::new(StandardCode::Unavailable),
             ErrorPayload::new(StandardCode::PermissionDenied).with_retryable(true),
@@ -2761,7 +2761,7 @@ mod tests {
     /// after the fallback resource has been asked too.
     #[tokio::test]
     async fn a_final_rejection_is_unauthorized_after_the_fallback() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         let channel = Arc::new(FakeChannel::rejecting(ErrorPayload::new(
             StandardCode::PermissionDenied,
         )));
