@@ -363,11 +363,11 @@ affinidi-messaging-didcomm = "0.15.9"
 # default features, so this line adds a version requirement and nothing else.
 affinidi-did-resolver-cache-sdk = "0.8.43"
 # did:scid identity rules (the `scid` module, 0.4.4): a `?src=` locator is not
-# part of the identity. Default features stay on: 0.4.4 does not compile with
-# them off (`KeyMaterial::generate` calls the per-curve generators
-# unconditionally), and a package built alone, such as
-# `cargo test -p vgi-forge-forgejo`, has nothing else to turn them on.
-affinidi-did-common = "0.4.4"
+# part of the identity. Default features off: only the identifier helpers.
+# 0.4.5 is the first that compiles that way (0.4.4's `KeyMaterial::generate`
+# named every curve's generator), which a package built alone, such as
+# `cargo test -p vgi-forge-forgejo`, depends on.
+affinidi-did-common = { version = "0.4.5", default-features = false }
 multibase = "0.9"
 # Test-only: build real did:webvh logs (verify-trust's deactivated-signer test).
 didwebvh-rs = "0.8.2"
