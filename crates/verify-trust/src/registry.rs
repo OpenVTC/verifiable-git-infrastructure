@@ -67,7 +67,7 @@ use trql_client::{
     HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportChoice, TransportKind,
     TrqlClient, TrqlError, TrqlTransport,
 };
-use trust_tasks_trql::TrustTask;
+use trust_tasks_rs::TrustTask;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub use mediated::EphemeralIdentity;
@@ -277,7 +277,7 @@ pub trait RegistryChannel: Send + Sync {
 }
 
 /// [`TrqlTransport`] over a [`RegistryChannel`], in JSON so the channel's
-/// owner needs no `trust-tasks-rs` of this line.
+/// owner needs no `trust-tasks-rs`.
 ///
 /// Every query goes out under a fresh random id (whatever the client chose),
 /// a reply must carry that id as its thread, and the first transport failure

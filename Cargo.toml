@@ -110,17 +110,14 @@ verify-trust = { version = "0.25.0", path = "crates/verify-trust" }
 # **0.27** is the same for trust-tasks 0.32 / affinidi-tdk 0.27 (vta-sdk 0.72),
 # the first trql-client released from a registry release branch.
 #
-# The vta-sdk 0.73 step reopens the split: vta-sdk 0.73 is on trust-tasks 0.34 /
-# affinidi-tdk 0.32, while trql-client 0.27 — still the registry's latest
-# release — declares `trust-tasks-rs ^0.32`. `TrqlTransport::exchange` is
-# trql-client's own trait, so verify-trust's transport impls name its
-# `TrustTask` through the `trust-tasks-trql` alias below (`E0053` otherwise),
-# as for the 0.56 move. It is the weaker form this note bounds: no trust-tasks
-# type crosses from verify-trust into vta-sdk or the bridge, and did-git-sign
-# has no trql-client edge. Retire the alias when a trql-client on trust-tasks
-# 0.34 is published.
-trql-client = "0.27.0"
-trust-tasks-trql = { package = "trust-tasks-rs", version = "0.32.10", default-features = false }
+# The vta-sdk 0.73 step reopened the split for one release: vta-sdk 0.73 is on
+# trust-tasks 0.34 / affinidi-tdk 0.32 while trql-client 0.27 declared
+# `trust-tasks-rs ^0.32`, so verify-trust's transport impls named its
+# `TrustTask` through a `trust-tasks-trql` alias (`E0053` otherwise).
+# **0.28** is the trql-client on trust-tasks 0.34 / affinidi-tdk 0.32, so the
+# alias is retired again and verify-trust names the workspace's single
+# `trust-tasks-rs` directly.
+trql-client = "0.28.0"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
