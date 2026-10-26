@@ -823,6 +823,7 @@ pub async fn provision_credential(
                 DiagStatus::Skipped(d) => println!("  -- {} (skipped: {d})", c.label()),
                 DiagStatus::Failed(d) => println!("  !! {} — {d}", c.label()),
                 DiagStatus::Pending | DiagStatus::Running => {}
+                _ => {}
             },
             VtaEvent::Connected {
                 reply: VtaReply::AdminOnly(a),
@@ -844,12 +845,17 @@ pub async fn provision_credential(
 }
 
 /// The bridge's DID in its context: the context's DID if it has one, else a
-/// `did:webvh` minted into it now — on the VTA's did:webvh hosting server
+/// `did:webvh` log minted into it now — on the VTA's did:webvh hosting server
 /// (`webvh_server`, or the only one the VTA has), with a `DIDCommMessaging`
-/// and a `TSPTransport` service naming the VTA's mediator. `(did, minted)`.
+/// and a `TSPTransport` service naming the VTA's mediator, and presented as
+/// `presentation` asks (the VTA's configuration when it states nothing). A
+/// bridge presented as did:scid is addressed by its did:scid DID URL with
+/// `?src=`, which a peer meeting it in a job needs to resolve it
+/// (VTI-KEY-163). `(did, minted)`.
 pub async fn ensure_bridge_did(
     session: &Session,
     webvh_server: Option<&str>,
+    presentation: vta_sdk::client::DidPresentation,
 ) -> Result<(String, bool)> {
     if let Some(did) = session.context_did().await? {
         return Ok((did, false));
@@ -908,13 +914,22 @@ pub async fn ensure_bridge_did(
         template_context: None,
         template_vars: Default::default(),
     };
-    let created = client.create_did_webvh(req).await.map_err(|e| {
-        anyhow!(
-            "minting the bridge's did:webvh in `{}`: {e}",
-            session.context()
-        )
-    })?;
-    Ok((created.did, true))
+    let created = client
+        .create_did_webvh_presented(req, presentation)
+        .await
+        .map_err(|e| anyhow!("minting the bridge's DID in `{}`: {e}", session.context()))?;
+    Ok((presented_did(&created), true))
+}
+
+/// The DID a newly minted bridge is addressed as: the did:scid DID URL with
+/// `?src=` when the VTA presented it as did:scid, the DID otherwise.
+fn presented_did(
+    created: &vta_sdk::protocols::did_management::create::CreateDidWebvhResultBody,
+) -> String {
+    match (created.did_method, &created.scid_did_url) {
+        (Some(vta_sdk::did_scid::DidMethod::Scid), Some(url)) => url.clone(),
+        _ => created.did.clone(),
+    }
 }
 
 /// What to print at the end: the DID, the VTC line, how to start, the URL
@@ -1369,5 +1384,31 @@ mod tests {
             .mount(&html)
             .await;
         assert!(fetch_web_flow(&html.uri()).await.is_err());
+    }
+    #[test]
+    fn a_bridge_minted_as_did_scid_is_addressed_by_its_src_url() {
+        let mut created: vta_sdk::protocols::did_management::create::CreateDidWebvhResultBody =
+            serde_json::from_value(serde_json::json!({
+                "did": "did:scid:vh:1:QmS",
+                "contextId": "vgi-bridge",
+                "scid": "QmS",
+                "portable": false,
+                "signingKeyId": "k1",
+                "kaKeyId": "k2",
+                "preRotationKeyCount": 0,
+                "createdAt": "2026-01-01T00:00:00Z",
+                "didMethod": "scid",
+                "scidAlsoKnownAs": true,
+                "webvhDid": "did:webvh:QmS:bridge.example",
+                "scidDidUrl": "did:scid:vh:1:QmS?src=bridge.example",
+            }))
+            .unwrap();
+        assert_eq!(
+            presented_did(&created),
+            "did:scid:vh:1:QmS?src=bridge.example"
+        );
+        created.did_method = Some(vta_sdk::did_scid::DidMethod::Webvh);
+        created.did = "did:webvh:QmS:bridge.example".into();
+        assert_eq!(presented_did(&created), "did:webvh:QmS:bridge.example");
     }
 }

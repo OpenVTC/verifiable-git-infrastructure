@@ -7,6 +7,9 @@
 
 use anyhow::{Result, bail};
 
+/// The prefix of a `did:scid:vh:1` identifier.
+const SCID_VH_PREFIX: &str = "did:scid:vh:1:";
+
 /// Check `did` against the DID-core `did` production (a DID, not a DID URL):
 ///
 /// ```text
@@ -15,7 +18,50 @@ use anyhow::{Result, bail};
 /// method-specific-id = *( *idchar ":" ) 1*idchar
 /// idchar             = ALPHA / DIGIT / "." / "-" / "_" / pct-encoded
 /// ```
+///
+/// One DID URL is admitted: a `did:scid:vh:1` identity with its `?src=`
+/// locator and no other query, path or fragment. The identity is the DID, but
+/// whoever reads these values (the repository's verifier, a stranger) needs
+/// the source to resolve it, so a bare `did:scid:vh:1` is refused here and the
+/// DID URL is required (VTI-KEY-160, VTI-KEY-163).
 pub fn check_did(field: &str, did: &str) -> Result<()> {
+    if did.starts_with(SCID_VH_PREFIX) {
+        return check_scid_did_url(field, did);
+    }
+    check_bare_did(field, did)
+}
+
+/// A `did:scid:vh:1:<scid>?src=<source>` DID URL: the DID passes the DID-core
+/// production, and `<source>` is a non-empty host and path with nothing a
+/// shell or a second query parameter could hide in.
+fn check_scid_did_url(field: &str, did_url: &str) -> Result<()> {
+    let Some((did, query)) = did_url.split_once('?') else {
+        bail!(
+            "{field} `{}` is a did:scid with no `?src=` locator; give it as \
+             `did:scid:vh:1:<scid>?src=<host>[/<path>]` so its log can be found",
+            did_url.escape_debug()
+        );
+    };
+    check_bare_did(field, did)?;
+    let src_ok = query.strip_prefix("src=").is_some_and(|src| {
+        !src.is_empty()
+            && src.len() <= 2048
+            && !src.starts_with('/')
+            && src.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':' | b'%')
+            })
+    });
+    if !src_ok {
+        bail!(
+            "{field} `{}` is not a did:scid DID URL (expected \
+             `did:scid:vh:1:<scid>?src=<host>[/<path>]`, with no other query or fragment)",
+            did_url.escape_debug()
+        );
+    }
+    Ok(())
+}
+
+fn check_bare_did(field: &str, did: &str) -> Result<()> {
     let bad = || -> Result<()> {
         bail!(
             "{field} `{}` is not a DID (expected `did:<method>:<method-specific-id>`, \
@@ -120,6 +166,38 @@ mod tests {
         ] {
             assert!(check_did("owner", bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_did_scid_is_admitted_only_with_its_src_locator() {
+        for ok in [
+            "did:scid:vh:1:QmScid?src=example.com",
+            "did:scid:vh:1:QmScid?src=dids.example.org/farm-auth",
+            "did:scid:vh:1:QmScid?src=localhost%3A8000/a",
+        ] {
+            assert!(check_did("owner", ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "did:scid:vh:1:QmScid",
+            "did:scid:vh:1:QmScid?src=",
+            "did:scid:vh:1:QmScid?versionId=1",
+            "did:scid:vh:1:QmScid?src=a.example&x=1",
+            "did:scid:vh:1:QmScid?src=a.example#key-0",
+            "did:scid:vh:1:QmScid?src=a b",
+            "did:scid:vh:1:QmScid?src=a.example;rm -rf ~",
+            "did:scid:vh:1:QmScid?src=a.example?src=b",
+            "did:scid:vh:1:Qm Scid?src=a.example",
+            "did:scid:vh:1:?src=a.example",
+            "did:web:a?src=example.com",
+        ] {
+            assert!(check_did("owner", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_did_scid_url_is_quoted_for_the_shell() {
+        let url = "did:scid:vh:1:QmScid?src=example.com/a";
+        assert_eq!(quote(url), format!("'{url}'"));
     }
 
     #[test]

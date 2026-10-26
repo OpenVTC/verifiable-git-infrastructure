@@ -29,6 +29,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The release build of the bridge on the vta-sdk 0.73 / affinidi-tdk
+      # 0.32 / trust-tasks 0.34 stack outgrows the runner's 7 GB: the OOM
+      # killer ended the build with exit code 143 and no compiler error.
+      # Swap lets the peaks spill to disk rather than kill the job.
+      # affinidi-messaging-mediator's image build uses the same workaround.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
       - name: Build
         run: docker build -f crates/vgi-bridge/Dockerfile -t "$IMAGE" .
       - name: The image declares its HEALTHCHECK

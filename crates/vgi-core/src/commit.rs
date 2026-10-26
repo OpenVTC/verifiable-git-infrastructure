@@ -137,14 +137,41 @@ pub fn committer_did(commit: &[u8]) -> Option<String> {
     if !identity.starts_with("did:") {
         return None;
     }
-    let did = identity
-        .split(['#', '?', '/'])
-        .next()
-        .unwrap_or(identity.as_str());
+    let did = claimed_did(&identity);
     if did.is_empty() {
         return None;
     }
     Some(did.to_string())
+}
+
+/// The DID a signer claim names, keeping the one query a verifier needs to
+/// resolve it: a `did:scid` identity's `?src=` locator. The fragment (which
+/// key) and any other path or query are stripped. A did:scid claimed without
+/// its locator can only be resolved where its source is already known, so the
+/// locator stays in the claim, and identities are compared with
+/// [`same_signer`].
+fn claimed_did(value: &str) -> &str {
+    let reference = value.split('#').next().unwrap_or(value);
+    if affinidi_did_common::scid::scid_src(reference).is_some() {
+        return reference;
+    }
+    value.split(['#', '?', '/']).next().unwrap_or(value)
+}
+
+/// Whether two signer DIDs name the same identity: equal, or the same
+/// `did:scid` with or without its `?src=` locator (VTI-KEY-160). A did:scid
+/// and the did:webvh of its log are different signers (VTI-KEY-164).
+#[must_use]
+pub fn same_signer(a: &str, b: &str) -> bool {
+    affinidi_did_common::scid::same_reference(a, b)
+}
+
+/// The identity a signer DID names: a `did:scid` without its `?src=`
+/// locator, anything else unchanged. What to ask a registry about.
+#[must_use]
+pub fn signer_identity(did: &str) -> String {
+    let did = did.split('#').next().unwrap_or(did);
+    affinidi_did_common::scid::strip_scid_src(did).into_owned()
 }
 
 /// The signer DID a commit claims, checking the `Signed-by-DID:` trailer
@@ -165,7 +192,7 @@ pub fn signer_did(commit: &[u8]) -> Option<String> {
 pub fn conflicting_signer_dids(commit: &[u8]) -> Option<(String, String)> {
     let trailer = trailer_did(commit)?;
     let committer = committer_did(commit)?;
-    (trailer != committer).then_some((trailer, committer))
+    (!same_signer(&trailer, &committer)).then_some((trailer, committer))
 }
 
 /// The trailer key that carries the signer DID.
@@ -215,13 +242,7 @@ fn trailer_did(commit: &[u8]) -> Option<String> {
     }
     // The fragment names which key signed; the DID is the identity to resolve
     // and to ask the registry about.
-    Some(
-        value
-            .split(['#', '?', '/'])
-            .next()
-            .unwrap_or(value)
-            .to_string(),
-    )
+    Some(claimed_did(value).to_string())
 }
 
 /// The value of the last trailer named `key` in `message`'s trailer block,
@@ -582,6 +603,70 @@ mod tests {
              \n\
              {trailer}\n"
         )
+    }
+
+    #[test]
+    fn a_did_scid_claim_keeps_its_src_locator() {
+        let commit = commit_with_trailer(
+            "Alice <alice@example.com>",
+            "Signed-by-DID: did:scid:vh:1:QmScid?src=dids.example.org/alice#key-0",
+        );
+        assert_eq!(
+            signer_did(commit.as_bytes()).unwrap(),
+            "did:scid:vh:1:QmScid?src=dids.example.org/alice"
+        );
+        // Any other query is still stripped, did:scid or not.
+        for (claim, did) in [
+            (
+                "did:scid:vh:1:QmScid?versionId=2#key-0",
+                "did:scid:vh:1:QmScid",
+            ),
+            (
+                "did:scid:vh:1:QmScid?src=a.example&x=1#key-0",
+                "did:scid:vh:1:QmScid",
+            ),
+            (
+                "did:webvh:Qm:a.example?versionId=2#key-0",
+                "did:webvh:Qm:a.example",
+            ),
+        ] {
+            let commit = commit_with_trailer(
+                "Alice <alice@example.com>",
+                &format!("Signed-by-DID: {claim}"),
+            );
+            assert_eq!(signer_did(commit.as_bytes()).unwrap(), did, "{claim}");
+        }
+    }
+
+    #[test]
+    fn a_did_scid_trailer_and_committer_agree_with_and_without_src() {
+        let commit = commit_with_trailer(
+            "Alice <did:scid:vh:1:QmScid#key-0>",
+            "Signed-by-DID: did:scid:vh:1:QmScid?src=dids.example.org#key-0",
+        );
+        assert_eq!(conflicting_signer_dids(commit.as_bytes()), None);
+        // The did:webvh of the same log is a different signer.
+        let commit = commit_with_trailer(
+            "Alice <did:webvh:QmScid:dids.example.org#key-0>",
+            "Signed-by-DID: did:scid:vh:1:QmScid?src=dids.example.org#key-0",
+        );
+        assert!(conflicting_signer_dids(commit.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn signer_identity_drops_only_a_did_scid_src() {
+        assert_eq!(
+            signer_identity("did:scid:vh:1:QmScid?src=a.example#key-0"),
+            "did:scid:vh:1:QmScid"
+        );
+        assert_eq!(
+            signer_identity("did:webvh:Qm:a.example"),
+            "did:webvh:Qm:a.example"
+        );
+        assert!(same_signer(
+            "did:scid:vh:1:QmScid?src=a.example",
+            "did:scid:vh:1:QmScid"
+        ));
     }
 
     #[test]

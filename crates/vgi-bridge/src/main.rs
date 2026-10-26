@@ -543,6 +543,14 @@ struct SetupArgs {
     /// the context has no DID and the VTA has several.
     #[arg(long, value_name = "ID")]
     webvh_server: Option<String>,
+    /// How a DID minted for the bridge is presented: `webvh` or `scid`.
+    /// Absent: the VTA's configuration.
+    #[arg(long, value_name = "METHOD", value_parser = parse_did_method, conflicts_with = "self_contained")]
+    did_method: Option<vta_sdk::did_scid::DidMethod>,
+    /// Whether a DID minted for the bridge lists its did:scid alias in
+    /// `alsoKnownAs`. Absent: the VTA's configuration (listed by default).
+    #[arg(long, value_name = "BOOL", conflicts_with = "self_contained")]
+    scid_also_known_as: Option<bool>,
     /// Where the bridge listens (plain HTTP, for the proxy or tunnel).
     #[arg(long, value_name = "ADDR", default_value = vgi_bridge::setup::DEFAULT_LISTEN)]
     listen: std::net::SocketAddr,
@@ -823,7 +831,21 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     // 8. The bridge's DID.
     let did = match cred {
         None => init(&cfg)?,
-        Some(cred) => rt.block_on(vta_did_ready(&cfg, cred, args.webvh_server.as_deref()))?,
+        Some(cred) => {
+            let mut presentation = vta_sdk::client::DidPresentation::default();
+            if let Some(method) = args.did_method {
+                presentation = presentation.did_method(method);
+            }
+            if let Some(listed) = args.scid_also_known_as {
+                presentation = presentation.scid_also_known_as(listed);
+            }
+            rt.block_on(vta_did_ready(
+                &cfg,
+                cred,
+                args.webvh_server.as_deref(),
+                presentation,
+            ))?
+        }
     };
 
     let start = setup::service_steps(service, &exe, &layout);
@@ -958,12 +980,14 @@ async fn vta_did_ready(
     cfg: &BridgeConfig,
     cred: vta_sdk::credentials::CredentialBundle,
     webvh_server: Option<&str>,
+    presentation: vta_sdk::client::DidPresentation,
 ) -> Result<String> {
     let v = cfg.vta.as_ref().context("no `[vta]` section")?;
     println!("Connecting to the VTA {} …", cred.vta_did);
     let session = vta_session(cfg, cred).await?;
     let out = async {
-        let (did, minted) = vgi_bridge::setup::ensure_bridge_did(&session, webvh_server).await?;
+        let (did, minted) =
+            vgi_bridge::setup::ensure_bridge_did(&session, webvh_server, presentation).await?;
         if minted {
             println!("  minted the bridge's DID {did}");
         }
@@ -1130,6 +1154,10 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn parse_did_method(s: &str) -> std::result::Result<vta_sdk::did_scid::DidMethod, String> {
+    s.parse()
 }
 
 #[cfg(test)]

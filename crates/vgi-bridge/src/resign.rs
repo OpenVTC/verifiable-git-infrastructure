@@ -903,7 +903,7 @@ fn signed_by(raw: &[u8], signing: &GitSigningKey) -> Result<bool> {
         .split('#')
         .next()
         .unwrap_or_default();
-    if signer_did(&payload).as_deref() != Some(did) {
+    if !signer_did(&payload).is_some_and(|claimed| vgi_core::same_signer(&claimed, did)) {
         return Ok(false);
     }
     let ours = create_ssh_signature(
@@ -1064,7 +1064,7 @@ fn resign_commit(
         .split('#')
         .next()
         .unwrap_or_default();
-    if signer_did(unsigned.as_bytes()).as_deref() != Some(did)
+    if !signer_did(unsigned.as_bytes()).is_some_and(|claimed| vgi_core::same_signer(&claimed, did))
         || conflicting_signer_dids(unsigned.as_bytes()).is_some()
     {
         bail!(
