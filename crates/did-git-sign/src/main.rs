@@ -64,10 +64,11 @@ async fn run_provision(
             VtaEvent::Resolved(_)
             | VtaEvent::AttemptCompleted { .. }
             | VtaEvent::PreflightDone { .. } => {}
-            VtaEvent::Connected { reply, .. } => {
-                if let VtaReply::AdminOnly(adm) = reply {
-                    admin_reply = Some(adm);
-                }
+            VtaEvent::Connected {
+                reply: VtaReply::AdminOnly(adm),
+                ..
+            } => {
+                admin_reply = Some(adm);
             }
             VtaEvent::Failed(reason) => {
                 failure = Some(reason);
