@@ -291,18 +291,15 @@ it. Open the App's settings
 Without it, a member's link attempt fails when the bridge asks GitHub for a
 device code.
 
-### 3.3 The event version
+### 3.3 The protocol versions
 
-The bridge sends `git-ns/bridge/event` **0.3**, which adds the bridge's role
-map to what the VTC is told (BRIDGE.md §6c). Leave `event_version` unset
-once your VTC serves 0.3. A VTC that serves only 0.2 needs
-`event_version = "0.2"`, and one older than that `"0.1"` (it would otherwise
-refuse every event as an unsupported type); what the versions do
-differently is in BRIDGE.md §7.
-
-For the **pull-request gate** (RUNBOOK §8m), set `event_version = "0.4"`
-once your VTC lists `git-ns/bridge/event/0.4` in its discovery answer. It is
-never the default: a VTC that does not take 0.4 would refuse every event.
+The bridge takes `git-ns/bridge/job` **0.6** and sends `git-ns/bridge/result`
+**0.2** and `git-ns/bridge/event` **0.5**, and nothing older (BRIDGE.md §7,
+"Protocol versions"). Your VTC must serve event 0.5 and result 0.2
+(verifiable-trust-infrastructure `main` does); one that does not refuses
+every event and result as an unsupported type. Leave `event_version` unset:
+`"0.5"` is the only value it takes. The role-map report (BRIDGE.md §6c) and
+the pull-request gate's report (RUNBOOK §8m) are always sent.
 
 **Success looks like:** when GitHub redirects back, the bridge's log says, at
 INFO:

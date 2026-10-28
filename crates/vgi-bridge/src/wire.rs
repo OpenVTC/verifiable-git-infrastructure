@@ -40,66 +40,57 @@ use crate::identity::BridgeIdentity;
 
 use trust_tasks_rs::Payload as GitNsPayload;
 
-/// `git-ns/bridge/event` 0.1, still sent to a VTC configured for it.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_1 as event_v0_1;
-/// `git-ns/bridge/event` 0.2, still sent to a VTC configured for it.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_2 as event_v0_2;
-/// `git-ns/bridge/event` 0.3, still sent to a VTC configured for it.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_3 as event_v0_3;
-/// `git-ns/bridge/event` 0.4, the type every event is built as. Each version
-/// is wire-identical for every event the older ones carry (0.2 changes only
-/// what the VTC does with a transfer, a reused name, and a resource outside
-/// the namespace; 0.3 only adds `roleMapReported`; 0.4 only adds
-/// `pullRequestOpened`), so an event for a VTC configured for an older one
-/// is the same payload under the older type URI: see [`event_type_uri`].
-/// `roleMapReported` is never sent under 0.1 or 0.2, and
-/// `pullRequestOpened` never under anything before 0.4.
-pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_4 as event;
-/// `git-ns/bridge/job` 0.4, still taken (job 0.5: a bridge that takes 0.5
-/// SHOULD go on accepting 0.4).
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_4 as job_v0_4;
-/// The payload types of `git-ns/bridge/job` 0.5, which every job is read
-/// as: a 0.4 job is a valid 0.5 job with the same meaning (0.5 only adds
-/// `closePullRequest`, which a 0.4 job cannot carry — [`job_kind_allowed`]).
-/// It adds rules the schema does not state, checked in
-/// [`check_kind_members`]: a namespace admin with no right of their own on
-/// a repository is listed at `git.ns.admin` and gets no role; there is no
-/// namespace-level `projectRoles`; each account appears once.
-pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_5 as job;
-pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_1 as result;
+/// The payload types of `git-ns/bridge/event` 0.5, the only version this
+/// bridge sends. 0.5 is 0.4 with nested repository paths
+/// (`git-ns/_shared/0.6`); every older version is a subset of it with the
+/// same meaning, and a VTC that serves 0.5 serves them all, so the bridge no
+/// longer sends any of them.
+pub use trust_tasks_rs::specs::git_ns::bridge::event::v0_5 as event;
+/// The payload types of `git-ns/bridge/job` 0.6, the only version this
+/// bridge takes. 0.6 is 0.5 with nested repository paths; a VTC sends every
+/// job as 0.6 to a bridge that lists 0.6 in its discovery answer, so the
+/// bridge lists 0.6 alone and refuses 0.5 and older with
+/// `unsupportedVersion` (on which the VTC asks it again). It adds rules the schema does not state, checked
+/// in [`check_kind_members`]: a namespace admin with no right of their own
+/// on a repository is listed at `git.ns.admin` and gets no role; there is
+/// no namespace-level `projectRoles`; each account appears once.
+pub use trust_tasks_rs::specs::git_ns::bridge::job::v0_6 as job;
+/// The payload types of `git-ns/bridge/result` 0.2, the only version this
+/// bridge sends (0.1 with nested repository paths and the DID Core `Did`).
+pub use trust_tasks_rs::specs::git_ns::bridge::result::v0_2 as result;
 
-/// `git-ns/bridge/job/0.5`'s type URI.
+/// `git-ns/bridge/job/0.6`'s type URI.
 pub const JOB_TYPE: &str = <job::Payload as GitNsPayload>::TYPE_URI;
-/// `git-ns/bridge/job/0.4`'s type URI.
-pub const JOB_TYPE_V0_4: &str = <job_v0_4::Payload as GitNsPayload>::TYPE_URI;
 /// The job versions this bridge takes, newest first — what it lists in
 /// answer to `trust-task-discovery`.
-pub const JOB_TYPES: [&str; 2] = [JOB_TYPE, JOB_TYPE_V0_4];
+pub const JOB_TYPES: [&str; 1] = [JOB_TYPE];
 
-/// `trust-task-discovery/0.2`, which a VTC asks before it sends 0.4 or 0.5
-/// jobs (`git-ns/bridge/job` 0.4 and 0.5 each forbid sending that version to
-/// a bridge that has not shown it takes it).
-pub const DISCOVERY_TYPE: &str = "https://trusttasks.org/spec/trust-task-discovery/0.2";
+/// `trust-task-discovery/0.3`, the current version: a VTC asks it before it
+/// sends a job (`git-ns/bridge/job` forbids sending a version to a bridge
+/// that has not shown it takes it).
+pub const DISCOVERY_TYPE: &str = "https://trusttasks.org/spec/trust-task-discovery/0.3";
+/// `trust-task-discovery/0.2`, which the VTC still asks in. Discovery 0.3
+/// has a responder answer each version it supports in the version it was
+/// asked; the answer is the same either way, since the bridge sends no
+/// `acceptanceWindow` (the one member 0.3 adds).
+pub const DISCOVERY_TYPE_V0_2: &str = "https://trusttasks.org/spec/trust-task-discovery/0.2";
+
+/// Whether `type_uri` (bare) is a `trust-task-discovery` request this bridge
+/// answers: 0.3 or 0.2.
+pub fn is_discovery_type(type_uri: &str) -> bool {
+    type_uri == DISCOVERY_TYPE || type_uri == DISCOVERY_TYPE_V0_2
+}
 
 /// Whether `type_uri` (bare) is a job this bridge takes: `git-ns/bridge/job`
-/// 0.5 or 0.4.
+/// 0.6.
 pub fn is_job_type(type_uri: &str) -> bool {
     JOB_TYPES.contains(&type_uri)
 }
 
 /// Whether `type_uri` (bare) is another version of `git-ns/bridge/job`,
-/// which this bridge refuses with `unsupportedVersion`: before 0.4 a
-/// namespace admin was sent as an owner, and nothing here reads that.
+/// which this bridge refuses with `unsupportedVersion`.
 pub fn is_other_job_version(type_uri: &str) -> bool {
     !is_job_type(type_uri) && type_uri.starts_with("https://trusttasks.org/spec/git-ns/bridge/job/")
-}
-
-/// Whether a job of `kind` may arrive under `type_uri` (one
-/// [`is_job_type`] accepts): `closePullRequest` exists only from 0.5, so a
-/// 0.4 job naming it is malformed — 0.4's schema has no such kind, and the
-/// 0.5 types every job is read with would otherwise let it through.
-pub fn job_kind_allowed(type_uri: &str, kind: job::PayloadKind) -> bool {
-    type_uri == JOB_TYPE || kind != job::PayloadKind::ClosePullRequest
 }
 
 /// The `trust-task-discovery` answer: the job types this bridge takes, if
@@ -135,28 +126,40 @@ pub fn declared_error(code: trust_tasks_rs::DeclaredErrorCode) -> ErrorPayload {
     ErrorPayload::new(parsed).with_retryable(code.retryable)
 }
 
-/// The type URI an event is sent under, for the version the VTC takes.
-pub fn event_type_uri(version: crate::config::EventVersion) -> &'static str {
-    use crate::config::EventVersion;
-    match version {
-        EventVersion::V0_1 => event_v0_1::Payload::TYPE_URI,
-        EventVersion::V0_2 => event_v0_2::Payload::TYPE_URI,
-        EventVersion::V0_3 => event_v0_3::Payload::TYPE_URI,
-        _ => event::Payload::TYPE_URI,
-    }
-}
-
-/// Whether `type_uri` (bare) is the VTC's acknowledgement of an event, of
-/// any version (a VTC acknowledges an event in the version it was sent,
-/// and the configured version may have changed since).
+/// Whether `type_uri` is the VTC's acknowledgement of an event, of any
+/// version: a VTC acknowledges an event in the version it was sent, and one
+/// this bridge sent under an older version before it moved to 0.5 may still
+/// be acknowledged after it. The acknowledgement carries nothing but its
+/// `threadId`, so its version does not matter.
 pub fn is_event_response_type(type_uri: &str) -> bool {
-    type_uri == event::Response::TYPE_URI
-        || type_uri == event_v0_3::Response::TYPE_URI
-        || type_uri == event_v0_2::Response::TYPE_URI
-        || type_uri == event_v0_1::Response::TYPE_URI
+    is_response_of(type_uri, "git-ns/bridge/event")
 }
 
-/// Parse a `git-ns/bridge/job` 0.4 or 0.5 payload (as 0.5).
+/// Whether `type_uri` is the VTC's acknowledgement of a result, of any
+/// version (as for [`is_event_response_type`]: a result sent as 0.1 before
+/// the move may be acknowledged after it). A 0.1 acknowledgement is a valid
+/// 0.2 one, which is what it is read as.
+pub fn is_result_response_type(type_uri: &str) -> bool {
+    is_response_of(type_uri, "git-ns/bridge/result")
+}
+
+/// `https://trusttasks.org/spec/<slug>/<M.N>#response`, for any `M.N`.
+fn is_response_of(type_uri: &str, slug: &str) -> bool {
+    type_uri
+        .strip_prefix("https://trusttasks.org/spec/")
+        .and_then(|rest| rest.strip_prefix(slug))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_suffix("#response"))
+        .is_some_and(|v| {
+            let mut parts = v.split('.');
+            let digits = |p: Option<&str>| {
+                p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            };
+            digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
+        })
+}
+
+/// Parse a `git-ns/bridge/job` 0.6 payload.
 pub fn parse_job(payload: &Value) -> std::result::Result<job::Payload, String> {
     serde_json::from_value(payload.clone()).map_err(|e| format!("job payload: {e}"))
 }
@@ -273,7 +276,7 @@ pub struct VerifiedDoc {
 }
 
 impl VerifiedDoc {
-    /// The bare type URI (`…/git-ns/bridge/job/0.4`, `…#response`).
+    /// The bare type URI (`…/git-ns/bridge/job/0.6`, `…#response`).
     pub fn type_uri(&self) -> String {
         self.doc.type_uri.to_string()
     }
@@ -955,29 +958,45 @@ mod tests {
     }
 
     #[test]
-    fn job_0_4_and_0_5_are_taken() {
+    fn acknowledgements_of_any_version_are_recognised() {
+        assert!(is_event_response_type(event::Response::TYPE_URI));
+        assert!(is_result_response_type(result::Response::TYPE_URI));
+        for v in ["0.1", "0.3", "0.4"] {
+            assert!(is_event_response_type(&format!(
+                "https://trusttasks.org/spec/git-ns/bridge/event/{v}#response"
+            )));
+        }
+        assert!(is_result_response_type(
+            "https://trusttasks.org/spec/git-ns/bridge/result/0.1#response"
+        ));
+        for not in [
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.5",
+            "https://trusttasks.org/spec/git-ns/bridge/event/x#response",
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.5.1#response",
+            "https://trusttasks.org/spec/git-ns/bridge/events/0.5#response",
+            "https://trusttasks.org/spec/git-ns/bridge/result/0.2#response",
+        ] {
+            assert!(!is_event_response_type(not), "{not}");
+        }
+        assert!(!is_result_response_type(
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.5#response"
+        ));
+    }
+
+    #[test]
+    fn only_job_0_6_is_taken() {
         assert!(is_job_type(JOB_TYPE));
-        assert!(is_job_type(JOB_TYPE_V0_4));
-        assert!(JOB_TYPE.ends_with("/git-ns/bridge/job/0.5"));
-        assert!(JOB_TYPE_V0_4.ends_with("/git-ns/bridge/job/0.4"));
-        for v in ["0.1", "0.2", "0.3", "0.6"] {
+        assert!(JOB_TYPE.ends_with("/git-ns/bridge/job/0.6"));
+        for v in ["0.1", "0.2", "0.3", "0.4", "0.5", "0.7"] {
             let t = format!("https://trusttasks.org/spec/git-ns/bridge/job/{v}");
             assert!(!is_job_type(&t));
             assert!(is_other_job_version(&t));
         }
         assert!(!is_other_job_version(JOB_TYPE));
-        assert!(!is_other_job_version(JOB_TYPE_V0_4));
-        // `closePullRequest` is a 0.5 kind: refused under 0.4, taken under
-        // 0.5; every other kind under either.
-        use job::PayloadKind as K;
-        assert!(job_kind_allowed(JOB_TYPE, K::ClosePullRequest));
-        assert!(!job_kind_allowed(JOB_TYPE_V0_4, K::ClosePullRequest));
-        assert!(job_kind_allowed(JOB_TYPE_V0_4, K::ProjectRoles));
-        assert!(job_kind_allowed(JOB_TYPE, K::ProjectRoles));
     }
 
     #[test]
-    fn discovery_lists_job_0_5_and_0_4_for_a_pattern_that_selects_them() {
+    fn discovery_lists_job_0_6_for_a_pattern_that_selects_it() {
         for p in [
             vec![],
             vec!["*".to_string()],
@@ -986,17 +1005,14 @@ mod tests {
         ] {
             assert_eq!(
                 discovery_answer(&p)["supportedTypes"],
-                json!([
-                    "https://trusttasks.org/spec/git-ns/bridge/job/0.5",
-                    "https://trusttasks.org/spec/git-ns/bridge/job/0.4"
-                ]),
+                json!(["https://trusttasks.org/spec/git-ns/bridge/job/0.6"]),
                 "{p:?}"
             );
         }
         for p in [
             vec!["acl/*".to_string()],
             vec!["git-ns/bridge".into()],
-            vec!["git-ns/bridge/job/0.4".into()],
+            vec!["git-ns/bridge/job/0.6".into()],
         ] {
             assert_eq!(discovery_answer(&p)["supportedTypes"], json!([]), "{p:?}");
         }

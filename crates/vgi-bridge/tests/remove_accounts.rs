@@ -187,7 +187,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
         "{err}"
     );
 
-    // Namespace-level projectRoles (no `repo`): job 0.4 has none.
+    // Namespace-level projectRoles (no `repo`): job 0.4 and later have none.
     w.send_job(json!({
         "jobId": "j_ns", "namespace": NS, "kind": "projectRoles", "desiredRoles": [],
         "removeAccounts": [account(gh, EVE, "eve-dev")],
@@ -231,7 +231,7 @@ async fn remove_accounts_shapes_the_spec_refuses_are_malformed_and_not_recorded(
     .await;
     assert_eq!(w.next().await["payload"]["code"], "malformedRequest");
 
-    // A 0.1 job is not taken at all: this bridge takes 0.4 only.
+    // A 0.1 job is not taken at all: this bridge takes 0.6 only.
     let doc = w
         .doc(
             JOB_0_1,

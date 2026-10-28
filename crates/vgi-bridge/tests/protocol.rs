@@ -370,28 +370,33 @@ fn assert_no_nulls(v: &Value) {
 }
 
 #[tokio::test]
-async fn discovery_lists_job_0_5_and_0_4_and_older_job_versions_are_refused() {
+async fn discovery_lists_job_0_6_and_older_job_versions_are_refused() {
     let mut w = world(Options::default()).await;
-    let ask = w
-        .doc(
-            "https://trusttasks.org/spec/trust-task-discovery/0.2",
-            json!({ "patterns": ["git-ns/bridge/job"] }),
-            None,
-        )
-        .await;
-    w.deliver(ask.clone()).await;
-    let answer = w.next().await;
-    assert_eq!(
-        answer["type"],
-        "https://trusttasks.org/spec/trust-task-discovery/0.2#response"
-    );
-    assert_eq!(answer["threadId"], ask["id"]);
-    assert_eq!(answer["payload"]["supportedTypes"], json!([JOB_0_5, JOB]));
+    // Answered in the version asked: 0.3, and 0.2 (which the VTC asks in).
+    for v in ["0.3", "0.2"] {
+        let ask = w
+            .doc(
+                &format!("https://trusttasks.org/spec/trust-task-discovery/{v}"),
+                json!({ "patterns": ["git-ns/bridge/job"] }),
+                None,
+            )
+            .await;
+        w.deliver(ask.clone()).await;
+        let answer = w.next().await;
+        assert_eq!(
+            answer["type"],
+            format!("https://trusttasks.org/spec/trust-task-discovery/{v}#response")
+        );
+        assert_eq!(answer["threadId"], ask["id"]);
+        assert_eq!(answer["payload"]["supportedTypes"], json!([JOB]));
+    }
 
     for old in [
         JOB_0_1,
         JOB_0_2,
         "https://trusttasks.org/spec/git-ns/bridge/job/0.3",
+        JOB_0_4,
+        JOB_0_5,
     ] {
         let doc = w.doc(old, inspect_job("job_old"), None).await;
         w.deliver(doc).await;

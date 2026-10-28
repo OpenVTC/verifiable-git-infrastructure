@@ -1,7 +1,12 @@
 //! The pull-request gate against the fake VTC and a mock GitHub:
 //! `pull_request` webhooks reported as `pullRequestOpened`
-//! (`git-ns/bridge/event` 0.4), and `closePullRequest` jobs
-//! (`git-ns/bridge/job` 0.5) carried out idempotently.
+//! (`git-ns/bridge/event` 0.5), and `closePullRequest` jobs
+//! (`git-ns/bridge/job` 0.6) carried out idempotently.
+
+// The bridge's git-ns/bridge types come from trust-tasks-rs's prebuilt
+// specification modules, which 0.36 deprecates (allowed in `vgi_bridge` too,
+// until it generates them); these tests read payloads through them.
+#![allow(deprecated)]
 
 mod common;
 
@@ -13,15 +18,13 @@ use vgi_bridge::store::{NamespaceRecord, OutboxEntry, Table};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const EVENT_0_4: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.4";
 const WIDGETS_ID: u64 = 812;
 const OWN_BOT: &str = "acme-vgi-bridge[bot]";
 
-/// A world that sends event 0.4, with `acme/widgets` managed. The
-/// bridge-posted check is off: these tests watch the gate, not the check.
-async fn gate_world(event_version: Option<&'static str>) -> World {
+/// A world with `acme/widgets` managed. The bridge-posted check is off:
+/// these tests watch the gate, not the check.
+async fn gate_world() -> World {
     let w = world(Options {
-        event_version,
         bridge_checks: false,
         ..Options::default()
     })
@@ -73,7 +76,7 @@ fn open_events(w: &World) -> usize {
 
 #[tokio::test]
 async fn an_opened_pull_request_is_reported_as_pull_request_opened() {
-    let mut w = gate_world(Some("0.4")).await;
+    let mut w = gate_world().await;
     let s = post_webhook(
         &w,
         "pull_request",
@@ -82,7 +85,7 @@ async fn an_opened_pull_request_is_reported_as_pull_request_opened() {
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    let ev = w.next_of(EVENT_0_4).await;
+    let ev = w.next_of(EVENT).await;
     assert_eq!(ev["payload"]["namespace"], NS);
     assert_eq!(
         ev["payload"]["event"],
@@ -98,9 +101,9 @@ async fn an_opened_pull_request_is_reported_as_pull_request_opened() {
             "fromFork": true,
         })
     );
-    // A valid 0.4 payload, and nothing of what the pull request contains.
+    // A valid 0.5 payload, and nothing of what the pull request contains.
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.4 payload");
+        .expect("a 0.5 payload");
     let text = ev.to_string();
     for secret in ["a title", "a body", "secret-branch-name"] {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
@@ -121,7 +124,7 @@ async fn an_opened_pull_request_is_reported_as_pull_request_opened() {
 
 #[tokio::test]
 async fn a_reopen_reports_who_reopened_it_and_a_draft_from_the_same_repository() {
-    let mut w = gate_world(Some("0.4")).await;
+    let mut w = gate_world().await;
     post_webhook(
         &w,
         "pull_request",
@@ -129,7 +132,7 @@ async fn a_reopen_reports_who_reopened_it_and_a_draft_from_the_same_repository()
         &pr_delivery("reopened", same_repo(), true, (4410987, "alice-acme")),
     )
     .await;
-    let ev = w.next_of(EVENT_0_4).await;
+    let ev = w.next_of(EVENT).await;
     let e = &ev["payload"]["event"];
     assert_eq!(e["action"], "reopened");
     assert_eq!(e["author"]["login"], "eve-dev");
@@ -144,7 +147,7 @@ async fn a_reopen_reports_who_reopened_it_and_a_draft_from_the_same_repository()
 
 #[tokio::test]
 async fn other_actions_and_unmanaged_or_foreign_repositories_are_not_reported() {
-    let mut w = gate_world(Some("0.4")).await;
+    let mut w = gate_world().await;
     for (i, action) in ["synchronize", "edited", "closed", "labeled"]
         .iter()
         .enumerate()
@@ -172,11 +175,7 @@ async fn other_actions_and_unmanaged_or_foreign_repositories_are_not_reported() 
 async fn the_same_delivery_still_prompts_the_bridge_posted_check() {
     // With the bridge-posted check on, an opening is both reported and
     // checked: the report takes nothing from the check's handling.
-    let mut w = world(Options {
-        event_version: Some("0.4"),
-        ..Options::default()
-    })
-    .await;
+    let mut w = world(Options::default()).await;
     seed_repo(w.bridge.store(), &repo("widgets"), WIDGETS_ID);
     mount_any_token(&w.server).await;
     post_webhook(
@@ -186,30 +185,13 @@ async fn the_same_delivery_still_prompts_the_bridge_posted_check() {
         &pr_delivery("opened", fork(), false, (5550123, "eve-dev")),
     )
     .await;
-    let ev = w.next_of(EVENT_0_4).await;
+    let ev = w.next_of(EVENT).await;
     assert_eq!(ev["payload"]["event"]["type"], "pullRequestOpened");
     // The check runner reads the pull request back from GitHub.
     wait_for_request(&w.server, "the check reads the pull request", |r| {
         r.url.path().starts_with("/repos/acme/widgets")
     })
     .await;
-}
-
-#[tokio::test]
-async fn below_event_0_4_no_pull_request_is_reported() {
-    // The default (0.3): a VTC that has not listed 0.4 is told of no pull
-    // requests, under any type.
-    let mut w = gate_world(None).await;
-    let s = post_webhook(
-        &w,
-        "pull_request",
-        "pr-3",
-        &pr_delivery("opened", fork(), false, (5550123, "eve-dev")),
-    )
-    .await;
-    assert_eq!(s, StatusCode::ACCEPTED);
-    w.quiet().await;
-    assert_eq!(open_events(&w), 0);
 }
 
 // ── jobs ─────────────────────────────────────────────────────────────────
@@ -226,7 +208,7 @@ fn close_job(job_id: &str) -> Value {
 }
 
 async fn send_close(w: &World, job_id: &str) -> Value {
-    let doc = w.doc(JOB_0_5, close_job(job_id), None).await;
+    let doc = w.doc(JOB, close_job(job_id), None).await;
     w.deliver(doc.clone()).await;
     doc
 }
@@ -316,7 +298,7 @@ fn pair(a: &str, b: &str) -> (String, String) {
 
 #[tokio::test]
 async fn an_open_pull_request_is_commented_on_then_closed() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     mount_events(&w.server, json!([])).await;
@@ -325,7 +307,7 @@ async fn an_open_pull_request_is_commented_on_then_closed() {
 
     send_close(&w, "job_close_1").await;
     let ack = w.next().await;
-    assert_eq!(ack["type"], format!("{JOB_0_5}#response"));
+    assert_eq!(ack["type"], format!("{JOB}#response"));
     assert_eq!(ack["payload"]["accepted"], true);
     let result = w.next_of(RESULT).await;
     assert_eq!(result["payload"]["outcome"], "succeeded", "{result}");
@@ -352,7 +334,7 @@ async fn an_open_pull_request_is_commented_on_then_closed() {
 #[tokio::test]
 async fn an_already_closed_or_merged_pull_request_is_left_alone() {
     for (state, merged) in [("closed", false), ("closed", true)] {
-        let mut w = gate_world(None).await;
+        let mut w = gate_world().await;
         mount_any_token(&w.server).await;
         mount_pull(&w.server, state, merged).await;
         mount_writes(&w.server).await;
@@ -374,7 +356,7 @@ async fn a_rerun_finds_its_own_comment_and_does_not_comment_twice() {
     // An earlier run of this job (before a restart) posted the comment and
     // did not get to close: the re-run reports `comment` unchanged and
     // closes. A comment by someone else carrying the marker does not count.
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     mount_events(&w.server, json!([])).await;
@@ -406,7 +388,7 @@ async fn a_rerun_finds_its_own_comment_and_does_not_comment_twice() {
 async fn only_the_bridges_own_comment_for_this_job_counts() {
     // Someone else's comment with the marker, and the bridge's own comment
     // for another job: neither stops the comment.
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     mount_events(&w.server, json!([])).await;
@@ -432,7 +414,7 @@ async fn only_the_bridges_own_comment_for_this_job_counts() {
 
 #[tokio::test]
 async fn a_reopen_by_someone_else_after_the_job_was_issued_wins() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     let later = (Utc::now() + chrono::TimeDelta::seconds(60)).to_rfc3339();
@@ -466,7 +448,7 @@ async fn a_reopen_by_someone_else_after_the_job_was_issued_wins() {
 
 #[tokio::test]
 async fn a_reopen_before_the_job_or_by_the_bridge_itself_does_not_stop_it() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     let later = (Utc::now() + chrono::TimeDelta::seconds(60)).to_rfc3339();
@@ -493,7 +475,7 @@ async fn a_reopen_before_the_job_or_by_the_bridge_itself_does_not_stop_it() {
 
 #[tokio::test]
 async fn without_pull_requests_write_the_job_is_forbidden_and_the_permission_missing() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     // The installation approved Pull requests at read only: GitHub refuses a
     // token that asks for write.
     Mock::given(method("POST"))
@@ -555,7 +537,7 @@ async fn without_pull_requests_write_the_job_is_forbidden_and_the_permission_mis
 
 #[tokio::test]
 async fn a_pull_request_that_does_not_exist_is_not_found() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/widgets/pulls/42"))
@@ -570,7 +552,7 @@ async fn a_pull_request_that_does_not_exist_is_not_found() {
 
 #[tokio::test]
 async fn a_close_that_fails_after_the_comment_is_partial() {
-    let mut w = gate_world(None).await;
+    let mut w = gate_world().await;
     mount_any_token(&w.server).await;
     mount_pull(&w.server, "open", false).await;
     mount_events(&w.server, json!([])).await;
@@ -598,17 +580,11 @@ async fn a_close_that_fails_after_the_comment_is_partial() {
 }
 
 #[tokio::test]
-async fn close_pull_request_is_a_job_0_5_kind() {
-    let mut w = gate_world(None).await;
-    // Under 0.4 the kind does not exist: malformed, never run.
-    let doc = w.doc(JOB, close_job("job_close_10"), None).await;
-    w.deliver(doc).await;
-    let err = w.next().await;
-    assert_eq!(err["payload"]["code"], "malformedRequest", "{err}");
-    // 0.5 without its members is malformed too.
+async fn close_pull_request_without_its_members_is_malformed() {
+    let mut w = gate_world().await;
     let mut bare = close_job("job_close_11");
     bare.as_object_mut().unwrap().remove("message");
-    let doc = w.doc(JOB_0_5, bare, None).await;
+    let doc = w.doc(JOB, bare, None).await;
     w.deliver(doc).await;
     let err = w.next().await;
     assert_eq!(err["payload"]["code"], "malformedRequest", "{err}");
@@ -616,20 +592,17 @@ async fn close_pull_request_is_a_job_0_5_kind() {
 }
 
 #[tokio::test]
-async fn a_job_0_4_is_still_taken() {
-    let mut w = gate_world(None).await;
-    w.send_job(
-        json!({ "jobId": "job_inspect", "namespace": NS, "kind": "inspect",
-                       "repo": "github.com/acme/widgets" }),
-    )
-    .await;
-    let ack = w.next().await;
-    assert_eq!(ack["type"], format!("{JOB}#response"));
-    assert_eq!(ack["payload"]["accepted"], true);
-    // Run, and answered with a result (every other test here sends 0.4 jobs
-    // too: `JOB` is 0.4).
-    let result = w.next_of(RESULT).await;
-    assert_eq!(result["payload"]["jobId"], "job_inspect");
+async fn a_job_0_5_or_0_4_is_refused_as_an_unsupported_version() {
+    // The bridge lists 0.6 alone; a VTC that still holds an older answer is
+    // told so (and asks again), and nothing runs.
+    let mut w = gate_world().await;
+    for (ty, id) in [(JOB_0_5, "job_close_10"), (JOB_0_4, "job_inspect")] {
+        let doc = w.doc(ty, close_job(id), None).await;
+        w.deliver(doc).await;
+        let err = w.next().await;
+        assert_eq!(err["payload"]["code"], "unsupportedVersion", "{err}");
+    }
+    w.quiet().await;
 }
 
 #[tokio::test]
@@ -637,7 +610,7 @@ async fn forgejo_has_no_pull_request_gate_yet() {
     let mut w = forgejo_world("").await;
     let doc = w
         .doc(
-            JOB_0_5,
+            JOB,
             json!({
                 "jobId": "job_fj", "namespace": NS, "kind": "closePullRequest",
                 "repo": format!("{FJ}/acme/widgets"), "number": 3, "message": "m",

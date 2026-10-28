@@ -2,6 +2,11 @@
 //! 2026-09-25 decision that a namespace admin gets no forge role whatever
 //! the map says.
 
+// The bridge's git-ns/bridge types come from trust-tasks-rs's prebuilt
+// specification modules, which 0.36 deprecates (allowed in `vgi_bridge` too,
+// until it generates them); these tests read payloads through them.
+#![allow(deprecated)]
+
 mod common;
 
 use common::*;
@@ -332,9 +337,9 @@ async fn report(w: &mut World) -> Value {
     w.bridge.report_role_map(NS).await;
     let ev = w.next_of(EVENT).await;
     assert_eq!(ev["payload"]["namespace"], NS);
-    // Fits the 0.3 payload type.
+    // Fits the 0.5 payload type.
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.3 payload");
+        .expect("a 0.5 payload");
     ev["payload"]["event"].clone()
 }
 
@@ -444,25 +449,6 @@ async fn a_newer_report_replaces_an_unacknowledged_one() {
         reports(&w),
         vec![vgi_bridge::rolemap::outbox_key(NS)],
         "one per namespace"
-    );
-}
-
-#[tokio::test]
-async fn a_bridge_on_event_0_2_never_reports_its_role_map() {
-    let mut w = world(Options {
-        event_version: Some("0.2"),
-        ..Options::default()
-    })
-    .await;
-    seed_repo(w.bridge.store(), &repo("widgets"), 812);
-    w.bridge.report_role_maps().await;
-    w.quiet().await;
-    assert!(
-        w.bridge
-            .store()
-            .list::<OutboxEntry>(Table::Outbox)
-            .unwrap()
-            .is_empty()
     );
 }
 
@@ -639,37 +625,5 @@ async fn a_resent_report_carries_the_map_applied_now_not_the_one_first_queued() 
     assert_eq!(
         last["payload"]["event"]["stale"],
         json!(["github.com/acme/widgets"])
-    );
-}
-
-#[tokio::test]
-async fn a_pending_report_is_dropped_once_the_vtc_takes_an_event_version_below_0_3() {
-    let mut w = world(Options {
-        event_version: Some("0.2"),
-        ..Options::default()
-    })
-    .await;
-    // A report queued under 0.3, before the version was lowered.
-    let key = vgi_bridge::rolemap::outbox_key(NS);
-    w.bridge
-        .store()
-        .put(
-            Table::Outbox,
-            &key,
-            &OutboxEntry::result(json!({
-                "namespace": NS,
-                "event": { "type": "roleMapReported", "roleMap": map("admin", "maintain", "none") },
-            })),
-        )
-        .unwrap();
-    w.bridge.resend_unacknowledged(true).await;
-    w.quiet().await;
-    assert!(
-        w.bridge
-            .store()
-            .get::<OutboxEntry>(Table::Outbox, &key)
-            .unwrap()
-            .is_none(),
-        "dropped, not sent under 0.2"
     );
 }

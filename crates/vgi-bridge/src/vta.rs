@@ -287,13 +287,8 @@ impl Session {
     /// VTA's backups and recoverable from its mnemonic, so a restored VTA
     /// still opens them.
     pub async fn sealing_key(&self, create: bool) -> Result<MasterKey> {
-        let listed = self
-            .client
-            .list_keys(0, 1000, Some("active"), Some(&self.context))
-            .await
-            .map_err(|e| explain(e, &self.context, "listing the context's keys"))?;
+        let listed = active_keys(&self.client, &self.context).await?;
         let labelled: Vec<String> = listed
-            .keys
             .iter()
             .filter(|k| {
                 k.label.as_deref() == Some(SEAL_KEY_LABEL)
@@ -548,6 +543,26 @@ impl SigningPolicy {
     }
 }
 
+/// Every active key record in `context`, across pages (`keys/list/0.2`
+/// pages by cursor: a page with no `next_cursor` is the last).
+async fn active_keys(client: &VtaClient, context: &str) -> Result<Vec<vta_sdk::keys::KeyRecord>> {
+    const PAGE: u64 = 500;
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = client
+            .list_keys(cursor.as_deref(), PAGE, Some("active"), Some(context))
+            .await
+            .map_err(|e| explain(e, context, "listing the context's keys"))?;
+        let got = page.keys.len();
+        keys.extend(page.keys);
+        match page.next_cursor {
+            Some(next) if got > 0 => cursor = Some(next),
+            _ => return Ok(keys),
+        }
+    }
+}
+
 /// What a rotation changes, without exporting anything: the DID's keys as
 /// the VTA lists them, and the keys its document lists.
 async fn fingerprint(
@@ -555,13 +570,8 @@ async fn fingerprint(
     did: &str,
     docs: &dyn DidDocuments,
 ) -> Result<(Vec<(String, String)>, Listed)> {
-    let listed = session
-        .client
-        .list_keys(0, 1000, Some("active"), Some(&session.context))
-        .await
-        .map_err(|e| explain(e, &session.context, "listing the context's keys"))?;
+    let listed = active_keys(&session.client, &session.context).await?;
     let mut keys: Vec<(String, String)> = listed
-        .keys
         .into_iter()
         .filter_map(|k| Some((key_id_of(did, &k.key_id)?, k.public_key)))
         .collect();
@@ -571,13 +581,8 @@ async fn fingerprint(
 
 /// When each of the DID's keys was created in the VTA (for "newest").
 async fn key_ages(session: &Session, did: &str) -> Result<BTreeMap<String, i64>> {
-    let listed = session
-        .client
-        .list_keys(0, 1000, Some("active"), Some(&session.context))
-        .await
-        .map_err(|e| explain(e, &session.context, "listing the context's keys"))?;
+    let listed = active_keys(&session.client, &session.context).await?;
     Ok(listed
-        .keys
         .into_iter()
         .filter_map(|k| Some((key_id_of(did, &k.key_id)?, k.created_at.timestamp_millis())))
         .collect())
@@ -953,9 +958,11 @@ impl VtaAppState {
                     updated_at: unix_seconds(&r.updated_at),
                 });
             }
-            match (page.truncated, page.cursor) {
-                (true, Some(c)) => cursor = Some(c),
-                _ => return Ok(out),
+            // `vta/app-state/list/1.1`: a page with no `nextCursor` is the
+            // last.
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return Ok(out),
             }
         }
     }
@@ -1566,7 +1573,7 @@ pub(crate) mod testing {
                     }
                     Ok(self.bundle.lock().unwrap().clone())
                 }
-                u if u == tt::TASK_KEYS_LIST_0_1 => {
+                u if u == tt::TASK_KEYS_LIST_0_2 => {
                     let keys = self.keys_made.lock().unwrap();
                     let mut out: Vec<Value> = keys.iter().map(|(id, label, _)| json!({
                         "keyId": id, "derivationPath": "m/1", "keyType": "ed25519",
@@ -1588,8 +1595,7 @@ pub(crate) mod testing {
                             "contextId": self.context, "createdAt": at, "updatedAt": at,
                         }));
                     }
-                    let total = out.len();
-                    Ok(json!({ "keys": out, "total": total }))
+                    Ok(json!({ "keys": out }))
                 }
                 u if u == tt::TASK_KEYS_CREATE_0_1 => {
                     let mut keys = self.keys_made.lock().unwrap();
@@ -1641,7 +1647,7 @@ pub(crate) mod testing {
                     }
                     _ => Err(VtaError::NotFound(key)),
                 },
-                u if u == tt::TASK_VTA_APP_STATE_PUT_1_0 => {
+                u if u == tt::TASK_VTA_APP_STATE_PUT_1_1 => {
                     let current = st.1.get(&key).and_then(|(v, x)| x.as_ref().map(|_| *v));
                     let expected = p.get("expectedVersion").and_then(Value::as_u64);
                     let ok = match (expected, current) {
@@ -1657,7 +1663,7 @@ pub(crate) mod testing {
                     st.1.insert(key.clone(), (v, Some(p["value"].clone())));
                     Ok(json!({
                         "contextId": self.context, "namespace": NAMESPACE, "key": key,
-                        "version": v, "created": current.is_none(), "updatedAt": chrono::Utc::now().to_rfc3339(),
+                        "version": v, "wasCreated": current.is_none(), "updatedAt": chrono::Utc::now().to_rfc3339(),
                     }))
                 }
                 u if u == tt::TASK_VTA_APP_STATE_DELETE_1_0 => {
@@ -1679,7 +1685,7 @@ pub(crate) mod testing {
                         "existed": true, "version": v, "deletedAt": "2026-09-25T00:00:00Z" }),
                     )
                 }
-                u if u == tt::TASK_VTA_APP_STATE_LIST_1_0 => {
+                u if u == tt::TASK_VTA_APP_STATE_LIST_1_1 => {
                     // The change feed (`sinceVersion`) carries tombstones; the
                     // snapshot does not.
                     let feed = p.get("sinceVersion").is_some();
@@ -1688,7 +1694,7 @@ pub(crate) mod testing {
                             .filter(|(_, (_, value))| feed || value.is_some())
                             .map(|(k, (v, value))| self.record(k, *v, value.as_ref()))
                             .collect();
-                    Ok(json!({ "records": records, "truncated": false, "highWatermark": st.0 }))
+                    Ok(json!({ "records": records, "highWatermark": st.0 }))
                 }
                 other => Err(VtaError::Validation(format!(
                     "the fake VTA does not do {other}"
