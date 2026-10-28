@@ -64,13 +64,8 @@ jobs:
       # Packages every publishable crate and compiles each from its tarball. cargo
       # resolves the workspace's own crates from the local packages, so this
       # works before vgi-core's new version is on crates.io.
-      #
-      # One rustc at a time while the graph compiles trust-tasks-rs twice (0.36,
-      # and 0.34 with every family for trql-client 0.28): each is 10 GB or more,
-      # and two at once run the runner out of memory. Back to the default once a
-      # trql-client on the workspace's trust-tasks line removes the second copy.
       - name: Package and verify all crates
-        run: cargo package --workspace --locked -j 1
+        run: cargo package --workspace --locked
 
   publish:
     name: Publish to crates.io

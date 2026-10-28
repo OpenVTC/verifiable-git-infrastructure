@@ -13,7 +13,9 @@ in a range it answers two questions, and **fails closed** on any doubt:
    document's `assertionMethod` count; a key agreement or other key that is
    merely present in `verificationMethod` does not.
 2. **Is that DID trusted, right now?** The signer DID is checked against a Trust
-   Registry with a TRQP authorization query.
+   Registry with a TRQP authorization query (`registry/authorization` 0.2,
+   asked again at 0.1 when a registry released before 0.29 refuses 0.2
+   `unsupportedVersion`).
 
 There is **no per-repository signer list**. The trailer and the committer header are
 author-controlled text, so the named DID is used strictly as a lookup hint

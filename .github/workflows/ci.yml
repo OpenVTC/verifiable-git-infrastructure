@@ -121,14 +121,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
-      # One build job, not one per core: the graph compiles trust-tasks-rs
-      # twice (0.36, and 0.34 with every family for trql-client 0.28), each
-      # rustc 10 GB or more unoptimised, and any two of them at once outgrow
-      # the runner's RAM and swap together (exit 143, with -j 4 and -j 2
-      # alike). Serial is slower on a cold cache only. Back to the default
-      # once a trql-client on the workspace's trust-tasks line removes the
-      # second copy.
-      - run: cargo test --workspace -j 1
+      - run: cargo test --workspace
       - name: Test did-git-sign with the test-only policy bypass
         run: cargo test -p did-git-sign --features insecure-policy-bypass
       # The parent-process bypass is a test-only feature. A release build must

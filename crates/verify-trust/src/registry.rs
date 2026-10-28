@@ -67,7 +67,7 @@ use trql_client::{
     HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportChoice, TransportKind,
     TrqlClient, TrqlError, TrqlTransport,
 };
-use trust_tasks_trql::TrustTask;
+use trust_tasks_rs::TrustTask;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub use mediated::EphemeralIdentity;
@@ -1301,7 +1301,7 @@ mod tests {
     fn reply_to(request_id: &str) -> TrustTask<Value> {
         let mut doc = TrustTask::new(
             "urn:uuid:reply".to_string(),
-            "https://trusttasks.org/spec/registry/authorization/0.1#response"
+            "https://trusttasks.org/spec/registry/authorization/0.2#response"
                 .parse()
                 .unwrap(),
             serde_json::json!({}),
@@ -1661,12 +1661,12 @@ mod tests {
         let p = &request["payload"];
         serde_json::json!({
             "id": "urn:uuid:reply",
-            "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+            "type": "https://trusttasks.org/spec/registry/authorization/0.2#response",
             "threadId": thread,
             "payload": {
-                "entity_id": p["entity_id"], "authority_id": p["authority_id"],
+                "entityId": p["entityId"], "authorityId": p["authorityId"],
                 "action": p["action"], "resource": p["resource"],
-                "authorized": true, "time_evaluated": "2026-09-25T00:00:00Z"
+                "authorized": true, "evaluatedAt": "2026-09-25T00:00:00Z"
             }
         })
     }
