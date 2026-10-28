@@ -20,7 +20,9 @@ jobs:
   build:
     name: Bridge image builds and answers its healthcheck
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 90, not 45: the image builds serially (see the Dockerfile) while the
+    # graph compiles trust-tasks-rs twice.
+    timeout-minutes: 90
     env:
       IMAGE: vgi-bridge:ci
       # A stand-in `/healthz`, pinned by digest like every image here.
