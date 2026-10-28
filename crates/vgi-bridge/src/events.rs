@@ -498,13 +498,11 @@ async fn inspect_in(bridge: &Bridge, ns: &NamespaceRecord, repo: &Resource) {
 }
 
 /// A pull request opened or reopened on a repository the namespace manages
-/// → `pullRequestOpened` (`git-ns/bridge/event` 0.4), queued for the VTC to
-/// decide on its pull-request policy. Returns whether one was queued.
+/// → `pullRequestOpened` (`git-ns/bridge/event` 0.4 and later), queued for
+/// the VTC to decide on its pull-request policy. Returns whether one was
+/// queued.
 ///
-/// Nothing is reported unless the VTC takes event 0.4
-/// ([`crate::config::EventVersion::reports_pull_requests`]): below it there
-/// is no pull-request gate, and no pull request is ever sent under an older
-/// type. Nor for a repository the namespace does not manage (the VTC
+/// Nothing is reported for a repository the namespace does not manage (the VTC
 /// governs no other), one of the binding's own (`.vgi`), or one outside the
 /// delivering App's organisation. Only who and where leave the bridge —
 /// never the title, body, branches or diff. Each delivery is reported once
@@ -529,11 +527,6 @@ pub(crate) fn pull_request_opened(
     else {
         return false;
     };
-    if !bridge.cfg.event_version.reports_pull_requests() {
-        tracing::debug!(%repo, number,
-            "not reporting a pull request: event_version is below 0.4 (no pull-request gate)");
-        return false;
-    }
     if !scope.admits_repo(bridge, &repo, forge_id, true) {
         tracing::debug!(%repo, forge_id, "not reporting a pull request on an unmanaged repository");
         return false;

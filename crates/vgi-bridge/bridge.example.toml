@@ -16,14 +16,11 @@
 
 # The one VTC this bridge serves. Jobs signed by any other DID are refused.
 vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
-# The git-ns/bridge/event version sent to that VTC: "0.3" (the default; it
-# reports the bridge's role map, BRIDGE.md §6c), or "0.2" / "0.1" until the
-# VTC understands 0.3 (BRIDGE.md §7, "Event versions"). Set "0.4" — never by
-# default — once the VTC lists git-ns/bridge/event/0.4 in its discovery
-# answer: it adds the pull requests opened and reopened, which the VTC's
-# pull-request gate decides on (BRIDGE.md §6d). Below 0.4 no pull request
-# is reported.
-# event_version = "0.3"
+# The bridge sends git-ns/bridge/event 0.5 and git-ns/bridge/result 0.2, and
+# takes git-ns/bridge/job 0.6, alone (BRIDGE.md §7, "Protocol versions"): the
+# VTC must serve event 0.5 and result 0.2. `event_version` takes "0.5" only;
+# an older value fails the start. Leave it unset.
+# event_version = "0.5"
 # The community's Trust Registry (for the bootstrap and the bridge's check):
 # the TrustRegistry service of the VTC's DID document (setup reads it there).
 trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"
@@ -107,7 +104,7 @@ master_key_file = "/home/ops/vgi-bridge/master-key"
 # setup pins this to the commit of its own release tag; by hand:
 #   gh api repos/OpenVTC/verifiable-git-infrastructure/commits/<version> --jq .sha
 action = "OpenVTC/verifiable-git-infrastructure/.github/actions/verify-trust@<40-hex commit>"
-version = "v0.25.0"
+version = "v0.26.0"
 # Required by the Forgejo plan: SHA-256 of the release tarball.
 # sha256 = "<64 hex>"
 # required_check = "Verify commit trust"

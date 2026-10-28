@@ -173,6 +173,11 @@ enabled; check it before the first push, not after the PR check fails.
 is about to use, so a mismatch fails at `git commit` with both halves named
 rather than in CI as `unknownKey`.
 
+**The VTA's version.** From 0.26, `did-git-sign` lists the context's keys with
+`keys/list/0.2` (cursor paging), the version vta-sdk 0.75 speaks, so it needs a
+VTA that serves it (vta-service 0.67 or later); an older VTA refuses the
+request and key selection fails.
+
 **The VTA signs; the key stays there.** Since 0.17, `did-git-sign` sends the VTA
 the commit's SHA-512 and asks it to sign an SSHSIG statement
 (`keys/sign-sshsig/0.1`); the private key never reaches the contributor's
@@ -999,12 +1004,11 @@ cnm git revoke --subject did:…:dave --right git.repo.maintain --resource githu
   with no linked GitHub account gets no role until they link (openvtc `l`).
 - **A role-map change reaches the forge by re-projection.** After you change
   `role_map` and restart the bridge, it reports its map to the VTC
-  (`git-ns/bridge/event` 0.3) with the repositories projected under the old
+  (`git-ns/bridge/event` `roleMapReported`) with the repositories projected under the old
   one — and again at every reconnection to the VTC and whenever it starts
   serving a newly bound namespace, so the VTC's copy is never older than
   its link — and the VTC re-projects those by itself; the console shows the map
-  each right projects to. On a bridge set to `event_version = "0.2"`, or to
-  force it anyway, re-project by hand:
+  each right projects to. To force it anyway, re-project by hand:
   `cnm git reproject github.com/acme` (a namespace) or
   `cnm git reproject github.com/acme/widgets` (one repository; `--reason`
   goes in the audit record), or **Re-project roles** on the console's Repos
@@ -1403,7 +1407,7 @@ outcomes (the Repos page).
 | Code | Cause | Fix |
 |---|---|---|
 | `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
-| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.4: this bridge takes 0.4 and 0.5 only | upgrade the VTC |
+| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.6: this bridge takes 0.6 only | a VTC that lists 0.6 asks the bridge again and resends as 0.6; one that does not, upgrade |
 | `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
 | VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
 | bind fails `notCapable` ("not bound") for an organisation on a host with several Apps | no `[[github]]` entry (and registered App) for that organisation: add one and register its App (BRIDGE.md §3) | — |
@@ -1416,8 +1420,9 @@ outcomes (the Repos page).
 | step `rateLimited` | the forge's rate limit | the job is retried |
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
-| events refused as an unsupported type | a VTC older than `git-ns/bridge/event` 0.3 (the bridge's default), or older than 0.4 with `event_version = "0.4"` set | update the VTC, or set the version it takes (`"0.3"`, `"0.2"`, `"0.1"`) meanwhile; below 0.3 the VTC is not told the role map, below 0.4 no pull requests (BRIDGE.md §7) |
-| the pull-request gate closes nothing | `event_version` below 0.4 (the default), the VTC not on job 0.5, the App without Pull requests (write), or a Forgejo namespace (no gate yet) | §8m |
+| events or results refused as an unsupported type | a VTC that does not serve `git-ns/bridge/event` 0.5 and `git-ns/bridge/result` 0.2, the only versions the bridge sends | update the VTC (BRIDGE.md §7); they are resent until it takes them |
+| bridge start refused: `event_version` "unknown variant" | the config names an event version the bridge no longer sends (`"0.1"`–`"0.4"`) | remove the line (BRIDGE.md §7) |
+| the pull-request gate closes nothing | the VTC without the pull-request gate, the App without Pull requests (write), or a Forgejo namespace (no gate yet) | §8m |
 
 ### 8l. Separation of duties and break-glass
 
@@ -1503,11 +1508,10 @@ The bridge's part (BRIDGE.md §6d): it reports each pull request opened or
 reopened on a managed repository, and closes one when the VTC says so, with
 the community's message. For that it needs:
 
-- `event_version = "0.4"` in its config, once the VTC lists
-  `git-ns/bridge/event/0.4` in its discovery answer (never the default —
-  BRIDGE.md §7);
-- a bridge that takes `git-ns/bridge/job` 0.5 (this one), which the VTC
-  learns from discovery;
+- a VTC that serves `git-ns/bridge/event` 0.5 (which it needs for every
+  event — BRIDGE.md §7);
+- a bridge that takes `git-ns/bridge/job` 0.5 or later (this one takes 0.6),
+  which the VTC learns from discovery;
 - the GitHub App's Pull requests at **write** (§8f).
 
 Forgejo namespaces have no gate yet (`closePullRequest` is `notCapable`).

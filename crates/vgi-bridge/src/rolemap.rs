@@ -37,7 +37,6 @@
 //! forge role whatever the map says.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 use vgi_forge::{EffectiveRights, Forge, ForgeRole, Namespace, Resource, Right, RoleMap};
@@ -149,26 +148,10 @@ pub(crate) fn event(bridge: &Bridge, ns: &NamespaceRecord) -> Option<Value> {
     Some(ev)
 }
 
-/// Set once the bridge has said, per process, that its VTC takes an event
-/// version without `roleMapReported`.
-static SAID_NO_REPORT: AtomicBool = AtomicBool::new(false);
-
 impl Bridge {
     /// Report the role map of namespace `ns_id` to the VTC, replacing any
-    /// earlier report still unacknowledged. Nothing under event 0.1 or 0.2,
-    /// where a report still pending (queued before the version was lowered)
-    /// is dropped rather than sent under a version without the type.
+    /// earlier report still unacknowledged.
     pub async fn report_role_map(&self, ns_id: &str) {
-        if !self.cfg.event_version.reports_role_map() {
-            let _ = self.store.delete(Table::Outbox, &outbox_key(ns_id));
-            if !SAID_NO_REPORT.swap(true, Ordering::Relaxed) {
-                tracing::info!(
-                    "event_version is below 0.3: the VTC is not told this bridge's role map, \
-                     and assumes the default"
-                );
-            }
-            return;
-        }
         let Ok(Some(ns)) = self.store.get::<NamespaceRecord>(Table::Namespaces, ns_id) else {
             return;
         };

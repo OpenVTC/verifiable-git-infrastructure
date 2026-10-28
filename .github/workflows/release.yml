@@ -97,9 +97,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
 
+      # One rustc at a time while the graph compiles trust-tasks-rs twice (0.36,
+      # and 0.34 with every family for trql-client 0.28): each is 10 GB or more,
+      # and two at once run the runner out of memory. Back to the default once a
+      # trql-client on the workspace's trust-tasks line removes the second copy.
       - name: Build ${{ matrix.bin }}
         shell: bash
-        run: cargo build --release --locked -p "$BIN" --target "$TARGET"
+        run: cargo build --release --locked -j 1 -p "$BIN" --target "$TARGET"
 
       # Package as a `.tar.gz` on every platform (git-bash on the Windows
       # runner provides tar + sha256sum), so downstream extraction is uniform.

@@ -961,15 +961,19 @@ async fn list_active_keys(
 ) -> Result<Vec<vta_sdk::keys::KeyRecord>> {
     const PAGE: u64 = 100;
     let mut keys = Vec::new();
+    // `keys/list/0.2` pages by cursor: a page with no `next_cursor` is the
+    // last.
+    let mut cursor: Option<String> = None;
     loop {
         let page = client
-            .list_keys(keys.len() as u64, PAGE, Some("active"), Some(context))
+            .list_keys(cursor.as_deref(), PAGE, Some("active"), Some(context))
             .await
             .map_err(|e| anyhow::anyhow!("failed to list keys in '{context}': {e}"))?;
         let got = page.keys.len();
         keys.extend(page.keys);
-        if got == 0 || keys.len() as u64 >= page.total {
-            return Ok(keys);
+        match page.next_cursor {
+            Some(next) if got > 0 => cursor = Some(next),
+            _ => return Ok(keys),
         }
     }
 }
@@ -1750,6 +1754,9 @@ async fn cmd_health(
 /// It carries no software version: the VTA answers this for any caller and
 /// keeps its version to `vta/restore/status`, which only administrators of the
 /// whole VTA may read, and `did-git-sign`'s credential administers one context.
+// The answer is vta-sdk's type, from trust-tasks-rs's prebuilt modules, which
+// 0.36 deprecates; it moves when vta-sdk does.
+#[allow(deprecated)]
 async fn print_session_health(client: &vta_sdk::client::VtaClient) {
     print!("VTA health:      ");
     match client.health_details().await {

@@ -29,18 +29,12 @@ pub struct BridgeConfig {
     /// The one VTC this bridge serves. Jobs signed by any other DID are
     /// refused (spec: `permissionDenied`), whatever their proof.
     pub vtc_did: String,
-    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.3"`
-    /// (the default); `"0.4"` once the VTC takes it (it lists
-    /// `git-ns/bridge/event/0.4` in its discovery answer); or `"0.2"` /
-    /// `"0.1"` for a VTC that does not understand 0.3 yet. All four are
-    /// wire-identical for every forge event the older ones carry; 0.2
-    /// changes what the VTC does with a transfer (it detaches the repository
-    /// and never moves its rights), 0.3 adds `roleMapReported`, the role map
-    /// the bridge projects rights with — which is never sent under 0.1 or
-    /// 0.2, so such a VTC keeps assuming the default map — and 0.4 adds
-    /// `pullRequestOpened`, which is never sent under anything older, so a
-    /// VTC below 0.4 has no pull-request gate. The bridge's own handling is
-    /// the same either way.
+    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.5"`,
+    /// the only one, and the default. The setting is kept so that a
+    /// configuration naming a version this bridge no longer sends (`"0.1"` to
+    /// `"0.4"`) fails the start rather than being silently ignored: a VTC
+    /// that needed one of those does not take 0.5, and would refuse every
+    /// event. Remove the line once the VTC serves 0.5.
     #[serde(default)]
     pub event_version: EventVersion,
     /// The community's Trust Registry, for the bootstrap plan and the
@@ -199,45 +193,12 @@ fn default_vta_start_timeout() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[non_exhaustive]
 pub enum EventVersion {
-    /// `git-ns/bridge/event` 0.1, for a VTC that has not moved to 0.2.
-    #[serde(rename = "0.1")]
-    V0_1,
-    /// `git-ns/bridge/event` 0.2, for a VTC that has not moved to 0.3: no
-    /// role-map report.
-    #[serde(rename = "0.2")]
-    V0_2,
-    /// `git-ns/bridge/event` 0.3: adds `roleMapReported`. Still the
-    /// default: see [`EventVersion::V0_4`] for why.
+    /// `git-ns/bridge/event` 0.5: 0.4 with nested repository paths
+    /// (`git-ns/_shared/0.6`). Every event — `roleMapReported` and
+    /// `pullRequestOpened` included — goes out under it.
     #[default]
-    #[serde(rename = "0.3")]
-    V0_3,
-    /// `git-ns/bridge/event` 0.4: adds `pullRequestOpened`, the report the
-    /// community's pull-request gate decides on.
-    ///
-    /// Opt-in, not the default. Event 0.4 says a bridge **MUST NOT** send a
-    /// 0.4 event to a VTC that has not listed the 0.4 type URI in answer to
-    /// a `trust-task-discovery` request from that bridge — a VTC that knows
-    /// only 0.3 refuses the type, and with it every event the bridge would
-    /// have sent. This bridge answers discovery but does not ask it, so it
-    /// cannot learn that on its own; setting `event_version = "0.4"` is the
-    /// operator's statement that the VTC takes it. (0.3 became the default
-    /// when it was added because 0.3 carried no such rule.)
-    #[serde(rename = "0.4")]
-    V0_4,
-}
-
-impl EventVersion {
-    /// Whether the VTC takes `roleMapReported` (event 0.3 and later).
-    pub fn reports_role_map(self) -> bool {
-        self >= EventVersion::V0_3
-    }
-
-    /// Whether the VTC takes `pullRequestOpened` (event 0.4 and later).
-    /// Below 0.4 the bridge reports no pull requests at all — never one
-    /// under an older type URI.
-    pub fn reports_pull_requests(self) -> bool {
-        self >= EventVersion::V0_4
-    }
+    #[serde(rename = "0.5")]
+    V0_5,
 }
 
 /// Inputs to every bootstrap plan.
@@ -1100,7 +1061,7 @@ oauth_client_id = "0b6e3a0c"
             "https://bridge.acme.example/github/github.com/webhook"
         );
         assert_eq!(c.checks.max_commits, 250);
-        assert_eq!(c.event_version, EventVersion::V0_3, "0.3 unless set");
+        assert_eq!(c.event_version, EventVersion::V0_5, "0.5 unless set");
     }
 
     #[test]
@@ -1145,7 +1106,7 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn the_event_version_is_0_1_to_0_4() {
+    fn the_event_version_is_0_5_alone() {
         let with = |v: &str| {
             BridgeConfig::parse(&EXAMPLE.replacen(
                 "public_url",
@@ -1153,16 +1114,10 @@ oauth_client_id = "0b6e3a0c"
                 1,
             ))
         };
-        assert_eq!(with("0.1").unwrap().event_version, EventVersion::V0_1);
-        assert_eq!(with("0.2").unwrap().event_version, EventVersion::V0_2);
-        assert_eq!(with("0.3").unwrap().event_version, EventVersion::V0_3);
-        assert_eq!(with("0.4").unwrap().event_version, EventVersion::V0_4);
-        assert!(!EventVersion::V0_3.reports_pull_requests());
-        assert!(EventVersion::V0_4.reports_pull_requests());
-        assert!(EventVersion::V0_4.reports_role_map());
-        assert!(!EventVersion::V0_2.reports_role_map());
-        assert!(EventVersion::V0_3.reports_role_map());
-        for bad in ["0.5", "1.0", "", "v0.2"] {
+        assert_eq!(with("0.5").unwrap().event_version, EventVersion::V0_5);
+        // A version the bridge no longer sends fails the start: the VTC it
+        // was set for would refuse every 0.5 event.
+        for bad in ["0.1", "0.2", "0.3", "0.4", "0.6", "1.0", "", "v0.5"] {
             assert!(with(bad).is_err(), "`{bad}` is refused");
         }
     }

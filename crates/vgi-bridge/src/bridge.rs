@@ -435,10 +435,10 @@ impl Bridge {
             self.send_error(
                 &verified.doc,
                 ErrorPayload::new(StandardCode::UnsupportedVersion)
-                    .with_message("this bridge takes git-ns/bridge/job 0.5 and 0.4 only"),
+                    .with_message("this bridge takes git-ns/bridge/job 0.6 only"),
             )
             .await;
-        } else if ty == wire::DISCOVERY_TYPE {
+        } else if wire::is_discovery_type(&ty) {
             let patterns: Vec<String> = verified
                 .doc
                 .payload
@@ -452,7 +452,7 @@ impl Bridge {
                 .unwrap_or_default();
             self.respond(&verified.doc, wire::discovery_answer(&patterns))
                 .await;
-        } else if ty == result::Response::TYPE_URI {
+        } else if wire::is_result_response_type(&ty) {
             self.on_result_ack(&verified);
         } else if wire::is_event_response_type(&ty) {
             self.on_event_ack(&verified);
@@ -507,19 +507,6 @@ impl Bridge {
                 return;
             }
         };
-        // Every job is read as 0.5; a kind 0.5 added is not a 0.4 job's.
-        let ty = v.doc.type_uri.to_string();
-        if !wire::job_kind_allowed(&ty, payload.kind) {
-            self.send_error(
-                &v.doc,
-                ErrorPayload::new(StandardCode::MalformedRequest).with_message(format!(
-                    "`{}` is a git-ns/bridge/job 0.5 kind; send it as 0.5",
-                    payload.kind
-                )),
-            )
-            .await;
-            return;
-        }
         if let Err(msg) = wire::check_kind_members(&payload) {
             self.send_error(
                 &v.doc,
@@ -938,23 +925,18 @@ impl Bridge {
     /// A role-map report's outbox entry `key`, built afresh for this send
     /// (`git-ns/bridge/event` 0.3: the report with the latest `issuedAt`
     /// wins, so a resend carries the map applied now, never the one first
-    /// queued). `false` when there is nothing to send: the VTC takes an event
-    /// version without `roleMapReported`, the namespace is no longer bound,
-    /// or its map rounds unordered. The entry is then dropped rather than
-    /// sent under an older version or with a map the bridge no longer
-    /// applies.
+    /// queued). `false` when there is nothing to send: the namespace is no
+    /// longer bound, or its map rounds unordered. The entry is then dropped
+    /// rather than sent with a map the bridge no longer applies.
     fn refresh_role_map_entry(&self, key: &str) -> bool {
         let ns_id = &key[crate::rolemap::OUTBOX_PREFIX.len()..];
-        let fresh = if self.cfg.event_version.reports_role_map() {
-            self.store
-                .get::<NamespaceRecord>(Table::Namespaces, ns_id)
-                .ok()
-                .flatten()
-                .and_then(|ns| crate::rolemap::event(self, &ns))
-                .and_then(|ev| self.event_outbox_payload(ns_id, ev, None).ok().flatten())
-        } else {
-            None
-        };
+        let fresh = self
+            .store
+            .get::<NamespaceRecord>(Table::Namespaces, ns_id)
+            .ok()
+            .flatten()
+            .and_then(|ns| crate::rolemap::event(self, &ns))
+            .and_then(|ev| self.event_outbox_payload(ns_id, ev, None).ok().flatten());
         let Some(payload) = fresh else {
             tracing::info!(
                 namespace = ns_id,
@@ -997,26 +979,9 @@ impl Bridge {
             );
             return;
         }
-        // A pull request queued while the bridge sent 0.4 is never sent
-        // under an older version after the configuration changed (event
-        // 0.4: a VTC below 0.4 is told of no pull requests). Dropped, not
-        // held: it is a fact about one moment, and a VTC that later takes
-        // 0.4 hears of the next opening or reopening.
-        if entry.kind == OutboxKind::Event
-            && !self.cfg.event_version.reports_pull_requests()
-            && entry.payload.pointer("/event/type").and_then(Value::as_str)
-                == Some("pullRequestOpened")
-        {
-            tracing::info!(
-                key,
-                "dropping a pending pull-request report: event_version is below 0.4"
-            );
-            let _ = self.store.delete(Table::Outbox, key);
-            return;
-        }
         let type_uri = match entry.kind {
             OutboxKind::Result => result::Payload::TYPE_URI,
-            _ => wire::event_type_uri(self.cfg.event_version),
+            _ => event::Payload::TYPE_URI,
         };
         let (id, doc) = match wire::signed_request(
             &self.identity(),

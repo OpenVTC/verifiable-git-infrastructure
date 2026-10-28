@@ -45,20 +45,18 @@ pub const NS: &str = "ns_acme";
 pub const KEYRING: &str =
     "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nweb-flow\n-----END PGP PUBLIC KEY BLOCK-----\n";
 
-/// `git-ns/bridge/job` 0.4, the only version the bridge takes.
-pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
-/// `git-ns/bridge/job` 0.5 (adds `closePullRequest`); the bridge takes both.
+/// `git-ns/bridge/job` 0.6, the only version the bridge takes.
+pub const JOB: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.6";
+/// `git-ns/bridge/job` 0.5, which the bridge refuses (it takes 0.6 only).
 pub const JOB_0_5: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.5";
+/// `git-ns/bridge/job` 0.4, which the bridge refuses.
+pub const JOB_0_4: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.4";
 /// `git-ns/bridge/job` 0.1, which the bridge refuses.
 pub const JOB_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.1";
-pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.1";
-/// `git-ns/bridge/event` 0.3, what the bridge sends unless configured
-/// otherwise.
-pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.3";
-/// `git-ns/bridge/event` 0.2, for a VTC configured `event_version = "0.2"`.
-pub const EVENT_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.2";
-/// `git-ns/bridge/event` 0.1, for a VTC configured `event_version = "0.1"`.
-pub const EVENT_0_1: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.1";
+/// `git-ns/bridge/result` 0.2, the only version the bridge sends.
+pub const RESULT: &str = "https://trusttasks.org/spec/git-ns/bridge/result/0.2";
+/// `git-ns/bridge/event` 0.5, the only version the bridge sends.
+pub const EVENT: &str = "https://trusttasks.org/spec/git-ns/bridge/event/0.5";
 /// `git-ns/bridge/job` 0.2, which the bridge refuses.
 pub const JOB_0_2: &str = "https://trusttasks.org/spec/git-ns/bridge/job/0.2";
 

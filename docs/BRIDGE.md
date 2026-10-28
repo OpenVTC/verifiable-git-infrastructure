@@ -239,6 +239,14 @@ Every signature the bridge makes is its own: it signs its Trust Task
 documents, results and Dependabot re-signs with its own Ed25519 key, never as
 the VTC.
 
+**The VTA's version.** The bridge pages its context's keys with
+`keys/list/0.2` and its app-state with `vta/app-state/list/1.1` and
+`vta/app-state/put/1.1` (cursor paging, `wasCreated`), the versions vta-sdk
+0.75 speaks. A VTA that serves only the older `keys/list/0.1` and
+`vta/app-state/*/1.0` (vta-service 0.66 and before) refuses them, and
+`vta setup` and the start fail: upgrade the VTA (vta-service 0.67 or later)
+before the bridge.
+
 **Setting it up.** `vgi-bridge setup` (§2) does all of this: it provisions
 the context-scoped credential, mints the `did:webvh` into the context,
 writes the `[vta]` section and runs `vta setup`'s checks. Doing it by hand is
@@ -913,7 +921,7 @@ is a maintainer's; the check, not a role, decides whose commits land), and
 **only `own` may map to `admin`**. `maintain` and `commit.sign` are rights a
 member may grant themselves, so a map that made either a forge admin would let
 them make themselves a repository administrator on their own authority; the
-start fails with an error naming the layer (`git-ns/bridge/job` 0.4 requires
+start fails with an error naming the layer (`git-ns/bridge/job` 0.4 and later require
 this). On a personal account `own` and `maintain` both become `write`, so
 there the forge cannot tell an owner from a maintainer: separation of duties
 is enforced at the VTC, not the forge.
@@ -925,17 +933,17 @@ role carries `git.ns.admin` projects nothing. Nothing here means *no
 direct role at all*: an account a job lists with no role has **any** direct
 collaborator role on that repository removed, one given by hand on the
 forge as much as one the bridge projected (only accounts a job does not
-list are left alone). `git-ns/bridge/job` 0.4 has no namespace-level role
-job (organisation owners): one without `repo` is `malformedRequest`. The
-bridge takes 0.4 and 0.5 (0.5 only adds `closePullRequest`, §6d) — older
-versions are refused `unsupportedVersion` — and answers
-`trust-task-discovery/0.2` from its VTC with both type URIs, which is how a
-VTC learns it may send them.
+list are left alone). `git-ns/bridge/job` (0.4 and later) has no namespace-level
+role job (organisation owners): one without `repo` is `malformedRequest`.
+The bridge takes 0.6 alone — older versions are refused
+`unsupportedVersion` — and answers `trust-task-discovery` (0.3 or 0.2) from
+its VTC with that type URI, which is how a VTC learns it may send it (§7,
+"Protocol versions").
 
 Job 0.4 has the VTC send `git.ns.admin` for a namespace admin with no right
 of their own on a repository, never the `git.repo.own` it implies; a VTC
-that sent earlier versions folded the two together, which is why this
-bridge takes nothing before 0.4. `git.ns.admin` is exercised through the VTC
+that sent earlier versions folded the two together. Every later version
+keeps the rule. `git.ns.admin` is exercised through the VTC
 and the bridge; who owns the organisation stays yours to manage by hand.
 Someone who is both a namespace admin and, in their own name, a
 repository's owner or maintainer gets that repository right's role.
@@ -970,8 +978,7 @@ Each report carries:
 The VTC uses the map to show each right's forge role and to work out which
 right a drifted forge role adopts as, and **re-projects every `stale`
 repository by itself**. A repository leaves `stale` once a projection of it
-succeeds. To re-project by hand — a bridge on event 0.2, or a forge you
-suspect has drifted — use `cnm git reproject --resource <namespace or repo>`
+succeeds. To re-project by hand — a forge you suspect has drifted — use `cnm git reproject --resource <namespace or repo>`
 or the console's **Re-project roles** on the Repos page
 (`git-ns/roles/reproject`). Until a repository is re-projected, the roles
 projected under the old map are the baseline drift is measured against, so
@@ -986,7 +993,7 @@ VTC roles: the `pr_open` setting of the community's `gitNamespace` policy at
 the VTC (RUNBOOK.md §8m). GitHub cannot enforce that by itself, so the
 bridge reports and the VTC decides:
 
-1. **The report** (`git-ns/bridge/event` 0.4 `pullRequestOpened`). A
+1. **The report** (`git-ns/bridge/event` 0.4 and later, `pullRequestOpened`). A
    verified `pull_request` webhook with action `opened` or `reopened`, on a
    repository the namespace manages, is reported with the pull request's
    number, its author (`pull_request.user`), who performed the action (the
@@ -999,11 +1006,8 @@ bridge reports and the VTC decides:
    each delivery is reported once. The same delivery still prompts the
    bridge-posted check (§6) exactly as before.
 
-   **Only under event 0.4**, which is opt-in (`event_version = "0.4"`, §7):
-   a VTC that does not take 0.4 is told of no pull request at all, and a
-   report still queued when the setting goes back below 0.4 is dropped
-   rather than sent under an older type.
-2. **The order** (`git-ns/bridge/job` 0.5 `closePullRequest`). When the
+   Sent as `git-ns/bridge/event` 0.5 (§7, "Protocol versions").
+2. **The order** (`git-ns/bridge/job` 0.5 and later, `closePullRequest`). When the
    policy does not allow the author, the VTC sends the community's message
    and the bridge runs two steps, reported as `comment` and `close`:
    - a pull request **already closed or merged** is left alone — both steps
@@ -1027,9 +1031,9 @@ bridge reports and the VTC decides:
    `partial`. Tokens are minted per job for the one repository, with
    `pull_requests: read` to look and `pull_requests: write` to act.
 
-The bridge takes `git-ns/bridge/job` 0.5 and 0.4, and lists both in its
+The bridge takes `git-ns/bridge/job` 0.6 alone, and lists it in its
 answer to `trust-task-discovery`, so a VTC learns it may send
-`closePullRequest`; a 0.4 job naming that kind is `malformedRequest`.
+`closePullRequest`.
 **Forgejo** has no gate yet: a `closePullRequest` there is `notCapable`, and
 the pull request stays open.
 
@@ -1109,46 +1113,42 @@ every organisation member can approve and merge whatever the bridge projects.
   posted. After a posted check the bridge inspects the repository and sends
   a `protectionChanged` carrying it, at most once a minute per repository.
 
-### Event versions
+### Protocol versions
 
-The bridge sends `git-ns/bridge/event` **0.3** by default. A VTC that does
-not understand 0.3 yet refuses it as an unsupported type; until it is
-updated, set in the config
+The bridge speaks one version of each `git-ns/bridge` task:
 
-```toml
-event_version = "0.2"   # "0.1", "0.2", "0.3" (the default) or "0.4"
-```
+| Task | Version | Older versions |
+|---|---|---|
+| `git-ns/bridge/job` (in) | **0.6** | 0.1–0.5 refused with `unsupportedVersion` |
+| `git-ns/bridge/result` (out) | **0.2** | not sent |
+| `git-ns/bridge/event` (out) | **0.5** | not sent |
 
-and restart. Switch back (or remove the line) once the VTC takes 0.3. The
-versions are wire-identical for every event an older one carries: an event
-is the same payload under each type URI, and events still queued when you
-switch go out under the new one. The VTC's acknowledgement is accepted in
-any version. What 0.3 adds is `roleMapReported` (§6c), which is **never
-sent under 0.1 or 0.2**: such a VTC goes on assuming the default role map,
-and a role-map change reaches a repository only when you re-project it
-(`cnm git reproject`) or its rights next change.
+Each is the one before with **nested repository paths**
+(`git-ns/_shared/0.6`: on a forge with nested groups a repository path may
+hold subgroups; GitHub and Forgejo have none, so nothing this bridge sends
+changes shape). A 0.5 job is a valid 0.6 job, and a VTC sends every job
+as 0.6 to a bridge that lists 0.6: this bridge lists only 0.6 in its `trust-task-discovery` answer (it answers discovery
+0.3 and 0.2, each in the version asked). A VTC still holding an older answer
+is refused with `unsupportedVersion`, forgets the answer, and asks again.
+Results and events still queued from before an upgrade go out under the new
+versions; the VTC's acknowledgement is accepted in any version.
 
-What 0.4 adds is `pullRequestOpened`, the report the pull-request gate
-decides on (§6d). **0.4 is not the default, and you set it yourself** once
-your VTC takes it — when the VTC lists
-`https://trusttasks.org/spec/git-ns/bridge/event/0.4` in its
-`trust-task-discovery` answer (a VTC with the pull-request gate does):
+**The VTC must serve `git-ns/bridge/event` 0.5 and `git-ns/bridge/result`
+0.2** (verifiable-trust-infrastructure `main` does, beside every older
+version). A VTC that does not refuses every event and result as an
+unsupported type. Update the VTC first, then the bridge.
 
-```toml
-event_version = "0.4"
-```
+`event_version` in the config is kept only so that a configuration naming
+a version this bridge no longer sends (`"0.1"` to `"0.4"`) fails the start
+instead of being ignored. Remove the line; `"0.5"` is the only value it
+takes, and the default.
 
-Event 0.4 forbids a bridge to send 0.4 to a VTC that has not listed it
-there, because a VTC that knows only 0.3 refuses the type — and with it
-every event this bridge would send it, the role map included. This bridge
-answers discovery but does not ask it, so it cannot find that out on its
-own; the setting is your statement that the VTC takes it. (0.3 became the
-default on release because 0.3 had no such rule.) Below 0.4 the bridge
-reports **no** pull requests, under any type, and a pull-request report still
-queued when you go back below 0.4 is dropped, not sent under the older type.
+Every event — `roleMapReported` (§6c) and `pullRequestOpened` (§6d)
+included — is always sent; there is no longer a version under which the
+role map or pull requests go unreported.
 
-What 0.2 changes is what the VTC does with an event. The bridge's own
-handling is the same whichever version it sends:
+What event 0.2 changed, and every later version keeps, is what the VTC
+does with an event. The bridge's handling:
 
 - **A transfer detaches.** A managed repository moved to another owner —
   another organisation, another forge, or another namespace this same bridge
