@@ -3,6 +3,10 @@
 //! (`git-ns/bridge/event` 0.4), and `closePullRequest` jobs
 //! (`git-ns/bridge/job` 0.5) carried out idempotently.
 
+// The event payload types are trust-tasks-rs 0.35's deprecated prebuilt
+// modules, as in the crate (`src/lib.rs`).
+#![allow(deprecated)]
+
 mod common;
 
 use axum::http::StatusCode;

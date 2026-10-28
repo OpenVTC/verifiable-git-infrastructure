@@ -49,14 +49,14 @@ fn answer(request: &Value, issuer: &str) -> Value {
     let p = &request["payload"];
     json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+        "type": "https://trusttasks.org/spec/registry/authorization/0.2#response",
         "threadId": request["id"],
         "issuer": issuer,
         "recipient": request["issuer"],
         "payload": {
-            "entity_id": p["entity_id"], "authority_id": p["authority_id"],
+            "entityId": p["entityId"], "authorityId": p["authorityId"],
             "action": p["action"], "resource": p["resource"],
-            "authorized": true, "time_evaluated": "2026-09-25T00:00:00Z"
+            "authorized": true, "evaluatedAt": "2026-09-25T00:00:00Z"
         }
     })
 }

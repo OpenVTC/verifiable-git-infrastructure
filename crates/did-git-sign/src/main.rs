@@ -1750,6 +1750,9 @@ async fn cmd_health(
 /// It carries no software version: the VTA answers this for any caller and
 /// keeps its version to `vta/restore/status`, which only administrators of the
 /// whole VTA may read, and `did-git-sign`'s credential administers one context.
+// The answer is vta-sdk's type, from trust-tasks-rs's prebuilt modules, which
+// 0.35 deprecates; it moves when vta-sdk does.
+#[allow(deprecated)]
 async fn print_session_health(client: &vta_sdk::client::VtaClient) {
     print!("VTA health:      ");
     match client.health_details().await {

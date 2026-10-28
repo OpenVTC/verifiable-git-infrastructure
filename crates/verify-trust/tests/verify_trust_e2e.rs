@@ -172,20 +172,20 @@ async fn stub_registry_with(grants: Vec<(String, String)>) -> String {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 let request: Value = serde_json::from_slice(&buf[header_end..]).unwrap();
-                let entity = request["payload"]["entity_id"].as_str().unwrap_or_default();
+                let entity = request["payload"]["entityId"].as_str().unwrap_or_default();
                 let resource = request["payload"]["resource"].as_str().unwrap_or_default();
                 let granted = grants.iter().any(|(e, r)| e == entity && r == resource);
                 let response = json!({
                     "id": "urn:uuid:stub-reply",
                     "threadId": request["id"],
-                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                    "type": "https://trusttasks.org/spec/registry/authorization/0.2#response",
                     "payload": {
-                        "entity_id": entity,
-                        "authority_id": request["payload"]["authority_id"],
+                        "entityId": entity,
+                        "authorityId": request["payload"]["authorityId"],
                         "action": request["payload"]["action"],
                         "resource": request["payload"]["resource"],
                         "authorized": granted,
-                        "time_evaluated": "2026-07-16T00:00:00Z",
+                        "evaluatedAt": "2026-07-16T00:00:00Z",
                     }
                 });
                 let body = response.to_string();

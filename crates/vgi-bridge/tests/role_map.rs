@@ -2,6 +2,10 @@
 //! 2026-09-25 decision that a namespace admin gets no forge role whatever
 //! the map says.
 
+// The event payload types are trust-tasks-rs 0.35's deprecated prebuilt
+// modules, as in the crate (`src/lib.rs`).
+#![allow(deprecated)]
+
 mod common;
 
 use common::*;

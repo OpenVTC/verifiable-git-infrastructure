@@ -3,6 +3,10 @@
 //! repository, every resource lies inside its event's namespace — and the
 //! 0.1 fallback for a VTC that has not moved.
 
+// The event payload types are trust-tasks-rs 0.35's deprecated prebuilt
+// modules, as in the crate (`src/lib.rs`).
+#![allow(deprecated)]
+
 mod common;
 
 use axum::http::StatusCode;

@@ -32,6 +32,11 @@
 //! its identity and secrets live too. The operator guide (`docs/BRIDGE.md`)
 //! covers deployment, VTA mode, the App registration, backups and networking.
 
+// trust-tasks-rs 0.35 deprecates its prebuilt specification modules, which the
+// bridge's git-ns/bridge/{job,result,event} types come from. Until the bridge
+// generates them (`trust-tasks-build`), the deprecation is allowed here.
+#![allow(deprecated)]
+
 pub mod appstate;
 pub mod bridge;
 #[cfg(feature = "forge-github")]
