@@ -121,7 +121,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
-      - run: cargo test --workspace
+      # Two build jobs, not one per core: the graph compiles trust-tasks-rs
+      # twice (0.36, and 0.34 with every family for trql-client 0.28), each
+      # rustc near 10 GB unoptimised. With four in flight the job outgrew RAM
+      # and swap together (exit 143); two keeps the peak to those two.
+      - run: cargo test --workspace -j 2
       - name: Test did-git-sign with the test-only policy bypass
         run: cargo test -p did-git-sign --features insecure-policy-bypass
       # The parent-process bypass is a test-only feature. A release build must

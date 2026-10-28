@@ -535,3 +535,14 @@ futures-util = "0.3"
 # `ServiceExt::oneshot` for the bridge's HTTP tests. Dev-only; already in the
 # graph under axum and reqwest.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+
+# trust-tasks-rs is generated code (one module per specification version), and
+# this graph compiles it twice: 0.36 for vta-sdk and the bridge, and 0.34 with
+# every family for trql-client 0.28 (see the `trust-tasks-trql` note). At the
+# release default (opt-level 3) each rustc for it peaked at 7-9 GB, and the two
+# at once ended the bridge-image build (exit 137); at opt-level 1 each stays
+# near 3 GB. The code is serde (de)serialisation of small documents, so the
+# lighter optimisation costs nothing measurable at run time. Applies only to
+# builds of this workspace (the release binaries and the bridge image).
+[profile.release.package.trust-tasks-rs]
+opt-level = 1
