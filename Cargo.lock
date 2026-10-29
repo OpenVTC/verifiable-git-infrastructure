@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7022,7 +7022,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -7066,7 +7066,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -7117,7 +7117,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7137,7 +7137,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "affinidi-did-common",
  "anyhow",
@@ -7152,7 +7152,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "async-trait",
  "http",
@@ -7164,7 +7164,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7184,7 +7184,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.27.0"
+version = "0.27.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
