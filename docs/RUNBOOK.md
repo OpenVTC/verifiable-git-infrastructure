@@ -32,10 +32,17 @@ These are outside VGI, and standing them up is the long pole.
 |---|---|---|
 | A **VTA** with a persona and Ed25519 signing key per contributor | the VTA signs each commit (`keys/sign-sshsig`); the private key never leaves it | each contributor's `did:webvh:…#key-N` |
 | A **Trust Registry** speaking TRQP | answers "is this DID authorized, right now" | `TRUST_REGISTRY_DID` |
-| Your **VTC's DID** | the community whose authority each trust tuple is evaluated under — TRQP's `authority_id` | `VTC_DID` |
+| Your **VTC's DID** | the community whose authority each trust tuple is evaluated under — TRQP's `authorityId` | `VTC_DID` |
 
 Two DIDs, no URLs. The registry's endpoint is discovered from its own DID
 document (§4), so there is nothing to keep in sync with it.
+
+VGI asks the registry `registry/authorization` **0.2** (since VGI 0.27, on
+trql-client 0.29). A registry that refuses 0.2 with `unsupportedVersion` — every
+registry release up to 0.28 serves 0.1 only — is asked again at 0.1, and the
+answer counts the same, so an older registry needs no upgrade first. The
+client remembers the refusal, so the extra exchange is paid once per client
+rather than on every query.
 
 Provisioning the VTA and registry themselves is documented in
 [verifiable-trust-infrastructure][vti], not here.
@@ -46,7 +53,7 @@ For each contributor, issue a grant in the registry over the tuple:
 
 ```
 entity    = did:webvh:…            the contributor's DID (no fragment)
-authority = <VTC_DID>              your VTC — TRQP calls this authority_id
+authority = <VTC_DID>              your VTC — TRQP calls this authorityId
 action    = git.commit.sign
 resource  = <forge-host>/<owner>/<repo>
                                    or <forge-host>/<owner> for an org-wide grant

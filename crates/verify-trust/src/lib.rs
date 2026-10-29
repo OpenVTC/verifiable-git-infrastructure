@@ -120,7 +120,7 @@ pub struct VerifyTrustArgs {
     /// the endpoint is discovered from).
     pub registry_did: String,
     /// DID of the **VTC** — the community whose authority the trust tuple is
-    /// evaluated under, sent as TRQP's `authority_id`.
+    /// evaluated under, sent as TRQP's `authorityId`.
     pub vtc_did: String,
     /// TRQP action, e.g. `git.commit.sign`.
     pub action: String,
@@ -1255,7 +1255,7 @@ async fn query_registry(
     for did in signer_dids {
         let mut decision: Result<Option<String>, String> = Ok(None);
         for resource in &resources {
-            // The VTC's DID is TRQP's `authority_id`. A registry records
+            // The VTC's DID is TRQP's `authorityId`. A registry records
             // identities: a did:scid without its `?src=` locator (VTI-KEY-160).
             let query = TrqpQuery::new(
                 vgi_core::signer_identity(did),
@@ -2487,12 +2487,15 @@ mod tests {
     // --- querying through a Registry ---
 
     /// A transport standing in for a mediator session: answers every query
-    /// with `authorized`, rejects it with a `trust-task-error` carrying
-    /// `rejection`, or fails every exchange with `failure`, recording what it
-    /// was sent.
+    /// with `authorized` (in `registry/authorization` 0.2, or — as a registry
+    /// released before 0.29 does — refusing 0.2 `unsupportedVersion` and
+    /// answering 0.1 when `v0_1_only`), rejects it with a `trust-task-error`
+    /// carrying `rejection`, or fails every exchange with `failure`, recording
+    /// what it was sent.
     struct FakeChannel {
         authorized: bool,
-        rejection: Option<trust_tasks_trql::ErrorPayload>,
+        v0_1_only: bool,
+        rejection: Option<trust_tasks_rs::ErrorPayload>,
         failure: Option<TrqlError>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
     }
@@ -2501,6 +2504,7 @@ mod tests {
         fn answering(authorized: bool) -> Self {
             Self {
                 authorized,
+                v0_1_only: false,
                 rejection: None,
                 failure: None,
                 seen: std::sync::Mutex::new(Vec::new()),
@@ -2514,10 +2518,17 @@ mod tests {
             }
         }
 
-        fn rejecting(rejection: trust_tasks_trql::ErrorPayload) -> Self {
+        fn rejecting(rejection: trust_tasks_rs::ErrorPayload) -> Self {
             Self {
                 rejection: Some(rejection),
                 ..Self::answering(false)
+            }
+        }
+
+        fn answering_v0_1_only(authorized: bool) -> Self {
+            Self {
+                v0_1_only: true,
+                ..Self::answering(authorized)
             }
         }
     }
@@ -2530,8 +2541,8 @@ mod tests {
 
         async fn exchange(
             &self,
-            request: trust_tasks_trql::TrustTask<serde_json::Value>,
-        ) -> Result<trust_tasks_trql::TrustTask<serde_json::Value>, TrqlError> {
+            request: trust_tasks_rs::TrustTask<serde_json::Value>,
+        ) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, TrqlError> {
             let typed = request;
             let request = serde_json::to_value(&typed).unwrap();
             assert_eq!(request["recipient"], "did:example:registry");
@@ -2555,18 +2566,50 @@ mod tests {
                 });
             }
             let p = &request["payload"];
+            let asked_v0_2 = request["type"]
+                .as_str()
+                .is_some_and(|t| t.contains("/registry/authorization/0.2"));
+            if self.v0_1_only {
+                if asked_v0_2 {
+                    let error = typed.reject_with(
+                        "urn:uuid:error",
+                        trust_tasks_rs::ErrorPayload::new(
+                            trust_tasks_rs::StandardCode::UnsupportedVersion,
+                        ),
+                    );
+                    return Ok(
+                        serde_json::from_value(serde_json::to_value(&error).unwrap()).unwrap(),
+                    );
+                }
+                return Ok(serde_json::from_value(serde_json::json!({
+                    "id": "urn:uuid:reply",
+                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                    "threadId": request["id"],
+                    "issuer": "did:example:registry",
+                    "payload": {
+                        "entity_id": p["entity_id"],
+                        "authority_id": p["authority_id"],
+                        "action": p["action"],
+                        "resource": p["resource"],
+                        "authorized": self.authorized,
+                        "time_evaluated": "2026-09-25T00:00:00Z"
+                    }
+                }))
+                .unwrap());
+            }
+            assert!(asked_v0_2, "asked {}", request["type"]);
             Ok(serde_json::from_value(serde_json::json!({
                 "id": "urn:uuid:reply",
-                "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                "type": "https://trusttasks.org/spec/registry/authorization/0.2#response",
                 "threadId": request["id"],
                 "issuer": "did:example:registry",
                 "payload": {
-                    "entity_id": p["entity_id"],
-                    "authority_id": p["authority_id"],
+                    "entityId": p["entityId"],
+                    "authorityId": p["authorityId"],
                     "action": p["action"],
                     "resource": p["resource"],
                     "authorized": self.authorized,
-                    "time_evaluated": "2026-09-25T00:00:00Z"
+                    "evaluatedAt": "2026-09-25T00:00:00Z"
                 }
             }))
             .unwrap())
@@ -2732,7 +2775,7 @@ mod tests {
     /// fallback is not asked — not a denial blamed on the signer.
     #[tokio::test]
     async fn a_retryable_rejection_fails_closed_as_unavailable() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         for rejection in [
             ErrorPayload::new(StandardCode::Unavailable),
             ErrorPayload::new(StandardCode::PermissionDenied).with_retryable(true),
@@ -2757,11 +2800,35 @@ mod tests {
         }
     }
 
+    /// A registry released before trql-client 0.29 serves
+    /// `registry/authorization` 0.1 only and refuses 0.2 `unsupportedVersion`:
+    /// the client asks again at 0.1, remembers that, and the answer counts.
+    #[tokio::test]
+    async fn a_registry_on_authorization_0_1_still_authorizes() {
+        let channel = Arc::new(FakeChannel::answering_v0_1_only(true));
+        let registry = Registry::with_transport(channel.clone(), "did:example:registry");
+        let (commits, signers) = one_signed_commit();
+        let report =
+            verify_prepared_with(&args_for_registry(), &commits, &signers, None, &registry)
+                .await
+                .unwrap();
+        assert!(report.ok, "{:?}", report.commits[0].status);
+        let seen = channel.seen.lock().unwrap();
+        let types: Vec<&str> = seen.iter().map(|d| d["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "https://trusttasks.org/spec/registry/authorization/0.2",
+                "https://trusttasks.org/spec/registry/authorization/0.1",
+            ]
+        );
+    }
+
     /// A non-retryable `trust-task-error` is the registry saying no: a denial,
     /// after the fallback resource has been asked too.
     #[tokio::test]
     async fn a_final_rejection_is_unauthorized_after_the_fallback() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         let channel = Arc::new(FakeChannel::rejecting(ErrorPayload::new(
             StandardCode::PermissionDenied,
         )));

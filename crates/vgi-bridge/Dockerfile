@@ -19,11 +19,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
  && rm -rf /var/lib/apt/lists/*
 COPY . .
-# One rustc at a time while the graph compiles trust-tasks-rs twice (0.36,
-# and 0.34 with every family for trql-client 0.28): each is 10 GB or more,
-# and two at once run the runner out of memory. Back to the default once a
-# trql-client on the workspace's trust-tasks line removes the second copy.
-RUN cargo build --release --locked -j 1 -p vgi-bridge
+RUN cargo build --release --locked -p vgi-bridge
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update \

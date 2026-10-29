@@ -60,7 +60,7 @@ struct Cli {
     registry_did: String,
 
     /// DID of your VTC — the community whose authority the trust tuple is
-    /// evaluated under (TRQP's `authority_id`).
+    /// evaluated under (TRQP's `authorityId`).
     #[arg(long)]
     vtc_did: String,
 

@@ -779,16 +779,16 @@ async fn the_bridge_queries_the_registry_as_its_own_did_over_its_link() {
                 assert_eq!(q["issuer"], bridge_did2, "sent as the bridge's DID");
                 let pl = &q["payload"];
                 let authorized =
-                    pl["entity_id"] == alice_did2.as_str() && pl["resource"] == "github.com/acme";
+                    pl["entityId"] == alice_did2.as_str() && pl["resource"] == "github.com/acme";
                 let reply = json!({
                     "id": format!("urn:uuid:r-{}", q["id"].as_str().unwrap()),
-                    "type": "https://trusttasks.org/spec/registry/authorization/0.1#response",
+                    "type": "https://trusttasks.org/spec/registry/authorization/0.2#response",
                     "threadId": q["id"],
                     "issuer": reg,
                     "payload": {
-                        "entity_id": pl["entity_id"], "authority_id": pl["authority_id"],
+                        "entityId": pl["entityId"], "authorityId": pl["authorityId"],
                         "action": pl["action"], "resource": pl["resource"],
-                        "authorized": authorized, "time_evaluated": "2026-09-25T00:00:00Z"
+                        "authorized": authorized, "evaluatedAt": "2026-09-25T00:00:00Z"
                     }
                 });
                 let sender = if forged {
