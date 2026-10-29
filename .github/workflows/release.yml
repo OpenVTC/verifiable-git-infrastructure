@@ -93,6 +93,21 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
 
+      # The ubuntu runners have 7 GB, and the trust-tasks-rs compile alone
+      # comes close to that: v0.25.0 and v0.27.0 lost both Linux binaries to
+      # the OOM killer (exit 143). Swap lets the peaks spill to disk, as in
+      # ci.yml and bridge-image.yml; the release profile's opt-level for
+      # trust-tasks-rs (workspace manifest) keeps the peak down.
+      - name: Add swap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+
       - name: System dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
