@@ -1,0 +1,21 @@
+# Written by `trust-tasks`. Do not edit by hand.
+version = 1
+registry = "https://trusttasks.org"
+
+[[task]]
+slug = "git-ns/bridge/event"
+version = "0.5"
+type_uri = "https://trusttasks.org/spec/git-ns/bridge/event/0.5"
+digest = "sha256:10ee2d0eb00caded8034421d84ff5aca970e9a3ee2150ce1ed8ab9ca962628ab"
+
+[[task]]
+slug = "git-ns/bridge/job"
+version = "0.6"
+type_uri = "https://trusttasks.org/spec/git-ns/bridge/job/0.6"
+digest = "sha256:c3026296106158774c2f15e981c07205bcd986bfb0f810a14a6045c5cbc8a7f4"
+
+[[task]]
+slug = "git-ns/bridge/result"
+version = "0.2"
+type_uri = "https://trusttasks.org/spec/git-ns/bridge/result/0.2"
+digest = "sha256:c826a1e555c21c6d63b5440e78b169b1fcd8497cde21aa7e5c6fb1ec36c96e0b"

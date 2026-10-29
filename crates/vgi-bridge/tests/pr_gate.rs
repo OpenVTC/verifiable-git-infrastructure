@@ -3,11 +3,6 @@
 //! (`git-ns/bridge/event` 0.5), and `closePullRequest` jobs
 //! (`git-ns/bridge/job` 0.6) carried out idempotently.
 
-// The bridge's git-ns/bridge types come from trust-tasks-rs's prebuilt
-// specification modules, which 0.36 deprecates (allowed in `vgi_bridge` too,
-// until it generates them); these tests read payloads through them.
-#![allow(deprecated)]
-
 mod common;
 
 use axum::http::StatusCode;

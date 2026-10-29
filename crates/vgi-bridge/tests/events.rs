@@ -3,11 +3,6 @@
 //! name detaches the old repository, and every resource lies inside its
 //! event's namespace.
 
-// The bridge's git-ns/bridge types come from trust-tasks-rs's prebuilt
-// specification modules, which 0.36 deprecates (allowed in `vgi_bridge` too,
-// until it generates them); these tests read payloads through them.
-#![allow(deprecated)]
-
 mod common;
 
 use axum::http::StatusCode;
