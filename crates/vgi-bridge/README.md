@@ -24,8 +24,9 @@ the bridge carries it out and reports back.
   `unsupportedVersion`; `trust-task-discovery` 0.3 or 0.2 from the VTC is
   answered with that type URI); exactly one `git-ns/bridge/result` (0.2)
   per job; `git-ns/bridge/event`s (0.5) for what happens on the forge. The payload
-  types are generated from the normative specifications
-  (`trust_tasks_rs::specs::git_ns`); every document is Data-Integrity signed
+  types are generated at build time from the normative specifications, at
+  the versions pinned in `trust-tasks.lock` (`trust-tasks-build`,
+  `vgi_bridge::specs::git_ns`); every document is Data-Integrity signed
   (`eddsa-jcs-2022`, proof purpose `authentication`; any other purpose is
   refused) and every inbound one checked — issuer, transport sender,
   recipient, freshness, then proof — before its payload is read.

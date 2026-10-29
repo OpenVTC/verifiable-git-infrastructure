@@ -2,11 +2,6 @@
 //! 2026-09-25 decision that a namespace admin gets no forge role whatever
 //! the map says.
 
-// The bridge's git-ns/bridge types come from trust-tasks-rs's prebuilt
-// specification modules, which 0.36 deprecates (allowed in `vgi_bridge` too,
-// until it generates them); these tests read payloads through them.
-#![allow(deprecated)]
-
 mod common;
 
 use common::*;

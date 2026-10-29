@@ -32,11 +32,6 @@
 //! its identity and secrets live too. The operator guide (`docs/BRIDGE.md`)
 //! covers deployment, VTA mode, the App registration, backups and networking.
 
-// trust-tasks-rs 0.36 deprecates its prebuilt specification modules, which the
-// bridge's git-ns/bridge/{job,result,event} types come from. Until the bridge
-// generates them (`trust-tasks-build`), the deprecation is allowed here.
-#![allow(deprecated)]
-
 pub mod appstate;
 pub mod bridge;
 #[cfg(feature = "forge-github")]
@@ -48,6 +43,15 @@ pub mod http;
 pub mod identity;
 mod jobs;
 pub mod mapping;
+/// The Trust Task specifications the bridge speaks — `git-ns/bridge/job`,
+/// `result` and `event` at the versions pinned in `trust-tasks.lock` —
+/// generated at build time by `trust-tasks-build`, at the module paths
+/// trust-tasks-rs's prebuilt modules used
+/// (`specs::git_ns::bridge::job::v0_6`). [`wire`] re-exports them.
+#[allow(clippy::all, missing_docs)]
+pub mod specs {
+    include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));
+}
 pub mod registry;
 #[cfg(feature = "forge-github")]
 pub mod registry_channel;

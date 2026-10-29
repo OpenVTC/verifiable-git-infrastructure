@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.27.1"
+version = "0.27.2"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.27.1", path = "crates/vgi-core" }
+vgi-core = { version = "0.27.2", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.27.1", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.27.2", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.27.1", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.27.1", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.27.1", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.27.2", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.27.2", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.27.2", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -502,10 +502,20 @@ affinidi-messaging-test-mediator = { version = "0.48", features = ["tsp"] }
 # `git-ns/bridge/job` 0.6 and `git-ns/bridge/result` 0.2 (nested repository
 # paths, `git-ns/_shared/0.6`), which the bridge now speaks alone. It
 # deprecates the prebuilt `specs::*` modules in favour of generating the tasks
-# an application pins (`trust-tasks-build`); the bridge still takes its
-# git-ns/bridge types from them, so `vgi-bridge` allows the deprecation at
-# crate level until it generates them.
-trust-tasks-rs = { version = "0.36.1", default-features = false, features = ["git-ns"] }
+# an application pins.
+#
+# **Runtime only, from 0.27.2.** The bridge no longer takes its git-ns/bridge
+# types from the prebuilt modules: `vgi-bridge`'s build.rs generates exactly the
+# versions pinned in `crates/vgi-bridge/trust-tasks.lock` with
+# `trust-tasks-build`, as `vgi_bridge::specs`, so this names no family. The
+# prebuilt families still compile — `trql-client` takes this crate's defaults
+# (`all-specs`) and `vta-sdk` enables the families it speaks — so the
+# `[profile.release.package.trust-tasks-rs]` setting below still applies.
+trust-tasks-rs = { version = "0.36.1", default-features = false }
+# Build dependency of `vgi-bridge`: generates `vgi_bridge::specs` from the
+# vendored bundles. `trust-tasks check` (trust-tasks-cli) verifies them. 0.1.2
+# is the release that generates for trust-tasks-rs 0.36.
+trust-tasks-build = "0.1.2"
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
