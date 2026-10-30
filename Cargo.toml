@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.27.2"
+version = "0.28.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.27.2", path = "crates/vgi-core" }
+vgi-core = { version = "0.28.0", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.27.2", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.28.0", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.27.2", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.27.2", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.27.2", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.28.0", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.28.0", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.28.0", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -132,7 +132,11 @@ verify-trust = { version = "0.27.2", path = "crates/verify-trust" }
 # `registry/authorization` at 0.2 and falls back to 0.1 when a registry
 # refuses that version (released registries <= 0.28 serve 0.1 only), and it
 # answers with its own types rather than trust-tasks payload types.
-trql-client = "0.29.0"
+# **0.30** generates the specs it speaks with `trust-tasks-build` (registry PR
+# #177) and enables no trust-tasks-rs feature, so it no longer turns on every
+# prebuilt family here. Its public types (`TransportChoice`, `TrqpQuery`, …)
+# cross into vgi-bridge's API, which is why this workspace moved to 0.28.0.
+trql-client = "0.30.0"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
@@ -508,8 +512,8 @@ affinidi-messaging-test-mediator = { version = "0.48", features = ["tsp"] }
 # types from the prebuilt modules: `vgi-bridge`'s build.rs generates exactly the
 # versions pinned in `crates/vgi-bridge/trust-tasks.lock` with
 # `trust-tasks-build`, as `vgi_bridge::specs`, so this names no family. The
-# prebuilt families still compile — `trql-client` takes this crate's defaults
-# (`all-specs`) and `vta-sdk` enables the families it speaks — so the
+# prebuilt families vta-sdk speaks still compile (trql-client enables none
+# from 0.30) — so the
 # `[profile.release.package.trust-tasks-rs]` setting below still applies.
 trust-tasks-rs = { version = "0.36.1", default-features = false }
 # Build dependency of `vgi-bridge`: generates `vgi_bridge::specs` from the
@@ -548,8 +552,8 @@ futures-util = "0.3"
 # graph under axum and reqwest.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
-# trust-tasks-rs is generated code (one module per specification version, and
-# trql-client takes every family). At the release default (opt-level 3) its one
+# trust-tasks-rs is generated code (one module per specification version; up
+# to 0.27, trql-client took every family, and vta-sdk still enables many). At the release default (opt-level 3) its one
 # rustc peaks at 7-9 GB, which is the whole of an ubuntu runner: v0.25.0 and
 # v0.27.0 lost their Linux release binaries to the OOM killer (exit 143) with a
 # single copy in the graph. At opt-level 1 it stays near 3 GB. The code is serde
