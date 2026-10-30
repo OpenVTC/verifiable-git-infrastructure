@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.28.0", path = "crates/vgi-core" }
+vgi-core = { version = "0.29.0", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.28.0", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.29.0", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.28.0", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.28.0", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.28.0", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.29.0", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.29.0", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.29.0", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -339,7 +339,12 @@ trql-client = "0.30.0"
 # 0.73 -> 0.75 takes trust-tasks 0.36, affinidi-tdk 0.36 and messaging-sdk
 # 0.44 (0.74 was the VTI #2300 line on trust-tasks 0.35 / affinidi-tdk 0.33,
 # skipped here).
-vta-sdk = { version = "0.75", default-features = false }
+#
+# 0.75 -> 0.76 is VTI's coordinated breaking release: vta-sdk takes its wire
+# types from the generated `vti-specs` crates (re-exported as `vta_sdk::specs`)
+# and enables no prebuilt trust-tasks-rs family, so did-git-sign's health
+# readout no longer needs `allow(deprecated)`. Same trust-tasks 0.36 line.
+vta-sdk = { version = "0.76", default-features = false }
 affinidi-tdk = "0.36"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
@@ -502,7 +507,7 @@ affinidi-messaging-test-mediator = { version = "0.48", features = ["tsp"] }
 # 0.27.3, dtgwg-trust-tasks-tf#723), so the bridge's payload types come from
 # this one line again.
 #
-# 0.36 is the line vta-sdk 0.75 is on, and carries `git-ns/bridge/event` 0.5,
+# 0.36 is the line vta-sdk 0.75 and 0.76 are on, and carries `git-ns/bridge/event` 0.5,
 # `git-ns/bridge/job` 0.6 and `git-ns/bridge/result` 0.2 (nested repository
 # paths, `git-ns/_shared/0.6`), which the bridge now speaks alone. It
 # deprecates the prebuilt `specs::*` modules in favour of generating the tasks
@@ -511,15 +516,16 @@ affinidi-messaging-test-mediator = { version = "0.48", features = ["tsp"] }
 # **Runtime only, from 0.27.2.** The bridge no longer takes its git-ns/bridge
 # types from the prebuilt modules: `vgi-bridge`'s build.rs generates exactly the
 # versions pinned in `crates/vgi-bridge/trust-tasks.lock` with
-# `trust-tasks-build`, as `vgi_bridge::specs`, so this names no family. The
-# prebuilt families vta-sdk speaks still compile (trql-client enables none
-# from 0.30) — so the
-# `[profile.release.package.trust-tasks-rs]` setting below still applies.
-trust-tasks-rs = { version = "0.36.1", default-features = false }
+# `trust-tasks-build`, as `vgi_bridge::specs`, so this names no family.
+# From 0.29.0 no prebuilt family compiles at all: trql-client 0.30 enables none, and
+# vta-sdk 0.76 takes its types from the generated `vti-specs` crates. Only
+# `validate` is on, which is why the release profile no longer needs a
+# lighter opt-level for this crate (it builds in ~5 s, ~0.35 GB).
+trust-tasks-rs = { version = "0.36.2", default-features = false }
 # Build dependency of `vgi-bridge`: generates `vgi_bridge::specs` from the
 # vendored bundles. `trust-tasks check` (trust-tasks-cli) verifies them. 0.1.2
 # is the release that generates for trust-tasks-rs 0.36.
-trust-tasks-build = "0.1.2"
+trust-tasks-build = "0.1.3"
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
@@ -551,14 +557,3 @@ futures-util = "0.3"
 # `ServiceExt::oneshot` for the bridge's HTTP tests. Dev-only; already in the
 # graph under axum and reqwest.
 tower = { version = "0.5", default-features = false, features = ["util"] }
-
-# trust-tasks-rs is generated code (one module per specification version; up
-# to 0.27, trql-client took every family, and vta-sdk still enables many). At the release default (opt-level 3) its one
-# rustc peaks at 7-9 GB, which is the whole of an ubuntu runner: v0.25.0 and
-# v0.27.0 lost their Linux release binaries to the OOM killer (exit 143) with a
-# single copy in the graph. At opt-level 1 it stays near 3 GB. The code is serde
-# (de)serialisation of small documents, so the lighter optimisation costs
-# nothing measurable at run time. Applies only to release builds of this
-# workspace (the release binaries and the bridge image).
-[profile.release.package.trust-tasks-rs]
-opt-level = 1
