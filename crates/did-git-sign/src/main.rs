@@ -1754,11 +1754,6 @@ async fn cmd_health(
 /// It carries no software version: the VTA answers this for any caller and
 /// keeps its version to `vta/restore/status`, which only administrators of the
 /// whole VTA may read, and `did-git-sign`'s credential administers one context.
-// `health_details()` returns vta-sdk's type, which is trust-tasks-rs's prebuilt
-// `vta/health/details/0.1` module; 0.36 deprecates those modules, and reading
-// the answer's fields trips it. Not ours to generate: the type is vta-sdk's,
-// and this allow goes when vta-sdk moves off the prebuilt modules.
-#[allow(deprecated)]
 async fn print_session_health(client: &vta_sdk::client::VtaClient) {
     print!("VTA health:      ");
     match client.health_details().await {
