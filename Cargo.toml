@@ -430,7 +430,7 @@ linux-keyutils-keyring-store = "1"
 rand = "0.8"
 # Pinned to 0.13, the line ssh-key 0.6 verifies with: builds the P-256 and
 # FIDO P-256 signatures in verify-trust's key-type tests.
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 tempfile = "3"
 serial_test = "4"
 # Property-based testing: used by vgi-core's trailer differential against git.
