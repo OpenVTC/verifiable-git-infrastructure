@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7023,7 +7023,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -7067,7 +7067,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -7119,7 +7119,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7139,7 +7139,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "affinidi-did-common",
  "anyhow",
@@ -7154,7 +7154,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-trait",
  "http",
@@ -7166,7 +7166,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7186,7 +7186,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7212,9 +7212,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.76.0"
+version = "0.78.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b785bb09ffc72c187a2a157c139a1f0ff9f539ae62c23a2fd918bf6eeb026e19"
+checksum = "7dfe75c6a2143a8821f3d918af1992d75e27e5653ca0130c21726cc305346ee0"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -7265,9 +7265,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f68aa1790829b391fc527c4bc0fc6ded47345e301f92d430842ddbafd0516b2"
+checksum = "de1af9ff4e47100ecf61ce6a7973a8d59fae48082a394a40fe98a2881af6e77d"
 dependencies = [
  "trust-tasks-rs",
  "vti-specs-core",
@@ -7278,9 +7278,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "347c7d7401f6c6bdcb3bd2e6bad2a050c05a1f0d8a45293d00c1d66ad767fade"
+checksum = "6a0e6ca07744fd3dc27208ef4f8874b22035a85082535798005b68b944badf1b"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
@@ -7288,9 +7288,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-rooms"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02c23c62b212503b67cb81232c092f79026dbef98502364dc9fb66a9f740ed7d"
+checksum = "db4f63b88ef8039fca8b9300ec1b308a05931a39fc098860e3ee5be9a1edd25e"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
@@ -7298,9 +7298,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-vta"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a24172177c7e44401bbbe36a5f170b7f4c63999a5942261193b9d2a2b4696c9"
+checksum = "c57a5e773de87b9faccd99a6e397414365b866a5d4e630320f7d71061828bb55"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
@@ -7308,9 +7308,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-vtc"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0146b59f121d7cdb745f190a6475dcc6f62f4e89897aa8b4c4283cb27849b05"
+checksum = "564a771bc25a38b86b89b7dc088626e9bcf963d00b6878f3b2c08f111cec4eb3"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
