@@ -60,4 +60,13 @@ updates:
       - dependency-name: "rand"
         update-types:
           - "version-update:semver-major"
+      # `p256` is held at 0.13, the line `ssh-key` 0.6 verifies with: verify-trust's
+      # key-type tests build P-256 and FIDO P-256 signatures with it and hand them
+      # to ssh-key. 0.14 drops `to_encoded_point` and ssh-key 0.6 has no
+      # `Signature: TryFrom<ecdsa::Signature<NistP256>>` for it (#190 failed to
+      # compile). Remove this entry when ssh-key 0.7 is stable and we move to it.
+      - dependency-name: "p256"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
           - "version-update:semver-minor"
