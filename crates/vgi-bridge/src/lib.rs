@@ -244,9 +244,14 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
         proof_checker_with_ttl(cfg.did_cache_ttl_secs).await?,
     );
     let bridge = Bridge::new(parts);
-    bridge.restore().await?;
-    #[cfg(feature = "forge-github")]
-    flows::offer_registrations(&bridge)?;
+
+    // Nothing runs before the first mediator session is up: the restore
+    // resends the outbox and reports the role maps, and the background
+    // loops and the HTTP server send and query over the link. The first
+    // session signals `ready` once connected (and the VTC offered a
+    // relationship), then serves nothing until `restored`.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (restored_tx, restored_rx) = tokio::sync::watch::channel(false);
 
     // The mediator session (TSP and DIDComm): connect, serve, reconnect with
     // capped backoff.
@@ -255,6 +260,8 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
         let link = Arc::clone(&link);
         let mut stop = stop_rx.clone();
         let mut rotations = bridge.rotations();
+        let mut ready = Some(ready_tx);
+        let mut restored = restored_rx;
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -284,9 +291,24 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
                             tracing::warn!(error = %e, "could not offer the VTC a TSP relationship; the next send tries again");
                         }
                         let started = std::time::Instant::now();
-                        // Anything queued while disconnected goes out now,
-                        // and the role maps are reported afresh.
-                        bridge.link_up().await;
+                        if let Some(ready) = ready.take() {
+                            // The first session: the restore, which runs
+                            // now, does the link-up.
+                            let _ = ready.send(());
+                            let go = tokio::select! {
+                                r = restored.wait_for(|r| *r) => r.is_ok(),
+                                _ = stop.changed() => false,
+                            };
+                            if !go {
+                                link.set(None).await;
+                                conn.shutdown().await;
+                                return;
+                            }
+                        } else {
+                            // Anything queued while disconnected goes out
+                            // now, and the role maps are reported afresh.
+                            bridge.link_up().await;
+                        }
                         loop {
                             tokio::select! {
                                 next = inbound.next() => match next {
@@ -325,44 +347,30 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
         })
     };
 
-    let background = tokio::spawn(Arc::clone(&bridge).background(stop_rx.clone()));
-
-    // VTA mode: pick up a rotation of the bridge's keys — on an interval,
-    // and at once on SIGHUP.
-    let refresh = vta_parts.as_ref().map(|(session, _, docs)| {
-        let v = cfg.vta.clone().expect("VTA mode");
-        tokio::spawn(vta::refresh_keys(
-            Arc::clone(&bridge),
-            session.clone(),
-            v,
-            Arc::clone(docs),
-            stop_rx.clone(),
-        ))
-    });
-
-    let listener = tokio::net::TcpListener::bind(cfg.listen)
-        .await
-        .with_context(|| format!("listening on {}", cfg.listen))?;
-    tracing::info!(listen = %cfg.listen, public = %cfg.public_url, "HTTP server up");
-    if let Some(warning) = cfg.listen_warning() {
-        tracing::warn!("{warning}");
+    tracing::info!(mediator = %cfg.mediator_did, "waiting for the mediator session before starting");
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let connected = tokio::select! {
+        r = ready_rx => r.is_ok(),
+        _ = &mut shutdown => false,
+    };
+    let services = if connected {
+        Some(start_services(&cfg, &bridge, vta_parts.as_ref(), &stop_rx, restored_tx).await?)
+    } else {
+        None
+    };
+    if services.is_some() {
+        shutdown.await;
     }
-    let mut stop_http = stop_rx.clone();
-    let server = axum::serve(listener, http::router(Arc::clone(&bridge))).with_graceful_shutdown(
-        async move {
-            let _ = stop_http.changed().await;
-        },
-    );
-    let server = tokio::spawn(async move { server.await });
-
-    shutdown_signal().await;
     tracing::info!("shutting down");
     let _ = stop_tx.send(true);
     let _ = messaging.await;
-    let _ = background.await;
-    let _ = server.await;
-    if let Some(r) = refresh {
-        let _ = r.await;
+    if let Some((background, server, refresh)) = services {
+        let _ = background.await;
+        let _ = server.await;
+        if let Some(r) = refresh {
+            let _ = r.await;
+        }
     }
     if let Some((session, mirror, _)) = vta_parts {
         // The mirror's last pass has run; say what did not make it.
@@ -379,6 +387,59 @@ pub async fn run(cfg: BridgeConfig, keys: Keys) -> Result<()> {
         session.shutdown().await;
     }
     Ok(())
+}
+
+type Spawned = tokio::task::JoinHandle<()>;
+
+/// Everything that runs once the first mediator session is up: the
+/// restore (which resends the outbox and reports the role maps), then the
+/// background loops, the VTA key refresh and the HTTP server.
+async fn start_services(
+    cfg: &BridgeConfig,
+    bridge: &Arc<Bridge>,
+    vta_parts: Option<&(vta::Session, Spawned, Arc<dyn vta::DidDocuments>)>,
+    stop_rx: &tokio::sync::watch::Receiver<bool>,
+    restored: tokio::sync::watch::Sender<bool>,
+) -> Result<(
+    Spawned,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    Option<Spawned>,
+)> {
+    bridge.restore().await?;
+    #[cfg(feature = "forge-github")]
+    flows::offer_registrations(bridge)?;
+    let _ = restored.send(true);
+
+    let background = tokio::spawn(Arc::clone(bridge).background(stop_rx.clone()));
+
+    // VTA mode: pick up a rotation of the bridge's keys — on an interval,
+    // and at once on SIGHUP.
+    let refresh = vta_parts.map(|(session, _, docs)| {
+        let v = cfg.vta.clone().expect("VTA mode");
+        tokio::spawn(vta::refresh_keys(
+            Arc::clone(bridge),
+            session.clone(),
+            v,
+            Arc::clone(docs),
+            stop_rx.clone(),
+        ))
+    });
+
+    let listener = tokio::net::TcpListener::bind(cfg.listen)
+        .await
+        .with_context(|| format!("listening on {}", cfg.listen))?;
+    tracing::info!(listen = %cfg.listen, public = %cfg.public_url, "HTTP server up");
+    if let Some(warning) = cfg.listen_warning() {
+        tracing::warn!("{warning}");
+    }
+    let mut stop_http = stop_rx.clone();
+    let server = axum::serve(listener, http::router(Arc::clone(bridge))).with_graceful_shutdown(
+        async move {
+            let _ = stop_http.changed().await;
+        },
+    );
+    let server = tokio::spawn(async move { server.await });
+    Ok((background, server, refresh))
 }
 
 async fn shutdown_signal() {
