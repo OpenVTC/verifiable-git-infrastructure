@@ -277,6 +277,11 @@ pub(crate) async fn bind_callback(
             if let Some(g) = adapter.github() {
                 record.bridge_checks = g.bridge_checks_ready(&record.resource);
             }
+            // The owner held under another id — bound, or orphaned — passes
+            // to this binding, which the proof just completed afresh (job
+            // 0.7, *Binding an owner again*): its forge-side state moves
+            // here, and the earlier ids are retired.
+            let (superseded, moved) = bridge.supersede(&mut record)?;
             bridge.store.put(Table::Namespaces, &namespace, &record)?;
             adapter.restore(&record)?;
             // The VTC grants the bridge's DID `git.commit.sign` on the
@@ -304,10 +309,28 @@ pub(crate) async fn bind_callback(
                 .owner_id
                 .map(|i| i.to_string())
                 .unwrap_or_default();
-            let ev = json!({ "type": "bindCompleted", "jobId": job_id, "ownerId": owner_id, "kind": kind });
+            let mut ev = json!({ "type": "bindCompleted", "jobId": job_id, "ownerId": owner_id, "kind": kind });
+            if !superseded.is_empty() {
+                ev["supersedes"] = json!(superseded);
+            }
             bridge.send_event(&namespace, ev, None).await?;
             // The VTC holds the default map until it is told otherwise.
             bridge.started_serving(&namespace).await;
+            // The repositories the earlier namespace governed start this one
+            // as the forge shows them: for its admins to adopt (job 0.7).
+            for r in moved.iter().filter(|r| !r.archived) {
+                if crate::events::NAMESPACE_REPOS
+                    .contains(&r.resource.repo_name().unwrap_or_default())
+                {
+                    continue;
+                }
+                let ev = json!({
+                    "type": "repoCreatedUnmanaged",
+                    "forgeId": r.forge_id.to_string(),
+                    "resource": r.resource.as_str(),
+                });
+                bridge.send_event(&namespace, ev, None).await?;
+            }
             let mut report = Report::default();
             if !binding.missing_permissions.is_empty() {
                 report.step(

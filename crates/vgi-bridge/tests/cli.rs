@@ -328,3 +328,72 @@ fn a_did_peer_minted_for_another_mediator_is_not_imported() {
     // Nothing was stored in its place.
     assert!(!bridge(&cfg, &["identity", "show"]).status.success());
 }
+
+#[test]
+fn namespace_list_shows_orphaned_namespaces_and_forget_removes_only_those() {
+    use vgi_bridge::store::{NamespaceRecord, NamespaceState, RepoRecord, Table};
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _) = initialised(dir.path());
+    {
+        let store = open_store(dir.path());
+        let acme = vgi_forge::Resource::parse("github.com/acme").unwrap();
+        let mut bound = NamespaceRecord::pending("ns_bound", acme);
+        bound.state = NamespaceState::Bound;
+        store.put(Table::Namespaces, "ns_bound", &bound).unwrap();
+        let gone = vgi_forge::Resource::parse("github.com/gone").unwrap();
+        let mut orphaned = NamespaceRecord::pending("ns_gone", gone.clone());
+        orphaned.state = NamespaceState::Orphaned;
+        orphaned.orphaned_at = Some(1_790_000_000);
+        store.put(Table::Namespaces, "ns_gone", &orphaned).unwrap();
+        store
+            .put(
+                Table::Repos,
+                "github.com#5",
+                &RepoRecord::new("ns_gone", gone.join("x").unwrap(), 5),
+            )
+            .unwrap();
+    }
+    let list = stdout(&bridge(&cfg, &["namespace", "list"]));
+    let lines: Vec<&str> = list.lines().collect();
+    assert_eq!(lines.len(), 2, "{list}");
+    assert!(
+        lines[0].starts_with("ns_bound\tbound\tgithub.com/acme"),
+        "{list}"
+    );
+    assert!(
+        lines[1].starts_with("ns_gone\torphaned\tgithub.com/gone\torphaned 2026-"),
+        "{list}"
+    );
+    assert!(lines[1].contains("removed after"), "{list}");
+
+    // A bound namespace is governed: not forgotten.
+    let o = bridge(&cfg, &["namespace", "forget", "ns_bound"]);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("not orphaned"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let o = bridge(&cfg, &["namespace", "forget", "ns_gone"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let store = open_store(dir.path());
+    assert!(
+        store
+            .get::<NamespaceRecord>(Table::Namespaces, "ns_gone")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get::<RepoRecord>(Table::Repos, "github.com#5")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get::<NamespaceRecord>(Table::Namespaces, "ns_bound")
+            .unwrap()
+            .is_some()
+    );
+}

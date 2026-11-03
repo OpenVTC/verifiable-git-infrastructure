@@ -215,10 +215,30 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
+    /// The context of bound namespace `ns_id`: what every job, projection,
+    /// re-sign and report needs. An orphaned namespace has none.
     pub(crate) fn load(bridge: &Bridge, ns_id: &str) -> Result<Ctx, String> {
         let ns = bridge
             .bound_namespace(ns_id)
             .map_err(|r| r.0.message.unwrap_or_default())?;
+        Self::with(bridge, ns)
+    }
+
+    /// The context of namespace `ns_id` bound **or orphaned**: only for the
+    /// check the bridge posts, which an orphaned namespace fails (event
+    /// 0.6). Nothing that changes the forge loads one.
+    #[cfg(feature = "forge-github")]
+    pub(crate) fn load_posting_checks(bridge: &Bridge, ns_id: &str) -> Result<Ctx, String> {
+        match bridge
+            .store
+            .get::<NamespaceRecord>(Table::Namespaces, ns_id)
+        {
+            Ok(Some(ns)) if ns.is_orphaned() && ns.binding.is_some() => Self::with(bridge, ns),
+            _ => Self::load(bridge, ns_id),
+        }
+    }
+
+    fn with(bridge: &Bridge, ns: NamespaceRecord) -> Result<Ctx, String> {
         let adapter = bridge
             .adapters
             .for_resource(&ns.resource)

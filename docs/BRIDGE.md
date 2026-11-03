@@ -935,7 +935,7 @@ collaborator role on that repository removed, one given by hand on the
 forge as much as one the bridge projected (only accounts a job does not
 list are left alone). `git-ns/bridge/job` (0.4 and later) has no namespace-level
 role job (organisation owners): one without `repo` is `malformedRequest`.
-The bridge takes 0.6 alone — older versions are refused
+The bridge takes 0.7 alone — older versions are refused
 `unsupportedVersion` — and answers `trust-task-discovery` (0.3 or 0.2) from
 its VTC with that type URI, which is how a VTC learns it may send it (§7,
 "Protocol versions").
@@ -1006,7 +1006,7 @@ bridge reports and the VTC decides:
    each delivery is reported once. The same delivery still prompts the
    bridge-posted check (§6) exactly as before.
 
-   Sent as `git-ns/bridge/event` 0.5 (§7, "Protocol versions").
+   Sent as `git-ns/bridge/event` 0.6 (§7, "Protocol versions").
 2. **The order** (`git-ns/bridge/job` 0.5 and later, `closePullRequest`). When the
    policy does not allow the author, the VTC sends the community's message
    and the bridge runs two steps, reported as `comment` and `close`:
@@ -1031,7 +1031,7 @@ bridge reports and the VTC decides:
    `partial`. Tokens are minted per job for the one repository, with
    `pull_requests: read` to look and `pull_requests: write` to act.
 
-The bridge takes `git-ns/bridge/job` 0.6 alone, and lists it in its
+The bridge takes `git-ns/bridge/job` 0.7 alone, and lists it in its
 answer to `trust-task-discovery`, so a VTC learns it may send
 `closePullRequest`.
 **Forgejo** has no gate yet: a `closePullRequest` there is `notCapable`, and
@@ -1119,28 +1119,33 @@ The bridge speaks one version of each `git-ns/bridge` task:
 
 | Task | Version | Older versions |
 |---|---|---|
-| `git-ns/bridge/job` (in) | **0.6** | 0.1–0.5 refused with `unsupportedVersion` |
+| `git-ns/bridge/job` (in) | **0.7** | 0.1–0.6 refused with `unsupportedVersion` |
 | `git-ns/bridge/result` (out) | **0.2** | not sent |
-| `git-ns/bridge/event` (out) | **0.5** | not sent |
+| `git-ns/bridge/event` (out) | **0.6** | not sent |
 
-Each is the one before with **nested repository paths**
+Job 0.6, result 0.2 and event 0.5 brought **nested repository paths**
 (`git-ns/_shared/0.6`: on a forge with nested groups a repository path may
 hold subgroups; GitHub and Forgejo have none, so nothing this bridge sends
-changes shape). A 0.5 job is a valid 0.6 job, and a VTC sends every job
-as 0.6 to a bridge that lists 0.6: this bridge lists only 0.6 in its `trust-task-discovery` answer (it answers discovery
-0.3 and 0.2, each in the version asked). A VTC still holding an older answer
+changes shape). Event 0.6 and job 0.7 add **orphaned namespaces** and
+**binding an owner again** (below, "Orphaned namespaces"); their schemas
+change only by `bindCompleted.supersedes`. A 0.6 job is a valid 0.7 job, and
+a VTC sends every job as 0.7 to a bridge that lists 0.7: this bridge lists
+only 0.7 in its `trust-task-discovery` answer (it answers discovery 0.3 and
+0.2, each in the version asked). A VTC still holding an older answer
 is refused with `unsupportedVersion`, forgets the answer, and asks again.
 Results and events still queued from before an upgrade go out under the new
 versions; the VTC's acknowledgement is accepted in any version.
 
-**The VTC must serve `git-ns/bridge/event` 0.5 and `git-ns/bridge/result`
-0.2** (verifiable-trust-infrastructure `main` does, beside every older
-version). A VTC that does not refuses every event and result as an
-unsupported type. Update the VTC first, then the bridge.
+**The VTC must serve `git-ns/bridge/event` 0.6 and `git-ns/bridge/result`
+0.2, and send `git-ns/bridge/job` 0.7.** A VTC that does not refuses every
+event and result as an unsupported type. Update the VTC first, then the
+bridge. A VTC that serves event 0.6 answers `git-ns:unknownNamespace` only
+when it does not have a namespace — never when it cannot read its records
+(`unavailable`) — since the bridge now stops acting on that answer.
 
 `event_version` in the config is kept only so that a configuration naming
-a version this bridge no longer sends (`"0.1"` to `"0.4"`) fails the start
-instead of being ignored. Remove the line; `"0.5"` is the only value it
+a version this bridge no longer sends (`"0.1"` to `"0.5"`) fails the start
+instead of being ignored. Remove the line; `"0.6"` is the only value it
 takes, and the default.
 
 Every event — `roleMapReported` (§6c) and `pullRequestOpened` (§6d)
@@ -1180,6 +1185,91 @@ has detached the repository and reports it there as unmanaged — so jobs the
 VTC sends for it in the new namespace act on a repository the bridge does
 not manage until it is adopted. Update the VTC to 0.2 before relying on
 transfers between namespaces.
+
+### Orphaned namespaces
+
+A VTC can lose a namespace this bridge still serves — its records restored
+from a backup older than the binding, a test instance recreated, the
+namespace removed by other means than an unbind. It then answers every
+event for it with `git-ns:unknownNamespace` (event 0.6). The bridge
+**orphans** the namespace when, and only when, that answer is a
+`trust-task-error` it verified as the VTC's, threaded to an event it sent
+naming the namespace (log: `the VTC no longer has this namespace: it is
+orphaned`). Any other code, or a refusal it cannot attribute so, orphans
+nothing. **A namespace is never orphaned, or removed, for being quiet**:
+months without a job or an event change nothing.
+
+While a namespace is orphaned the bridge:
+
+- **changes nothing on the forge for it**: no roles projected or removed, no
+  repository created, bootstrapped or archived, no pull request closed, no
+  Dependabot commit re-signed;
+- **fails the check it posts** there (§6): *The namespace is not governed by
+  this VTC*, naming the VTC (`vtc_did`). Nothing passes it until the
+  namespace is bound again. A required workflow that asks the registry
+  itself is decided by what the registry still holds;
+- **sends no event for it** — `roleMapReported` included — and drops any
+  waiting to be resent;
+- **deletes nothing on the forge and keeps its forge-side state**: the App
+  installation, the `.vgi` workflow repository and ruleset pin, the managed
+  set and the record of what it projected. That is what a re-binding takes
+  over.
+
+It comes back **bound** when the VTC sends a job naming it — the VTC has it
+after all. The bridge admits the job and reports the namespace's role map, as
+for any namespace it starts serving.
+
+**Binding the owner again** (job 0.7). A VTC that lost a namespace binds its
+owner again under a new namespace id: `cnm git namespace bind` as for a
+first binding. The bridge accepts the `beginBind` for an owner it already
+holds, bound or orphaned, and requires the forge-side proof afresh, bound to
+this job's single-use `state`. An installation, membership or sign-in that
+already exists proves nothing about who asked this time. On GitHub, where the
+App is already installed on the owner, the admin opens the job's link and
+**saves the installation's settings**. GitHub then redirects to the App's
+setup URL with `setup_action=update` (the manifest sets
+`setup_on_update`), and that redirect completes the bind only if it carries
+this job's `state` and names an installation of this App on this owner. On
+Forgejo the admin signs in again through the bind's OAuth flow. Until the
+proof arrives the earlier namespace is untouched, and a bind that fails or
+expires changes nothing about it.
+
+When the proof arrives the new namespace **supersedes** the earlier ones:
+the bridge moves the forge-side state it held for the owner (the
+installation, the workflow repository's pin, the managed set, each
+repository's projection record) to the new id, and **retires** the earlier
+ids. A retired id is answered with `unknownNamespace`, as one the bridge
+never served, and a `beginBind` naming one is refused: ids are never reused.
+`bindCompleted` names them in `supersedes`. No governance carries over: the
+earlier VTC's owners are dropped from the repository records, and each
+repository is reported to the new namespace as `repoCreatedUnmanaged`, for
+its admins to adopt. The roles the bridge projected under the earlier
+namespace stay on the forge as drift until the new namespace projects its
+own. A re-binding never leaves two records serving one owner.
+
+**The operator** sees every namespace with its state, and for an orphaned
+one when it was orphaned and when it will be removed:
+
+```sh
+vgi-bridge namespace list
+# ns_01J8Z6Q4M2  bound     github.com/acme
+# ns_01J8Z0A1B2  orphaned  github.com/acme-labs  orphaned 2026-10-01T09:00:00Z  removed after 2026-10-31T09:00:00Z
+vgi-bridge namespace forget ns_01J8Z0A1B2
+```
+
+`forget` removes the bridge's record of an orphaned namespace and the
+repository records it kept, and nothing on the forge: the installation, the
+`.vgi` repository, rulesets and roles stay, for the owner's admins to remove
+by hand if nobody will bind the owner again. It refuses a namespace that is
+not orphaned. Like every admin command it opens the store, so stop the
+bridge first. In VTA mode it deletes the records from the context's
+app-state, and the bridge drops them from its cache when it next starts.
+
+The bridge also removes an orphaned namespace's record on its own once
+`orphan_retention_days` (default 30, at least 30) have passed since it was
+orphaned. It runs that check from its hourly maintenance, and logs a warning
+once a day for each namespace due within a week (`an orphaned namespace's
+record will be removed after its retention period`).
 
 ## 8. Manual configuration
 

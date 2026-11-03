@@ -1414,8 +1414,9 @@ outcomes (the Repos page).
 | Code | Cause | Fix |
 |---|---|---|
 | `git-ns/bridge/job:notCapable` | the bridge cannot do it here: no adapter for the host (App not registered), `createRepo` on a personal account or in manual mode, a namespace-level role projection | the message says which: register the App; create by hand (`vgi repo init` in manual mode) and adopt; manage organisation roles yourself |
-| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.6: this bridge takes 0.6 only | a VTC that lists 0.6 asks the bridge again and resends as 0.6; one that does not, upgrade |
-| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) | §8i |
+| `unsupportedVersion` | a job of `git-ns/bridge/job` before 0.7: this bridge takes 0.7 only | a VTC that lists 0.7 asks the bridge again and resends as 0.7; one that does not, upgrade |
+| `git-ns:unknownNamespace` (from the bridge) | the bridge has no such namespace — its store was lost, or restored from before the bind (self-contained mode) — or the id was retired when the owner was bound again under a new one | §8i; for a retired id, use the namespace that superseded it |
+| bridge log "the VTC no longer has this namespace: it is orphaned"; the bridge-posted check fails "The namespace is not governed by this VTC" | the VTC answered an event for the namespace with `git-ns:unknownNamespace`: its records lost it (restored from before the bind, a recreated test VTC). The bridge changes nothing on the forge there and reports nothing until the VTC sends a job for it | if the VTC does have it, any job for it (an `inspect`) brings it back; otherwise bind the owner again (`cnm git namespace bind`, then save the App's installation settings from the link) — the new namespace takes the forge side over (§8n). `vgi-bridge namespace list` shows it |
 | VTA-mode start refused: "rolled back or replayed", "has no record of … not even a deletion", or a secret "does not open … at the version it is stored at" | the context's app-state went back in time, or someone other than the bridge rewrote it | restore the VTA's current state or recreate the context; re-set the secret; revoke credentials that are not the bridge's |
 | bind fails `notCapable` ("not bound") for an organisation on a host with several Apps | no `[[github]]` entry (and registered App) for that organisation: add one and register its App (BRIDGE.md §3) | — |
 | bridge `/healthz` 503, log "another bridge … is writing the same VTA context" | two hosts (or a stolen credential) on one bridge context; the bridge stopped writing its state and holds its results | §8i; BRIDGE.md §2a |
@@ -1427,8 +1428,9 @@ outcomes (the Repos page).
 | step `rateLimited` | the forge's rate limit | the job is retried |
 | step `forgeError` | anything else the forge refused (the detail says what) | read the detail; jobs are check-then-apply, so sending again is safe |
 | a `roles` step fails naming a team or organisation ownership | the direct role went; access remains through the team or ownership | remove it on the forge |
-| events or results refused as an unsupported type | a VTC that does not serve `git-ns/bridge/event` 0.5 and `git-ns/bridge/result` 0.2, the only versions the bridge sends | update the VTC (BRIDGE.md §7); they are resent until it takes them |
-| bridge start refused: `event_version` "unknown variant" | the config names an event version the bridge no longer sends (`"0.1"`–`"0.4"`) | remove the line (BRIDGE.md §7) |
+| events or results refused as an unsupported type | a VTC that does not serve `git-ns/bridge/event` 0.6 and `git-ns/bridge/result` 0.2, the only versions the bridge sends | update the VTC (BRIDGE.md §7); they are resent until it takes them |
+| bridge start refused: `event_version` "unknown variant" | the config names an event version the bridge no longer sends (`"0.1"`–`"0.5"`) | remove the line (BRIDGE.md §7) |
+| bridge start refused: `orphan_retention_days` must be at least 30 | a retention shorter than the 30 days event 0.6 asks for | raise it, or remove the line (default 30) |
 | the pull-request gate closes nothing | the VTC without the pull-request gate, the App without Pull requests (write), or a Forgejo namespace (no gate yet) | §8m |
 
 ### 8l. Separation of duties and break-glass
@@ -1515,9 +1517,9 @@ The bridge's part (BRIDGE.md §6d): it reports each pull request opened or
 reopened on a managed repository, and closes one when the VTC says so, with
 the community's message. For that it needs:
 
-- a VTC that serves `git-ns/bridge/event` 0.5 (which it needs for every
+- a VTC that serves `git-ns/bridge/event` 0.6 (which it needs for every
   event — BRIDGE.md §7);
-- a bridge that takes `git-ns/bridge/job` 0.5 or later (this one takes 0.6),
+- a bridge that takes `git-ns/bridge/job` 0.5 or later (this one takes 0.7),
   which the VTC learns from discovery;
 - the GitHub App's Pull requests at **write** (§8f).
 
@@ -1527,3 +1529,45 @@ Forgejo namespaces have no gate yet (`closePullRequest` is `notCapable`).
 still what stops untrusted code from merging. While the VTC or the bridge is
 down, or the App lacks the permission, pull requests simply stay open; a
 pull request the gate let through is not "approved" for anything.
+
+### 8n. A namespace the VTC lost: orphaned, and binding it again
+
+When the VTC loses a namespace the bridge still serves (its records
+restored from a backup older than the binding, a test VTC recreated), it
+answers the bridge's next event for it with `git-ns:unknownNamespace`, and
+the bridge **orphans** the namespace (BRIDGE.md §7, "Orphaned namespaces").
+From then on the bridge changes nothing on the forge there: no roles, no
+repositories, no pull requests closed, no Dependabot re-sign. It reports
+nothing, and the check it posts fails with *The namespace is not governed
+by this VTC*. Nothing on the forge is deleted: the App installation, the
+`.vgi` repository, rulesets and roles all stay. A namespace is never
+orphaned for being quiet.
+
+```sh
+vgi-bridge namespace list    # id, state, owner; when orphaned, and when it will be removed
+```
+
+Then one of:
+
+- **The VTC has it after all** (the answer was a mistake, or its records came
+  back): any job for the namespace — an inspection from the console — makes
+  it bound again. The bridge reports its role map and carries on.
+- **Govern the owner again:** bind it afresh at the VTC (`cnm git namespace
+  bind`, as for a first binding). The VTC gets a new namespace id. Open the
+  link the bind returns. On GitHub, where the App is already installed,
+  review the installation's settings and **save**: that redirect, carrying
+  the bind's single-use state, is the proof. Nothing else completes the
+  bind, and until it completes the old namespace is left as it is. The new
+  namespace takes over the bridge's forge-side state for the owner (the
+  installation, the `.vgi` pin, the managed set, what was projected), and
+  the old id is retired: the bridge answers for it as an unknown
+  namespace. No rights carry over. Every repository arrives as
+  `repoCreatedUnmanaged` for the namespace admins to adopt (§8d), and the
+  roles projected before stay on the forge as drift until the new
+  namespace projects its own.
+- **Nobody will govern it:** `vgi-bridge namespace forget <id>` (bridge
+  stopped) removes the bridge's record. Otherwise the bridge removes it
+  itself after `orphan_retention_days` (default 30), warning in its log
+  daily during the last week. Either way nothing on the forge changes:
+  uninstall the App and remove the `.vgi` repository and rulesets on the
+  forge by hand if they should go.

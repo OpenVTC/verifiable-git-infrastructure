@@ -29,12 +29,12 @@ pub struct BridgeConfig {
     /// The one VTC this bridge serves. Jobs signed by any other DID are
     /// refused (spec: `permissionDenied`), whatever their proof.
     pub vtc_did: String,
-    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.5"`,
+    /// The `git-ns/bridge/event` version the bridge sends that VTC: `"0.6"`,
     /// the only one, and the default. The setting is kept so that a
     /// configuration naming a version this bridge no longer sends (`"0.1"` to
-    /// `"0.4"`) fails the start rather than being silently ignored: a VTC
-    /// that needed one of those does not take 0.5, and would refuse every
-    /// event. Remove the line once the VTC serves 0.5.
+    /// `"0.5"`) fails the start rather than being silently ignored: a VTC
+    /// that needed one of those does not take 0.6, and would refuse every
+    /// event. Remove the line once the VTC serves 0.6.
     #[serde(default)]
     pub event_version: EventVersion,
     /// The community's Trust Registry, for the bootstrap plan and the
@@ -91,6 +91,15 @@ pub struct BridgeConfig {
     /// How long a bind or link waits for the person, in seconds.
     #[serde(default = "default_flow_ttl")]
     pub flow_ttl_secs: u64,
+    /// Days an orphaned namespace's record is kept before the bridge removes
+    /// it on its own (`git-ns/bridge/event` 0.6, *Orphaned namespaces*),
+    /// counted from when the VTC answered `git-ns:unknownNamespace` for it.
+    /// At least 30 (the default). The log warns daily from 7 days before.
+    /// Removal discards the bridge's record only, never anything on the
+    /// forge; `vgi-bridge namespace forget` removes one sooner. A namespace
+    /// is never orphaned or removed for being quiet.
+    #[serde(default = "default_orphan_retention_days")]
+    pub orphan_retention_days: u64,
     /// Approving reviews a pull request on every governed repository needs
     /// before it can merge (0–10; default 0, none). Approvals count only from
     /// accounts the forge lets write to the repository, which under this
@@ -193,12 +202,12 @@ fn default_vta_start_timeout() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[non_exhaustive]
 pub enum EventVersion {
-    /// `git-ns/bridge/event` 0.5: 0.4 with nested repository paths
-    /// (`git-ns/_shared/0.6`). Every event — `roleMapReported` and
+    /// `git-ns/bridge/event` 0.6: 0.5 with orphaned namespaces and
+    /// `bindCompleted.supersedes`. Every event — `roleMapReported` and
     /// `pullRequestOpened` included — goes out under it.
     #[default]
-    #[serde(rename = "0.5")]
-    V0_5,
+    #[serde(rename = "0.6")]
+    V0_6,
 }
 
 /// Inputs to every bootstrap plan.
@@ -522,6 +531,14 @@ fn default_body_limit() -> usize {
 fn default_sweep() -> u64 {
     3600
 }
+/// The shortest retention an orphaned namespace may be given, and the
+/// default (`git-ns/bridge/event` 0.6: SHOULD NOT be shorter than 30 days).
+pub const MIN_ORPHAN_RETENTION_DAYS: u64 = 30;
+
+fn default_orphan_retention_days() -> u64 {
+    MIN_ORPHAN_RETENTION_DAYS
+}
+
 fn default_resend() -> u64 {
     60
 }
@@ -892,6 +909,13 @@ impl BridgeConfig {
                 bail!("`vta.url` must be https (the credential handshake travels over it)");
             }
         }
+        if self.orphan_retention_days < MIN_ORPHAN_RETENTION_DAYS {
+            bail!(
+                "`orphan_retention_days` must be at least {MIN_ORPHAN_RETENTION_DAYS}: an orphaned \
+                 namespace's record is what a VTC that binds the owner again takes over; got {}",
+                self.orphan_retention_days
+            );
+        }
         if !(10..=3600).contains(&self.did_cache_ttl_secs) {
             bail!("`did_cache_ttl_secs` must be between 10 and 3600");
         }
@@ -1061,7 +1085,7 @@ oauth_client_id = "0b6e3a0c"
             "https://bridge.acme.example/github/github.com/webhook"
         );
         assert_eq!(c.checks.max_commits, 250);
-        assert_eq!(c.event_version, EventVersion::V0_5, "0.5 unless set");
+        assert_eq!(c.event_version, EventVersion::V0_6, "0.6 unless set");
     }
 
     #[test]
@@ -1106,7 +1130,26 @@ oauth_client_id = "0b6e3a0c"
     }
 
     #[test]
-    fn the_event_version_is_0_5_alone() {
+    fn orphan_retention_is_at_least_30_days() {
+        let with = |v: &str| {
+            BridgeConfig::parse(&EXAMPLE.replacen(
+                "public_url",
+                &format!("orphan_retention_days = {v}\npublic_url"),
+                1,
+            ))
+        };
+        assert_eq!(
+            BridgeConfig::parse(EXAMPLE).unwrap().orphan_retention_days,
+            30
+        );
+        assert_eq!(with("90").unwrap().orphan_retention_days, 90);
+        for bad in ["0", "7", "29"] {
+            assert!(with(bad).is_err(), "`{bad}` is refused");
+        }
+    }
+
+    #[test]
+    fn the_event_version_is_0_6_alone() {
         let with = |v: &str| {
             BridgeConfig::parse(&EXAMPLE.replacen(
                 "public_url",
@@ -1114,10 +1157,10 @@ oauth_client_id = "0b6e3a0c"
                 1,
             ))
         };
-        assert_eq!(with("0.5").unwrap().event_version, EventVersion::V0_5);
+        assert_eq!(with("0.6").unwrap().event_version, EventVersion::V0_6);
         // A version the bridge no longer sends fails the start: the VTC it
-        // was set for would refuse every 0.5 event.
-        for bad in ["0.1", "0.2", "0.3", "0.4", "0.6", "1.0", "", "v0.5"] {
+        // was set for would refuse every 0.6 event.
+        for bad in ["0.1", "0.2", "0.3", "0.4", "0.5", "0.7", "1.0", "", "v0.6"] {
             assert!(with(bad).is_err(), "`{bad}` is refused");
         }
     }

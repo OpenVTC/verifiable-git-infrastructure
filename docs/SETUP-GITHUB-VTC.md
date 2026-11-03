@@ -293,12 +293,11 @@ device code.
 
 ### 3.3 The protocol versions
 
-The bridge takes `git-ns/bridge/job` **0.6** and sends `git-ns/bridge/result`
-**0.2** and `git-ns/bridge/event` **0.5**, and nothing older (BRIDGE.md §7,
-"Protocol versions"). Your VTC must serve event 0.5 and result 0.2
-(verifiable-trust-infrastructure `main` does); one that does not refuses
-every event and result as an unsupported type. Leave `event_version` unset:
-`"0.5"` is the only value it takes. The role-map report (BRIDGE.md §6c) and
+The bridge takes `git-ns/bridge/job` **0.7** and sends `git-ns/bridge/result`
+**0.2** and `git-ns/bridge/event` **0.6**, and nothing older (BRIDGE.md §7,
+"Protocol versions"). Your VTC must serve event 0.6 and result 0.2, and send
+job 0.7; one that does not refuses every event and result as an unsupported
+type. Leave `event_version` unset: `"0.6"` is the only value it takes. The role-map report (BRIDGE.md §6c) and
 the pull-request gate's report (RUNBOOK §8m) are always sent.
 
 **Success looks like:** when GitHub redirects back, the bridge's log says, at

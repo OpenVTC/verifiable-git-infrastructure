@@ -9,7 +9,15 @@
 //!   maps to, the capabilities found while binding (and any later
 //!   `CapabilityChanged`), and on GitHub the managed repository set and the
 //!   required-workflow pin — which the adapter refuses to act without after a
-//!   restart, so [`crate::Bridge::restore`] hands them back first.
+//!   restart, so [`crate::Bridge::restore`] hands them back first. A
+//!   namespace the VTC answered `git-ns:unknownNamespace` for is kept,
+//!   [orphaned](NamespaceState::Orphaned), until a job shows the VTC has it,
+//!   a re-binding supersedes it, or the operator (or the retention sweep)
+//!   removes it ([`crate::namespaces`]).
+//! - **Retired namespace ids** ([`RetiredNamespace`], in [`Table::Meta`]
+//!   under [`RETIRED_PREFIX`]): ids a re-binding superseded. The bridge
+//!   answers for them as for ids it never served, and never takes one
+//!   again.
 //! - **Repositories** ([`RepoRecord`]): forge id, owners and the roles the
 //!   bridge projected — the projection an `inspect` compares against, since a
 //!   job carries none.
@@ -193,7 +201,7 @@ impl JobRecord {
     }
 }
 
-/// Whether a namespace's binding has completed.
+/// Where a namespace's binding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -202,6 +210,13 @@ pub enum NamespaceState {
     Pending,
     /// Bound: the adapter acts on it.
     Bound,
+    /// The VTC answered an event for it with `git-ns:unknownNamespace`
+    /// (`git-ns/bridge/event` 0.6, *Orphaned namespaces*): the bridge
+    /// changes nothing on the forge for it, fails the check it posts there,
+    /// and sends no event for it, but keeps its forge-side state. A job from
+    /// the VTC naming it makes it bound again
+    /// ([`NamespaceRecord::orphaned_at`] says since when).
+    Orphaned,
 }
 
 /// The required-workflow pin, as GitHub's adapter hands it out.
@@ -246,6 +261,14 @@ pub struct NamespaceRecord {
     /// Forge ids of the repositories the bridge manages here.
     #[serde(default)]
     pub managed: BTreeSet<u64>,
+    /// Unix seconds, when the namespace was orphaned (`state` is
+    /// [`NamespaceState::Orphaned`]); the retention period counts from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_at: Option<i64>,
+    /// Unix seconds, when the operator was last warned that the retention
+    /// sweep will remove this orphaned namespace (at most once a day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_warned_at: Option<i64>,
 }
 
 impl NamespaceRecord {
@@ -261,6 +284,48 @@ impl NamespaceRecord {
             pin: None,
             bridge_checks: None,
             managed: BTreeSet::new(),
+            orphaned_at: None,
+            removal_warned_at: None,
+        }
+    }
+
+    /// Whether the bridge serves it as bound (its binding complete, not
+    /// orphaned): the only state it acts on the forge or reports in.
+    pub fn is_bound(&self) -> bool {
+        self.state == NamespaceState::Bound && self.binding.is_some()
+    }
+
+    /// Whether it is orphaned.
+    pub fn is_orphaned(&self) -> bool {
+        self.state == NamespaceState::Orphaned
+    }
+}
+
+/// The [`Table::Meta`] key prefix of retired namespace ids.
+pub const RETIRED_PREFIX: &str = "retired-namespace/";
+
+/// A namespace id a re-binding superseded (`git-ns/bridge/job` 0.7,
+/// *Binding an owner again*): answered for as an id the bridge never served,
+/// and never taken again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RetiredNamespace {
+    /// The owner it was held for (`host/owner`).
+    pub resource: Resource,
+    /// The namespace id that took its forge-side state over.
+    pub superseded_by: String,
+    /// Unix seconds.
+    pub retired_at: i64,
+}
+
+impl RetiredNamespace {
+    /// `id`'s record, retired now in favour of `superseded_by`.
+    pub fn new(resource: Resource, superseded_by: impl Into<String>, retired_at: i64) -> Self {
+        RetiredNamespace {
+            resource,
+            superseded_by: superseded_by.into(),
+            retired_at,
         }
     }
 }
@@ -824,6 +889,25 @@ impl Store {
             out.push((key, value));
         }
         Ok(out)
+    }
+
+    /// Whether namespace id `id` was retired by a re-binding.
+    pub fn is_retired(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .get::<RetiredNamespace>(Table::Meta, &format!("{RETIRED_PREFIX}{id}"))?
+            .is_some())
+    }
+
+    /// Every retired namespace id, with its record.
+    pub fn retired(&self) -> Result<Vec<(String, RetiredNamespace)>> {
+        Ok(self
+            .list::<Value>(Table::Meta)?
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let id = k.strip_prefix(RETIRED_PREFIX)?.to_string();
+                serde_json::from_value(v).ok().map(|r| (id, r))
+            })
+            .collect())
     }
 
     /// Seal `value` under `name` and store it.

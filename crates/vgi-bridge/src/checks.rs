@@ -1179,7 +1179,8 @@ pub(crate) fn spawn(
     });
 }
 
-/// The namespace the check is for, if the bridge posts checks there.
+/// The namespace the check is for, if the bridge posts checks there: a
+/// bound one, or an orphaned one, where the check fails (event 0.6).
 fn check_namespace(bridge: &Bridge, repo: &Resource) -> Option<Ctx> {
     let ns = bridge
         .store
@@ -1187,8 +1188,11 @@ fn check_namespace(bridge: &Bridge, repo: &Resource) -> Option<Ctx> {
         .ok()?
         .into_iter()
         .map(|(_, n)| n)
-        .find(|n| n.state == NamespaceState::Bound && n.resource.contains(repo))?;
-    let ctx = Ctx::load(bridge, &ns.id).ok()?;
+        .find(|n| {
+            matches!(n.state, NamespaceState::Bound | NamespaceState::Orphaned)
+                && n.resource.contains(repo)
+        })?;
+    let ctx = Ctx::load_posting_checks(bridge, &ns.id).ok()?;
     ctx.adapter
         .forge()
         .capabilities(&ctx.namespace)
@@ -1275,7 +1279,12 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
     let id = g
         .start_check_run(&trigger.repo, &trigger.head_sha, &check_name, &external)
         .await?;
-    let (conclusion, title, mut summary) =
+    let orphaned = ctx.ns.is_orphaned();
+    let (conclusion, title, mut summary) = if orphaned {
+        // The VTC answered that it does not have the namespace (event 0.6):
+        // nothing here is governed, so nothing passes.
+        orphaned_check(&bridge.cfg.vtc_did, &ctx.ns.resource)
+    } else {
         match verify(bridge, &g, &ctx, trigger, &base_ref, &base_sha).await {
             Ok(v) => v,
             Err(e) => (
@@ -1286,8 +1295,10 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
                     e.to_string().replace('`', "'")
                 ),
             ),
-        };
+        }
+    };
     if conclusion == CheckConclusion::Failure
+        && !orphaned
         && let Some(pr) = &pr_info
         && let Some(hint) = crate::resign::check_hint(bridge, &ctx, trigger, pr, &protected)
     {
@@ -1318,6 +1329,20 @@ pub async fn run(bridge: &Bridge, trigger: &CheckTrigger) -> Result<CheckOutcome
         },
     );
     Ok(CheckOutcome::Posted(conclusion))
+}
+
+/// The failing check posted in an orphaned namespace: it names the VTC the
+/// bridge serves, which no longer governs the namespace.
+fn orphaned_check(vtc: &str, ns: &Resource) -> (CheckConclusion, String, String) {
+    (
+        CheckConclusion::Failure,
+        "The namespace is not governed by this VTC".to_string(),
+        format!(
+            "`{ns}` is not governed by the VTC `{vtc}`: it answered that it does not have this \
+             namespace, so the bridge verifies nothing here and passes nothing. A namespace \
+             admin binds it again at the VTC; until then nothing can pass this check."
+        ),
+    )
 }
 
 /// Tell the VTC about the check just posted on a managed repository: an

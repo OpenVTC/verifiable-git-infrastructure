@@ -43,11 +43,12 @@ pub mod http;
 pub mod identity;
 mod jobs;
 pub mod mapping;
+pub mod namespaces;
 /// The Trust Task specifications the bridge speaks — `git-ns/bridge/job`,
 /// `result` and `event` at the versions pinned in `trust-tasks.lock` —
 /// generated at build time by `trust-tasks-build`, at the module paths
 /// trust-tasks-rs's prebuilt modules used
-/// (`specs::git_ns::bridge::job::v0_6`). [`wire`] re-exports them.
+/// (`specs::git_ns::bridge::job::v0_7`). [`wire`] re-exports them.
 #[allow(clippy::all, missing_docs)]
 pub mod specs {
     include!(concat!(env!("OUT_DIR"), "/trust_tasks_generated.rs"));

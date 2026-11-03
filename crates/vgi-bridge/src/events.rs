@@ -26,7 +26,7 @@ use crate::store::{BranchLedger, NamespaceRecord, NamespaceState, RepoRecord, Ta
 /// The namespace-level repository the GitHub adapter keeps for the
 /// required workflow. Part of the binding, never reported as unmanaged
 /// (spec).
-const NAMESPACE_REPOS: [&str; 1] = [".vgi"];
+pub(crate) const NAMESPACE_REPOS: [&str; 1] = [".vgi"];
 
 /// The adapter a delivery is for: the GitHub App the route names
 /// (`/github/<host>/<owner>/webhook`), or the Forgejo host's. Its own

@@ -5,6 +5,6 @@
 # framework specifications (`trust-task-discovery`, `trust-task-error`) come
 # with the runtime and are not listed.
 [tasks]
-"git-ns/bridge/event" = "0.5"
-"git-ns/bridge/job" = "0.6"
+"git-ns/bridge/event" = "0.6"
+"git-ns/bridge/job" = "0.7"
 "git-ns/bridge/result" = "0.2"
