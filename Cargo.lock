@@ -1520,6 +1520,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1532,6 +1533,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305 0.9.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2291,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3216,12 +3218,13 @@ dependencies = [
 
 [[package]]
 name = "hpke"
-version = "0.14.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
+checksum = "8f512e325a1a71bf3273fb9b7fc9e5d96dac136fb4a95d0e6637001b12ea3e09"
 dependencies = [
  "aead 0.6.1",
  "chacha20poly1305",
+ "curve25519-dalek 5.0.0",
  "getrandom 0.4.3",
  "hkdf 0.13.0",
  "hybrid-array",
@@ -7023,7 +7026,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
@@ -7067,7 +7070,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -7119,7 +7122,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7139,7 +7142,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "affinidi-did-common",
  "anyhow",
@@ -7154,7 +7157,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "http",
@@ -7166,7 +7169,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7186,7 +7189,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7212,9 +7215,9 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vta-sdk"
-version = "0.78.0"
+version = "0.79.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dfe75c6a2143a8821f3d918af1992d75e27e5653ca0130c21726cc305346ee0"
+checksum = "8b7ea311fd506b3ed23688658b43b38b2e69472ac86fd0be199f2b60224a9af1"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
@@ -7265,9 +7268,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de1af9ff4e47100ecf61ce6a7973a8d59fae48082a394a40fe98a2881af6e77d"
+checksum = "f110de8f095862fa11af0b04898a0c32e9344d40558a4984e4a072e31f0e95b8"
 dependencies = [
  "trust-tasks-rs",
  "vti-specs-core",
@@ -7278,9 +7281,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-core"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a0e6ca07744fd3dc27208ef4f8874b22035a85082535798005b68b944badf1b"
+checksum = "e03da777ef36565f157a0726f5dac36838fa2dbced3a734668fc5026d7b35a92"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
@@ -7298,9 +7301,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-vta"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c57a5e773de87b9faccd99a6e397414365b866a5d4e630320f7d71061828bb55"
+checksum = "e0f73068cdd75ec01b843f7c74d9ed67dd0d0f4be3d7507c2cc823b61fc8c092"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",
@@ -7308,9 +7311,9 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-vtc"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "564a771bc25a38b86b89b7dc088626e9bcf963d00b6878f3b2c08f111cec4eb3"
+checksum = "7f46634a65199c242fbca4c10b6de25e2928c82b59872cb2c66f2072bac11bb7"
 dependencies = [
  "trust-tasks-build",
  "trust-tasks-rs",

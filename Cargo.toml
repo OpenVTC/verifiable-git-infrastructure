@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.31.0"
+version = "0.32.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Glenn Gore <glenn@affinidi.com>"]
@@ -22,13 +22,13 @@ publish = true
 
 [workspace.dependencies]
 # VGI shared primitives (sshsig codec, commit handling, DID key extraction).
-vgi-core = { version = "0.31.0", path = "crates/vgi-core" }
+vgi-core = { version = "0.32.0", path = "crates/vgi-core" }
 # Forge-neutral adapter trait and types for the git-namespaces bridge.
-vgi-forge = { version = "0.31.0", path = "crates/vgi-forge" }
+vgi-forge = { version = "0.32.0", path = "crates/vgi-forge" }
 # The adapters and the verifier, for the bridge.
-vgi-forge-github = { version = "0.31.0", path = "crates/vgi-forge-github" }
-vgi-forge-forgejo = { version = "0.31.0", path = "crates/vgi-forge-forgejo" }
-verify-trust = { version = "0.31.0", path = "crates/verify-trust" }
+vgi-forge-github = { version = "0.32.0", path = "crates/vgi-forge-github" }
+vgi-forge-forgejo = { version = "0.32.0", path = "crates/vgi-forge-forgejo" }
+verify-trust = { version = "0.32.0", path = "crates/verify-trust" }
 # Trust Registry query client (registry authorization queries).
 #
 # Held on a git `rev` for several releases while the registry workspace caught
@@ -350,7 +350,12 @@ trql-client = "0.30.0"
 # `rooms/keys/act` 0.10, VTI #2380). Nothing here speaks voting or the vta/pcs
 # tasks whose versions moved. 0.77 was skipped. Same trust-tasks 0.36 /
 # affinidi-tdk 0.36 / messaging-sdk 0.44 line.
-vta-sdk = { version = "0.78", default-features = false }
+#
+# 0.78 -> 0.79 keeps OpenVTC on one vta-sdk again: it moves to 0.79 for credential
+# rolls (`vta/pcs/voter/register/0.5`, `voter/read/0.6`, voting/_shared/0.4) and
+# notifications (`vta/notifications/*`, VTI #2405). Nothing here speaks either.
+# Same trust-tasks 0.36 / affinidi-tdk 0.36 / messaging-sdk 0.44 line.
+vta-sdk = { version = "0.79", default-features = false }
 affinidi-tdk = "0.36"
 # **Security floor**, named for it alone. 0.27.2 (with the DIDComm crate's
 # 0.15.9 below) binds an authcrypt message's reported sender to the key the
