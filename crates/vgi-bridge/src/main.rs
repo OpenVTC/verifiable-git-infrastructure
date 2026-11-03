@@ -55,9 +55,32 @@ enum Cmd {
         #[command(subcommand)]
         command: VtaCmd,
     },
+    /// The namespaces this bridge holds: list them, or forget an orphaned
+    /// one (its VTC answered that it does not have it).
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCmd,
+    },
     /// Exit 0 when the running bridge's `GET /healthz` answers 200 (for a
     /// container HEALTHCHECK: the image has no curl). Opens no store.
     Healthcheck,
+}
+
+#[derive(Subcommand)]
+enum NamespaceCmd {
+    /// One line per namespace: its id, state (pending, bound, orphaned) and
+    /// owner on the forge, and for an orphaned one when it was orphaned and
+    /// when the retention sweep removes it (`orphan_retention_days`).
+    List,
+    /// Remove an orphaned namespace's record from the bridge: the namespace
+    /// and the repository records it kept. Nothing on the forge is touched
+    /// (the App installation, the workflow repository, rulesets and roles
+    /// stay). Refused for a namespace that is not orphaned. Stop the bridge
+    /// first.
+    Forget {
+        /// The namespace id, as `namespace list` shows it.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,6 +289,28 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
                         }
                     }
                 }
+                Cmd::Namespace { command } => {
+                    let remote = vgi_bridge::vta::VtaAppState::new(&session);
+                    match command {
+                        NamespaceCmd::List => {
+                            let mut all = vgi_bridge::namespaces::list_remote(&remote).await?;
+                            all.sort_by(|a, b| a.id.cmp(&b.id));
+                            for ns in &all {
+                                println!(
+                                    "{}",
+                                    vgi_bridge::namespaces::list_line(
+                                        ns,
+                                        cfg.orphan_retention_days
+                                    )
+                                );
+                            }
+                        }
+                        NamespaceCmd::Forget { id } => {
+                            let f = vgi_bridge::namespaces::forget_remote(&remote, &id).await?;
+                            print_forgotten(&id, &f);
+                        }
+                    }
+                }
                 _ => bail!("not a VTA-mode command"),
             }
             Ok(())
@@ -274,6 +319,15 @@ fn vta_command(cfg: &BridgeConfig, command: Cmd) -> Result<()> {
         session.shutdown().await;
         out
     })
+}
+
+/// What `namespace forget` tells the operator.
+fn print_forgotten(id: &str, f: &vgi_bridge::namespaces::Forgotten) {
+    eprintln!(
+        "forgot the orphaned namespace `{id}` ({}) and {} repository record(s); nothing on the \
+         forge was changed",
+        f.resource, f.repos
+    );
 }
 
 /// Read a hand-set secret from standard input.
@@ -1133,6 +1187,25 @@ fn main() -> Result<()> {
                     let id = mint(&cfg, &store)?;
                     println!("{}", id.did());
                     eprintln!("register this DID at the VTC as the bridge serving its namespaces");
+                }
+            }
+            Ok(())
+        }
+        Cmd::Namespace { command } => {
+            let store = open_store(&cfg)?;
+            match command {
+                NamespaceCmd::List => {
+                    use vgi_bridge::store::{NamespaceRecord, Table};
+                    for (_, ns) in store.list::<NamespaceRecord>(Table::Namespaces)? {
+                        println!(
+                            "{}",
+                            vgi_bridge::namespaces::list_line(&ns, cfg.orphan_retention_days)
+                        );
+                    }
+                }
+                NamespaceCmd::Forget { id } => {
+                    let f = vgi_bridge::namespaces::forget(&store, &id)?;
+                    print_forgotten(&id, &f);
                 }
             }
             Ok(())

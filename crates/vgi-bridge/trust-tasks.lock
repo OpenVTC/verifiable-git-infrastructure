@@ -4,15 +4,15 @@ registry = "https://trusttasks.org"
 
 [[task]]
 slug = "git-ns/bridge/event"
-version = "0.5"
-type_uri = "https://trusttasks.org/spec/git-ns/bridge/event/0.5"
-digest = "sha256:10ee2d0eb00caded8034421d84ff5aca970e9a3ee2150ce1ed8ab9ca962628ab"
+version = "0.6"
+type_uri = "https://trusttasks.org/spec/git-ns/bridge/event/0.6"
+digest = "sha256:a6e89599d8db9d0c6650660d6c2dbe64bc527b6512f91ef5ac89583216e5f6de"
 
 [[task]]
 slug = "git-ns/bridge/job"
-version = "0.6"
-type_uri = "https://trusttasks.org/spec/git-ns/bridge/job/0.6"
-digest = "sha256:c3026296106158774c2f15e981c07205bcd986bfb0f810a14a6045c5cbc8a7f4"
+version = "0.7"
+type_uri = "https://trusttasks.org/spec/git-ns/bridge/job/0.7"
+digest = "sha256:9cca80cd82e16eb93c6a25965651329985660920be6ef9df334fcc2c86d6cbc2"
 
 [[task]]
 slug = "git-ns/bridge/result"

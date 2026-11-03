@@ -1,6 +1,6 @@
 //! The pull-request gate against the fake VTC and a mock GitHub:
 //! `pull_request` webhooks reported as `pullRequestOpened`
-//! (`git-ns/bridge/event` 0.5), and `closePullRequest` jobs
+//! (`git-ns/bridge/event` 0.6), and `closePullRequest` jobs
 //! (`git-ns/bridge/job` 0.6) carried out idempotently.
 
 mod common;
@@ -96,9 +96,9 @@ async fn an_opened_pull_request_is_reported_as_pull_request_opened() {
             "fromFork": true,
         })
     );
-    // A valid 0.5 payload, and nothing of what the pull request contains.
+    // A valid 0.6 payload, and nothing of what the pull request contains.
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.5 payload");
+        .expect("a 0.6 payload");
     let text = ev.to_string();
     for secret in ["a title", "a body", "secret-branch-name"] {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
@@ -587,11 +587,15 @@ async fn close_pull_request_without_its_members_is_malformed() {
 }
 
 #[tokio::test]
-async fn a_job_0_5_or_0_4_is_refused_as_an_unsupported_version() {
-    // The bridge lists 0.6 alone; a VTC that still holds an older answer is
+async fn a_job_0_6_0_5_or_0_4_is_refused_as_an_unsupported_version() {
+    // The bridge lists 0.7 alone; a VTC that still holds an older answer is
     // told so (and asks again), and nothing runs.
     let mut w = gate_world().await;
-    for (ty, id) in [(JOB_0_5, "job_close_10"), (JOB_0_4, "job_inspect")] {
+    for (ty, id) in [
+        (JOB_0_6, "job_close_11"),
+        (JOB_0_5, "job_close_10"),
+        (JOB_0_4, "job_inspect"),
+    ] {
         let doc = w.doc(ty, close_job(id), None).await;
         w.deliver(doc).await;
         let err = w.next().await;

@@ -1,4 +1,4 @@
-//! `git-ns/bridge/event` (0.2 semantics, sent as 0.5) against the fake VTC:
+//! `git-ns/bridge/event` (0.2 semantics, sent as 0.6) against the fake VTC:
 //! a transfer detaches and carries nothing into another namespace, a reused
 //! name detaches the old repository, and every resource lies inside its
 //! event's namespace.
@@ -451,9 +451,9 @@ async fn events_are_typed_0_5_and_an_older_acknowledgement_clears_them() {
     .await;
     let ev = w.next_of(EVENT).await;
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.5 payload");
+        .expect("a 0.6 payload");
     // A VTC that answers in 0.3 (an event this bridge sent before it moved
-    // to 0.5) still clears it.
+    // to 0.6) still clears it.
     let ack = w
         .doc(
             "https://trusttasks.org/spec/git-ns/bridge/event/0.3#response",

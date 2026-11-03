@@ -91,9 +91,15 @@ impl Adapter {
 
     /// Hand a stored namespace back to the adapter after a restart: the
     /// binding, and on GitHub the required-workflow availability, managed
-    /// set and pin — without which its org-mode steps refuse to run.
+    /// set and pin — without which its org-mode steps refuse to run. An
+    /// orphaned namespace is handed back too: the bridge still posts its
+    /// (failing) check there, and a re-binding takes this state over. The
+    /// bridge itself keeps every forge change for it off.
     pub fn restore(&self, record: &NamespaceRecord) -> Result<()> {
-        if record.state != NamespaceState::Bound {
+        if !matches!(
+            record.state,
+            NamespaceState::Bound | NamespaceState::Orphaned
+        ) {
             return Ok(());
         }
         let Some(binding) = &record.binding else {

@@ -435,7 +435,7 @@ impl Bridge {
             self.send_error(
                 &verified.doc,
                 ErrorPayload::new(StandardCode::UnsupportedVersion)
-                    .with_message("this bridge takes git-ns/bridge/job 0.6 only"),
+                    .with_message("this bridge takes git-ns/bridge/job 0.7 only"),
             )
             .await;
         } else if wire::is_discovery_type(&ty) {
@@ -568,8 +568,17 @@ impl Bridge {
             }
         }
 
+        // A job naming an orphaned namespace shows the VTC has it after all:
+        // bound again before the job is admitted (job 0.7, request rule 1),
+        // and its role map reported once the job is answered, as for any
+        // namespace the bridge starts serving.
+        let ns_id = payload.namespace.to_string();
+        let revived = self.unorphan(&ns_id);
         if let Err(JobRefusal(err)) = self.admit(&payload) {
             self.send_error(&v.doc, *err).await;
+            if revived {
+                self.started_serving(&ns_id).await;
+            }
             return;
         }
 
@@ -636,6 +645,9 @@ impl Bridge {
                 self.spawn_job(job_id);
             }
         }
+        if revived {
+            self.started_serving(&ns_id).await;
+        }
     }
 
     /// The request-time refusals (spec, request rules 1 and 2).
@@ -643,6 +655,17 @@ impl Bridge {
         use job::PayloadKind as K;
         let ns_id = p.namespace.to_string();
         if p.kind == K::BeginBind {
+            // A re-binding retired this id: never taken again (job 0.7,
+            // *Binding an owner again*).
+            if self.is_retired(&ns_id) {
+                return Err(JobRefusal::standard(
+                    StandardCode::MalformedRequest,
+                    format!(
+                        "namespace id `{ns_id}` was retired when its owner was bound again; a \
+                         namespace id is never reused"
+                    ),
+                ));
+            }
             let target = p.target.as_ref().expect("checked by kind");
             let resource = Resource::namespace_of(&target.forge, &target.owner)
                 .map_err(|e| JobRefusal::standard(StandardCode::MalformedRequest, e.to_string()))?;
@@ -725,10 +748,11 @@ impl Bridge {
         Ok(())
     }
 
-    /// The bound namespace `id`, or `unknownNamespace`.
+    /// The bound namespace `id`, or `unknownNamespace`. An orphaned
+    /// namespace is not bound: nothing acts on the forge for it.
     pub(crate) fn bound_namespace(&self, id: &str) -> Result<NamespaceRecord, JobRefusal> {
         match self.store.get::<NamespaceRecord>(Table::Namespaces, id) {
-            Ok(Some(ns)) if ns.state == NamespaceState::Bound && ns.binding.is_some() => Ok(ns),
+            Ok(Some(ns)) if ns.is_bound() => Ok(ns),
             Ok(_) => Err(JobRefusal::unknown_namespace(format!(
                 "no namespace `{id}` is bound to this bridge"
             ))),
@@ -860,6 +884,15 @@ impl Bridge {
         drift: Option<Vec<Value>>,
         key: Option<String>,
     ) -> Result<()> {
+        // No event for an orphaned namespace (event 0.6): the VTC has
+        // answered that it does not have it.
+        if self.is_orphaned(namespace) {
+            tracing::debug!(
+                namespace,
+                "not reporting an event for an orphaned namespace"
+            );
+            return Ok(());
+        }
         let Some(payload) = self.event_outbox_payload(namespace, event_json, drift)? else {
             return Ok(());
         };
@@ -968,6 +1001,18 @@ impl Bridge {
         let Ok(Some(entry)) = self.store.get::<OutboxEntry>(Table::Outbox, key) else {
             return;
         };
+        // An event waiting for a namespace orphaned since is dropped, never
+        // resent (event 0.6).
+        if entry.kind == OutboxKind::Event
+            && entry
+                .payload
+                .get("namespace")
+                .and_then(Value::as_str)
+                .is_some_and(|ns| self.is_orphaned(ns))
+        {
+            let _ = self.store.delete(Table::Outbox, key);
+            return;
+        }
         // VTA mode: what a result or event reports (a binding, a managed
         // repository) must be in the VTA before the VTC hears of it, or a
         // host lost in between would come back without it. Held here, the
@@ -1123,8 +1168,29 @@ impl Bridge {
         tracing::warn!(code = %code, thread = %thread, "the VTC refused a document");
         // A result for a job the VTC never sent will never be accepted:
         // stop sending it. Anything else is retried.
-        if code == result::error_codes::UNKNOWN_JOB.code || code == "git-ns:unknownNamespace" {
+        if code == result::error_codes::UNKNOWN_JOB.code {
             self.clear_outbox_thread(&thread);
+        } else if code == event::error_codes::UNKNOWN_NAMESPACE.code {
+            // The VTC does not have the namespace (event 0.6). The answer
+            // is verified as the VTC's (it came through the checker); it
+            // counts only when it threads to an event this bridge sent and
+            // still holds, which names the namespace. A refusal it cannot
+            // attribute so orphans nothing.
+            let Some(entry) = self.clear_outbox_thread(&thread) else {
+                tracing::warn!(thread = %thread,
+                    "an unknownNamespace answer threads to nothing this bridge is sending; ignored");
+                return;
+            };
+            match (
+                entry.kind,
+                entry.payload.get("namespace").and_then(Value::as_str),
+            ) {
+                (OutboxKind::Event, Some(ns)) if !thread.is_empty() => {
+                    self.orphan(ns);
+                }
+                _ => tracing::warn!(thread = %thread,
+                    "an unknownNamespace answer to something other than an event; nothing is orphaned"),
+            }
         }
     }
 
@@ -1165,7 +1231,9 @@ impl Bridge {
 
     /// Hourly: prune old delivery ids and finished jobs whose results the
     /// VTC acknowledged long ago (kept 30 days, so a late repeat is still
-    /// answered from the ledger), and rotate Forgejo bot tokens that are due.
+    /// answered from the ledger), rotate Forgejo bot tokens that are due, and
+    /// remove orphaned namespaces past their retention
+    /// ([`Bridge::sweep_orphaned`]).
     pub async fn maintenance(&self) {
         let now = now();
         if let Ok(ds) = self.store.list::<i64>(Table::Deliveries) {
@@ -1194,5 +1262,8 @@ impl Bridge {
         crate::resign::prune(self);
         #[cfg(feature = "forge-forgejo")]
         crate::flows::rotate_forgejo_tokens(self).await;
+        // Orphaned namespaces past their retention; never one for being
+        // quiet (event 0.6).
+        self.sweep_orphaned().await;
     }
 }

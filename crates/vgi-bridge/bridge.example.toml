@@ -16,11 +16,11 @@
 
 # The one VTC this bridge serves. Jobs signed by any other DID are refused.
 vtc_did = "did:webvh:QmVtcScid7:acme-vtc.example"
-# The bridge sends git-ns/bridge/event 0.5 and git-ns/bridge/result 0.2, and
-# takes git-ns/bridge/job 0.6, alone (BRIDGE.md §7, "Protocol versions"): the
-# VTC must serve event 0.5 and result 0.2. `event_version` takes "0.5" only;
+# The bridge sends git-ns/bridge/event 0.6 and git-ns/bridge/result 0.2, and
+# takes git-ns/bridge/job 0.7, alone (BRIDGE.md §7, "Protocol versions"): the
+# VTC must serve event 0.6 and result 0.2. `event_version` takes "0.6" only;
 # an older value fails the start. Leave it unset.
-# event_version = "0.5"
+# event_version = "0.6"
 # The community's Trust Registry (for the bootstrap and the bridge's check):
 # the TrustRegistry service of the VTC's DID document (setup reads it there).
 trust_registry_did = "did:webvh:QmRegScid3:registry.acme-vtc.example"
@@ -89,6 +89,12 @@ master_key_file = "/home/ops/vgi-bridge/master-key"
 # resend_secs = 60
 # How long a bind or account link waits for the person.
 # flow_ttl_secs = 900
+# Days an orphaned namespace (one the VTC answered `unknownNamespace` for) is
+# kept before the bridge removes its record on its own — never anything on
+# the forge. At least 30 (the default); the log warns daily from 7 days
+# before. `vgi-bridge namespace list` shows them, `namespace forget` removes
+# one sooner (BRIDGE.md, "Orphaned namespaces").
+# orphan_retention_days = 30
 
 # Approving reviews every governed repository's pull requests need before
 # they merge (0-10; default 0). They count only from accounts the community's

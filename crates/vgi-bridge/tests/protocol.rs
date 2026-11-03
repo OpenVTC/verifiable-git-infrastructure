@@ -397,6 +397,7 @@ async fn discovery_lists_job_0_6_and_older_job_versions_are_refused() {
         "https://trusttasks.org/spec/git-ns/bridge/job/0.3",
         JOB_0_4,
         JOB_0_5,
+        JOB_0_6,
     ] {
         let doc = w.doc(old, inspect_job("job_old"), None).await;
         w.deliver(doc).await;

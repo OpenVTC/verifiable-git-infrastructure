@@ -41,26 +41,27 @@ use crate::identity::BridgeIdentity;
 
 use trust_tasks_rs::Payload as GitNsPayload;
 
-/// The payload types of `git-ns/bridge/event` 0.5, the only version this
-/// bridge sends. 0.5 is 0.4 with nested repository paths
-/// (`git-ns/_shared/0.6`); every older version is a subset of it with the
-/// same meaning, and a VTC that serves 0.5 serves them all, so the bridge no
-/// longer sends any of them.
-pub use crate::specs::git_ns::bridge::event::v0_5 as event;
-/// The payload types of `git-ns/bridge/job` 0.6, the only version this
-/// bridge takes. 0.6 is 0.5 with nested repository paths; a VTC sends every
-/// job as 0.6 to a bridge that lists 0.6 in its discovery answer, so the
-/// bridge lists 0.6 alone and refuses 0.5 and older with
-/// `unsupportedVersion` (on which the VTC asks it again). It adds rules the schema does not state, checked
+/// The payload types of `git-ns/bridge/event` 0.6, the only version this
+/// bridge sends. 0.6 is 0.5 with orphaned namespaces (a VTC's
+/// `git-ns:unknownNamespace` answer orphans the namespace on the bridge)
+/// and `bindCompleted.supersedes`; every older version is a subset of it
+/// with the same meaning, so the bridge sends none of them.
+pub use crate::specs::git_ns::bridge::event::v0_6 as event;
+/// The payload types of `git-ns/bridge/job` 0.7, the only version this
+/// bridge takes. 0.7 is 0.6 (same schema) with binding an owner again and a
+/// job un-orphaning its namespace; a VTC sends every job as 0.7 to a bridge
+/// that lists 0.7 in its discovery answer, so the bridge lists 0.7 alone and
+/// refuses 0.6 and older with `unsupportedVersion` (on which the VTC asks it
+/// again). It adds rules the schema does not state, checked
 /// in [`check_kind_members`]: a namespace admin with no right of their own
 /// on a repository is listed at `git.ns.admin` and gets no role; there is
 /// no namespace-level `projectRoles`; each account appears once.
-pub use crate::specs::git_ns::bridge::job::v0_6 as job;
+pub use crate::specs::git_ns::bridge::job::v0_7 as job;
 /// The payload types of `git-ns/bridge/result` 0.2, the only version this
 /// bridge sends (0.1 with nested repository paths and the DID Core `Did`).
 pub use crate::specs::git_ns::bridge::result::v0_2 as result;
 
-/// `git-ns/bridge/job/0.6`'s type URI.
+/// `git-ns/bridge/job/0.7`'s type URI.
 pub const JOB_TYPE: &str = <job::Payload as GitNsPayload>::TYPE_URI;
 /// The job versions this bridge takes, newest first — what it lists in
 /// answer to `trust-task-discovery`.
@@ -83,7 +84,7 @@ pub fn is_discovery_type(type_uri: &str) -> bool {
 }
 
 /// Whether `type_uri` (bare) is a job this bridge takes: `git-ns/bridge/job`
-/// 0.6.
+/// 0.7.
 pub fn is_job_type(type_uri: &str) -> bool {
     JOB_TYPES.contains(&type_uri)
 }
@@ -129,7 +130,7 @@ pub fn declared_error(code: trust_tasks_rs::DeclaredErrorCode) -> ErrorPayload {
 
 /// Whether `type_uri` is the VTC's acknowledgement of an event, of any
 /// version: a VTC acknowledges an event in the version it was sent, and one
-/// this bridge sent under an older version before it moved to 0.5 may still
+/// this bridge sent under an older version before it moved to 0.6 may still
 /// be acknowledged after it. The acknowledgement carries nothing but its
 /// `threadId`, so its version does not matter.
 pub fn is_event_response_type(type_uri: &str) -> bool {
@@ -277,7 +278,7 @@ pub struct VerifiedDoc {
 }
 
 impl VerifiedDoc {
-    /// The bare type URI (`…/git-ns/bridge/job/0.6`, `…#response`).
+    /// The bare type URI (`…/git-ns/bridge/job/0.7`, `…#response`).
     pub fn type_uri(&self) -> String {
         self.doc.type_uri.to_string()
     }
@@ -965,7 +966,7 @@ mod tests {
     fn acknowledgements_of_any_version_are_recognised() {
         assert!(is_event_response_type(event::Response::TYPE_URI));
         assert!(is_result_response_type(result::Response::TYPE_URI));
-        for v in ["0.1", "0.3", "0.4"] {
+        for v in ["0.1", "0.3", "0.4", "0.5"] {
             assert!(is_event_response_type(&format!(
                 "https://trusttasks.org/spec/git-ns/bridge/event/{v}#response"
             )));
@@ -974,24 +975,24 @@ mod tests {
             "https://trusttasks.org/spec/git-ns/bridge/result/0.1#response"
         ));
         for not in [
-            "https://trusttasks.org/spec/git-ns/bridge/event/0.5",
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.6",
             "https://trusttasks.org/spec/git-ns/bridge/event/x#response",
-            "https://trusttasks.org/spec/git-ns/bridge/event/0.5.1#response",
-            "https://trusttasks.org/spec/git-ns/bridge/events/0.5#response",
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.6.1#response",
+            "https://trusttasks.org/spec/git-ns/bridge/events/0.6#response",
             "https://trusttasks.org/spec/git-ns/bridge/result/0.2#response",
         ] {
             assert!(!is_event_response_type(not), "{not}");
         }
         assert!(!is_result_response_type(
-            "https://trusttasks.org/spec/git-ns/bridge/event/0.5#response"
+            "https://trusttasks.org/spec/git-ns/bridge/event/0.6#response"
         ));
     }
 
     #[test]
-    fn only_job_0_6_is_taken() {
+    fn only_job_0_7_is_taken() {
         assert!(is_job_type(JOB_TYPE));
-        assert!(JOB_TYPE.ends_with("/git-ns/bridge/job/0.6"));
-        for v in ["0.1", "0.2", "0.3", "0.4", "0.5", "0.7"] {
+        assert!(JOB_TYPE.ends_with("/git-ns/bridge/job/0.7"));
+        for v in ["0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.8"] {
             let t = format!("https://trusttasks.org/spec/git-ns/bridge/job/{v}");
             assert!(!is_job_type(&t));
             assert!(is_other_job_version(&t));
@@ -1000,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_lists_job_0_6_for_a_pattern_that_selects_it() {
+    fn discovery_lists_job_0_7_for_a_pattern_that_selects_it() {
         for p in [
             vec![],
             vec!["*".to_string()],
@@ -1009,14 +1010,14 @@ mod tests {
         ] {
             assert_eq!(
                 discovery_answer(&p)["supportedTypes"],
-                json!(["https://trusttasks.org/spec/git-ns/bridge/job/0.6"]),
+                json!(["https://trusttasks.org/spec/git-ns/bridge/job/0.7"]),
                 "{p:?}"
             );
         }
         for p in [
             vec!["acl/*".to_string()],
             vec!["git-ns/bridge".into()],
-            vec!["git-ns/bridge/job/0.6".into()],
+            vec!["git-ns/bridge/job/0.7".into()],
         ] {
             assert_eq!(discovery_answer(&p)["supportedTypes"], json!([]), "{p:?}");
         }

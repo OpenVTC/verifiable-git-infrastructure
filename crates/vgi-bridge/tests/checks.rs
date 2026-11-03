@@ -220,6 +220,52 @@ async fn a_posted_check_on_a_managed_repository_is_reported_in_ext() {
     w.quiet().await;
 }
 
+/// A namespace the VTC answered `unknownNamespace` for (event 0.6): the
+/// check the bridge posts there fails, naming the VTC, whatever the commits
+/// are — and nothing is verified or reported.
+#[tokio::test]
+async fn an_orphaned_namespace_fails_the_check_it_posts() {
+    use vgi_bridge::store::{NamespaceRecord, NamespaceState, Table};
+    let repo = pr_repo();
+    let mut w = check_world(&repo, repo.pr.clone()).await;
+    seed_repo(w.bridge.store(), &common::repo("widgets"), 812);
+    w.bridge
+        .store()
+        .update::<NamespaceRecord, _>(Table::Namespaces, NS, |n| {
+            let mut n = n.unwrap();
+            n.state = NamespaceState::Orphaned;
+            n.orphaned_at = Some(1);
+            Ok((Some(n), ()))
+        })
+        .unwrap();
+    mount_pr(&w, repo.head(), "main", &repo.base, 10).await;
+    post_webhook(
+        &w,
+        "pull_request",
+        "d-orphan",
+        &pr_event("synchronize", repo.head(), "main", &repo.base),
+    )
+    .await;
+    wait_delivery(&w, "d-orphan").await;
+    let done = completed_checks(&w.server).await;
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0]["conclusion"], "failure", "{}", done[0]);
+    assert_eq!(
+        done[0]["output"]["title"],
+        "The namespace is not governed by this VTC"
+    );
+    let summary = done[0]["output"]["summary"].as_str().unwrap();
+    assert!(
+        summary.contains(w.vtc.did()) && summary.contains("not governed"),
+        "{summary}"
+    );
+    assert!(
+        w.verifier.seen.lock().unwrap().is_empty(),
+        "nothing verified"
+    );
+    w.quiet().await;
+}
+
 #[tokio::test]
 async fn an_untrusted_commit_fails_the_check() {
     let repo = pr_repo();

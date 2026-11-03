@@ -332,9 +332,9 @@ async fn report(w: &mut World) -> Value {
     w.bridge.report_role_map(NS).await;
     let ev = w.next_of(EVENT).await;
     assert_eq!(ev["payload"]["namespace"], NS);
-    // Fits the 0.5 payload type.
+    // Fits the 0.6 payload type.
     serde_json::from_value::<vgi_bridge::wire::event::Payload>(ev["payload"].clone())
-        .expect("a 0.5 payload");
+        .expect("a 0.6 payload");
     ev["payload"]["event"].clone()
 }
 
