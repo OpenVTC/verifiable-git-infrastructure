@@ -147,10 +147,11 @@ verify-trust = { version = "0.33.0", path = "crates/verify-trust" }
 # second node is trust-tasks-rs alone — no second affinidi-tdk or messaging
 # stack — and trql-client 0.30 enables no prebuilt family, so it compiles in
 # seconds. No trust-tasks type crosses from verify-trust into vta-sdk or the
-# bridge, and did-git-sign has no trql-client edge. Retire the alias when a
-# trql-client on trust-tasks 0.37 is published.
-trql-client = "0.30.0"
-trust-tasks-trql = { package = "trust-tasks-rs", version = "0.36.2", default-features = false }
+# bridge, and did-git-sign has no trql-client edge.
+# **0.31** is the trql-client on trust-tasks 0.37 / affinidi-tdk 0.37 (registry
+# PR #182; no source change), so the alias is retired again and verify-trust
+# names the workspace's single `trust-tasks-rs` directly.
+trql-client = "0.31.0"
 # VTA client for signing with DID-held keys, and the `display_name` module
 # (NameBook / shorten_did / verified agent names) shared with the PNM, CNM
 # and VTC operator CLIs so every surface abbreviates a DID the same way.
