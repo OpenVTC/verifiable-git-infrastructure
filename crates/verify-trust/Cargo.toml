@@ -34,9 +34,8 @@ tsp = ["affinidi-tdk/tsp"]
 vgi-core = { workspace = true }
 trql-client = { workspace = true }
 # `TrustTask`, for the mediator transports' `TrqlTransport` impls: the
-# trust-tasks line trql-client 0.30 is on, which is not the workspace's (see
-# the `trust-tasks-trql` note in the workspace manifest).
-trust-tasks-trql = { workspace = true }
+# workspace's single trust-tasks line, which trql-client 0.31 is on too.
+trust-tasks-rs = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
