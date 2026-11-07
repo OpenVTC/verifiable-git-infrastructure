@@ -450,7 +450,7 @@ sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dialoguer = { version = "0.12", features = ["password"] }
-sysinfo = "0.39"
+sysinfo = "0.40"
 chrono = "0.4"
 hex = "0.4"
 # Message ids for the registry queries verify-trust sends over a mediator.
