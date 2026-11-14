@@ -6742,9 +6742,9 @@ dependencies = [
 
 [[package]]
 name = "trust-tasks-proof"
-version = "0.37.2"
+version = "0.37.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3a252f7815bcf23905c0eaf4416cfb7f23cd75fbb5719b47ca14099009a4863"
+checksum = "523b370de66bea567762d45a86bdc3ff8dc48806920027b3ba02006f8ef31418"
 dependencies = [
  "affinidi-crypto",
  "affinidi-data-integrity",
