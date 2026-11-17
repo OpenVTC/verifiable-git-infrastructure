@@ -29,4 +29,17 @@ ignore = [
     # curves, and drop this when `pgp` and `ssh-key` move to elliptic-curve
     # 0.14 (ssh-key 0.7 is still a release candidate).
     "RUSTSEC-2026-0387",
+    # RUSTSEC-2026-0543, `chrono` unmaintained (chronotope/chrono#1768).
+    # Status only: no vulnerability is reported, every version is affected
+    # and there is no fixed release. The workspace uses chrono directly
+    # (did-git-sign, verify-trust, vgi-bridge, vgi-forge-github) and it
+    # arrives again through the affinidi-tdk stack, so it cannot leave the
+    # graph from this repo alone. Drop when this workspace and affinidi-tdk-rs
+    # have migrated to `jiff` or `time`.
+    "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0542, `humantime` marked unmaintained because chrono is.
+    # Status only, no vulnerability; humantime 2.4.0 has no dependencies, so
+    # chrono's status does not reach it. Drop with RUSTSEC-2026-0543, or when
+    # nothing here depends on humantime.
+    "RUSTSEC-2026-0542",
 ]
