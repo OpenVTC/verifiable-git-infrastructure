@@ -588,6 +588,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 redb = "4"
 # The operator's config file.
 toml = "1"
+# The bridge binary's global allocator (see crates/vgi-bridge/Cargo.toml).
+# Binaries only: never a library dependency.
+tikv-jemallocator = "0.7"
 # Stream combinators over the delivery layer's inbound stream (already in the
 # graph through the messaging SDK).
 futures-util = "0.3"
