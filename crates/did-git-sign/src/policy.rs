@@ -222,7 +222,11 @@ pub fn audit_log_path() -> Result<PathBuf> {
 }
 
 fn parent_process_info() -> (Option<u32>, Option<String>) {
-    let mut sys = System::new();
+    // sysinfo 0.40 reports unsupported platforms as an error; with no
+    // process table there is no parent to name, and `decide` fails closed.
+    let Ok(mut sys) = System::new() else {
+        return (None, None);
+    };
     let self_pid = std::process::id();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
     let parent_pid = sys
