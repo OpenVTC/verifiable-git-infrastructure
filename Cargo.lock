@@ -459,7 +459,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-proof",
  "trust-tasks-rs",
  "url",
@@ -567,7 +567,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tracing",
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-proof",
  "trust-tasks-rs",
  "uuid",
@@ -6835,15 +6835,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
 [[package]]
 name = "trust-tasks-build"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6736227b796ed33289a450db554cc6ae2ade853322e6e89cc0f5ef94f2970024"
+checksum = "d4bc4ea9eed5eeee38822e3efa03da008fb0da38d15e49648d9b25862ac2fcdc"
 dependencies = [
  "anyhow",
  "heck",
@@ -6853,7 +6853,27 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
+ "syn 2.0.119",
+ "toml",
+ "typify",
+]
+
+[[package]]
+name = "trust-tasks-build"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2ced855a337a2879300990d5316d2889dea8c885199252b8334c0bd8f4ea6ff"
+dependencies = [
+ "anyhow",
+ "heck",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "syn 2.0.119",
  "toml",
  "typify",
@@ -7230,7 +7250,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-build",
+ "trust-tasks-build 0.2.1",
  "trust-tasks-proof",
  "trust-tasks-rs",
  "url",
@@ -7411,7 +7431,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7bf071c648f55c6dbbe73c19067a9a2b953bfc67e37a619f6f1822dc5e2684f"
 dependencies = [
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
@@ -7421,7 +7441,7 @@ version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f80c3d7b0cd7c7786c77a066c800c03aaac6c6f7d9bb04a7cecd608bc3045e9"
 dependencies = [
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
@@ -7431,7 +7451,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81ca2055130dd32e6779d0c81c52cb58a497fc1abec9763f213f7851add18154"
 dependencies = [
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
@@ -7441,7 +7461,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a3ea38a5a2bc6ea5619db6a905b5fc1e32f7080e90adefa8c42635abc95803b"
 dependencies = [
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
@@ -7451,7 +7471,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138e965e4785c3bc51e7849907958b3f087bcc8e4d8508fe0f7d7131c763d8c8"
 dependencies = [
- "trust-tasks-build",
+ "trust-tasks-build 0.1.4",
  "trust-tasks-rs",
 ]
 
