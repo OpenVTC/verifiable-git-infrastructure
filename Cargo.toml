@@ -562,7 +562,7 @@ affinidi-messaging-test-mediator = { version = "0.50", features = ["tsp"] }
 #
 # 0.37 is the line vta-sdk 0.80 is on. The bridge's pinned git-ns bundles are
 # unchanged; only the generator's runtime moves.
-trust-tasks-rs = { version = "0.37.2", default-features = false }
+trust-tasks-rs = { version = "0.39.0", default-features = false }
 # Build dependency of `vgi-bridge`: generates `vgi_bridge::specs` from the
 # vendored bundles. `trust-tasks check` (trust-tasks-cli) verifies them. 0.1.2
 # is the release that generates for trust-tasks-rs 0.36.
