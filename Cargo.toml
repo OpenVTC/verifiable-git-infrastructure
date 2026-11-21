@@ -566,7 +566,7 @@ trust-tasks-rs = { version = "0.37.2", default-features = false }
 # Build dependency of `vgi-bridge`: generates `vgi_bridge::specs` from the
 # vendored bundles. `trust-tasks check` (trust-tasks-cli) verifies them. 0.1.2
 # is the release that generates for trust-tasks-rs 0.36.
-trust-tasks-build = "0.1.3"
+trust-tasks-build = "0.2.0"
 # Data Integrity sign/verify for Trust Task documents (eddsa-jcs-2022), on the
 # same line as the payload types. Its affinidi-data-integrity and DID-resolver
 # dependencies are the versions the TDK already builds here.
