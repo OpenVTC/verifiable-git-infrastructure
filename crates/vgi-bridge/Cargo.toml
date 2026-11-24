@@ -64,11 +64,7 @@ trust-tasks-proof = { workspace = true }
 # the TDK's messaging SDK (ATM, built with TSP), its delivery layer, and
 # vta-sdk's DID-secrets-bundle helpers and TSP binding envelope.
 affinidi-tdk = { workspace = true, features = ["tsp"] }
-# Security floors, not new code: the messaging SDK and DIDComm crate the TDK
-# already builds, at the releases that bind an authcrypt sender to the key
-# actually used. See the workspace manifest.
 affinidi-messaging-sdk = { workspace = true }
-affinidi-messaging-didcomm = { workspace = true }
 affinidi-messaging-delivery = { workspace = true }
 affinidi-messaging-core = { workspace = true }
 # VTA mode (`crate::vta`): the client, the session transports (DIDComm, with
@@ -147,4 +143,4 @@ vta-sdk = { workspace = true, features = ["test-loopback"] }
 # A fixed verification-method resolver for the key-rotation test (a
 # did:webvh resolved without the network). Already in the graph through
 # trust-tasks-proof.
-affinidi-data-integrity = "0.8"
+affinidi-data-integrity = "0.9.2"

@@ -685,12 +685,48 @@ fn in_subtree(root: &str, context: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// A DID the VTA lists, as the picker needs it: the identifier and the
+/// context that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedDid {
+    did: String,
+    context_id: String,
+}
+
+/// The DID methods offered for signing: did:webvh and did:scid (its
+/// `scid:vh` profile), the ones `webvh/dids/list` returned before the VTA's
+/// method-neutral `vta/dids/list`.
+const SIGNING_METHODS: [&str; 2] = ["webvh", "scid:vh"];
+
+/// Every signing DID the caller can see (`vta/dids/list`, read to the end),
+/// optionally narrowed to one context. A DID the VTA files under no context
+/// cannot be placed in the picker's subtree, so it is left out.
+async fn list_signing_dids(
+    client: &vta_sdk::client::VtaClient,
+    context_id: Option<&str>,
+) -> Result<Vec<ListedDid>> {
+    let filter = vta_sdk::client::DidListFilter {
+        context_id: context_id.map(str::to_string),
+        methods: Some(SIGNING_METHODS.iter().map(|m| m.to_string()).collect()),
+        ..Default::default()
+    };
+    Ok(client
+        .list_dids(&filter)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
+        .into_iter()
+        .filter_map(|d| {
+            Some(ListedDid {
+                did: d.did.to_string(),
+                context_id: d.context_id?,
+            })
+        })
+        .collect())
+}
+
 /// The DIDs held in `root` or any of its sub-contexts, ordered by context and
 /// then DID so the picker is stable.
-fn dids_in_subtree(
-    dids: &[vta_sdk::webvh::WebvhDidRecord],
-    root: &str,
-) -> Vec<vta_sdk::webvh::WebvhDidRecord> {
+fn dids_in_subtree(dids: &[ListedDid], root: &str) -> Vec<ListedDid> {
     let mut found: Vec<_> = dids
         .iter()
         .filter(|d| in_subtree(root, &d.context_id))
@@ -723,10 +759,7 @@ fn context_label(id: &str, name: &str, dids: usize, primary: Option<&str>) -> St
 
 /// A DID in the picker: its name when the book has one, and the context it
 /// lives in, since the candidates now span a subtree.
-fn did_label(
-    book: &vta_sdk::display_name::NameBook,
-    did: &vta_sdk::webvh::WebvhDidRecord,
-) -> String {
+fn did_label(book: &vta_sdk::display_name::NameBook, did: &ListedDid) -> String {
     format!("{} — in {}", names::inline(book, &did.did), did.context_id)
 }
 
@@ -795,16 +828,12 @@ async fn interactive_select(
         bail!("no contexts found in VTA — create a context first");
     }
 
-    // Every DID the caller can see, in one round trip. `webvh/dids/list`
-    // filters `contextId` exactly, so asking per context would miss a persona
-    // in a sub-context (where openvtc puts every one); with no filter it
-    // returns each DID whose context the caller's ACL covers, and that check
-    // is subtree-aware. The subtree is then selected here.
-    let all_dids = client
-        .list_dids_webvh(None, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
-        .dids;
+    // Every DID the caller can see. `vta/dids/list` filters `contextId`
+    // exactly, so asking per context would miss a persona in a sub-context
+    // (where openvtc puts every one); with no context filter it returns each
+    // DID whose context the caller's ACL covers, and that check is
+    // subtree-aware. The subtree is then selected here.
+    let all_dids = list_signing_dids(client, None).await?;
 
     let context_labels: Vec<String> = contexts
         .contexts
@@ -844,11 +873,7 @@ async fn interactive_select(
                 .interact()?)
         })?;
         create_context_did(client, &context.id, presentation).await?;
-        let listed = client
-            .list_dids_webvh(Some(&context.id), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to list DIDs: {e}"))?
-            .dids;
+        let listed = list_signing_dids(client, Some(&context.id)).await?;
         dids = dids_in_subtree(&listed, &context.id);
         if dids.is_empty() {
             bail!(
@@ -859,8 +884,7 @@ async fn interactive_select(
     }
 
     // A DID is what the operator is choosing between here, so this is the
-    // picker that most needs a name. `list_dids_webvh` carries no label of
-    // its own, so the names come from the book: an ACL label if the VTA has
+    // picker that most needs a name. The names come from the book: an ACL label if the VTA has
     // one, otherwise an agent name when asked for.
     names::resolve_agent_names_into(
         book,
@@ -1968,13 +1992,11 @@ mod tests {
         assert!(existing.contains("pnm acl create") && !existing.contains("contexts create"));
     }
 
-    fn did_record(did: &str, context: &str) -> vta_sdk::webvh::WebvhDidRecord {
-        serde_json::from_value(serde_json::json!({
-            "did": did, "serverId": "s", "mnemonic": "m", "scid": "Qm", "contextId": context,
-            "portable": true, "logEntryCount": 1,
-            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
-        }))
-        .expect("record")
+    fn did_record(did: &str, context: &str) -> ListedDid {
+        ListedDid {
+            did: did.to_string(),
+            context_id: context.to_string(),
+        }
     }
 
     #[test]
