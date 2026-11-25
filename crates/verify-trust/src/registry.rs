@@ -360,9 +360,26 @@ impl std::fmt::Debug for Registry {
 }
 
 impl Registry {
-    /// Query over HTTPS, at `url` (`POST <url>/trust-tasks`), as today.
+    /// Query over HTTPS, at `url` (`POST <url>/trust-tasks`), for a URL
+    /// taken from the registry's DID document: the transport refuses
+    /// loopback, private, link-local and other non-public addresses.
     pub fn https(url: &str, registry_did: &str) -> Result<Self> {
-        let transport = HttpsTransport::new(HttpsTransportConfig::new(url))?;
+        Self::https_with(HttpsTransportConfig::new(url), registry_did)
+    }
+
+    /// Query over HTTPS at a URL the operator configured (`--registry-url`,
+    /// the bridge's registry override), which may name a registry on a
+    /// private network or on this machine, so non-public addresses are
+    /// allowed. Never pass a URL taken from a DID document here.
+    pub fn https_configured(url: &str, registry_did: &str) -> Result<Self> {
+        Self::https_with(
+            HttpsTransportConfig::new(url).with_allow_non_public_addresses(true),
+            registry_did,
+        )
+    }
+
+    fn https_with(config: HttpsTransportConfig, registry_did: &str) -> Result<Self> {
+        let transport = HttpsTransport::new(config)?;
         Ok(Self {
             client: TrqlClient::new(Arc::new(transport), registry_did),
             kind: TransportKind::Https,

@@ -1195,7 +1195,8 @@ mod pgp_platform {
             String::new(),
             registry.clone(),
         );
-        let registry = verify_trust::Registry::https(&registry, "did:example:registry").unwrap();
+        let registry =
+            verify_trust::Registry::https_configured(&registry, "did:example:registry").unwrap();
         verify_prepared_with_facts(
             &args,
             commits,

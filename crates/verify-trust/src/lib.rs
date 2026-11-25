@@ -333,7 +333,9 @@ pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
 /// `https` may accompany.
 fn https_override(url: &str, transport: TransportSelector, registry_did: &str) -> Result<Registry> {
     match transport {
-        TransportSelector::Auto | TransportSelector::Https => Registry::https(url, registry_did),
+        TransportSelector::Auto | TransportSelector::Https => {
+            Registry::https_configured(url, registry_did)
+        }
         other => bail!(
             "--registry-url is an HTTPS endpoint and cannot be combined with --transport \
              {other}; drop one of them"
@@ -395,7 +397,7 @@ pub async fn verify_prepared(
     let registry_url = args.registry_url.as_deref().context(
         "registry URL not resolved: discover it from --registry-did or pass --registry-url",
     )?;
-    let registry = Registry::https(registry_url, &args.registry_did)?;
+    let registry = Registry::https_configured(registry_url, &args.registry_did)?;
     verify_prepared_with(args, commits, signers, exempt, &registry).await
 }
 

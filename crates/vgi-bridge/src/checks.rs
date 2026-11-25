@@ -228,7 +228,7 @@ impl VerifyTrustVerifier {
     /// The client for this check: the override, or the discovered binding.
     async fn registry(&self, tdk: &affinidi_tdk::TDK) -> Result<verify_trust::Registry> {
         if let Some(u) = &self.registry_override {
-            return verify_trust::Registry::https(u, &self.registry_did);
+            return verify_trust::Registry::https_configured(u, &self.registry_did);
         }
         let mut cached = self.registry_route.lock().await;
         let route = match cached.as_ref() {
