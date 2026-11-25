@@ -333,7 +333,9 @@ pub async fn handle_verify_trust(args: VerifyTrustArgs) -> Result<i32> {
 /// `https` may accompany.
 fn https_override(url: &str, transport: TransportSelector, registry_did: &str) -> Result<Registry> {
     match transport {
-        TransportSelector::Auto | TransportSelector::Https => Registry::https(url, registry_did),
+        TransportSelector::Auto | TransportSelector::Https => {
+            Registry::https_configured(url, registry_did)
+        }
         other => bail!(
             "--registry-url is an HTTPS endpoint and cannot be combined with --transport \
              {other}; drop one of them"
@@ -395,7 +397,7 @@ pub async fn verify_prepared(
     let registry_url = args.registry_url.as_deref().context(
         "registry URL not resolved: discover it from --registry-did or pass --registry-url",
     )?;
-    let registry = Registry::https(registry_url, &args.registry_did)?;
+    let registry = Registry::https_configured(registry_url, &args.registry_did)?;
     verify_prepared_with(args, commits, signers, exempt, &registry).await
 }
 
@@ -2495,7 +2497,7 @@ mod tests {
     struct FakeChannel {
         authorized: bool,
         v0_1_only: bool,
-        rejection: Option<trust_tasks_trql::ErrorPayload>,
+        rejection: Option<trust_tasks_rs::ErrorPayload>,
         failure: Option<TrqlError>,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
     }
@@ -2518,7 +2520,7 @@ mod tests {
             }
         }
 
-        fn rejecting(rejection: trust_tasks_trql::ErrorPayload) -> Self {
+        fn rejecting(rejection: trust_tasks_rs::ErrorPayload) -> Self {
             Self {
                 rejection: Some(rejection),
                 ..Self::answering(false)
@@ -2541,8 +2543,8 @@ mod tests {
 
         async fn exchange(
             &self,
-            request: trust_tasks_trql::TrustTask<serde_json::Value>,
-        ) -> Result<trust_tasks_trql::TrustTask<serde_json::Value>, TrqlError> {
+            request: trust_tasks_rs::TrustTask<serde_json::Value>,
+        ) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, TrqlError> {
             let typed = request;
             let request = serde_json::to_value(&typed).unwrap();
             assert_eq!(request["recipient"], "did:example:registry");
@@ -2573,8 +2575,8 @@ mod tests {
                 if asked_v0_2 {
                     let error = typed.reject_with(
                         "urn:uuid:error",
-                        trust_tasks_trql::ErrorPayload::new(
-                            trust_tasks_trql::StandardCode::UnsupportedVersion,
+                        trust_tasks_rs::ErrorPayload::new(
+                            trust_tasks_rs::StandardCode::UnsupportedVersion,
                         ),
                     );
                     return Ok(
@@ -2775,7 +2777,7 @@ mod tests {
     /// fallback is not asked — not a denial blamed on the signer.
     #[tokio::test]
     async fn a_retryable_rejection_fails_closed_as_unavailable() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         for rejection in [
             ErrorPayload::new(StandardCode::Unavailable),
             ErrorPayload::new(StandardCode::PermissionDenied).with_retryable(true),
@@ -2828,7 +2830,7 @@ mod tests {
     /// after the fallback resource has been asked too.
     #[tokio::test]
     async fn a_final_rejection_is_unauthorized_after_the_fallback() {
-        use trust_tasks_trql::{ErrorPayload, StandardCode};
+        use trust_tasks_rs::{ErrorPayload, StandardCode};
         let channel = Arc::new(FakeChannel::rejecting(ErrorPayload::new(
             StandardCode::PermissionDenied,
         )));

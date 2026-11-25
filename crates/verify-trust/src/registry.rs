@@ -67,7 +67,7 @@ use trql_client::{
     HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportChoice, TransportKind,
     TrqlClient, TrqlError, TrqlTransport,
 };
-use trust_tasks_trql::TrustTask;
+use trust_tasks_rs::TrustTask;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub use mediated::EphemeralIdentity;
@@ -165,10 +165,7 @@ pub fn choose_route(
              not a mediator DID"
         );
     }
-    Ok(TransportChoice {
-        kind,
-        endpoint: endpoint.to_string(),
-    })
+    Ok(TransportChoice::new(kind, endpoint))
 }
 
 fn list(kinds: &[TransportKind]) -> String {
@@ -363,9 +360,26 @@ impl std::fmt::Debug for Registry {
 }
 
 impl Registry {
-    /// Query over HTTPS, at `url` (`POST <url>/trust-tasks`), as today.
+    /// Query over HTTPS, at `url` (`POST <url>/trust-tasks`), for a URL
+    /// taken from the registry's DID document: the transport refuses
+    /// loopback, private, link-local and other non-public addresses.
     pub fn https(url: &str, registry_did: &str) -> Result<Self> {
-        let transport = HttpsTransport::new(HttpsTransportConfig::new(url))?;
+        Self::https_with(HttpsTransportConfig::new(url), registry_did)
+    }
+
+    /// Query over HTTPS at a URL the operator configured (`--registry-url`,
+    /// the bridge's registry override), which may name a registry on a
+    /// private network or on this machine, so non-public addresses are
+    /// allowed. Never pass a URL taken from a DID document here.
+    pub fn https_configured(url: &str, registry_did: &str) -> Result<Self> {
+        Self::https_with(
+            HttpsTransportConfig::new(url).with_allow_non_public_addresses(true),
+            registry_did,
+        )
+    }
+
+    fn https_with(config: HttpsTransportConfig, registry_did: &str) -> Result<Self> {
+        let transport = HttpsTransport::new(config)?;
         Ok(Self {
             client: TrqlClient::new(Arc::new(transport), registry_did),
             kind: TransportKind::Https,
@@ -1785,10 +1799,7 @@ mod tests {
         // which `query_registry` records as `registryUnavailable` — and the
         // second must fail at once rather than trying again.
         let tdk = crate::build_resolver(false).await.unwrap();
-        let route = TransportChoice {
-            kind: supported_transports()[0],
-            endpoint: "did:web:127.0.0.1%3A9".to_string(),
-        };
+        let route = TransportChoice::new(supported_transports()[0], "did:web:127.0.0.1%3A9");
         let registry = Registry::ephemeral(&tdk, &route, REGISTRY).unwrap();
         let query = || trql_client::TrqpQuery::new("did:example:e", "did:example:a", "x", "y");
 

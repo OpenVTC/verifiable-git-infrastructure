@@ -808,10 +808,10 @@ async fn the_bridge_queries_the_registry_as_its_own_did_over_its_link() {
         .with_timeout(std::time::Duration::from_millis(500));
         let verifier = VerifyTrustVerifier::new(w.bridge.config())
             .with_channel(Arc::new(channel))
-            .with_route(trql_client::TransportChoice {
-                kind: trql_client::TransportKind::Didcomm,
-                endpoint: "did:web:mediator.acme.example".into(),
-            });
+            .with_route(trql_client::TransportChoice::new(
+                trql_client::TransportKind::Didcomm,
+                "did:web:mediator.acme.example",
+            ));
 
         // The fake registry: grants Alice on the namespace, and answers
         // through the bridge's inbound path — as itself, or (forged) as
