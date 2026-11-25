@@ -67,7 +67,7 @@ use trql_client::{
     HttpsTransport, HttpsTransportConfig, ServiceCapabilities, TransportChoice, TransportKind,
     TrqlClient, TrqlError, TrqlTransport,
 };
-use trust_tasks_trql::TrustTask;
+use trust_tasks_rs::TrustTask;
 
 #[cfg(any(feature = "didcomm", feature = "tsp"))]
 pub use mediated::EphemeralIdentity;
@@ -165,10 +165,7 @@ pub fn choose_route(
              not a mediator DID"
         );
     }
-    Ok(TransportChoice {
-        kind,
-        endpoint: endpoint.to_string(),
-    })
+    Ok(TransportChoice::new(kind, endpoint))
 }
 
 fn list(kinds: &[TransportKind]) -> String {
@@ -1785,10 +1782,7 @@ mod tests {
         // which `query_registry` records as `registryUnavailable` — and the
         // second must fail at once rather than trying again.
         let tdk = crate::build_resolver(false).await.unwrap();
-        let route = TransportChoice {
-            kind: supported_transports()[0],
-            endpoint: "did:web:127.0.0.1%3A9".to_string(),
-        };
+        let route = TransportChoice::new(supported_transports()[0], "did:web:127.0.0.1%3A9");
         let registry = Registry::ephemeral(&tdk, &route, REGISTRY).unwrap();
         let query = || trql_client::TrqpQuery::new("did:example:e", "did:example:a", "x", "y");
 

@@ -147,10 +147,7 @@ async fn ephemeral(
     timeout: Duration,
 ) -> Registry {
     let tdk = verify_trust::build_resolver(false).await.unwrap();
-    let route = TransportChoice {
-        kind,
-        endpoint: env.mediator.did().to_string(),
-    };
+    let route = TransportChoice::new(kind, env.mediator.did());
     Registry::ephemeral_with_timeout(&tdk, &route, registry_did, Some(timeout)).unwrap()
 }
 

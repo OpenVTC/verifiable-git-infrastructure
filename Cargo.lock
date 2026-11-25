@@ -462,9 +462,9 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "trust-tasks-build 0.2.2",
+ "trust-tasks-build",
  "trust-tasks-proof",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "zeroize",
@@ -575,9 +575,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tracing",
- "trust-tasks-build 0.2.2",
+ "trust-tasks-build",
  "trust-tasks-proof",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
  "uuid",
 ]
 
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "did-git-sign"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6852,9 +6852,9 @@ dependencies = [
 
 [[package]]
 name = "trql-client"
-version = "0.31.0"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daa9c0797f0fb87fc89b734ae0ce7daf9276abd1e052b51521438c6e4b4a1798"
+checksum = "e6797d6a1aa59c6a6c1a8526a9663f3b533be4cccc5b2cdde0fc08666b852967"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6862,29 +6862,11 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.37.15",
-]
-
-[[package]]
-name = "trust-tasks-build"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4bc4ea9eed5eeee38822e3efa03da008fb0da38d15e49648d9b25862ac2fcdc"
-dependencies = [
- "anyhow",
- "heck",
- "prettyplease",
- "proc-macro2",
- "quote",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "syn 2.0.119",
- "toml",
- "typify",
+ "trust-tasks-build",
+ "trust-tasks-rs",
+ "uuid",
 ]
 
 [[package]]
@@ -6924,22 +6906,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "trust-tasks-rs 0.41.2",
-]
-
-[[package]]
-name = "trust-tasks-rs"
-version = "0.37.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "702ad3e50fb73403bffc7291d7b2439cfe34d6debf5a55aecd0912995c588f10"
-dependencies = [
- "async-trait",
- "chrono",
- "regress 0.11.1",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror",
+ "trust-tasks-rs",
 ]
 
 [[package]]
@@ -6969,7 +6936,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
 ]
 
 [[package]]
@@ -7224,7 +7191,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verify-trust"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-test-mediator",
@@ -7251,7 +7218,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-rs 0.37.15",
+ "trust-tasks-rs",
  "uuid",
  "vgi-core",
  "vta-sdk",
@@ -7266,7 +7233,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi-bridge"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "affinidi-data-integrity",
  "affinidi-messaging-core",
@@ -7301,9 +7268,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trql-client",
- "trust-tasks-build 0.2.2",
+ "trust-tasks-build",
  "trust-tasks-proof",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
  "url",
  "uuid",
  "verify-trust",
@@ -7318,7 +7285,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-cli"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7338,7 +7305,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-core"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "affinidi-did-common",
  "anyhow",
@@ -7353,7 +7320,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "async-trait",
  "http",
@@ -7365,7 +7332,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-forgejo"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7385,7 +7352,7 @@ dependencies = [
 
 [[package]]
 name = "vgi-forge-github"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -7452,7 +7419,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
  "trust-tasks-tsp",
  "url",
  "uuid",
@@ -7484,7 +7451,7 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea9b2c93c9bd5f7d2a0c655870568b031af888f5ccbbb01fb633bcd1c3ce4716"
 dependencies = [
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-rs",
  "vti-specs-core",
  "vti-specs-rooms",
  "vti-specs-vta",
@@ -7494,52 +7461,52 @@ dependencies = [
 
 [[package]]
 name = "vti-specs-core"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3069baf5eb65830213a728d8a139ab6838f7f41f9fdb23433d7bdaf110ff5985"
+checksum = "ac30280fbe07ba52168efff5333a0569cd5e35e0ce2ee586148a5cf8ddd7465e"
 dependencies = [
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-build",
+ "trust-tasks-rs",
 ]
 
 [[package]]
 name = "vti-specs-rooms"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3990705e2b1afdb3793d46145f0fc5859e5f8b4dc6b9382ead8e4c5dcf9998aa"
+checksum = "d23dc0fc9a551a82928008ca52d74a872181089bc9a10019ff9241640fb8429a"
 dependencies = [
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-build",
+ "trust-tasks-rs",
 ]
 
 [[package]]
 name = "vti-specs-vta"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc0f08a7fcf49f8d72655365c75fd446e480964c0959356917fd9f542086b441"
+checksum = "5faf57c1a367618985662e99adaccde43fc954598d250f5fb64e0a5a818ac01d"
 dependencies = [
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-build",
+ "trust-tasks-rs",
 ]
 
 [[package]]
 name = "vti-specs-vtc"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b64afb30cb925d7c55ad04693d33259db8dd9ea7c72d108dc68bcd77d1fc7267"
+checksum = "fa7be798f65c1cc2c2f4ec9eef16a0cb434b843b515b1be2064ae11160920407"
 dependencies = [
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-build",
+ "trust-tasks-rs",
 ]
 
 [[package]]
 name = "vti-specs-vtn"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2097e2c57d117a0250d848def032e9dcdb1fbe8c50f4377dab737cdc03f629ce"
+checksum = "d03d98520b19cf9f19c1314deb57489172f70206936afca9652e39152c3cd731"
 dependencies = [
- "trust-tasks-build 0.1.4",
- "trust-tasks-rs 0.41.2",
+ "trust-tasks-build",
+ "trust-tasks-rs",
 ]
 
 [[package]]
