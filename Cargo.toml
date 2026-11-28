@@ -618,7 +618,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # dependencies of its own. The bridge's state is small (bindings, pins, a job
 # ledger) and written rarely; fjall, which VTI uses, is an LSM engine with
 # background compaction — more machinery than a few hundred records need.
-redb = "4"
+redb = "5"
 # The operator's config file.
 toml = "1"
 # The bridge binary's global allocator (see crates/vgi-bridge/Cargo.toml).
